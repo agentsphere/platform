@@ -3006,6 +3006,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "sqlx",
  "thiserror 2.0.18",
@@ -3015,6 +3016,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

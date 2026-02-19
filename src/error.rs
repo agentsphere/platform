@@ -22,6 +22,9 @@ pub enum ApiError {
     #[error("validation error")]
     Validation(Vec<String>),
 
+    #[error("too many requests")]
+    TooManyRequests,
+
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
@@ -43,6 +46,10 @@ impl IntoResponse for ApiError {
             ),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg })),
             Self::Conflict(msg) => (StatusCode::CONFLICT, serde_json::json!({ "error": msg })),
+            Self::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({ "error": "too many requests" }),
+            ),
             Self::Validation(errors) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 serde_json::json!({ "error": "validation error", "fields": errors }),

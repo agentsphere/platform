@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE pipelines SET status = 'running', started_at = now()\n        WHERE id = $1 AND status = 'pending'\n        RETURNING project_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ad2755e92af4d92e8f4e0b05d34cc7c4bbeca82f7efcc2b472d39231a3614a5b"
+}

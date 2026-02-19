@@ -239,5 +239,22 @@ Build pages in the order that corresponding APIs become available:
 6. Observability: log search, trace waterfall, metric charts
 7. Admin: user/role management, delegations
 
+## Security Context (from security hardening)
+
+The UI consumes a security-hardened backend. Follow these patterns:
+
+- **Session cookies**: Login sets `HttpOnly; SameSite=Strict; Path=/` cookies. The `Secure` flag is added when `PLATFORM_SECURE_COOKIES=true` (production). The API client should handle 401 responses by redirecting to login.
+- **CORS**: The backend enforces CORS via `PLATFORM_CORS_ORIGINS`. During dev, configure it to allow `localhost` origins.
+- **XSS prevention**: The backend sets `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. On the frontend:
+  - Never use `dangerouslySetInnerHTML` with unsanitized user input
+  - Sanitize markdown rendering (issue/MR bodies, comments) — use a safe markdown parser
+  - Escape user-generated content in all templates
+- **CSRF protection**: `SameSite=Strict` cookies provide CSRF protection. The API also accepts Bearer tokens for programmatic access.
+- **Secret display**: The secrets page must only show metadata (name, scope, version). Secret values are never returned by the API. The token creation flow shows the raw token exactly once — display a clear "copy now, won't be shown again" warning.
+- **Error handling**: Don't expose internal error details to the user. Map 500 errors to generic "Something went wrong" messages. Log details to the console for debugging.
+- **WebSocket auth**: WebSocket connections to `/api/.../ws` must include the session cookie. Handle reconnection gracefully when sessions expire.
+- **Input validation**: Client-side validation should mirror server-side limits (names 1-255, titles 1-500, bodies 0-100K, etc.) for UX, but the server is the source of truth.
+- **Content Security Policy**: Consider adding a CSP meta tag that restricts script sources to self. No inline scripts, no eval.
+
 ## Estimated LOC
 ~2,500 TypeScript

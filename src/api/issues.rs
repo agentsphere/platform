@@ -10,8 +10,9 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
-use crate::rbac::Permission;
+use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -106,6 +107,42 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+async fn require_project_read(
+    state: &AppState,
+    auth: &AuthUser,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let project = sqlx::query!(
+        "SELECT visibility, owner_id FROM projects WHERE id = $1 AND is_active = true",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project".into()))?;
+
+    if project.visibility == "public"
+        || project.visibility == "internal"
+        || project.owner_id == auth.user_id
+    {
+        return Ok(());
+    }
+
+    let allowed = resolver::has_permission(
+        &state.pool,
+        &state.valkey,
+        auth.user_id,
+        Some(project_id),
+        Permission::ProjectRead,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    if !allowed {
+        return Err(ApiError::NotFound("project".into()));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Issue handlers
 // ---------------------------------------------------------------------------
@@ -117,6 +154,15 @@ async fn create_issue(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Validate input
+    validation::check_length("title", &body.title, 1, 500)?;
+    if let Some(ref b) = body.body {
+        validation::check_length("body", b, 0, 100_000)?;
+    }
+    if let Some(ref labels) = body.labels {
+        validation::check_labels(labels)?;
+    }
+
     // Creating issues requires project:write
     let allowed = crate::rbac::resolver::has_permission(
         &state.pool,
@@ -211,10 +257,12 @@ async fn create_issue(
 
 async fn list_issues(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
     Query(params): Query<ListIssuesParams>,
 ) -> Result<Json<ListResponse<IssueResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
@@ -274,9 +322,11 @@ async fn list_issues(
 
 async fn get_issue(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let issue = sqlx::query!(
         r#"
         SELECT id, project_id, number, author_id, title, body, status, labels, assignee_id, created_at, updated_at
@@ -311,6 +361,17 @@ async fn update_issue(
     Path((id, number)): Path<(Uuid, i32)>,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    // Validate input
+    if let Some(ref t) = body.title {
+        validation::check_length("title", t, 1, 500)?;
+    }
+    if let Some(ref b) = body.body {
+        validation::check_length("body", b, 0, 100_000)?;
+    }
+    if let Some(ref labels) = body.labels {
+        validation::check_labels(labels)?;
+    }
+
     // Author or project:write
     let issue_author = sqlx::query_scalar!(
         "SELECT author_id FROM issues WHERE project_id = $1 AND number = $2",
@@ -402,9 +463,11 @@ async fn update_issue(
 
 async fn list_comments(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> Result<Json<Vec<CommentResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let issue_id = sqlx::query_scalar!(
         "SELECT id FROM issues WHERE project_id = $1 AND number = $2",
         id,
@@ -446,6 +509,9 @@ async fn create_comment(
     Path((id, number)): Path<(Uuid, i32)>,
     Json(body): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+    validation::check_length("body", &body.body, 1, 100_000)?;
+
     let issue_id = sqlx::query_scalar!(
         "SELECT id FROM issues WHERE project_id = $1 AND number = $2",
         id,
@@ -503,6 +569,8 @@ async fn update_comment(
     Path((id, number, comment_id)): Path<(Uuid, i32, Uuid)>,
     Json(body): Json<UpdateCommentRequest>,
 ) -> Result<Json<CommentResponse>, ApiError> {
+    validation::check_length("body", &body.body, 1, 100_000)?;
+
     // Verify issue exists
     let _issue_id = sqlx::query_scalar!(
         "SELECT id FROM issues WHERE project_id = $1 AND number = $2",
@@ -547,6 +615,21 @@ async fn update_comment(
     )
     .fetch_one(&state.pool)
     .await?;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "comment.update",
+            resource: "comment",
+            resource_id: Some(comment_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     Ok(Json(CommentResponse {
         id: comment.id,

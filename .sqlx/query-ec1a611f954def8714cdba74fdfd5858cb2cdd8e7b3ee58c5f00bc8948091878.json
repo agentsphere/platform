@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT name, image FROM pipeline_steps\n        WHERE pipeline_id = $1 AND status = 'success' AND image ILIKE '%kaniko%'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "image",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ec1a611f954def8714cdba74fdfd5858cb2cdd8e7b3ee58c5f00bc8948091878"
+}

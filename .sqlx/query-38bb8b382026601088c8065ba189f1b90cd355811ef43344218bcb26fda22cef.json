@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pipelines SET status = 'failure', finished_at = now() WHERE id = $1 AND status IN ('pending', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38bb8b382026601088c8065ba189f1b90cd355811ef43344218bcb26fda22cef"
+}

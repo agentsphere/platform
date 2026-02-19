@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status)\n        VALUES ($1, 'production', $2, 'active', 'pending')\n        ON CONFLICT (project_id, environment)\n        DO UPDATE SET image_ref = $2, desired_status = 'active', current_status = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9093dc1d709a8eb73073191f5e860b75a300d5fe43523bfff8ddc67080b1c3f3"
+}

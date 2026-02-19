@@ -66,10 +66,14 @@ Write the implementation to make tests pass:
 4. Use trait-based DI (`impl Repository`) for business logic modules that benefit from test mocking. API handlers use `PgPool` directly via `State(state)` — trait indirection there adds complexity without value.
 5. Use the builder pattern for constructing complex structs (K8s pod specs, query builders)
 6. No `.unwrap()` in production code
-7. Never log sensitive data (passwords, tokens, secrets)
-8. Keep handler functions under 100 lines (clippy `too_many_lines`). Extract helpers like `get_project_repo_path()` for repeated DB lookups or shared setup logic.
+7. Never log sensitive data (passwords, tokens, secrets, webhook URLs)
+8. Keep handler functions under 100 lines (clippy `too_many_lines`). Extract helpers like `get_project_repo_path()`, `require_project_write()` for repeated DB lookups or shared setup logic.
 9. For permission checks in sub-routers (`fn router() -> Router<AppState>`), use **inline checks** or a helper function like `require_project_write()` — NOT the `require_permission` route layer. The route layer needs `from_fn_with_state(state.clone(), ...)` which requires a concrete `AppState` value, unavailable at sub-router construction time.
 10. **Update the plan** as you go — if the implementation deviates from the plan (different approach, extra complexity, changed schema, new dependencies), update the relevant `plans/` file immediately. Don't wait until the end.
+11. **Validate all inputs** at the handler boundary using `crate::validation::*` helpers. Every string field from user input must have a length check. See `CLAUDE.md` Security Patterns for field limits.
+12. **Check authorization for all read endpoints** on sub-resources (issues, MRs, comments, reviews) — use `require_project_read()` which returns 404 (not 403) for private resources.
+13. **Apply SSRF protection** to any feature that makes outbound HTTP requests to user-supplied URLs. Follow the `validate_webhook_url()` pattern from `src/api/webhooks.rs`.
+14. **Rate-limit brute-forceable endpoints** (login, password reset, token creation) using `crate::auth::rate_limit::check_rate()`.
 
 Run `just test-unit` — all unit tests should pass (green phase).
 
@@ -121,11 +125,18 @@ Verify every item before considering the work done:
 - [ ] Handlers follow signature convention: State, AuthUser, Path, Query, Json
 - [ ] No `.unwrap()` in production code
 - [ ] No handler function exceeds 100 lines (extract helpers for shared DB lookups, repo path resolution, etc.)
-- [ ] Sensitive data (passwords, tokens, secrets) is never logged
+- [ ] Sensitive data (passwords, tokens, secrets, webhook URLs) is never logged
 - [ ] Migrations are reversible (up + down)
 - [ ] `.sqlx/` offline cache is up to date
 - [ ] Remove `#[allow(dead_code)]` from foundation items now consumed by new code
 - [ ] Zero warnings with `cargo clippy --all-features -- -D warnings`
+- [ ] All user-facing string inputs have length validation via `crate::validation::*`
+- [ ] Read endpoints on sub-resources check project-level read access (`require_project_read`)
+- [ ] Read endpoints for private resources return 404 (not 403) to avoid leaking existence
+- [ ] Any outbound HTTP to user-supplied URLs has SSRF protection (block private IPs, metadata endpoints)
+- [ ] Brute-forceable endpoints have rate limiting (`check_rate`)
+- [ ] New mutations write to `audit_log` — audit detail fields never contain URLs or secrets
+- [ ] Webhook dispatch uses the shared `WEBHOOK_CLIENT` (with timeouts) and `WEBHOOK_SEMAPHORE` (concurrency limit)
 
 ## Step 8: Update plan & summarize changes
 

@@ -13,6 +13,7 @@ use crate::auth::{password, token};
 use crate::error::ApiError;
 use crate::rbac::Permission;
 use crate::store::AppState;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,6 +128,9 @@ async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Rate-limit login attempts (10 per 5 minutes per username)
+    crate::auth::rate_limit::check_rate(&state.valkey, "login", &body.name, 10, 300).await?;
+
     // Look up user by name
     let user = sqlx::query!(
         r#"
@@ -138,54 +142,28 @@ async fn login(
         body.name,
     )
     .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::Unauthorized)?;
-
-    if !user.is_active {
-        return Err(ApiError::Unauthorized);
-    }
-
-    // Verify password
-    if !password::verify_password(&body.password, &user.password_hash)
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::Unauthorized);
-    }
-
-    // Create session
-    let (raw_token, token_hash) = token::generate_session_token();
-    let expires_at = Utc::now() + Duration::hours(24);
-
-    sqlx::query!(
-        r#"
-        INSERT INTO auth_sessions (user_id, token_hash, expires_at)
-        VALUES ($1, $2, $3)
-        "#,
-        user.id,
-        token_hash,
-        expires_at,
-    )
-    .execute(&state.pool)
     .await?;
 
-    write_audit(
-        &state.pool,
-        &AuditEntry {
-            actor_id: user.id,
-            actor_name: &user.name,
-            action: "auth.login",
-            resource: "session",
-            resource_id: None,
-            project_id: None,
-            detail: None,
-            ip_addr: None,
-        },
-    )
-    .await;
+    // Timing-safe: always run argon2 verify even when user not found
+    let (hash_to_verify, user) = match user {
+        Some(u) => (u.password_hash.clone(), Some(u)),
+        None => (password::dummy_hash().to_owned(), None),
+    };
+
+    let password_valid =
+        password::verify_password(&body.password, &hash_to_verify).map_err(ApiError::Internal)?;
+
+    let user = match user {
+        Some(u) if password_valid && u.is_active => u,
+        _ => return Err(ApiError::Unauthorized),
+    };
+
+    // Create session
+    let session = create_login_session(&state, user.id, &user.name).await?;
 
     let response = LoginResponse {
-        token: raw_token,
-        expires_at,
+        token: session.token,
+        expires_at: session.expires_at,
         user: UserResponse {
             id: user.id,
             name: user.name,
@@ -198,8 +176,13 @@ async fn login(
     };
 
     // Set session cookie + return JSON
+    let secure_flag = if state.config.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
+        "session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400{secure_flag}",
         response.token
     );
     Ok((
@@ -207,6 +190,52 @@ async fn login(
         [(axum::http::header::SET_COOKIE, cookie)],
         Json(response),
     ))
+}
+
+struct SessionInfo {
+    token: String,
+    expires_at: DateTime<Utc>,
+}
+
+async fn create_login_session(
+    state: &AppState,
+    user_id: Uuid,
+    user_name: &str,
+) -> Result<SessionInfo, ApiError> {
+    let (raw_token, token_hash) = token::generate_session_token();
+    let expires_at = Utc::now() + Duration::hours(24);
+
+    sqlx::query!(
+        r#"
+        INSERT INTO auth_sessions (user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3)
+        "#,
+        user_id,
+        token_hash,
+        expires_at,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: user_id,
+            actor_name: user_name,
+            action: "auth.login",
+            resource: "session",
+            resource_id: None,
+            project_id: None,
+            detail: None,
+            ip_addr: None,
+        },
+    )
+    .await;
+
+    Ok(SessionInfo {
+        token: raw_token,
+        expires_at,
+    })
 }
 
 #[tracing::instrument(skip(state), fields(user_id = %auth.user_id), err)]
@@ -290,6 +319,14 @@ async fn create_user(
 
     if !is_admin {
         return Err(ApiError::Forbidden);
+    }
+
+    // Validate inputs
+    validation::check_name(&body.name)?;
+    validation::check_email(&body.email)?;
+    validation::check_length("password", &body.password, 8, 1024)?;
+    if let Some(ref dn) = body.display_name {
+        validation::check_length("display_name", dn, 1, 255)?;
     }
 
     let hash = password::hash_password(&body.password).map_err(ApiError::Internal)?;
@@ -458,6 +495,17 @@ async fn update_user(
         }
     }
 
+    // Validate inputs
+    if let Some(ref dn) = body.display_name {
+        validation::check_length("display_name", dn, 1, 255)?;
+    }
+    if let Some(ref email) = body.email {
+        validation::check_email(email)?;
+    }
+    if let Some(ref pw) = body.password {
+        validation::check_length("password", pw, 8, 1024)?;
+    }
+
     // Build update — only set fields that are provided
     let password_hash = match &body.password {
         Some(pw) => Some(password::hash_password(pw).map_err(ApiError::Internal)?),
@@ -532,6 +580,18 @@ async fn deactivate_user(
         .execute(&state.pool)
         .await?;
 
+    // Revoke all sessions and tokens for the deactivated user
+    sqlx::query!("DELETE FROM auth_sessions WHERE user_id = $1", id)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+
+    // Invalidate permission cache (best-effort)
+    let _ = crate::rbac::resolver::invalidate_permissions(&state.valkey, id, None).await;
+
     write_audit(
         &state.pool,
         &AuditEntry {
@@ -560,12 +620,22 @@ async fn create_api_token(
     auth: AuthUser,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validation::check_length("name", &body.name, 1, 255)?;
+
     let (raw_token, token_hash) = token::generate_api_token();
 
     let scopes = body.scopes.unwrap_or_default();
-    let expires_at = body
-        .expires_in_days
-        .map(|days| Utc::now() + Duration::days(days));
+
+    const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
+    const MAX_TOKEN_EXPIRY_DAYS: i64 = 365;
+
+    let days = body.expires_in_days.unwrap_or(DEFAULT_TOKEN_EXPIRY_DAYS);
+    if !(1..=MAX_TOKEN_EXPIRY_DAYS).contains(&days) {
+        return Err(ApiError::BadRequest(format!(
+            "expires_in_days must be between 1 and {MAX_TOKEN_EXPIRY_DAYS}"
+        )));
+    }
+    let expires_at = Some(Utc::now() + Duration::days(days));
 
     let row = sqlx::query!(
         r#"

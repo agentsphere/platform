@@ -176,5 +176,27 @@ Central notification dispatch:
 6. Webhook delivery with HMAC signing
 7. Event-driven notification helpers callable from other modules
 
+## Security Context (from security hardening)
+
+All new handlers must follow the security patterns established in the codebase:
+
+### Secrets-specific security
+
+- **Input validation**: Secret names must be validated (1-255, alphanumeric + `-_`). Secret values have a max size (e.g., 64KB). Scope must be one of the allowed values. See `CLAUDE.md` Security Patterns for field limits.
+- **Master key management**: `PLATFORM_MASTER_KEY` must be validated at startup (exactly 32 bytes hex-encoded). Panic in production mode if missing or invalid. In dev mode, derive a deterministic key from a known value.
+- **Encrypt at rest**: All secret values stored via AES-256-GCM. The nonce must be randomly generated per encryption (never reuse nonces). Use `aes-gcm` crate.
+- **Write-only API**: Secret values must **never** be returned via API. List endpoints return metadata only (name, scope, version, created_at). The `resolve_secret()` function is internal-only.
+- **Scope enforcement**: Pipeline secrets must not be resolvable by agent scope and vice versa. Enforce scope matching in `resolve_secrets_for_env()`.
+- **Audit logging**: Log secret create/delete but **never** log secret values. Audit detail should contain only the secret name and scope.
+- **Template injection**: The `${{ secrets.NAME }}` resolution in pipeline configs must only match the exact pattern — don't use general-purpose template engines that could allow code execution.
+
+### Notifications-specific security
+
+- **SSRF on webhook delivery**: Use the same SSRF protection pattern as `src/api/webhooks.rs` — block private IPs, metadata endpoints, non-HTTP schemes. Or reuse the shared `WEBHOOK_CLIENT` with timeouts.
+- **Email injection**: When sending SMTP emails, sanitize the `to`, `subject`, and `body` fields. Don't allow header injection via newlines in subject/headers.
+- **Rate limiting on notifications**: Prevent notification spam — limit the number of notifications per user per hour. A runaway alert rule or build loop could generate thousands of notifications.
+- **Audit logging**: Log notification dispatch (type, channel, recipient) but never log email bodies or webhook payloads in audit detail.
+- **Input validation**: Notification type, subject, body, and ref_type must all be length-validated. Channel must be one of the allowed values.
+
 ## Estimated LOC
 ~1,000 Rust (500 secrets + 500 notify)

@@ -12,6 +12,7 @@ use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
 use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,6 +102,18 @@ async fn create_project(
 
     if !allowed {
         return Err(ApiError::Forbidden);
+    }
+
+    // Validate inputs
+    validation::check_name(&body.name)?;
+    if let Some(ref dn) = body.display_name {
+        validation::check_length("display_name", dn, 1, 255)?;
+    }
+    if let Some(ref desc) = body.description {
+        validation::check_length("description", desc, 0, 10_000)?;
+    }
+    if let Some(ref branch) = body.default_branch {
+        validation::check_branch_name(branch)?;
     }
 
     let visibility = body.visibility.as_deref().unwrap_or("private");
@@ -332,6 +345,17 @@ async fn update_project(
         if !allowed {
             return Err(ApiError::Forbidden);
         }
+    }
+
+    // Validate inputs
+    if let Some(ref dn) = body.display_name {
+        validation::check_length("display_name", dn, 1, 255)?;
+    }
+    if let Some(ref desc) = body.description {
+        validation::check_length("description", desc, 0, 10_000)?;
+    }
+    if let Some(ref branch) = body.default_branch {
+        validation::check_branch_name(branch)?;
     }
 
     if let Some(ref vis) = body.visibility

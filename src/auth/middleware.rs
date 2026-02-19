@@ -31,7 +31,8 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let ip_addr = extract_ip(parts);
+        let trust_proxy = state.config.trust_proxy_headers;
+        let ip_addr = extract_ip(parts, trust_proxy);
 
         // Try Bearer token first
         if let Some(raw_token) = extract_bearer_token(parts)
@@ -111,9 +112,10 @@ fn extract_session_cookie(parts: &Parts) -> Option<String> {
     None
 }
 
-fn extract_ip(parts: &Parts) -> Option<String> {
-    // Try x-forwarded-for first (proxied requests)
-    if let Some(forwarded) = parts.headers.get("x-forwarded-for")
+fn extract_ip(parts: &Parts, trust_proxy: bool) -> Option<String> {
+    // Only trust X-Forwarded-For when behind a configured reverse proxy
+    if trust_proxy
+        && let Some(forwarded) = parts.headers.get("x-forwarded-for")
         && let Ok(val) = forwarded.to_str()
         && let Some(first_ip) = val.split(',').next()
     {

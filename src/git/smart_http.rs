@@ -347,7 +347,7 @@ async fn receive_pack(
 
     if status.success() {
         // Run post-receive hooks in background
-        let pool = state.pool.clone();
+        let hook_state = state.clone();
         let params = super::hooks::PostReceiveParams {
             project_id: project.project_id,
             user_id: git_user.user_id,
@@ -356,7 +356,7 @@ async fn receive_pack(
             default_branch: project.default_branch.clone(),
         };
         tokio::spawn(async move {
-            if let Err(e) = super::hooks::post_receive(&pool, &params).await {
+            if let Err(e) = super::hooks::post_receive(&hook_state, &params).await {
                 tracing::error!(error = %e, "post-receive hook failed");
             }
         });

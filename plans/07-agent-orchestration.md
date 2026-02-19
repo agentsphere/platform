@@ -224,5 +224,19 @@ User creates session → session row (pending)
 5. Messages can be sent to running agents
 6. Pod reaper handles terminated sessions
 
+## Security Context (from security hardening)
+
+All new handlers must follow the security patterns established in the codebase:
+
+- **Input validation**: Validate all request fields using `crate::validation::*` helpers. Session `prompt` should have a length limit (1-100K). `provider` and `branch` must be validated. See `CLAUDE.md` Security Patterns for field limits.
+- **Authorization on reads**: Session list/detail endpoints must check project-level read access via `require_project_read()` (returns 404 for unauthorized private projects).
+- **Agent identity security**: Ephemeral agent tokens must be scoped (use the token scope enforcement from plan-11). Agent users must not be able to log in via password or spawn recursive agents.
+- **Rate limiting**: Apply rate limiting to session creation (`POST /api/projects/:id/sessions`) to prevent resource exhaustion — an unbounded number of agent pods could overwhelm the cluster.
+- **Pod security**: Agent pods should have resource limits, a non-root security context, and a read-only root filesystem where feasible. Don't mount the host filesystem or K8s service account tokens beyond what's needed.
+- **Secrets in environment**: `ANTHROPIC_API_KEY` and `PLATFORM_API_TOKEN` must come from K8s Secrets, not hardcoded. Use the secrets engine (plan-09) for resolution.
+- **WebSocket auth**: The `/ws` endpoint must validate the session cookie/token on connection, not just on HTTP upgrade. Re-check auth periodically for long-lived connections.
+- **Audit logging**: Log session create/stop/message events. Never log prompts, API keys, or agent output in audit `detail`.
+- **Webhook dispatch**: Use `fire_webhooks()` for session lifecycle events (created, completed, failed) — it has built-in SSRF protection, timeouts, and concurrency limits.
+
 ## Estimated LOC
 ~800 Rust

@@ -213,5 +213,17 @@ pub async fn run(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) {
 - **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods — chain directly, don't import from `axum::routing`
 - **Clippy**: Functions with 7+ params need a params struct. `Copy` types use `self` not `&self`.
 - **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
-- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for deployment mutations.
+- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for deployment mutations. Never include URLs or secrets in audit `detail` JSON.
 - **kube::Error → ApiError**: Already implemented, so `?` propagation works from kube-rs calls in handlers.
+
+### Security context (from security hardening)
+
+All new handlers must follow the security patterns established in the codebase:
+
+- **Input validation**: Validate all request fields using `crate::validation::*` helpers at handler boundary. Field limits: names 1-255, descriptions 0-10K, URLs 1-2048. See `CLAUDE.md` Security Patterns for full table.
+- **Authorization on reads**: All deployment read endpoints (`GET /api/projects/:id/deployments/*`) must check project-level read access using a `require_project_read()` helper (returns 404 for unauthorized private projects, not 403).
+- **SSRF on ops repo URLs**: The `ops_repo.repo_url` is a user-supplied Git URL. Validate it doesn't point to private IPs, localhost, or metadata endpoints before cloning. Follow the `validate_webhook_url()` pattern from `src/api/webhooks.rs`.
+- **Rate limiting**: Not typically needed for deployment endpoints (already auth-gated), but apply to any endpoint that triggers expensive operations (e.g., force-sync).
+- **Webhook dispatch**: When firing deploy webhooks, use `crate::api::webhooks::fire_webhooks()` which has built-in timeouts, concurrency limits, and SSRF-safe dispatch.
+- **Audit sanitization**: Deployment mutations should log to audit trail, but never include repo URLs or image refs that may contain tokens in audit `detail`.
+- **Manifest rendering**: Be cautious with template injection — user-supplied `values_override` JSON is interpolated into K8s manifests via minijinja. Ensure template rendering doesn't allow code execution or path traversal.

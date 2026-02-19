@@ -2,7 +2,7 @@
 
 Single Rust binary (~15K LOC) replacing 8+ off-the-shelf services (Gitea, Woodpecker, Authelia, OpenObserve, Maddy, OpenBao) with a unified platform. Architecture: `plans/unified-platform.md`. Toolchain: `plans/rust-dev-process.md`. Phased delivery: `plans/01-foundation.md` through `plans/10-web-ui.md`.
 
-**Current status**: Phases 01 (Foundation), 02 (Identity & Auth), 03 (Git Server), and 04 (Project Management) complete. Modules 05-09 can be implemented in parallel.
+**Current status**: Phases 01 (Foundation), 02 (Identity & Auth), 03 (Git Server), and 04 (Project Management) complete. Security hardening applied across all phases (rate limiting, SSRF protection, input validation, auth hardening). Phase 05 (Build Engine) in progress. Modules 05-09 can be implemented in parallel.
 
 ## Commands
 
@@ -169,6 +169,116 @@ Projects use soft-delete (`is_active = false`). Always filter with `AND is_activ
 - `src/api/issues.rs` — Issues + comments
 - `src/api/merge_requests.rs` — MRs + reviews + comments + merge
 - `src/api/webhooks.rs` — Webhook CRUD + `fire_webhooks()` utility
+
+## Security Patterns
+
+### Input validation
+
+All API handlers must validate inputs before processing. Use helpers from `src/validation.rs`:
+
+```rust
+use crate::validation;
+
+// In handler, before any DB or business logic:
+validation::check_name(&body.name)?;              // 1-255, alphanumeric + -_.
+validation::check_email(&body.email)?;             // 1-254, contains @
+validation::check_length("password", &body.password, 8, 1024)?;
+validation::check_length("description", &desc, 0, 10_000)?;
+validation::check_branch_name(&body.branch)?;      // 1-255, no "..", no null bytes
+validation::check_labels(&body.labels)?;            // max 50, each 1-100
+validation::check_url(&body.url)?;                 // 1-2048, http(s) only
+validation::check_lfs_oid(&oid)?;                  // exactly 64 hex chars
+```
+
+**Field limits** (enforce these for all new endpoints):
+
+| Field type | Min | Max |
+|---|---|---|
+| Name/slug | 1 | 255 |
+| Email | 3 | 254 |
+| Password | 8 | 1,024 |
+| Title | 1 | 500 |
+| Body/description | 0 | 100,000 |
+| URL | 1 | 2,048 |
+| Labels | - | 50 items, each 1-100 chars |
+| Display name | 1 | 255 |
+
+### Rate limiting
+
+Use `src/auth/rate_limit.rs` for endpoints vulnerable to brute force:
+
+```rust
+crate::auth::rate_limit::check_rate(&state.valkey, "login", &identifier, 10, 300).await?;
+// prefix: "login", max: 10 attempts, window: 300 seconds
+```
+
+Currently applied to: login. Apply to any new authentication or password-related endpoints.
+
+### SSRF protection
+
+Webhook URLs (and any user-supplied URLs that the server will fetch) must be validated against SSRF:
+
+```rust
+// In src/api/webhooks.rs — validate_webhook_url() blocks:
+// - Private IPs (10/8, 172.16/12, 192.168/16, 127/8)
+// - Link-local (169.254/16)
+// - Loopback (::1, localhost)
+// - Cloud metadata (169.254.169.254, metadata.google.internal)
+// - Non-HTTP schemes (ftp://, file://, etc.)
+```
+
+Apply the same pattern to any new feature that makes outbound HTTP requests to user-supplied URLs.
+
+### Webhook dispatch security
+
+- **Shared client**: `WEBHOOK_CLIENT` static with 5s connect / 10s total timeout, no redirects
+- **Concurrency limit**: `WEBHOOK_SEMAPHORE` (50 concurrent deliveries); excess dropped with warning
+- **HMAC signing**: `X-Platform-Signature: sha256={hex}` when secret configured
+- **Audit sanitization**: never log webhook URLs (may contain tokens)
+
+### Authorization patterns
+
+**Read endpoints on sub-resources** (issues, MRs, comments, reviews) must check project-level read access:
+
+```rust
+async fn require_project_read(state: &AppState, auth: &AuthUser, project_id: Uuid) -> Result<(), ApiError> {
+    let project = sqlx::query!("SELECT visibility, owner_id FROM projects WHERE id = $1 AND is_active = true", project_id)
+        .fetch_optional(&state.pool).await?.ok_or_else(|| ApiError::NotFound("project".into()))?;
+    if project.visibility == "public" || project.visibility == "internal" || project.owner_id == auth.user_id {
+        return Ok(());
+    }
+    let allowed = resolver::has_permission(&state.pool, &state.valkey, auth.user_id, Some(project_id), Permission::ProjectRead)
+        .await.map_err(ApiError::Internal)?;
+    if !allowed { return Err(ApiError::NotFound("project".into())); }  // 404 to avoid leaking existence
+    Ok(())
+}
+```
+
+Key: return **404** (not 403) for private resources the user can't access — avoids leaking resource existence.
+
+### Request-level defense (configured in `main.rs`)
+
+- **Body size limits**: 10 MB default for API, 500 MB for Git push/LFS routes
+- **Security headers**: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`
+- **CORS**: configured via `PLATFORM_CORS_ORIGINS` (comma-separated), denied by default
+- **Session cleanup**: hourly background task deletes expired sessions/tokens
+
+### Auth hardening
+
+- **Timing-safe login**: always run argon2 verify (use `password::dummy_hash()` for missing users)
+- **Secure cookies**: `Secure` flag when `PLATFORM_SECURE_COOKIES=true`
+- **Token expiry**: 1-365 days, default 90 days; enforce at creation time
+- **User deactivation**: deletes all sessions + API tokens + invalidates permission cache
+- **Proxy trust**: `PLATFORM_TRUST_PROXY` controls X-Forwarded-For parsing
+
+### Security-related config env vars
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `PLATFORM_SECURE_COOKIES` | `false` | Add `Secure` flag to session cookies |
+| `PLATFORM_CORS_ORIGINS` | (empty = deny) | Comma-separated allowed CORS origins |
+| `PLATFORM_TRUST_PROXY` | `false` | Trust `X-Forwarded-For` for client IP |
+| `PLATFORM_DEV` | `false` | Dev mode (allows default credentials) |
 
 ## Type System Patterns
 

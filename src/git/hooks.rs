@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::store::AppState;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,68 +64,38 @@ pub fn parse_ref_updates(input: &str) -> Vec<RefUpdate> {
 
 /// Run post-receive logic after a successful push.
 ///
-/// For each branch update:
-/// 1. Check if `.platform.yaml` exists in the repo at the new commit
-/// 2. If yes, insert a pipeline row with status `pending`
-/// 3. Query active webhooks for `push` events (dispatch deferred to notify module)
-#[tracing::instrument(skip(pool, params), fields(project_id = %params.project_id, user = %params.user_name), err)]
-pub async fn post_receive(pool: &PgPool, params: &PostReceiveParams) -> Result<(), ApiError> {
-    // List updated refs by reading the repo's latest reflog or using git for-each-ref
-    // In the smart HTTP stateless-rpc flow, we don't get ref update lines from stdin
-    // (those go to git-receive-pack). We check which branches exist and trigger for
-    // all branches that have .platform.yaml.
-    //
-    // A more precise implementation would intercept the ref updates from the receive-pack
-    // protocol. For now, we trigger on the default branch if .platform.yaml exists.
-    let has_config =
-        check_file_exists(&params.repo_path, &params.default_branch, ".platform.yaml").await;
+/// 1. Delegate to `pipeline::trigger::on_push()` to parse `.platform.yaml` and create pipeline + steps
+/// 2. If a pipeline was created, notify the executor via Valkey
+/// 3. Fire push webhooks
+#[tracing::instrument(skip(state, params), fields(project_id = %params.project_id, user = %params.user_name), err)]
+pub async fn post_receive(state: &AppState, params: &PostReceiveParams) -> Result<(), ApiError> {
+    let commit_sha = get_branch_sha(&params.repo_path, &params.default_branch).await;
 
-    if has_config {
-        // Get the HEAD commit SHA of the default branch
-        let commit_sha = get_branch_sha(&params.repo_path, &params.default_branch).await;
+    let trigger_params = crate::pipeline::trigger::PushTriggerParams {
+        project_id: params.project_id,
+        user_id: params.user_id,
+        repo_path: params.repo_path.clone(),
+        branch: params.default_branch.clone(),
+        commit_sha,
+    };
 
-        let git_ref = format!("refs/heads/{}", params.default_branch);
-
-        sqlx::query!(
-            r#"
-            INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by)
-            VALUES ($1, 'push', $2, $3, 'pending', $4)
-            "#,
-            params.project_id,
-            git_ref,
-            commit_sha.as_deref(),
-            params.user_id,
-        )
-        .execute(pool)
-        .await?;
-
-        tracing::info!(
-            project_id = %params.project_id,
-            git_ref = %git_ref,
-            "pipeline triggered by push"
-        );
+    match crate::pipeline::trigger::on_push(&state.pool, &trigger_params).await {
+        Ok(Some(pipeline_id)) => {
+            crate::pipeline::trigger::notify_executor(&state.valkey, pipeline_id).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "pipeline trigger failed");
+        }
     }
 
-    // Query active webhooks with 'push' event
-    let webhooks = sqlx::query!(
-        r#"
-        SELECT id, url, secret
-        FROM webhooks
-        WHERE project_id = $1 AND active = true AND 'push' = ANY(events)
-        "#,
-        params.project_id,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    if !webhooks.is_empty() {
-        tracing::info!(
-            count = webhooks.len(),
-            project_id = %params.project_id,
-            "found push webhooks"
-        );
-        // TODO: wire integration — dispatch webhook HTTP POST via notify module
-    }
+    // Fire push webhooks
+    let payload = serde_json::json!({
+        "ref": format!("refs/heads/{}", params.default_branch),
+        "project_id": params.project_id,
+        "pusher": params.user_name,
+    });
+    crate::api::webhooks::fire_webhooks(&state.pool, params.project_id, "push", &payload).await;
 
     Ok(())
 }
@@ -135,6 +105,7 @@ pub async fn post_receive(pool: &PgPool, params: &PostReceiveParams) -> Result<(
 // ---------------------------------------------------------------------------
 
 /// Check if a file exists in a git repo at a given ref.
+#[allow(dead_code)] // available for future use; trigger module uses read_file_at_ref instead
 async fn check_file_exists(repo_path: &Path, git_ref: &str, file_path: &str) -> bool {
     let result = tokio::process::Command::new("git")
         .arg("-C")

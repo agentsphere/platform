@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pipelines SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status IN ('pending', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dd95d8c9f70c8eabe6ab3958a7511783a1a8d165bcf298b462b15938ee6b40c7"
+}

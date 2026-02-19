@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
-use crate::rbac::Permission;
+use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -132,6 +133,63 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+async fn require_project_read(
+    state: &AppState,
+    auth: &AuthUser,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let project = sqlx::query!(
+        "SELECT visibility, owner_id FROM projects WHERE id = $1 AND is_active = true",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project".into()))?;
+
+    if project.visibility == "public"
+        || project.visibility == "internal"
+        || project.owner_id == auth.user_id
+    {
+        return Ok(());
+    }
+
+    let allowed = resolver::has_permission(
+        &state.pool,
+        &state.valkey,
+        auth.user_id,
+        Some(project_id),
+        Permission::ProjectRead,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    if !allowed {
+        return Err(ApiError::NotFound("project".into()));
+    }
+    Ok(())
+}
+
+async fn require_project_write(
+    state: &AppState,
+    auth: &AuthUser,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let allowed = resolver::has_permission(
+        &state.pool,
+        &state.valkey,
+        auth.user_id,
+        Some(project_id),
+        Permission::ProjectWrite,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    if !allowed {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // MR handlers
 // ---------------------------------------------------------------------------
@@ -154,19 +212,15 @@ async fn create_mr(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateMrRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let allowed = crate::rbac::resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(id),
-        Permission::ProjectWrite,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::Forbidden);
+    // Validate input
+    validation::check_length("title", &body.title, 1, 500)?;
+    if let Some(ref b) = body.body {
+        validation::check_length("body", b, 0, 100_000)?;
     }
+    validation::check_branch_name(&body.source_branch)?;
+    validation::check_branch_name(&body.target_branch)?;
+
+    require_project_write(&state, &auth, id).await?;
 
     if body.source_branch == body.target_branch {
         return Err(ApiError::BadRequest(
@@ -265,10 +319,12 @@ async fn create_mr(
 
 async fn list_mrs(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
     Query(params): Query<ListMrParams>,
 ) -> Result<Json<ListResponse<MrResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
@@ -331,9 +387,11 @@ async fn list_mrs(
 
 async fn get_mr(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> Result<Json<MrResponse>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let mr = sqlx::query!(
         r#"
         SELECT id, project_id, number, author_id, source_branch, target_branch, title, body,
@@ -371,6 +429,14 @@ async fn update_mr(
     Path((id, number)): Path<(Uuid, i32)>,
     Json(body): Json<UpdateMrRequest>,
 ) -> Result<Json<MrResponse>, ApiError> {
+    // Validate input
+    if let Some(ref t) = body.title {
+        validation::check_length("title", t, 1, 500)?;
+    }
+    if let Some(ref b) = body.body {
+        validation::check_length("body", b, 0, 100_000)?;
+    }
+
     let mr_author = sqlx::query_scalar!(
         "SELECT author_id FROM merge_requests WHERE project_id = $1 AND number = $2",
         id,
@@ -575,9 +641,11 @@ async fn merge_mr(
 
 async fn list_reviews(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> Result<Json<Vec<ReviewResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let mr_id = sqlx::query_scalar!(
         "SELECT id FROM merge_requests WHERE project_id = $1 AND number = $2",
         id,
@@ -620,6 +688,12 @@ async fn create_review(
     Path((id, number)): Path<(Uuid, i32)>,
     Json(body): Json<CreateReviewRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    if let Some(ref b) = body.body {
+        validation::check_length("body", b, 0, 100_000)?;
+    }
+
     if !["approve", "request_changes", "comment"].contains(&body.verdict.as_str()) {
         return Err(ApiError::BadRequest(
             "verdict must be approve, request_changes, or comment".into(),
@@ -684,9 +758,11 @@ async fn create_review(
 
 async fn list_comments(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> Result<Json<Vec<CommentResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
     let mr_id = sqlx::query_scalar!(
         "SELECT id FROM merge_requests WHERE project_id = $1 AND number = $2",
         id,
@@ -728,6 +804,9 @@ async fn create_comment(
     Path((id, number)): Path<(Uuid, i32)>,
     Json(body): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+    validation::check_length("body", &body.body, 1, 100_000)?;
+
     let mr_id = sqlx::query_scalar!(
         "SELECT id FROM merge_requests WHERE project_id = $1 AND number = $2",
         id,
@@ -770,6 +849,8 @@ async fn update_comment(
     Path((id, number, comment_id)): Path<(Uuid, i32, Uuid)>,
     Json(body): Json<UpdateCommentRequest>,
 ) -> Result<Json<CommentResponse>, ApiError> {
+    validation::check_length("body", &body.body, 1, 100_000)?;
+
     // Verify MR exists
     let _mr_id = sqlx::query_scalar!(
         "SELECT id FROM merge_requests WHERE project_id = $1 AND number = $2",
@@ -813,6 +894,21 @@ async fn update_comment(
     )
     .fetch_one(&state.pool)
     .await?;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "comment.update",
+            resource: "comment",
+            resource_id: Some(comment_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     Ok(Json(CommentResponse {
         id: comment.id,

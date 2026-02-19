@@ -234,5 +234,19 @@ Query:
 7. Alert rules evaluate and fire notifications
 8. Live log tail via WebSocket + Valkey pub/sub
 
+## Security Context (from security hardening)
+
+All new handlers must follow the security patterns established in the codebase:
+
+- **Input validation**: Validate all query parameters (time ranges, limits, offsets, filter strings). `q` full-text search parameter must be length-limited (1-1000). Metric names, label keys/values, service names should be validated. See `CLAUDE.md` Security Patterns for field limits.
+- **Authorization on reads**: All observe endpoints must check project-level read access when `project_id` is specified. Use `require_project_read()` pattern — return 404 for unauthorized private projects.
+- **OTLP ingest auth**: The `/v1/{traces,logs,metrics}` endpoints receive data from OTel Collectors. Decide on auth model: API token in `Authorization` header, or network-level restriction (K8s NetworkPolicy). At minimum, require a Bearer token.
+- **Rate limiting / backpressure**: OTLP ingest can receive high volumes. Implement backpressure — reject with 429 if buffer is full, rather than OOM. Set per-project or per-service ingestion limits.
+- **Alert rule validation**: Alert rule `query` field is user-supplied. Ensure it's parameterized, not raw SQL. Validate threshold values, condition operators, and `for_seconds` range.
+- **Parquet path safety**: When constructing MinIO paths for Parquet files, use sanitized batch IDs and dates — never interpolate user-supplied strings into object storage paths.
+- **Live tail WebSocket auth**: Re-validate auth on WebSocket connection, not just upgrade. Enforce project-level read permission for the subscribed `project_id`.
+- **Audit logging**: Log alert rule create/update/delete. Don't log raw telemetry data in audit entries.
+- **Sensitive data in telemetry**: Be aware that ingested logs/traces may contain secrets. Don't index or expose attributes that commonly contain secrets (e.g., `http.request.header.authorization`).
+
 ## Estimated LOC
 ~2,200 Rust

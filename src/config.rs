@@ -16,6 +16,12 @@ pub struct Config {
     pub smtp_port: u16,
     pub smtp_from: String,
     pub admin_password: Option<String>,
+    pub pipeline_namespace: String,
+    pub registry_url: Option<String>,
+    pub secure_cookies: bool,
+    pub cors_origins: Vec<String>,
+    pub trust_proxy_headers: bool,
+    pub dev_mode: bool,
 }
 
 impl Config {
@@ -40,6 +46,21 @@ impl Config {
             smtp_from: env::var("PLATFORM_SMTP_FROM")
                 .unwrap_or_else(|_| "platform@localhost".into()),
             admin_password: env::var("PLATFORM_ADMIN_PASSWORD").ok(),
+            pipeline_namespace: env::var("PLATFORM_PIPELINE_NAMESPACE")
+                .unwrap_or_else(|_| "platform-pipelines".into()),
+            registry_url: env::var("PLATFORM_REGISTRY_URL").ok(),
+            secure_cookies: env::var("PLATFORM_SECURE_COOKIES")
+                .ok()
+                .is_some_and(|v| v == "true"),
+            cors_origins: env::var("PLATFORM_CORS_ORIGINS")
+                .ok()
+                .map_or_else(Vec::new, |v| {
+                    v.split(',').map(|s| s.trim().to_owned()).collect()
+                }),
+            trust_proxy_headers: env::var("PLATFORM_TRUST_PROXY")
+                .ok()
+                .is_some_and(|v| v == "true"),
+            dev_mode: env::var("PLATFORM_DEV").ok().is_some_and(|v| v == "true"),
         }
     }
 }

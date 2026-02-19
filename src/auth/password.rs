@@ -1,5 +1,19 @@
+use std::sync::LazyLock;
+
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+
+/// Pre-computed argon2 hash used for timing-safe login when the user doesn't exist.
+/// This ensures that login attempts for non-existent users take the same time as
+/// verifying a real password, preventing user enumeration via timing.
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    hash_password("__dummy_password_for_timing_safety__")
+        .expect("dummy hash generation must succeed")
+});
+
+pub fn dummy_hash() -> &'static str {
+    &DUMMY_HASH
+}
 
 pub fn hash_password(plain: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);

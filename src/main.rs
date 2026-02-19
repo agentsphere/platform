@@ -1,13 +1,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::http::{HeaderName, HeaderValue};
 use tokio::signal;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod audit;
 mod config;
 mod error;
 mod store;
+mod validation;
 
 // Phase 02 — Identity, Auth & RBAC
 mod api;
@@ -17,8 +22,10 @@ mod rbac;
 // Phase 03 — Git Server
 mod git;
 
+// Phase 05 — Build Engine
+mod pipeline;
+
 // Module stubs — populated in later phases
-mod pipeline {}
 mod deployer {}
 mod agent {}
 mod observe {}
@@ -69,12 +76,51 @@ async fn main() -> anyhow::Result<()> {
     // Bootstrap system roles, permissions, and admin user on first run
     store::bootstrap::run(&pool, cfg.admin_password.as_deref()).await?;
 
+    // Start pipeline executor background task
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx));
+
+    // Spawn expired session/token cleanup task (hourly)
+    let cleanup_pool = pool.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let _ = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < now()")
+                .execute(&cleanup_pool)
+                .await;
+            let _ = sqlx::query(
+                "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < now()",
+            )
+            .execute(&cleanup_pool)
+            .await;
+            tracing::debug!("expired sessions/tokens cleanup complete");
+        }
+    });
+
     // Build router
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
-        .merge(git::git_protocol_router())
-        .with_state(state);
+        // Git routes get a higher body limit (500 MB for push/LFS)
+        .merge(git::git_protocol_router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
+        .with_state(state)
+        // Default body limit: 10 MB for API endpoints
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        // Security response headers
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(build_cors_layer(&cfg));
 
     let addr: SocketAddr = cfg.listen.parse()?;
     tracing::info!(%addr, "starting platform");
@@ -83,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Signal background tasks to stop
+    let _ = shutdown_tx.send(());
 
     tracing::info!("platform stopped");
     Ok(())
@@ -112,4 +161,30 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
+}
+
+fn build_cors_layer(cfg: &config::Config) -> CorsLayer {
+    let cors = CorsLayer::new()
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(tower_http::cors::Any)
+        .allow_credentials(true);
+
+    if cfg.cors_origins.is_empty() {
+        // No origins configured — deny cross-origin requests
+        cors.allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")))
+    } else {
+        let origins: Vec<HeaderValue> = cfg
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        cors.allow_origin(origins)
+    }
 }

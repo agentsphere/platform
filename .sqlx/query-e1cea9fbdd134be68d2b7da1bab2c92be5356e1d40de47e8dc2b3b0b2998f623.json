@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e1cea9fbdd134be68d2b7da1bab2c92be5356e1d40de47e8dc2b3b0b2998f623"
+}

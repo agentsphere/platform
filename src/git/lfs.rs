@@ -113,6 +113,7 @@ async fn batch(
     let mut objects = Vec::with_capacity(body.objects.len());
 
     for obj in &body.objects {
+        crate::validation::check_lfs_oid(&obj.oid)?;
         let path = format!("lfs/{}/{}", project.project_id, obj.oid);
 
         let actions = match body.operation.as_str() {

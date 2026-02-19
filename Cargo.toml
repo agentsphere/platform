@@ -15,7 +15,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["ws", "macros"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace", "fs", "limit", "set-header"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +38,7 @@ k8s-openapi = { version = "0.27", features = ["v1_32"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 
 # OTEL / observability
 prost = "0.14"
@@ -91,6 +92,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# URL parsing (webhook SSRF validation)
+url = "2"
 
 # Embedded UI
 rust-embed = { version = "8", features = ["compression"] }
