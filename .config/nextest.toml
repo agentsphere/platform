@@ -1,0 +1,7 @@
+[profile.default]
+failure-output = "immediate-final"
+success-output = "never"
+
+[profile.ci]
+retries = 1
+failure-output = "immediate"

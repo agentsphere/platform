@@ -1,0 +1,32 @@
+fail_fast: true
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.22.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: rust-fmt
+        name: rustfmt
+        language: system
+        entry: cargo fmt --check
+        types: [rust]
+        pass_filenames: false
+
+      - id: rust-clippy
+        name: clippy
+        language: system
+        entry: cargo clippy --all-features -- -D warnings
+        types: [rust]
+        pass_filenames: false

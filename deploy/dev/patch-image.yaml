@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: platform
+          image: platform:dev
+          imagePullPolicy: Never
+          env:
+            - name: PLATFORM_LOG
+              value: "debug"

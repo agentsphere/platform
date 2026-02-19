@@ -1,0 +1,21 @@
+# Agent runtime image for Claude Code sessions
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js (for Claude Code)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for agent
+RUN useradd -m -s /bin/bash agent
+USER agent
+WORKDIR /home/agent
+
+ENTRYPOINT ["/bin/bash"]
