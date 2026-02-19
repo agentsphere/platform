@@ -7,14 +7,14 @@ COPY ui/ .
 RUN npm run build
 
 # Stage 2: Dependency recipe
-FROM rust:1.85-slim-bookworm AS planner
+FROM rust:1.88-slim-bookworm AS planner
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Build deps + binary
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y mold && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /app

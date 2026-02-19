@@ -94,6 +94,8 @@ rust-embed = { version = "8", features = ["compression"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
+insta = { version = "1", features = ["json"] }
+proptest = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

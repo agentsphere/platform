@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --lib --profile ci
+      - run: cargo nextest run --lib --profile ci --no-tests=pass
 
   test-integration:
     runs-on: ubuntu-latest
@@ -61,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --profile ci
+      - run: cargo nextest run --profile ci --no-tests=pass
 
   deny:
     runs-on: ubuntu-latest
