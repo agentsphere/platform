@@ -71,7 +71,7 @@ pub fn router() -> Router<AppState> {
 
 /// `POST /:owner/:repo/info/lfs/objects/batch`
 ///
-/// Git LFS batch API. Returns presigned MinIO URLs for upload/download.
+/// Git LFS batch API. Returns presigned `MinIO` URLs for upload/download.
 #[tracing::instrument(skip(state, body), fields(%owner, %repo), err)]
 async fn batch(
     State(state): State<AppState>,
