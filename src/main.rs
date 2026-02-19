@@ -25,9 +25,11 @@ mod git;
 // Phase 05 — Build Engine
 mod pipeline;
 
+// Phase 07 — Agent Orchestration
+mod agent;
+
 // Module stubs — populated in later phases
 mod deployer {}
-mod agent {}
 mod observe {}
 mod secrets {}
 mod notify {}
@@ -79,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
     // Start pipeline executor background task
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx));
+
+    // Start agent session reaper background task
+    let agent_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(agent::service::run_reaper(state.clone(), agent_shutdown_rx));
 
     // Spawn expired session/token cleanup task (hourly)
     let cleanup_pool = pool.clone();
