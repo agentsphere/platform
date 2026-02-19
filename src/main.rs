@@ -25,10 +25,12 @@ mod git;
 // Phase 05 — Build Engine
 mod pipeline;
 
+// Phase 08 — Observability
+mod observe;
+
 // Module stubs — populated in later phases
 mod deployer {}
 mod agent {}
-mod observe {}
 mod secrets {}
 mod notify {}
 
@@ -78,7 +80,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Start pipeline executor background task
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx));
+    tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx.clone()));
+
+    // Start observe background tasks (flush, rotation, alert evaluation)
+    let observe_channels = observe::spawn_background_tasks(state.clone(), shutdown_rx);
 
     // Spawn expired session/token cleanup task (hourly)
     let cleanup_pool = pool.clone();
@@ -102,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
+        .merge(observe::router(observe_channels))
         // Git routes get a higher body limit (500 MB for push/LFS)
         .merge(git::git_protocol_router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
         .with_state(state)
