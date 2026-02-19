@@ -181,3 +181,52 @@ Merge MR       → git merge in bare repo → update MR status → fire webhook 
 
 ## Estimated LOC
 ~1,000 Rust
+
+---
+
+## Foundation & Auth Context (from 01+02 implementation)
+
+Things the implementor must know from completed phases:
+
+### What already exists
+- **`src/store::AppState`** — `{ pool: PgPool, valkey: fred::clients::Pool, minio: opendal::Operator, kube: kube::Client, config: Arc<Config> }`
+- **`src/auth/middleware::AuthUser`** — axum `FromRequestParts` extractor. Fields: `user_id: Uuid`, `user_name: String`, `ip_addr: Option<String>`. Checks Bearer token then session cookie.
+- **`src/rbac::Permission`** — enum with 13 variants. `as_str(self)` takes `self` by value (it's `Copy`).
+- **`src/rbac::resolver`** — `has_permission(pool, valkey, user_id, project_id, perm) -> Result<bool>`
+- **`src/rbac::middleware::require_permission`** — route-layer middleware. Usage:
+  ```rust
+  .route_layer(axum::middleware::from_fn_with_state(
+      state.clone(),
+      require_permission(Permission::ProjectRead),
+  ))
+  ```
+  Extracts `project_id` from `/projects/:id` path segments automatically.
+- **`src/error::ApiError`** — `NotFound`, `Unauthorized`, `Forbidden`, `BadRequest`, `Conflict`, `Internal`. Has `From<sqlx::Error>` (maps 23505 unique violation → `Conflict`).
+- **`src/api/mod.rs`** — `pub fn router() -> Router<AppState>`. Currently merges `users::router()` and `admin::router()`. Add new module routers here.
+
+### Router pattern
+The existing `api::router()` in `src/api/mod.rs` merges sub-routers:
+```rust
+pub fn router() -> Router<AppState> {
+    Router::new().merge(users::router()).merge(admin::router())
+}
+```
+Add `projects::router()`, `issues::router()`, etc. following the same pattern.
+
+### Permission checking patterns
+Two approaches exist in the codebase:
+1. **Inline** (used by admin.rs): call `resolver::has_permission()` directly in the handler. Simpler for routes needing different permissions.
+2. **Route-layer** (available via `require_permission`): apply to a group of routes sharing one permission. Better for project-scoped endpoints.
+
+The `require_permission` middleware auto-extracts `project_id` from `/projects/:id` in the URL path, so project-scoped permissions work automatically.
+
+### Notes on this module's plan
+- **Section 5 (`src/api/mod.rs`)**: The router assembly described in the plan is more elaborate than what currently exists. The actual pattern is simpler — just `.merge()` calls. Don't restructure the existing router; just add new sub-module routers.
+- **Section 6 (`src/api/health.rs`)**: The `/healthz` endpoint already exists inline in `main.rs`. Moving it to a separate file is optional.
+
+### Crate API gotchas (from 01+02)
+- **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods — chain directly (e.g., `.route("/path", get(list).post(create))`), don't import from `axum::routing`
+- **Clippy**: Functions with 7+ params need a params struct. `Copy` types use `self` not `&self`.
+- **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
+- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for mutations (see `api/users.rs` or `api/admin.rs`).
+- **Pagination**: `ListParams { limit: Option<i64>, offset: Option<i64> }` and `ListResponse<T> { items: Vec<T>, total: i64 }` already used in `api/users.rs` — consider sharing or defining per-module.

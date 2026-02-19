@@ -170,3 +170,48 @@ Human/agent triggers rollback → sets desired_status = "rollback"
 
 ## Estimated LOC
 ~800 Rust
+
+---
+
+## Foundation & Auth Context (from 01+02 implementation)
+
+Things the implementor must know from completed phases:
+
+### What already exists
+- **`src/store::AppState`** — `{ pool: PgPool, valkey: fred::clients::Pool, minio: opendal::Operator, kube: kube::Client, config: Arc<Config> }`
+- **`src/config::Config`** — includes `git_repos_path: PathBuf` (ops repo clones could reuse or have their own dir)
+- **`src/auth/middleware::AuthUser`** — axum `FromRequestParts` extractor. Fields: `user_id: Uuid`, `user_name: String`, `ip_addr: Option<String>`.
+- **`src/rbac::Permission`** — enum with `DeployRead`, `DeployPromote`, `AdminUsers`, etc. `as_str(self)` takes `self` by value (it's `Copy`).
+- **`src/rbac::resolver`** — `has_permission(pool, valkey, user_id, project_id, perm) -> Result<bool>`
+- **`src/rbac::middleware::require_permission`** — route-layer middleware. Usage:
+  ```rust
+  .route_layer(axum::middleware::from_fn_with_state(
+      state.clone(),
+      require_permission(Permission::DeployRead),
+  ))
+  ```
+  Extracts `project_id` from `/projects/:id` path segments automatically.
+- **`src/error::ApiError`** — `NotFound`, `Unauthorized`, `Forbidden`, `BadRequest`, `Conflict`, `Internal`. Has `From<kube::Error>` so `?` works directly on kube-rs calls.
+- **`src/store/valkey.rs`** — `publish(pool, channel, message)` for pub/sub notifications. Note: uses `pool.next().publish()` internally.
+- **`src/api/mod.rs`** — `pub fn router() -> Router<AppState>`. Add deployment API routes here.
+
+### Background task pattern
+The reconciler should follow this convention (spawned from `main.rs`):
+```rust
+pub async fn run(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => reconcile(&state).await,
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+```
+
+### Crate API gotchas (from 01+02)
+- **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods — chain directly, don't import from `axum::routing`
+- **Clippy**: Functions with 7+ params need a params struct. `Copy` types use `self` not `&self`.
+- **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
+- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for deployment mutations.
+- **kube::Error → ApiError**: Already implemented, so `?` propagation works from kube-rs calls in handlers.

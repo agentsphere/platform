@@ -8,10 +8,12 @@ mod config;
 mod error;
 mod store;
 
+// Phase 02 — Identity, Auth & RBAC
+mod api;
+mod auth;
+mod rbac;
+
 // Module stubs — populated in later phases
-mod auth {}
-mod rbac {}
-mod api {}
 mod git {}
 mod pipeline {}
 mod deployer {}
@@ -67,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     // Build router
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .merge(api::router())
         .with_state(state);
 
     let addr: SocketAddr = cfg.listen.parse()?;

@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields consumed by modules 03-09
 pub struct Config {
     pub listen: String,
     pub database_url: String,

@@ -134,3 +134,38 @@ GET  /api/projects/:id/commits
 
 ## Estimated LOC
 ~1,400 Rust
+
+---
+
+## Foundation & Auth Context (from 01+02 implementation)
+
+Things the implementor must know from completed phases:
+
+### What already exists
+- **`src/store::AppState`** — `{ pool: PgPool, valkey: fred::clients::Pool, minio: opendal::Operator, kube: kube::Client, config: Arc<Config> }`
+- **`src/config::Config`** — includes `git_repos_path: PathBuf` (default `/data/repos`), `minio_endpoint`, etc.
+- **`src/auth/middleware::AuthUser`** — axum `FromRequestParts` extractor. Fields: `user_id: Uuid`, `user_name: String`, `ip_addr: Option<String>`. Checks Bearer token then session cookie.
+- **`src/auth/token::hash_token`** — `fn hash_token(token: &str) -> String` — SHA-256 hex digest. Use this to look up API tokens by hash.
+- **`src/rbac::Permission`** — enum with 13 variants including `ProjectRead`, `ProjectWrite`. `as_str(self)` returns `"project:read"`, etc. (takes `self` by value, not `&self` — it's `Copy`).
+- **`src/rbac::resolver`** — `has_permission(pool, valkey, user_id, project_id, perm) -> Result<bool>`, `invalidate_permissions(valkey, user_id, project_id) -> Result<()>`
+- **`src/rbac::middleware::require_permission`** — route-layer middleware. Usage: `.route_layer(axum::middleware::from_fn_with_state(state, require_permission(Permission::ProjectRead)))`. Extracts `project_id` from `/projects/:id` path segments automatically.
+- **`src/error::ApiError`** — `NotFound(String)`, `Unauthorized`, `Forbidden`, `BadRequest(String)`, `Conflict(String)`, `Internal(anyhow::Error)`. Implements `From<sqlx::Error>`, `From<fred::error::Error>`.
+- **`src/api/mod.rs`** — `pub fn router() -> Router<AppState>` that merges `users::router()` and `admin::router()`. New modules should add their router here or be merged in `main.rs`.
+
+### Router pattern
+Each module exposes `pub fn router() -> Router<AppState>`. The git module will need two routers:
+1. API routes under `/api/projects/:id/*` — merged into the main api router
+2. Smart HTTP routes at root level (`/:owner/:repo/*`) — merged directly in `main.rs`
+
+### Auth for git smart HTTP
+Git clients use HTTP Basic Auth. The `AuthUser` extractor checks `Authorization: Bearer` and session cookies, but NOT Basic Auth. The git module needs its own Basic Auth extraction:
+- Username → look up user by name
+- Password → could be account password or API token. For API tokens: hash with `auth::token::hash_token()`, look up in `api_tokens`. For passwords: verify with `auth::password::verify_password()`.
+- Then verify permissions via `resolver::has_permission()`
+
+### Crate API gotchas (from 01+02)
+- **rand 0.10**: Use `rand::fill(&mut bytes)` (free function), not `rng().fill_bytes()`
+- **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods — chain directly, don't import from `axum::routing`
+- **Clippy**: Functions with 7+ params need a params struct. `Copy` types use `self` not `&self`.
+- **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
+- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for mutations (see `api/users.rs` or `api/admin.rs`).

@@ -219,7 +219,14 @@ Sessions A-E can all start simultaneously after Phase 1 completes. Session F can
 - `src/` current state (to import from store/, auth/, rbac/)
 
 **What to tell each agent**:
-> You are implementing module XX of a unified Rust platform. Foundation (01) and auth (02) are complete — you can import `AppState`, `AuthUser`, `RequirePermission` from the existing crate. Your module should expose a `pub fn router() -> Router<AppState>` and optionally a background task via `pub async fn run(state, shutdown)`. Do NOT import from other Wave 1 modules (03-09). Cross-module calls should be left as `// TODO: wire integration` comments. Use `sqlx::query_as!` for all DB access. Refer to your plan file for the full spec.
+> You are implementing module XX of a unified Rust platform. Foundation (01) and auth (02) are complete — you can import from these existing modules:
+> - `use crate::store::AppState;` — shared state (pool, valkey, minio, kube, config)
+> - `use crate::auth::middleware::AuthUser;` — auth extractor (from Bearer token or session cookie)
+> - `use crate::rbac::{Permission, resolver};` — permission enum and `has_permission()` / `effective_permissions()`
+> - `use crate::rbac::middleware::require_permission;` — route-layer middleware for permission checks
+> - `use crate::error::ApiError;` — error type with NotFound, Unauthorized, Forbidden, BadRequest, Conflict, Internal
+>
+> Your module should expose a `pub fn router() -> Router<AppState>` and optionally a background task via `pub async fn run(state, shutdown)`. Do NOT import from other Wave 1 modules (03-09). Cross-module calls should be left as `// TODO: wire integration` comments. Use `sqlx::query_as!` for all DB access. After adding queries, run `just db-prepare`. Refer to your plan file for the full spec.
 
 ---
 
@@ -255,10 +262,11 @@ A module is "done" and ready for integration wiring when ALL of the following ar
 
 ### Phase 1 done:
 - [x] `cargo check` compiles (01-foundation complete 2026-02-19)
-- [ ] `cargo run` starts, connects to DB/Valkey/MinIO, creates admin user
-- [ ] `/healthz` returns 200
-- [ ] Login → get session → access protected endpoint works (02-identity)
-- [ ] RBAC permission enforcement works (role-based) (02-identity)
+- [x] `cargo run` starts, connects to DB/Valkey/MinIO, creates admin user (01-foundation)
+- [x] `/healthz` returns 200 (01-foundation)
+- [x] Auth module implemented: login, sessions, API tokens (02-identity complete 2026-02-19)
+- [x] RBAC permission enforcement works: role-based + delegation (02-identity complete 2026-02-19)
+- [x] `just ci` passes: fmt + clippy + deny + 11 unit tests + release build (02-identity)
 - [ ] kube-rs pod exec/attach spike validated (for 07-agent)
 
 ### Phase 2 done (per module):
@@ -302,8 +310,25 @@ A module is "done" and ready for integration wiring when ALL of the following ar
 
 7. **Bootstrap uses dynamic `sqlx::query()`, not `sqlx::query!()`**: The bootstrap module seeds data with dynamic queries (bind parameters, no compile-time checking). This means `cargo sqlx prepare` reports "no queries found" — that's expected until modules add `sqlx::query!()` / `sqlx::query_as!()` calls.
 
+### From 02-Identity & Auth (2026-02-19)
+
+8. **rand 0.10 API changed from 0.8**: `rand::RngCore` is no longer re-exported from the crate root. `rand::rng().fill_bytes()` doesn't work. Use `rand::fill(&mut bytes)` (free function) for random byte generation.
+
+9. **axum 0.8 MethodRouter methods**: `.patch()`, `.put()`, `.delete()` are methods on `MethodRouter`, not standalone functions. Don't import them from `axum::routing` — chain directly: `.route("/path", get(handler).patch(other))`.
+
+10. **INET column needs ipnetwork crate**: `audit_log.ip_addr` is INET in Postgres. sqlx needs the `ipnetwork` feature flag to bind Rust types. Without it, skip the column in INSERT (stays NULL). Consider adding ipnetwork when needed.
+
+11. **Clippy `too_many_arguments` threshold is 7**: Any function with 7+ params triggers the lint. Use a params/options struct from the start (e.g., `AuditEntry`, `CreateDelegationParams`).
+
+12. **Clippy `trivially_copy_pass_by_ref` on small enums**: For `Copy` types like `Permission`, use `self` not `&self` in method signatures (e.g., `fn as_str(self) -> &'static str`).
+
+13. **RequirePermission middleware available but not required**: Phase 02 admin routes use inline `resolver::has_permission()` checks. The `RequirePermission` middleware (`rbac::middleware::require_permission`) is implemented and available for modules 03-09 as a route layer. Use it for modules with many endpoints sharing the same permission.
+
 ### For Future Modules
 
 - When adding new `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache, then commit the changes.
 - Each module should use `sqlx::query_as!()` (compile-time checked) for all DB access, unlike bootstrap which used dynamic queries.
 - Test migrations on a fresh DB (`just cluster-down && just cluster-up && just db-migrate`) before committing.
+- **Auth imports for handlers**: `use crate::auth::middleware::AuthUser;` for the auth extractor, `use crate::rbac::{Permission, resolver};` for permission checks.
+- **Audit logging**: Use `AuditEntry` struct pattern (see `api/users.rs` or `api/admin.rs`) with `write_audit()` for all mutations.
+- **Permission cache invalidation**: Call `resolver::invalidate_permissions(valkey, user_id, project_id)` after any role/delegation change.

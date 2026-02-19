@@ -1,6 +1,8 @@
 # Platform — Coding Guidelines
 
-Single Rust binary (~13K LOC) replacing 8+ off-the-shelf services (Gitea, Woodpecker, Authelia, OpenObserve, Maddy, OpenBao) with a unified platform. Architecture: `plans/unified-platform.md`. Toolchain: `plans/rust-dev-process.md`. Phased delivery: `plans/01-foundation.md` through `plans/10-web-ui.md`.
+Single Rust binary (~15K LOC) replacing 8+ off-the-shelf services (Gitea, Woodpecker, Authelia, OpenObserve, Maddy, OpenBao) with a unified platform. Architecture: `plans/unified-platform.md`. Toolchain: `plans/rust-dev-process.md`. Phased delivery: `plans/01-foundation.md` through `plans/10-web-ui.md`.
+
+**Current status**: Phase 01 (Foundation) and Phase 02 (Identity & Auth) complete. Modules 03-09 can be implemented in parallel.
 
 ## Commands
 
@@ -44,6 +46,75 @@ just cluster-down   # destroy kind cluster
 - **No unsafe** — `unsafe_code = "forbid"` in `Cargo.toml` lints.
 - **No openssl** — `deny.toml` bans `openssl`/`openssl-sys`. Use rustls everywhere.
 - **sqlx compile-time checking** — all queries use `sqlx::query!` or `sqlx::query_as!`. Run `just db-prepare` after any query change. CI uses `SQLX_OFFLINE=true`.
+
+## Auth & RBAC Patterns (Phase 02)
+
+### Handler authentication
+
+Use `AuthUser` as an axum extractor. It checks Bearer token then session cookie:
+
+```rust
+use crate::auth::middleware::AuthUser;
+
+async fn my_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,  // extracts user_id, user_name, ip_addr
+    // ... other extractors
+) -> Result<Json<Response>, ApiError> {
+    // auth.user_id, auth.user_name available
+}
+```
+
+### Permission checks — inline (for few endpoints)
+
+```rust
+use crate::rbac::{Permission, resolver};
+
+async fn admin_handler(State(state): State<AppState>, auth: AuthUser) -> Result<..., ApiError> {
+    let allowed = resolver::has_permission(&state.pool, &state.valkey, auth.user_id, None, Permission::AdminUsers)
+        .await.map_err(ApiError::Internal)?;
+    if !allowed { return Err(ApiError::Forbidden); }
+    // ...
+}
+```
+
+### Permission checks — route layer (for many endpoints sharing a permission)
+
+```rust
+use crate::rbac::middleware::require_permission;
+use crate::rbac::Permission;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/projects", get(list).post(create))
+        .route_layer(axum::middleware::from_fn_with_state(state, require_permission(Permission::ProjectRead)))
+}
+```
+
+### Audit logging
+
+All mutations must write to `audit_log`. Use the `AuditEntry` struct pattern:
+
+```rust
+struct AuditEntry<'a> {
+    actor_id: Uuid,
+    actor_name: &'a str,
+    action: &'a str,        // e.g. "user.create", "role.assign"
+    resource: &'a str,      // e.g. "user", "role"
+    resource_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    detail: Option<serde_json::Value>,
+    ip_addr: Option<&'a str>,  // from auth.ip_addr
+}
+```
+
+### Permission cache invalidation
+
+After any role or delegation change, invalidate the affected user's permission cache:
+
+```rust
+resolver::invalidate_permissions(&state.valkey, user_id, project_id).await;
+```
 
 ## Type System Patterns
 
@@ -294,12 +365,12 @@ pub fn test_app_state(pool: PgPool) -> AppState { /* mock valkey, minio, kube */
 ```rust
 async fn handler_name(
     State(state): State<AppState>,        // always first
-    AuthUser(user): AuthUser,             // auth second
+    auth: AuthUser,                       // auth second (plain struct, not tuple)
     Path(id): Path<Uuid>,                 // path params
     Query(params): Query<ListParams>,     // query params
     Json(body): Json<CreateRequest>,      // body last
 ) -> Result<Json<Response>, ApiError> {
-    // ...
+    // auth.user_id, auth.user_name, auth.ip_addr available
 }
 ```
 
@@ -328,6 +399,16 @@ pub struct ListResponse<T: serde::Serialize> {
 - Reversible migrations (`just db-add` creates up/down pairs)
 - After any SQL change: `just db-migrate && just db-prepare`
 - Commit `.sqlx/` changes with the code
+
+## Crate API Gotchas
+
+- **rand 0.10**: Use `rand::fill(&mut bytes)` (free function). `rand::rng().fill_bytes()` doesn't work — `RngCore` is not re-exported from the crate root.
+- **argon2 + rand**: Use `argon2::password_hash::rand_core::OsRng` for salt generation, NOT `rand::rng()`. They use incompatible `rand_core` versions (0.6 vs 0.9).
+- **fred Pool**: `pool.next().publish()` for pub/sub — `Pool` doesn't impl `PubsubInterface`, only `Client` does.
+- **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods, not standalone `axum::routing` functions. Chain on routes directly.
+- **sqlx INET**: Postgres `INET` columns need the `ipnetwork` crate + sqlx feature. Without it, skip binding those columns.
+- **Clippy `too_many_arguments`**: Threshold is 7 params. Use a params struct (e.g., `AuditEntry`, `CreateDelegationParams`) from the start.
+- **Clippy `trivially_copy_pass_by_ref`**: For `Copy` types, use `self` not `&self` (e.g., `fn as_str(self)`).
 
 ## Git Workflow
 

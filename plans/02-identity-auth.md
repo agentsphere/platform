@@ -161,6 +161,45 @@ Every mutation in this module writes to `audit_log` (include both `actor_id` and
 
 ---
 
+## Implementation Notes (Lessons Learned)
+
+**Completed**: 2026-02-19
+
+### rand 0.10 API: `rand::fill()` not `rng().fill_bytes()`
+rand 0.10 removed the `RngCore` re-export from the crate root. The `ThreadRng` returned by `rand::rng()` does not expose `fill_bytes()` as a method. Instead, use the free function `rand::fill(&mut bytes)` for random byte generation. This is the idiomatic rand 0.10 pattern.
+
+### axum 0.8: `.patch()` / `.put()` are MethodRouter methods
+In axum 0.8, `.patch()` and `.put()` are methods on `MethodRouter`, not standalone functions that need importing from `axum::routing`. Don't add `patch` or `put` to `use axum::routing::{...}` — they're chained directly on the route: `.route("/path", get(handler).patch(other))`.
+
+### INET column requires ipnetwork crate
+The `audit_log.ip_addr` column is type `INET` in Postgres. `sqlx` requires the `ipnetwork` feature to bind Rust types to INET. We chose to skip binding `ip_addr` for now (column stays NULL) rather than adding the dependency. A future pass can add `ipnetwork` to Cargo.toml and the `sqlx` feature flag.
+
+### Clippy `too_many_arguments` on audit helpers
+The initial `write_audit()` function had 9 parameters, triggering clippy's `too_many_arguments` lint. Fixed by introducing an `AuditEntry` struct. Same pattern applied to `CreateDelegationParams` for delegation creation. **Lesson**: any function with 7+ parameters should use a params struct from the start.
+
+### Clippy `trivially_copy_pass_by_ref` on Permission
+`Permission` is a `Copy` type (small enum). Clippy flagged `as_str(&self)` as `trivially_copy_pass_by_ref`. Changed signature to `as_str(self)` (takes by value). **Lesson**: for `Copy` types, prefer `self` over `&self` in methods.
+
+### RequirePermission middleware — simpler than planned
+The plan suggested a full tower `Layer` + `Service` implementation. In practice, `axum::middleware::from_fn_with_state` is much simpler for axum 0.8. However, the current implementation doesn't use `RequirePermission` on any routes — admin checks are done inline in handlers via `resolver::has_permission()`. The middleware is available for modules 03-09 to use as a route layer.
+
+### Admin permission checks — inline vs middleware
+For Phase 02 admin endpoints, we used inline `require_admin()` helper functions that call `resolver::has_permission()` directly, rather than route-layer middleware. This proved simpler and more explicit for a small number of admin routes. Future modules with many endpoints per permission should use the `RequirePermission` middleware layer instead.
+
+### AuditEntry struct has dead ip_addr field
+The `AuditEntry.ip_addr` field is populated from `AuthUser.ip_addr` but not bound to the SQL INSERT (due to INET type issue). Added `#[allow(dead_code)]` on the field. Will be used when ipnetwork is added.
+
+### Actual LOC
+~1,600 Rust across 12 new files + modifications to 5 existing files. Close to the ~1,500 estimate.
+
+### Unit tests
+11 unit tests implemented:
+- `password.rs`: hash/verify round-trip, wrong password rejection, empty password handling
+- `token.rs`: session token format/prefix, API token format/prefix, hash determinism, different tokens produce different hashes
+- `types.rs`: Permission as_str/from_str round-trip for all 13 variants, unknown permission string returns error, serde round-trip, Display trait
+
+---
+
 ## Foundation Context (from 01-foundation implementation)
 
 Things the implementor must know from Phase 01:

@@ -12,13 +12,11 @@ pub async fn connect(url: &str) -> anyhow::Result<fred::clients::Pool> {
     Ok(pool)
 }
 
-#[allow(dead_code)]
 pub async fn get_cached<T: DeserializeOwned>(pool: &fred::clients::Pool, key: &str) -> Option<T> {
     let value: Option<String> = pool.get(key).await.ok()?;
     value.and_then(|v| serde_json::from_str(&v).ok())
 }
 
-#[allow(dead_code)]
 pub async fn set_cached<T: Serialize>(
     pool: &fred::clients::Pool,
     key: &str,
@@ -32,13 +30,12 @@ pub async fn set_cached<T: Serialize>(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub async fn invalidate(pool: &fred::clients::Pool, key: &str) -> anyhow::Result<()> {
     pool.del::<(), _>(key).await?;
     Ok(())
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // used by later modules (not yet wired)
 pub async fn publish(
     pool: &fred::clients::Pool,
     channel: &str,

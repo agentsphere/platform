@@ -194,3 +194,42 @@ executor task:
 
 ## Estimated LOC
 ~1,400 Rust
+
+---
+
+## Foundation & Auth Context (from 01+02 implementation)
+
+Things the implementor must know from completed phases:
+
+### What already exists
+- **`src/store::AppState`** — `{ pool: PgPool, valkey: fred::clients::Pool, minio: opendal::Operator, kube: kube::Client, config: Arc<Config> }`
+- **`src/config::Config`** — includes `git_repos_path: PathBuf`, `minio_endpoint`, `minio_access_key`, `minio_secret_key`
+- **`src/auth/middleware::AuthUser`** — axum `FromRequestParts` extractor. Fields: `user_id: Uuid`, `user_name: String`, `ip_addr: Option<String>`.
+- **`src/rbac::Permission`** — enum with `ProjectWrite`, `ProjectRead`, `DeployRead`, `DeployPromote`, etc. `as_str(self)` takes `self` by value (it's `Copy`).
+- **`src/rbac::resolver`** — `has_permission(pool, valkey, user_id, project_id, perm) -> Result<bool>`
+- **`src/rbac::middleware::require_permission`** — route-layer middleware for permission checks. Extracts `project_id` from `/projects/:id` automatically.
+- **`src/error::ApiError`** — `NotFound`, `Unauthorized`, `Forbidden`, `BadRequest`, `Conflict`, `Internal`. Has `From<sqlx::Error>`, `From<fred::error::Error>`, `From<kube::Error>`.
+- **`src/store/valkey.rs`** — `publish(pool, channel, message)` for pub/sub (use `pool.next().publish()` internally — `Pool` doesn't impl `PubsubInterface`).
+- **`src/api/mod.rs`** — `pub fn router() -> Router<AppState>`. Add pipeline API routes here.
+
+### Router pattern
+Each module exposes `pub fn router() -> Router<AppState>`. Merge into `api::router()`.
+
+### Background task pattern
+The plan calls for a pipeline executor that spawns pipeline runs. This should follow the background task convention:
+```rust
+pub async fn run(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) { ... }
+```
+Spawned from `main.rs` before the axum server starts.
+
+### DB column notes
+- Pipeline table uses `git_ref` (not `ref` — avoids SQL reserved word). Already in migration.
+- `pipeline_steps` has `step_order` column and `project_id` denormalized. Already in migration.
+
+### Crate API gotchas (from 01+02)
+- **rand 0.10**: Use `rand::fill(&mut bytes)` (free function), not `rng().fill_bytes()`
+- **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods — chain directly, don't import from `axum::routing`
+- **Clippy**: Functions with 7+ params need a params struct. `Copy` types use `self` not `&self`.
+- **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
+- **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for mutations.
+- **kube::Error → ApiError**: `From<kube::Error>` is already implemented on `ApiError`, so `?` works directly in handlers that use kube-rs.

@@ -1,6 +1,6 @@
-# Safe Development Process
+# Development Process
 
-Follow this 8-step protocol when implementing any feature, fix, or change. Do not skip steps.
+Follow this 9-step protocol when implementing any feature, fix, or change. Do not skip steps.
 
 Refer to `CLAUDE.md` for all coding patterns and conventions.
 
@@ -24,9 +24,10 @@ Apply these throughout every step:
 
 1. Read the relevant plan in `plans/` if one exists for this feature
 2. Identify which module(s) under `src/` are affected
-3. Identify which database tables are involved (check `plans/unified-platform.md` for schema)
-4. List the files that will be created or modified
-5. State the acceptance criteria before writing any code
+3. **Read the existing source** of affected files — understand current code before proposing changes
+4. Identify which database tables are involved (check `plans/unified-platform.md` for schema)
+5. List the files that will be created or modified
+6. State the acceptance criteria before writing any code
 
 ## Step 2: Design types first
 
@@ -53,12 +54,6 @@ For any new business logic (state machines, permission checks, parsers, validato
    - Permission boundary tests (authorized and unauthorized)
 3. Run `just test-unit` — tests should compile but fail (red phase)
 
-For database-dependent code, write `#[sqlx::test]` integration tests in `tests/`:
-
-1. Create test file in `tests/` directory
-2. Use `#[sqlx::test(migrations = "migrations")]` with the `pool: PgPool` fixture
-3. Test the full flow: setup data, call function, assert result
-
 **Skip test-first for**: handler wiring, route registration, config loading glue.
 
 ## Step 4: Implement the code
@@ -81,26 +76,24 @@ Run `just test-unit` — all unit tests should pass (green phase).
 If the change involves database queries or HTTP endpoints:
 
 1. Write or update integration tests in `tests/`
-2. For endpoint tests: construct a test `Router`, send requests with `tower::ServiceExt::oneshot`
-3. For DB tests: use `#[sqlx::test(migrations = "migrations")]`
-4. Use test helpers from `tests/helpers/mod.rs` for common setup
-5. Use `insta::assert_json_snapshot!` for API response format stability
-6. Run `just test` (requires `DATABASE_URL` pointing to a running Postgres)
+2. For DB tests: use `#[sqlx::test(migrations = "migrations")]` with the `pool: PgPool` fixture
+3. Test the full flow: setup data, call function, assert result
+4. For endpoint tests: construct a test `Router`, send requests with `tower::ServiceExt::oneshot`
+5. Use test helpers from `tests/helpers/mod.rs` for common setup
+6. Use `insta::assert_json_snapshot!` for API response format stability
+7. Run `just test` (requires `DATABASE_URL` pointing to a running Postgres)
 
 If the change is pure logic with no I/O, skip to step 6.
 
 ## Step 6: Quality gate
 
-Run ALL checks. Do not skip any:
+Run the full local CI. Do not skip any checks:
 
 ```bash
-just fmt          # auto-format code
-just lint         # clippy pedantic — fix all warnings
-just test-unit    # all unit tests pass
-just deny         # dependency audit passes
+just ci           # fmt + lint + deny + test-unit + build
 ```
 
-If database queries changed:
+If database queries changed, also run:
 
 ```bash
 just db-prepare   # regenerate .sqlx/ offline cache
@@ -128,6 +121,7 @@ Verify every item before considering the work done:
 - [ ] Sensitive data (passwords, tokens, secrets) is never logged
 - [ ] Migrations are reversible (up + down)
 - [ ] `.sqlx/` offline cache is up to date
+- [ ] Remove `#[allow(dead_code)]` from foundation items now consumed by new code
 - [ ] Zero warnings with `cargo clippy --all-features -- -D warnings`
 
 ## Step 8: Update plan & summarize changes
@@ -151,3 +145,36 @@ After all checks pass:
 3. What files were created or modified
 4. What plan changes were made (deviations, status updates)
 5. Any follow-up items or known limitations
+
+## Step 9: Capture lessons learned
+
+After completing the work, reflect on what you encountered and update project knowledge:
+
+**Update this dev skill** (`.claude/skills/dev.md`):
+
+1. If a step was missing, ambiguous, or led you astray — fix it in this file
+2. If you discovered a new pattern that should be standard — add it to the relevant step
+3. If a checklist item in Step 7 would have caught a bug earlier — add it
+4. If a principle was violated and caused rework — strengthen the guidance
+
+**Update `CLAUDE.md`**:
+
+1. New conventions discovered during implementation (e.g., derive ordering, trait bounds, sqlx quirks)
+2. New architecture rules that emerged (e.g., "always do X when adding a module")
+3. Gotchas and footguns — things that compiled but broke at runtime, or caused confusing errors
+4. Dependency-specific pitfalls (version conflicts, feature flag requirements, API surprises)
+5. New patterns that should be standardized across modules
+
+**Update auto memory** (MEMORY.md in your auto memory directory):
+
+1. Add critical gotchas that wasted significant time
+2. Update project state (phase progress, what's complete)
+3. Record workflow tips that sped things up or prevented mistakes
+
+**Rules for this step:**
+
+- Only record things that are **stable and confirmed** — not speculative
+- Keep entries concise — a gotcha should be 1-3 lines, not a paragraph
+- If something contradicts an existing entry, update the existing entry rather than adding a duplicate
+- Don't add things that are already documented — check first
+- Prefer updating existing sections over creating new ones
