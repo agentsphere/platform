@@ -1,11 +1,13 @@
 {
   "name": "platform-ui",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "esbuild src/index.tsx --bundle --outdir=dist --servedir=dist --loader:.tsx=tsx --loader:.ts=ts --jsx=automatic --jsx-import-source=preact --define:process.env.NODE_ENV=\\\"development\\\"",
-    "build": "esbuild src/index.tsx --bundle --outdir=dist --minify --loader:.tsx=tsx --loader:.ts=ts --jsx=automatic --jsx-import-source=preact --define:process.env.NODE_ENV=\\\"production\\\""
+    "dev": "node build.mjs --dev",
+    "build": "node build.mjs"
   },
   "dependencies": {
+    "marked": "^15.0.0",
     "preact": "^10.25.0",
     "preact-router": "^4.1.2"
   },

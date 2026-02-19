@@ -28,6 +28,9 @@ mod pipeline;
 // Phase 06 — Continuous Deployer
 mod deployer;
 
+// Phase 10 — Web UI
+mod ui;
+
 // Module stubs — populated in later phases
 mod agent {}
 mod observe {}
@@ -112,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         // Git routes get a higher body limit (500 MB for push/LFS)
         .merge(git::git_protocol_router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
         .with_state(state)
+        .fallback(ui::static_handler)
         // Default body limit: 10 MB for API endpoints
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
         // Security response headers
