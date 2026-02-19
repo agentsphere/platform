@@ -12,6 +12,7 @@ pub struct Config {
     pub minio_secret_key: String,
     pub master_key: Option<String>,
     pub git_repos_path: PathBuf,
+    pub ops_repos_path: PathBuf,
     pub smtp_host: Option<String>,
     pub smtp_port: u16,
     pub smtp_from: String,
@@ -42,6 +43,8 @@ impl Config {
             master_key: env::var("PLATFORM_MASTER_KEY").ok(),
             git_repos_path: env::var("PLATFORM_GIT_REPOS_PATH")
                 .map_or_else(|_| PathBuf::from("/data/repos"), PathBuf::from),
+            ops_repos_path: env::var("PLATFORM_OPS_REPOS_PATH")
+                .map_or_else(|_| PathBuf::from("/data/ops-repos"), PathBuf::from),
             smtp_host: env::var("PLATFORM_SMTP_HOST").ok(),
             smtp_port: env::var("PLATFORM_SMTP_PORT")
                 .ok()

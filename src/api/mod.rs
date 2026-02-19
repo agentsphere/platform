@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod deployments;
 pub mod issues;
 pub mod merge_requests;
 pub mod pipelines;
@@ -19,5 +20,6 @@ pub fn router() -> Router<AppState> {
         .merge(merge_requests::router())
         .merge(webhooks::router())
         .merge(pipelines::router())
+        .merge(deployments::router())
         .merge(crate::git::browser_router())
 }

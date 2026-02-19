@@ -25,8 +25,10 @@ mod git;
 // Phase 05 — Build Engine
 mod pipeline;
 
+// Phase 06 — Continuous Deployer
+mod deployer;
+
 // Module stubs — populated in later phases
-mod deployer {}
 mod agent {}
 mod observe {}
 mod secrets {}
@@ -76,9 +78,14 @@ async fn main() -> anyhow::Result<()> {
     // Bootstrap system roles, permissions, and admin user on first run
     store::bootstrap::run(&pool, cfg.admin_password.as_deref()).await?;
 
-    // Start pipeline executor background task
+    // Start background tasks
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx));
+    let deployer_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(deployer::reconciler::run(
+        state.clone(),
+        deployer_shutdown_rx,
+    ));
 
     // Spawn expired session/token cleanup task (hourly)
     let cleanup_pool = pool.clone();

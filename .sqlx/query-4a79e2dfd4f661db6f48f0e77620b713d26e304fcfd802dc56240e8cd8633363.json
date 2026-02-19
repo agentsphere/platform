@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO ops_repos (name, repo_url, branch, path, sync_interval_s)\n        VALUES ($1, $2, COALESCE($3, 'main'), COALESCE($4, '/'), COALESCE($5, 60))\n        RETURNING id, name, repo_url, branch, path, sync_interval_s, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "repo_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "sync_interval_s",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4a79e2dfd4f661db6f48f0e77620b713d26e304fcfd802dc56240e8cd8633363"
+}

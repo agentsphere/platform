@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE deployments\n        SET desired_status = 'rollback', current_status = 'pending', deployed_by = $3\n        WHERE project_id = $1 AND environment = $2\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4e53cc265b604bf93294faaca04104e120a750c76c09f49a725563a2bada4682"
+}

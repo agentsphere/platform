@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE deployments\n        SET current_status = 'healthy', deployed_at = now(), current_sha = $2\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "542e1269c414ce41e0cd47089946cc09650f2cc7a3d547c883aa7a3beb890d2b"
+}

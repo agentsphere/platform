@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT image_ref FROM deployment_history\n        WHERE deployment_id = $1 AND status = 'success' AND action = 'deploy'\n        ORDER BY created_at DESC LIMIT 1 OFFSET 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image_ref",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b5d6dc8d0ad19976ff031ce85dc68a8e965fb595ba7380ac71e65599a67ba9e8"
+}

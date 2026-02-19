@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, project_id, environment, ops_repo_id, manifest_path,\n               image_ref, values_override, desired_status, current_status,\n               current_sha, deployed_by, deployed_at, created_at, updated_at\n        FROM deployments WHERE project_id = $1 AND environment = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "environment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "ops_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "manifest_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "image_ref",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "values_override",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "desired_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "current_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "current_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "deployed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "deployed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "94cddaa3c99e88efe44b42f5d7cc482e72be19f934cb2f7679ed98c88439d1f3"
+}

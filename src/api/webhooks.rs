@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use axum::extract::{Path, State};
@@ -33,68 +32,6 @@ static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 /// Concurrency limiter for webhook dispatch (max 50 concurrent deliveries).
 static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
-
-// ---------------------------------------------------------------------------
-// SSRF protection
-// ---------------------------------------------------------------------------
-
-/// Validate a webhook URL to block SSRF attacks.
-/// Rejects private/loopback IPs, link-local, metadata endpoints, and non-HTTP schemes.
-fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
-    let parsed =
-        url::Url::parse(url_str).map_err(|_| ApiError::BadRequest("invalid URL".into()))?;
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ApiError::BadRequest(
-            "webhook URL must use http or https".into(),
-        ));
-    }
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ApiError::BadRequest("webhook URL must have a host".into()))?;
-
-    // Block well-known dangerous hostnames
-    let blocked_hosts = [
-        "localhost",
-        "169.254.169.254",
-        "metadata.google.internal",
-        "[::1]",
-    ];
-    let host_lower = host.to_lowercase();
-    if blocked_hosts.iter().any(|b| host_lower == *b) {
-        return Err(ApiError::BadRequest(
-            "webhook URL must not target internal/metadata endpoints".into(),
-        ));
-    }
-
-    // Block private/reserved IPs
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_ip(ip)
-    {
-        return Err(ApiError::BadRequest(
-            "webhook URL must not target private/reserved IP addresses".into(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()          // 127.0.0.0/8
-                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local() // 169.254/16
-                || v4.is_broadcast()  // 255.255.255.255
-                || v4.is_unspecified() // 0.0.0.0
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()          // ::1
-                || v6.is_unspecified() // ::
-        }
-    }
-}
 
 async fn require_project_write(
     state: &AppState,
@@ -183,7 +120,7 @@ async fn create_webhook(
 
     // Validate URL (format + SSRF protection)
     validation::check_url(&body.url)?;
-    validate_webhook_url(&body.url)?;
+    validation::check_ssrf_url(&body.url, &["http", "https"])?;
 
     // Validate events
     if body.events.is_empty() {
@@ -317,7 +254,7 @@ async fn update_webhook(
     // Validate inputs
     if let Some(ref url) = body.url {
         validation::check_url(url)?;
-        validate_webhook_url(url)?;
+        validation::check_ssrf_url(url, &["http", "https"])?;
     }
     if let Some(ref events) = body.events {
         if events.is_empty() {
@@ -529,54 +466,4 @@ async fn dispatch_single(url: &str, secret: Option<&str>, payload: &serde_json::
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ssrf_blocks_localhost() {
-        assert!(validate_webhook_url("http://localhost:3000/hook").is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_metadata() {
-        assert!(validate_webhook_url("http://169.254.169.254/latest/meta-data/").is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_private_ip() {
-        assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
-        assert!(validate_webhook_url("http://192.168.1.1/hook").is_err());
-        assert!(validate_webhook_url("http://172.16.0.1/hook").is_err());
-        assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_loopback_v6() {
-        assert!(validate_webhook_url("http://[::1]/hook").is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_non_http() {
-        assert!(validate_webhook_url("ftp://example.com/hook").is_err());
-        assert!(validate_webhook_url("file:///etc/passwd").is_err());
-    }
-
-    #[test]
-    fn ssrf_allows_public_url() {
-        assert!(validate_webhook_url("https://example.com/webhook").is_ok());
-        assert!(validate_webhook_url("http://hooks.slack.com/services/xxx").is_ok());
-    }
-
-    #[test]
-    fn private_ip_detection() {
-        assert!(is_private_ip("127.0.0.1".parse().unwrap()));
-        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
-        assert!(is_private_ip("192.168.0.1".parse().unwrap()));
-        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
-        assert!(is_private_ip("169.254.1.1".parse().unwrap()));
-        assert!(is_private_ip("::1".parse().unwrap()));
-        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
-    }
-}
+// SSRF and IP validation tests moved to src/validation.rs

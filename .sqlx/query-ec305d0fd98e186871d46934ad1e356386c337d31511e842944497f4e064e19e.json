@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT name, repo_url, branch, path, sync_interval_s FROM ops_repos WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "sync_interval_s",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ec305d0fd98e186871d46934ad1e356386c337d31511e842944497f4e064e19e"
+}

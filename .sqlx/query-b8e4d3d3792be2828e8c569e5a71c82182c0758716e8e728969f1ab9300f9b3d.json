@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO deployment_history\n            (deployment_id, image_ref, ops_repo_sha, action, status, deployed_by)\n        VALUES ($1, $2, $3, $4, 'success', $5)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8e4d3d3792be2828e8c569e5a71c82182c0758716e8e728969f1ab9300f9b3d"
+}

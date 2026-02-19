@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE deployments SET\n            image_ref = COALESCE($3, image_ref),\n            desired_status = COALESCE($4, desired_status),\n            values_override = COALESCE($5, values_override),\n            ops_repo_id = COALESCE($6, ops_repo_id),\n            manifest_path = COALESCE($7, manifest_path),\n            current_status = 'pending',\n            deployed_by = $8\n        WHERE project_id = $1 AND environment = $2\n        RETURNING id, project_id, environment, ops_repo_id, manifest_path,\n                  image_ref, values_override, desired_status, current_status,\n                  current_sha, deployed_by, deployed_at, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "environment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "ops_repo_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "manifest_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "image_ref",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "values_override",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "desired_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "current_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "current_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "deployed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "deployed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "add9362b92e381ef02937fce2ca518a6133defcbccf750fa05aee9bf3c8d5de1"
+}
