@@ -19,6 +19,3 @@ ui/dist/
 
 # Kind kubeconfig
 kind-platform.kubeconfig
-
-# Reference Go prototype (read-only, not part of this repo)
-/mgr/

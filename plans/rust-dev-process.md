@@ -2,7 +2,7 @@
 
 ## Context
 
-The unified platform (`plans/unified-platform.md`) replaces 8+ off-the-shelf services with a single Rust binary (~13K LOC Rust + ~2.7K LOC TypeScript). An existing Go prototype in `mgr/` (~2,600 LOC) provides reference patterns. This plan defines the development toolchain, workflow, and CI/CD pipeline so that the dev setup is efficient from day one.
+The unified platform (`plans/unified-platform.md`) replaces 8+ off-the-shelf services with a single Rust binary (~13K LOC Rust + ~2.7K LOC TypeScript). Implementation details from the original Go prototype are preserved in `plans/mgr-reference.md`. This plan defines the development toolchain, workflow, and CI/CD pipeline so that the dev setup is efficient from day one.
 
 The platform lives in its own GitHub repository (open source), not as a subfolder of the infra repo. Development happens on macOS (Apple Silicon). CI runs on GitHub Actions with GitHub Enterprise runners. Container images are pushed to GitHub Container Registry (ghcr.io). Local dev uses a kind cluster for Kubernetes integration — no external cluster dependencies. Single developer + Claude Code.
 
@@ -16,7 +16,7 @@ The platform lives in its own GitHub repository (open source), not as a subfolde
 |---|---|
 | GitHub repository | Created at `github.com/agentsphere/platform` (or org of choice), public, MIT/Apache-2.0 license |
 | `plans/unified-platform.md` | Architectural blueprint — module structure, crate decisions, data model |
-| Go prototype `mgr/` | Reference for migration SQL, UI code, pod exec patterns (stays in infra repo, read-only reference) |
+| `plans/mgr-reference.md` | Implementation reference from original Go prototype — pod specs, K8s attach patterns, progress tracker, runner image |
 
 ### Local tooling (one-time install)
 
@@ -87,7 +87,7 @@ platform/                        # repo root
     store/
   migrations/                    # sqlx migrations
   tests/                         # integration tests
-  ui/                            # Preact SPA (carried from mgr/ui/)
+  ui/                            # Preact SPA
   docker/
     Dockerfile                   # app image (multi-stage, cargo-chef)
     Dockerfile.claude-runner     # agent runtime image
@@ -1006,7 +1006,7 @@ When implementation starts, create these files in order:
 8. `.env.example` — template env vars
 9. `.pre-commit-config.yaml` — self-contained hooks
 10. `src/main.rs` + `src/lib.rs` — entrypoint skeleton
-11. `migrations/` — first migration (ported from `mgr/internal/store/migrations/`)
+11. `migrations/` — first migration (schema in `plans/unified-platform.md`)
 12. `hack/kind-config.yaml` — kind cluster definition
 13. `hack/kind-up.sh` — cluster bootstrap script
 14. `hack/kind-down.sh` — cluster teardown

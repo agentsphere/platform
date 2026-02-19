@@ -115,22 +115,23 @@ When multiple agents work in parallel, they will all touch a few shared files. D
 |------------|-----------|
 | `src/main.rs` | Each module adds its router via a `pub fn router() -> Router<AppState>` function. One final merge pass nests all routers. During parallel dev, each module can be tested independently with its own axum `Router`. |
 | `src/lib.rs` | Each module adds one `pub mod <name>;` line. Append-only — merge conflicts are trivial. |
-| `migrations/` | **All core migrations are created upfront in 01-foundation** (21 files, `20260220_0100xx` range). This gives the full schema on day 1 so `sqlx` compile-time checks work. If a module needs additional migrations later (e.g., adding a column), use the module's timestamp range below. |
+| `migrations/` | **All core migrations are created upfront in 01-foundation** (21 files). **IMPORTANT**: sqlx version numbers must be a single `_`-delimited segment — use `20260220010001_name.up.sql` (no underscore between date and sequence), NOT `20260220_010001_name.up.sql`. If a module needs additional migrations later (e.g., adding a column), use the module's timestamp range below. |
 | `Cargo.toml` | Each module may add dependencies. Use a single merge pass after the parallel wave to reconcile. |
 
-**Migration timestamp ranges** (for any additional migrations during parallel dev — core schema is already in `0100xx`):
+**Migration timestamp ranges** (for any additional migrations during parallel dev — core schema is already in `0100xx`).
+Format: `{YYYYMMDDSSSSSS}_name.up.sql` — the version is everything before the first `_`. No underscores within the version number.
 
-| Module | Timestamp prefix | Notes |
-|--------|-----------------|-------|
-| 01-foundation | `20260220_0100xx` | Core schema (21 files, created upfront) |
-| 02-identity | `20260220_0200xx` | Only if auth needs schema changes |
-| 03-git | `20260220_0300xx` | |
-| 04-project | `20260220_0400xx` | |
-| 05-build | `20260220_0500xx` | |
-| 06-deployer | `20260220_0600xx` | |
-| 07-agent | `20260220_0700xx` | |
-| 08-observe | `20260220_0800xx` | |
-| 09-secrets-notify | `20260220_0900xx` | |
+| Module | Timestamp prefix | Example filename | Notes |
+|--------|-----------------|------------------|-------|
+| 01-foundation | `202602200100xx` | `20260220010001_utility.up.sql` | Core schema (21 files, created upfront) |
+| 02-identity | `202602200200xx` | `20260220020001_some_change.up.sql` | Only if auth needs schema changes |
+| 03-git | `202602200300xx` | | |
+| 04-project | `202602200400xx` | | |
+| 05-build | `202602200500xx` | | |
+| 06-deployer | `202602200600xx` | | |
+| 07-agent | `202602200700xx` | | |
+| 08-observe | `202602200800xx` | | |
+| 09-secrets-notify | `202602200900xx` | | |
 
 ---
 
@@ -204,7 +205,7 @@ Optimal assignment for parallel Claude Code sessions:
 |---------|---------|-------------|-----------------|
 | A | 03-git + 04-project | Both deal with git repos and project data, natural overlap | ~2,400 LOC, medium |
 | B | 05-build + 06-deployer | Build produces what deployer consumes, related K8s patterns | ~2,200 LOC, high (K8s pod lifecycle) |
-| C | 07-agent | Self-contained, ports from mgr/ Go reference | ~800 LOC, high (pod exec/attach spike) |
+| C | 07-agent | Self-contained, ports from Go prototype (see `plans/mgr-reference.md`) | ~800 LOC, high (pod exec/attach spike) |
 | D | 08-observability | Largest module, needs full attention (OTLP, Parquet, queries) | ~2,200 LOC, high |
 | E | 09-secrets-notify | Two small modules, quick to implement | ~1,000 LOC, low |
 | F | 10-web-ui | Separate language (TypeScript), independent build | ~2,500 LOC TS, low |
@@ -253,11 +254,11 @@ A module is "done" and ready for integration wiring when ALL of the following ar
 ## Verification Checkpoints
 
 ### Phase 1 done:
-- [ ] `cargo check` compiles
+- [x] `cargo check` compiles (01-foundation complete 2026-02-19)
 - [ ] `cargo run` starts, connects to DB/Valkey/MinIO, creates admin user
 - [ ] `/healthz` returns 200
-- [ ] Login → get session → access protected endpoint works
-- [ ] RBAC permission enforcement works (role-based)
+- [ ] Login → get session → access protected endpoint works (02-identity)
+- [ ] RBAC permission enforcement works (role-based) (02-identity)
 - [ ] kube-rs pod exec/attach spike validated (for 07-agent)
 
 ### Phase 2 done (per module):
@@ -280,3 +281,29 @@ A module is "done" and ready for integration wiring when ALL of the following ar
 - [ ] `just ci` passes all checks
 - [ ] Load test: OTLP ingest at expected throughput (08)
 - [ ] Graceful shutdown: all background tasks drain cleanly
+
+---
+
+## Lessons Learned
+
+### From 01-Foundation (2026-02-19)
+
+1. **sqlx migration version format**: The version number is everything before the first `_` in the filename. `20260220_010001_name.up.sql` creates version `20260220`, not `20260220010001`. All 21 migrations collided. Fix: `20260220010001_name.up.sql` — no underscore between date and sequence number.
+
+2. **FK ordering in migrations**: `user_roles` references `projects(id)`, so `projects` must be created first. The original plan had projects at position 008 but user_roles at 004. Topologically sort tables by FK dependencies when planning migration order.
+
+3. **rand 0.10 vs argon2 0.5 version conflict**: `argon2` re-exports `rand_core 0.6` via `password-hash`, but `rand 0.10` uses `rand_core 0.9`. These are incompatible types even though they look the same. Use `argon2::password_hash::rand_core::OsRng` for argon2 salt generation, not `rand::rng()`.
+
+4. **fred `Pool` doesn't implement `PubsubInterface`**: Only `Client` does. Use `pool.next().publish()` to get a `&Client` reference that supports pub/sub.
+
+5. **Dead code warnings with `-D warnings`**: Foundation types are consumed by later modules. Use targeted `#[allow(dead_code)]` on `Config`, `ApiError`, `AppState`, and valkey helpers. Remove annotations as modules adopt them.
+
+6. **kind port conflicts with OrbStack/Docker**: The kind cluster maps ports 5432/6379/8080/9000/9001 to localhost. OrbStack may hold these ports even after containers exit (stale ESTABLISHED connections). Stop OrbStack services or remap kind ports before running `just cluster-up`.
+
+7. **Bootstrap uses dynamic `sqlx::query()`, not `sqlx::query!()`**: The bootstrap module seeds data with dynamic queries (bind parameters, no compile-time checking). This means `cargo sqlx prepare` reports "no queries found" — that's expected until modules add `sqlx::query!()` / `sqlx::query_as!()` calls.
+
+### For Future Modules
+
+- When adding new `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache, then commit the changes.
+- Each module should use `sqlx::query_as!()` (compile-time checked) for all DB access, unlike bootstrap which used dynamic queries.
+- Test migrations on a fresh DB (`just cluster-down && just cluster-up && just db-migrate`) before committing.

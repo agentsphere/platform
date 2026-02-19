@@ -11,13 +11,13 @@
 - 03-git-server, 04-project-mgmt, 05-build-engine, 06-deployer, 08-observability, 09-secrets-notify
 
 ## Reference
-- `mgr/` Go codebase provides the design patterns and logic to port
+- `plans/mgr-reference.md` — concrete implementation details (pod spec, SPDY attach, progress tracker, runner image) extracted from the original Go prototype
 
 ---
 
 ## Scope
 
-Agent session lifecycle: create sessions, spawn agent pods in K8s, bridge WebSocket for live streaming, manage ephemeral agent identities with delegated RBAC permissions. Port from the existing `mgr/` Go prototype. Primary provider: Claude Code.
+Agent session lifecycle: create sessions, spawn agent pods in K8s, bridge WebSocket for live streaming, manage ephemeral agent identities with delegated RBAC permissions. Port from the original Go prototype (see `plans/mgr-reference.md`). Primary provider: Claude Code.
 
 ---
 

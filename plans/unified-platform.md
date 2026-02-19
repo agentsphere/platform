@@ -32,7 +32,7 @@ The vision: **one custom Rust binary** that replaces Gitea + Woodpecker + Authel
 | **Error handling** | `Result<T, E>` propagation across 11 modules. `thiserror` for domain errors. | `if err != nil` x 10,000. |
 | **K8s client** | `kube-rs` — mature, async, typed. Pod exec/attach works (spike first). | `client-go` — canonical, but Go-only advantage. |
 | **CI build time** | ~3-5min clean (GitHub Enterprise runners — not a constraint). | ~15s clean. |
-| **Existing code** | Rewrite `mgr/` (~2,600 LOC Go). ~2-3 week cost, but would rewrite most of it anyway during unification. | Direct reuse. |
+| **Existing code** | Rewrite Go prototype (~2,600 LOC). ~2-3 week cost, but would rewrite most of it anyway during unification. Reference: `plans/mgr-reference.md`. | Direct reuse. |
 
 **Decision**: Rust. This is a stateful platform with correctness requirements (RBAC, observability ingest, deployer reconciliation), not a CRUD API. The type system and zero-cost abstractions pay for themselves.
 
@@ -1069,7 +1069,7 @@ Replaces: Woodpecker CI's build capabilities.
 
 ### 7. Agent Orchestration (~800 LOC Rust, ~3-4 days)
 
-Port existing `mgr/` Go logic to Rust:
+Port Go prototype logic to Rust (see `plans/mgr-reference.md` for implementation details):
 
 - Agent session lifecycle (create, stream, message, stop)
 - `src/agent/identity.rs` — ephemeral agent user, delegate permissions from requesting user
@@ -1149,7 +1149,7 @@ Served from binary via `rust-embed`. Reuse existing Preact setup, esbuild config
 
 Rust LOC is ~20-25% higher than Go equivalent due to type definitions, trait impls, and explicit error handling. But the code that compiles is more likely to be correct.
 
-The `mgr/` Go codebase (~2,600 LOC) provides design patterns and logic to port. Not direct reuse, but the architecture transfers 1:1.
+The original Go prototype (~2,600 LOC) provided design patterns and logic to port. Implementation details preserved in `plans/mgr-reference.md`. Not direct reuse, but the architecture transfers 1:1.
 
 ---
 
@@ -1162,7 +1162,7 @@ kube-rs pod exec/attach for interactive agent sessions. Validate that WebSocket 
 Core framework + auth + RBAC + git server. At the end: can create users, assign roles, push/clone repos, authenticate with tokens, delegate permissions. CI pipeline building + pushing container image.
 
 ### Phase 2 — Agent Loop (week 4-5)
-Port agent orchestration from `mgr/`. Agent identity + delegation. At the end: agents can create projects, get workspaces, build code, push results — with RBAC-scoped permissions.
+Port agent orchestration (see `plans/mgr-reference.md`). Agent identity + delegation. At the end: agents can create projects, get workspaces, build code, push results — with RBAC-scoped permissions.
 
 ### Phase 3 — Build Engine + Deployer (week 6-8)
 Pipeline execution, artifact storage, continuous deployer, ops repos. At the end: push triggers build → artifact to MinIO → desired state in DB → deployer applies manifests from ops repo.

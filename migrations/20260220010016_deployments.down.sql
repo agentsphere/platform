@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS deployment_history CASCADE;
+DROP TABLE IF EXISTS deployments CASCADE;

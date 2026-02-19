@@ -158,3 +158,27 @@ On first run (when `users` table is empty):
 
 ## Estimated LOC
 ~1,200 Rust
+
+---
+
+## Implementation Notes (Lessons Learned)
+
+**Completed**: 2026-02-19
+
+### sqlx Migration Naming
+The plan originally used `20260220_010001_name.sql` naming. This **does not work** — sqlx treats the first `_`-delimited segment as the version number, so all 21 files shared version `20260220` and collided. The correct format concatenates date + sequence into a single version number: `20260220010001_name.{up,down}.sql`. This was fixed during implementation.
+
+### Migration Ordering: FK Dependencies
+The plan had `user_roles` (004) before `projects` (008), but `user_roles.project_id` references `projects(id)`. Fixed by moving `projects` to position 004 and shifting `user_roles` to 005. Any future migration plans must topologically sort tables by FK dependencies.
+
+### rand 0.10 / argon2 0.5 Version Conflict
+`argon2 0.5` depends on `password-hash 0.5` which uses `rand_core 0.6`. Our `Cargo.toml` has `rand = "0.10"` which uses `rand_core 0.9`. These are incompatible — `rand::rng()` returns a `ThreadRng` from `rand_core 0.9` but `SaltString::generate()` wants `CryptoRngCore` from `rand_core 0.6`. **Fix**: Use `argon2::password_hash::rand_core::OsRng` (the 0.6-compatible re-export) instead of `rand::rng()` or `rand::rngs::OsRng`.
+
+### fred Pool Does Not Implement PubsubInterface
+`fred::clients::Pool` does not implement `PubsubInterface` directly. To call `publish()`, use `pool.next()` which returns `&Client` (which does implement `PubsubInterface`). The `subscriber-client` feature enables `i-pubsub`, but only for `Client`, `SubscriberClient`, etc. — not `Pool`.
+
+### Dead Code Warnings
+Many types/functions in foundation are not yet used (they exist for later modules). Clippy with `-D warnings` promotes these to errors. Add `#[allow(dead_code)]` on `Config`, `ApiError`, `AppState`, and individual helper functions in `valkey.rs`. Remove these annotations as modules consume them.
+
+### kind Port Conflicts
+`hack/kind-up.sh` maps ports 5432, 6379, 8080, 9000, 9001 from the kind container to localhost. If OrbStack or other Docker services are already using these ports, kind cluster creation fails. **Always stop conflicting services before running `just cluster-up`**. Alternatively, remap to non-conflicting ports in `hack/kind-config.yaml`.

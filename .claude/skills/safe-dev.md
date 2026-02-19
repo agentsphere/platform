@@ -6,6 +6,20 @@ Refer to `CLAUDE.md` for all coding patterns and conventions.
 
 ---
 
+## Principles
+
+Apply these throughout every step:
+
+- **DRY (Don't Repeat Yourself)** — Extract shared logic into functions, traits, or modules. If you copy-paste code, refactor it into a single source of truth.
+- **Single Responsibility** — Each function, struct, and module should do one thing well. If a function needs an "and" to describe it, split it.
+- **Least Surprise** — Code should behave as a reader would expect. Name things clearly, avoid hidden side effects, keep public APIs obvious.
+- **Fail Fast** — Validate inputs at boundaries and return errors early. Don't let invalid state propagate deep into the system.
+- **YAGNI (You Aren't Gonna Need It)** — Don't build abstractions or features for hypothetical future needs. Solve the problem at hand.
+- **Composition over Inheritance** — Prefer trait composition and small composable functions over deep hierarchies or god objects.
+- **Plans are Living Documents** — Update the relevant `plans/` file as you implement. Plans rot when they diverge from reality — keep them honest.
+
+---
+
 ## Step 1: Understand the requirement
 
 1. Read the relevant plan in `plans/` if one exists for this feature
@@ -58,6 +72,7 @@ Write the implementation to make tests pass:
 5. Use the builder pattern for constructing complex structs (K8s pod specs, query builders)
 6. No `.unwrap()` in production code
 7. Never log sensitive data (passwords, tokens, secrets)
+8. **Update the plan** as you go — if the implementation deviates from the plan (different approach, extra complexity, changed schema, new dependencies), update the relevant `plans/` file immediately. Don't wait until the end.
 
 Run `just test-unit` — all unit tests should pass (green phase).
 
@@ -115,11 +130,24 @@ Verify every item before considering the work done:
 - [ ] `.sqlx/` offline cache is up to date
 - [ ] Zero warnings with `cargo clippy --all-features -- -D warnings`
 
-## Step 8: Summarize changes
+## Step 8: Update plan & summarize changes
 
-After all checks pass, provide a summary:
+After all checks pass:
+
+**Update the plan file** (`plans/`):
+
+1. Mark completed sections/tasks as done (e.g., `[x]` or `✅`)
+2. Update status fields (phase, progress, completion %)
+3. Document any deviations from the original plan — what changed and why
+4. Note added complexity, new edge cases, or unexpected dependencies discovered during implementation
+5. Record alternative approaches that were considered but rejected, with brief reasoning
+6. Update any schema, API, or architecture descriptions that no longer match reality
+7. Add or revise remaining work estimates if scope changed
+
+**Provide a summary:**
 
 1. What was implemented
 2. What tests were added (unit + integration)
 3. What files were created or modified
-4. Any follow-up items or known limitations
+4. What plan changes were made (deviations, status updates)
+5. Any follow-up items or known limitations
