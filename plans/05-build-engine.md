@@ -76,12 +76,12 @@ Handle the various ways a pipeline can start:
   - `pub async fn on_push(pool, project_id, ref_name, commit_sha, triggered_by) -> Result<Option<Uuid>>`
   - Read `.platform.yaml` from the pushed commit (`git show <sha>:.platform.yaml`)
   - Check if push matches trigger filter (branch pattern)
-  - If match: insert `pipelines` row with status `pending`, insert `pipeline_steps` rows
+  - If match: insert `pipelines` row (column is `git_ref`, not `ref` — avoids SQL reserved word), insert `pipeline_steps` rows with `step_order` set from definition order, `project_id` denormalized on each step
   - Return pipeline ID
 
 - **API trigger**:
   - `POST /api/projects/:id/pipelines` — manually trigger pipeline
-  - Required: `ref` (branch or tag)
+  - Required: `git_ref` (branch or tag)
   - Requires: `project:write`
 
 - **MR trigger** (called when MR is created/updated):

@@ -36,8 +36,9 @@ Project CRUD, issues with comments, merge requests with reviews, webhooks. The "
   - Requires: `project:read` on this project (or public visibility)
 - `PATCH /api/projects/:id` — update project settings
   - Requires: `project:write` on this project or owner
-- `DELETE /api/projects/:id` — soft-delete project (mark inactive)
+- `DELETE /api/projects/:id` — soft-delete project (set `is_active = false`)
   - Requires: admin or owner
+  - Soft-deleted projects are excluded from list queries by default
 
 ### 2. `src/api/issues.rs` — Issues & Comments
 
@@ -45,7 +46,12 @@ Issues use project-scoped auto-incrementing numbers (not UUID in the URL).
 
 - `POST /api/projects/:id/issues` — create issue
   - Required: `title`; Optional: `body`, `labels`, `assignee_id`
-  - Auto-assign `number` = max(number) + 1 for this project
+  - Auto-assign `number` via atomic increment on `projects.next_issue_number`:
+    ```sql
+    UPDATE projects SET next_issue_number = next_issue_number + 1
+    WHERE id = $1 RETURNING next_issue_number
+    ```
+    This avoids race conditions vs `max(number) + 1`.
   - Requires: `project:write`
 - `GET /api/projects/:id/issues` — list issues
   - Filter by: `status` (open/closed), `labels`, `assignee_id`
@@ -62,12 +68,18 @@ Issues use project-scoped auto-incrementing numbers (not UUID in the URL).
 - `PATCH /api/projects/:id/issues/:number/comments/:comment_id` — edit comment
   - Requires: comment author or admin
 
+**Note:** The `comments` table now supports both issues and MRs. The same CRUD endpoints apply to MRs:
+- `POST /api/projects/:id/merge-requests/:number/comments` — add comment to MR
+- `PATCH /api/projects/:id/merge-requests/:number/comments/:comment_id` — edit MR comment
+
+Comments set either `issue_id` or `mr_id` (never both). The `project_id` is denormalized on the row.
+
 ### 3. `src/api/merge_requests.rs` — Merge Requests & Reviews
 
 - `POST /api/projects/:id/merge-requests` — create MR
   - Required: `source_branch`, `target_branch`, `title`
   - Optional: `body`
-  - Auto-assign `number`
+  - Auto-assign `number` via atomic increment on `projects.next_mr_number` (same pattern as issues)
   - Validate: source_branch exists in repo, source != target
   - Requires: `project:write`
 - `GET /api/projects/:id/merge-requests` — list MRs

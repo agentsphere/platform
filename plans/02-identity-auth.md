@@ -88,11 +88,13 @@ pub enum Permission {
   - Both delegations granted by user and delegations received
 
 ### 9. `src/rbac/middleware.rs` — Tower Permission Layer
-- `RequirePermission` — tower layer that checks RBAC before handler executes
+- `RequirePermission` — axum route layer that checks RBAC before handler executes
   - Works with `AuthUser` extractor to get user identity
-  - Extracts `project_id` from path parameters when checking project-scoped permissions
+  - For project-scoped permissions: extracts `project_id` from path parameter named `id` or `project_id`
+  - For global permissions (admin routes): checks without project scope
   - Returns `ApiError::Forbidden` if user lacks required permission
 - Usage in router: `.route_layer(RequirePermission::new(Permission::ProjectWrite))`
+- **Design note**: This is a route layer (not an extractor in the handler signature). The layer runs before the handler, extracts the user from the request extensions (set by auth middleware), extracts project_id from the URL path, and calls `has_permission(user_id, project_id, perm)`. This keeps permission checking out of handler logic.
 
 ### 10. `src/api/users.rs` — User Management API
 - `POST /api/users` — create user (admin only)
@@ -121,7 +123,7 @@ pub enum Permission {
 - `DELETE /api/tokens/:id` — revoke token
 
 ### 13. Audit Log Writes
-Every mutation in this module writes to `audit_log`:
+Every mutation in this module writes to `audit_log` (include both `actor_id` and `actor_name`):
 - `user.create`, `user.update`, `user.deactivate`
 - `role.assign`, `role.remove`, `role.create`
 - `delegation.create`, `delegation.revoke`

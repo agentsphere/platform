@@ -98,34 +98,38 @@ pub mod secrets;
 pub mod notify;
 ```
 
-### 6. Migrations — Core Schema
+### 6. Migrations — Full Schema (created upfront)
 
-Create migrations in order. Each migration is a separate file:
+All migrations are created in this foundation step so the schema is complete on day 1. This enables `sqlx` compile-time query checking across all modules from the start of parallel development. Use `just db-add <name>` to create up/down pairs.
+
+**Important**: The schema includes all fixes from the review — `set_updated_at()` trigger function, renamed reserved-word columns (`git_ref`, `metric_type`, `notification_type`), missing indexes, fixed FK cascades, `comments` table with MR support, `projects.next_issue_number`/`next_mr_number` counters, `pipeline_steps.step_order`, and immutable `audit_log` (no FK on `actor_id`).
 
 ```
 migrations/
-  20250219_001_users.sql           — users table
-  20250219_002_roles_permissions.sql — roles, permissions, role_permissions
-  20250219_003_user_roles.sql      — user_roles (global + project-scoped)
-  20250219_004_delegations.sql     — delegation table
-  20250219_005_auth_sessions.sql   — auth_sessions
-  20250219_006_api_tokens.sql      — api_tokens
-  20250219_007_projects.sql        — projects
-  20250219_008_issues_comments.sql — issues, comments
-  20250219_009_webhooks.sql        — webhooks
-  20250219_010_merge_requests.sql  — merge_requests, mr_reviews
-  20250219_011_agent_sessions.sql  — agent_sessions, agent_messages
-  20250219_012_pipelines.sql       — pipelines, pipeline_steps, artifacts
-  20250219_013_ops_repos.sql       — ops_repos
-  20250219_014_deployments.sql     — deployments, deployment_history
-  20250219_015_observability.sql   — traces, spans, log_entries, metric_series, metric_samples
-  20250219_016_alerts.sql          — alert_rules, alert_events
-  20250219_017_secrets.sql         — secrets
-  20250219_018_notifications.sql   — notifications
-  20250219_019_audit_log.sql       — audit_log with indexes
+  20260220_010001_utility.sql          — set_updated_at() trigger function
+  20260220_010002_users.sql            — users table + trigger
+  20260220_010003_roles_permissions.sql — roles, permissions, role_permissions
+  20260220_010004_user_roles.sql       — user_roles + index
+  20260220_010005_delegations.sql      — delegations + delegate_id index
+  20260220_010006_auth_sessions.sql    — auth_sessions + user_id index
+  20260220_010007_api_tokens.sql       — api_tokens + user_id index
+  20260220_010008_projects.sql         — projects (with is_active, next_issue/mr_number) + trigger
+  20260220_010009_issues.sql           — issues + trigger
+  20260220_010010_merge_requests.sql   — merge_requests, mr_reviews (with project_id) + trigger
+  20260220_010011_comments.sql         — comments (issue_id nullable, mr_id, project_id, CHECK)
+  20260220_010012_webhooks.sql         — webhooks
+  20260220_010013_agent_sessions.sql   — agent_sessions + indexes, agent_messages
+  20260220_010014_pipelines.sql        — pipelines (git_ref, not ref) + indexes, pipeline_steps (step_order, project_id), artifacts
+  20260220_010015_ops_repos.sql        — ops_repos
+  20260220_010016_deployments.sql      — deployments + trigger + reconcile index, deployment_history
+  20260220_010017_observability.sql    — traces, spans, log_entries + indexes, metric_series (metric_type), metric_samples
+  20260220_010018_alerts.sql           — alert_rules, alert_events + status index
+  20260220_010019_secrets.sql          — secrets + trigger + global name index
+  20260220_010020_notifications.sql    — notifications (notification_type) + user_status index
+  20260220_010021_audit_log.sql        — audit_log (no FK on actor_id, has actor_name) + indexes
 ```
 
-SQL schema exactly as defined in `plans/unified-platform.md` (the Core Tables section).
+SQL schema exactly as defined in `plans/unified-platform.md` (the Core Tables section), with all reviewed fixes applied.
 
 ### 7. Bootstrap Logic
 

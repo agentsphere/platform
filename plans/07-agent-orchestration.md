@@ -29,7 +29,7 @@ Re-exports service, identity, provider. Contains `AgentProvider` trait definitio
 ### 2. `src/agent/provider.rs` — AgentProvider Trait
 
 ```rust
-#[async_trait]
+// Uses native async fn in trait (Rust 2024 edition) — no #[async_trait] crate needed
 pub trait AgentProvider: Send + Sync {
     /// Build the K8s pod spec for this agent type
     fn pod_spec(&self, session: &AgentSession, config: &ProviderConfig) -> Result<PodSpec>;

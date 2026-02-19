@@ -115,22 +115,22 @@ When multiple agents work in parallel, they will all touch a few shared files. D
 |------------|-----------|
 | `src/main.rs` | Each module adds its router via a `pub fn router() -> Router<AppState>` function. One final merge pass nests all routers. During parallel dev, each module can be tested independently with its own axum `Router`. |
 | `src/lib.rs` | Each module adds one `pub mod <name>;` line. Append-only — merge conflicts are trivial. |
-| `migrations/` | Timestamp-prefixed filenames (e.g., `20260220_010100_create_pipelines.sql`). No ordering conflicts as long as timestamps don't collide. **Convention**: each module claims a timestamp range (see below). |
+| `migrations/` | **All core migrations are created upfront in 01-foundation** (21 files, `20260220_0100xx` range). This gives the full schema on day 1 so `sqlx` compile-time checks work. If a module needs additional migrations later (e.g., adding a column), use the module's timestamp range below. |
 | `Cargo.toml` | Each module may add dependencies. Use a single merge pass after the parallel wave to reconcile. |
 
-**Migration timestamp ranges** (prevents collisions during parallel dev):
+**Migration timestamp ranges** (for any additional migrations during parallel dev — core schema is already in `0100xx`):
 
-| Module | Timestamp prefix |
-|--------|-----------------|
-| 01-foundation | `20260220_0100xx` |
-| 02-identity | `20260220_0200xx` |
-| 03-git | `20260220_0300xx` |
-| 04-project | `20260220_0400xx` |
-| 05-build | `20260220_0500xx` |
-| 06-deployer | `20260220_0600xx` |
-| 07-agent | `20260220_0700xx` |
-| 08-observe | `20260220_0800xx` |
-| 09-secrets-notify | `20260220_0900xx` |
+| Module | Timestamp prefix | Notes |
+|--------|-----------------|-------|
+| 01-foundation | `20260220_0100xx` | Core schema (21 files, created upfront) |
+| 02-identity | `20260220_0200xx` | Only if auth needs schema changes |
+| 03-git | `20260220_0300xx` | |
+| 04-project | `20260220_0400xx` | |
+| 05-build | `20260220_0500xx` | |
+| 06-deployer | `20260220_0600xx` | |
+| 07-agent | `20260220_0700xx` | |
+| 08-observe | `20260220_0800xx` | |
+| 09-secrets-notify | `20260220_0900xx` | |
 
 ---
 

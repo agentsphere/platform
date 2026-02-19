@@ -70,10 +70,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   build:
-    runs-on: ubuntu-latest
     needs: [fmt, lint, test-unit, test-integration, deny]
+    strategy:
+      matrix:
+        include:
+          - runner: platform-amd64
+            arch: amd64
+          - runner: platform-arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.arch }}
       - run: cargo build --release

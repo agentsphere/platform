@@ -72,6 +72,13 @@ The core insight: all these tools operate on the same concepts (users, projects,
 ### Core Tables
 
 ```sql
+-- ── Utility ─────────────────────────────────
+
+-- Auto-update updated_at on any row modification
+CREATE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
 -- ── Identity & RBAC ──────────────────────────
 
 CREATE TABLE users (
@@ -84,6 +91,7 @@ CREATE TABLE users (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE roles (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -117,6 +125,7 @@ CREATE TABLE user_roles (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, role_id, project_id)
 );
+CREATE INDEX idx_user_roles_user ON user_roles(user_id);
 
 -- delegation: a user/agent grants a subset of their own permissions to another user/agent
 -- e.g. user delegates 'ops:observe' + 'deploy:promote' to an agent for a project
@@ -132,6 +141,7 @@ CREATE TABLE delegations (
     revoked_at    TIMESTAMPTZ,
     UNIQUE (delegator_id, delegate_id, permission_id, project_id)
 );
+CREATE INDEX idx_delegations_delegate ON delegations(delegate_id);
 -- constraint: delegator must themselves hold the permission they're delegating.
 -- enforced in application logic (not DB constraint) because it depends on role resolution.
 
@@ -144,6 +154,7 @@ CREATE TABLE auth_sessions (
     expires_at  TIMESTAMPTZ NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_auth_sessions_user ON auth_sessions(user_id);
 
 CREATE TABLE api_tokens (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -156,22 +167,27 @@ CREATE TABLE api_tokens (
     expires_at  TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
 
 -- ── Projects ──────────────────────────────
 
 CREATE TABLE projects (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_id        UUID NOT NULL REFERENCES users(id),
+    owner_id        UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     name            TEXT NOT NULL,                  -- slug: my-todo-app
     display_name    TEXT,
     description     TEXT,
     visibility      TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','internal','public')),
     default_branch  TEXT NOT NULL DEFAULT 'main',
     repo_path       TEXT,                           -- path to bare repo on disk
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    next_issue_number   INTEGER NOT NULL DEFAULT 0,  -- atomic counter for issue/MR numbers
+    next_mr_number      INTEGER NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (owner_id, name)
 );
+CREATE TRIGGER trg_projects_updated_at BEFORE UPDATE ON projects FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE issues (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -187,15 +203,20 @@ CREATE TABLE issues (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, number)
 );
+CREATE TRIGGER trg_issues_updated_at BEFORE UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE comments (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    issue_id    UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    issue_id    UUID REFERENCES issues(id) ON DELETE CASCADE,
+    mr_id       UUID REFERENCES merge_requests(id) ON DELETE CASCADE,
     author_id   UUID NOT NULL REFERENCES users(id),
     body        TEXT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (issue_id IS NOT NULL OR mr_id IS NOT NULL)
 );
+CREATE TRIGGER trg_comments_updated_at BEFORE UPDATE ON comments FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE webhooks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -226,9 +247,11 @@ CREATE TABLE merge_requests (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, number)
 );
+CREATE TRIGGER trg_merge_requests_updated_at BEFORE UPDATE ON merge_requests FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE mr_reviews (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     mr_id       UUID NOT NULL REFERENCES merge_requests(id) ON DELETE CASCADE,
     reviewer_id UUID NOT NULL REFERENCES users(id),
     verdict     TEXT NOT NULL CHECK (verdict IN ('approve','request_changes','comment')),
@@ -255,6 +278,9 @@ CREATE TABLE agent_sessions (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at     TIMESTAMPTZ
 );
+CREATE INDEX idx_agent_sessions_project ON agent_sessions(project_id);
+CREATE INDEX idx_agent_sessions_user ON agent_sessions(user_id);
+CREATE INDEX idx_agent_sessions_status ON agent_sessions(status);
 
 CREATE TABLE agent_messages (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -276,7 +302,7 @@ CREATE TABLE pipelines (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     trigger     TEXT NOT NULL CHECK (trigger IN ('push','api','schedule','mr')),
-    ref         TEXT NOT NULL,                      -- branch or tag
+    git_ref     TEXT NOT NULL,                      -- branch or tag (renamed from 'ref' to avoid SQL reserved word)
     commit_sha  TEXT,
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending','running','success','failure','cancelled')),
@@ -285,10 +311,14 @@ CREATE TABLE pipelines (
     finished_at TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_pipelines_project ON pipelines(project_id, created_at DESC);
+CREATE INDEX idx_pipelines_status ON pipelines(status);
 
 CREATE TABLE pipeline_steps (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pipeline_id UUID NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    step_order  INTEGER NOT NULL,                    -- execution order (0-based)
     name        TEXT NOT NULL,
     image       TEXT NOT NULL,
     commands    TEXT[] NOT NULL DEFAULT '{}',
@@ -342,6 +372,9 @@ CREATE TABLE deployments (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, environment)
 );
+CREATE TRIGGER trg_deployments_updated_at BEFORE UPDATE ON deployments FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- Index for the deployer's main reconciliation query
+CREATE INDEX idx_deployments_reconcile ON deployments(desired_status, current_status);
 
 -- deployment_history: audit trail of every deploy action
 CREATE TABLE deployment_history (
@@ -384,7 +417,7 @@ CREATE TABLE traces (
 
 CREATE TABLE spans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    trace_id    TEXT NOT NULL,                   -- FK to traces.trace_id
+    trace_id    TEXT NOT NULL,                   -- references traces.trace_id (no FK — spans may arrive before their trace)
     span_id     TEXT NOT NULL UNIQUE,            -- 16-char hex
     parent_span_id TEXT,                         -- NULL for root span
     name        TEXT NOT NULL,                   -- e.g. 'tool_call:bash', 'http:POST /api/apps'
@@ -432,14 +465,15 @@ CREATE TABLE metric_series (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL,                   -- e.g. 'http_requests_total', 'agent_session_duration_seconds'
     labels      JSONB NOT NULL DEFAULT '{}',
-    type        TEXT NOT NULL DEFAULT 'gauge'
-                CHECK (type IN ('gauge','counter','histogram','summary')),
+    metric_type TEXT NOT NULL DEFAULT 'gauge'     -- renamed from 'type' to avoid SQL reserved word
+                CHECK (metric_type IN ('gauge','counter','histogram','summary')),
     unit        TEXT,                            -- 'bytes', 'seconds', 'requests', etc.
     project_id  UUID REFERENCES projects(id),    -- NULL = platform-level metric
     last_value  DOUBLE PRECISION,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (name, labels)
 );
+CREATE TRIGGER trg_metric_series_updated_at BEFORE UPDATE ON metric_series FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- metric samples (hot buffer — last 1h, flushed to MinIO periodically)
 CREATE TABLE metric_samples (
@@ -475,6 +509,7 @@ CREATE TABLE alert_events (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at TIMESTAMPTZ
 );
+CREATE INDEX idx_alert_events_status ON alert_events(status, created_at DESC);
 
 -- ── Secrets ───────────────────────────────
 
@@ -491,13 +526,16 @@ CREATE TABLE secrets (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, name)
 );
+CREATE TRIGGER trg_secrets_updated_at BEFORE UPDATE ON secrets FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- Separate unique index for global secrets (project_id IS NULL) since NULL != NULL in UNIQUE constraints
+CREATE UNIQUE INDEX idx_secrets_global_name ON secrets(name) WHERE project_id IS NULL;
 
 -- ── Notifications ─────────────────────────
 
 CREATE TABLE notifications (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type        TEXT NOT NULL,                    -- 'build_failed', 'mr_created', 'agent_completed', 'alert_firing'
+    notification_type TEXT NOT NULL,              -- renamed from 'type'; e.g. 'build_failed', 'mr_created', 'agent_completed', 'alert_firing'
     subject     TEXT NOT NULL,
     body        TEXT,
     channel     TEXT NOT NULL DEFAULT 'in_app'
@@ -508,16 +546,18 @@ CREATE TABLE notifications (
     ref_id      UUID,                             -- FK to the relevant entity
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_notifications_user_status ON notifications(user_id, status);
 
 -- ── Audit Log ─────────────────────────────
 
 CREATE TABLE audit_log (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    actor_id    UUID NOT NULL REFERENCES users(id),  -- user or agent who performed action
+    actor_id    UUID NOT NULL,                   -- user or agent who performed action (no FK — audit logs are immutable)
+    actor_name  TEXT NOT NULL,                   -- denormalized for when user is deleted
     action      TEXT NOT NULL,                   -- 'user.create', 'project.delete', 'secret.read', 'role.delegate'
     resource    TEXT NOT NULL,                   -- 'user', 'project', 'secret', 'delegation'
     resource_id UUID,                            -- ID of affected resource
-    project_id  UUID REFERENCES projects(id),
+    project_id  UUID REFERENCES projects(id) ON DELETE SET NULL,
     detail      JSONB,                           -- extra context (old/new values, etc.)
     ip_addr     INET,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
