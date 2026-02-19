@@ -38,30 +38,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       - uses: docker/build-push-action@v6
-        id: build
         with:
           context: .
           file: docker/Dockerfile
-          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digest
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
 
   merge-manifest:
     runs-on: ubuntu-latest
@@ -76,23 +60,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=
-            type=raw,value=latest
-
-      - uses: actions/download-artifact@v7
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digest-*
-          merge-multiple: true
-
       - name: Create multi-arch manifest
-        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA: ${{ github.sha }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}') \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          docker manifest create ${IMAGE}:${SHA} \
+            ${IMAGE}:${SHA}-amd64 \
+            ${IMAGE}:${SHA}-arm64
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${SHA}-amd64 \
+            ${IMAGE}:${SHA}-arm64
+          docker manifest push ${IMAGE}:${SHA}
+          docker manifest push ${IMAGE}:latest
