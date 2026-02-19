@@ -1,3 +1,7 @@
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# mold linker is only available in the Docker build stage (see docker/Dockerfile).
+# Do not set a Linux linker here — it breaks GitHub Actions runners.
+
+[profile.dev.package."*"]
+# Optimize deps even in dev (speeds up sqlx proc macros ~3-5x after first build)
+# Note: this is duplicated in Cargo.toml [profile.dev.package."*"] which takes precedence.
+# Keeping here as documentation of intent.
