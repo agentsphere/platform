@@ -48,6 +48,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          provenance: false
 
   merge-manifest:
     runs-on: ubuntu-latest
