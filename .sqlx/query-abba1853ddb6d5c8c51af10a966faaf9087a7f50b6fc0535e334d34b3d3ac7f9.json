@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT p.id, p.repo_path, p.default_branch, p.visibility\n        FROM projects p\n        JOIN users u ON u.id = p.owner_id\n        WHERE u.name = $1 AND p.name = $2 AND p.is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "default_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "visibility",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "abba1853ddb6d5c8c51af10a966faaf9087a7f50b6fc0535e334d34b3d3ac7f9"
+}

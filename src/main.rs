@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
+        .merge(git::git_protocol_router())
         .with_state(state);
 
     let addr: SocketAddr = cfg.listen.parse()?;

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by)\n            VALUES ($1, 'push', $2, $3, 'pending', $4)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c155a5b7235e047284b6aa9a25d7553a42b65b5b6c02d81b1fea0a306c5866f4"
+}

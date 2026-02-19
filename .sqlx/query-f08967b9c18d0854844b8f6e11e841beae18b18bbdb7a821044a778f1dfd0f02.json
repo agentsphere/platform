@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT repo_path, default_branch, owner_id, name FROM projects WHERE id = $1 AND is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repo_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "default_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f08967b9c18d0854844b8f6e11e841beae18b18bbdb7a821044a778f1dfd0f02"
+}

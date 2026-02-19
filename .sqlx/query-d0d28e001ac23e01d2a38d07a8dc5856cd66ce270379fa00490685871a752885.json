@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!: i64\"\n        FROM api_tokens\n        WHERE token_hash = $1\n          AND user_id = $2\n          AND (expires_at IS NULL OR expires_at > now())\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d0d28e001ac23e01d2a38d07a8dc5856cd66ce270379fa00490685871a752885"
+}

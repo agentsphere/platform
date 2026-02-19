@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, Request, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::HeaderMap;
+use axum::http::header::AUTHORIZATION;
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -61,6 +61,7 @@ pub fn router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 /// Validate a git ref name to prevent injection.
+#[allow(dead_code)] // used in tests; available for future handler validation
 fn validate_ref(git_ref: &str) -> Result<(), ApiError> {
     if git_ref.is_empty()
         || git_ref.contains("..")
@@ -85,10 +86,7 @@ fn validate_ref(git_ref: &str) -> Result<(), ApiError> {
 ///
 /// Tries the password as an API token first, then falls back to password verification.
 /// This is NOT an axum extractor — called explicitly by smart HTTP handlers.
-pub async fn authenticate_basic(
-    headers: &HeaderMap,
-    pool: &PgPool,
-) -> Result<GitUser, ApiError> {
+pub async fn authenticate_basic(headers: &HeaderMap, pool: &PgPool) -> Result<GitUser, ApiError> {
     let (username, password_raw) = extract_basic_credentials(headers)?;
 
     // Look up user by name
@@ -161,9 +159,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Result<(String, String), Ap
 
     let decoded_str = String::from_utf8(decoded).map_err(|_| ApiError::Unauthorized)?;
 
-    let (username, password_raw) = decoded_str
-        .split_once(':')
-        .ok_or(ApiError::Unauthorized)?;
+    let (username, password_raw) = decoded_str.split_once(':').ok_or(ApiError::Unauthorized)?;
 
     if username.is_empty() {
         return Err(ApiError::Unauthorized);
@@ -200,15 +196,15 @@ pub async fn resolve_project(
     .await?
     .ok_or_else(|| ApiError::NotFound("repository".into()))?;
 
-    let repo_disk_path = row
-        .repo_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let repo_disk_path = row.repo_path.map_or_else(
+        || {
             config
                 .git_repos_path
                 .join(owner)
                 .join(format!("{repo_name}.git"))
-        });
+        },
+        PathBuf::from,
+    );
 
     Ok(ResolvedProject {
         project_id: row.id,
@@ -244,13 +240,7 @@ async fn info_refs(
     let project = resolve_project(&state.pool, &state.config, &owner, &repo).await?;
 
     // Auth + RBAC
-    check_access(
-        &state,
-        &headers,
-        &project,
-        service == "git-upload-pack",
-    )
-    .await?;
+    check_access(&state, &headers, &project, service == "git-upload-pack").await?;
 
     // Run git service with --advertise-refs
     let output = tokio::process::Command::new("git")
@@ -289,12 +279,11 @@ async fn upload_pack(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let project =
-        resolve_project(&state.pool, &state.config, &owner, &repo).await?;
+    let project = resolve_project(&state.pool, &state.config, &owner, &repo).await?;
 
     check_access(&state, request.headers(), &project, true).await?;
 
-    run_git_service(&project.repo_disk_path, "upload-pack", request.into_body()).await
+    run_git_service(&project.repo_disk_path, "upload-pack", request.into_body())
 }
 
 /// `POST /:owner/:repo/git-receive-pack`
@@ -306,13 +295,11 @@ async fn receive_pack(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let project =
-        resolve_project(&state.pool, &state.config, &owner, &repo).await?;
+    let project = resolve_project(&state.pool, &state.config, &owner, &repo).await?;
 
-    let git_user =
-        check_access(&state, request.headers(), &project, false)
-            .await?
-            .expect("receive-pack always authenticates");
+    let git_user = check_access(&state, request.headers(), &project, false)
+        .await?
+        .expect("receive-pack always authenticates");
 
     let body = request.into_body();
 
@@ -417,14 +404,7 @@ async fn check_access(
     }
 
     // Authenticate
-    let git_user = authenticate_basic(headers, &state.pool).await.map_err(|e| {
-        // Return 401 with WWW-Authenticate header for git clients
-        if matches!(e, ApiError::Unauthorized) {
-            e
-        } else {
-            e
-        }
-    })?;
+    let git_user = authenticate_basic(headers, &state.pool).await?;
 
     if is_read && project.visibility == "internal" {
         // Any authenticated user can read internal projects
@@ -469,11 +449,7 @@ fn pkt_line_header(service: &str) -> Vec<u8> {
 /// Run a git service (upload-pack or receive-pack) with bidirectional streaming.
 ///
 /// Used for upload-pack where we can stream the response progressively.
-async fn run_git_service(
-    repo_path: &Path,
-    service: &str,
-    body: Body,
-) -> Result<Response, ApiError> {
+fn run_git_service(repo_path: &Path, service: &str, body: Body) -> Result<Response, ApiError> {
     let mut child = tokio::process::Command::new("git")
         .arg(service)
         .arg("--stateless-rpc")
