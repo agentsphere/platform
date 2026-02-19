@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!: i64\"\n        FROM projects\n        WHERE is_active = true\n          AND ($1::uuid IS NULL OR owner_id = $1)\n          AND ($2::text IS NULL OR visibility = $2)\n          AND ($3::text IS NULL OR name ILIKE $3)\n          AND (\n              visibility = 'public'\n              OR visibility = 'internal'\n              OR owner_id = $4\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3ee1b0258377b8f637055aae2fc54c52b5ec795b91ef586a4eab4f6e38bff5bc"
+}

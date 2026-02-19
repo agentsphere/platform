@@ -33,12 +33,12 @@ Apply these throughout every step:
 
 Before writing logic, define the types:
 
-1. Create newtype wrappers for any new IDs (`pub struct XId(Uuid)` with `#[sqlx(transparent)]`)
-2. Define status enums with `#[derive(sqlx::Type)]` for any new state fields
-3. Add `can_transition_to()` methods for status enums that represent state machines
-4. Define request/response structs for any new API endpoints (separate from DB model structs)
-5. Define per-module error enum variants for all failure modes
-6. Add `From<ModuleError> for ApiError` conversion mapping to HTTP status codes
+1. Define status enums with `#[derive(sqlx::Type)]` for any new state fields
+2. Add `can_transition_to()` methods for status enums that represent state machines
+3. Define request/response structs for any new API endpoints (separate from DB model structs)
+4. Define per-module error enum variants for all failure modes
+5. Add `From<ModuleError> for ApiError` conversion mapping to HTTP status codes
+6. Optionally create newtype wrappers for new IDs (`pub struct XId(Uuid)` with `#[sqlx(transparent)]`). The current codebase uses raw `Uuid` consistently — newtypes are a future improvement, not a blocker.
 
 Run `cargo check` to verify types compile.
 
@@ -63,11 +63,13 @@ Write the implementation to make tests pass:
 1. Use `#[tracing::instrument(skip(pool, state), fields(...))]` on all async functions with side effects
 2. Use structured tracing fields: `tracing::info!(user_id = %id, "description")`
 3. Use `?` for error propagation with `.context("descriptive message")` from anyhow
-4. Use trait-based DI: accept `impl Repository` not `PgPool` directly for business logic
+4. Use trait-based DI (`impl Repository`) for business logic modules that benefit from test mocking. API handlers use `PgPool` directly via `State(state)` — trait indirection there adds complexity without value.
 5. Use the builder pattern for constructing complex structs (K8s pod specs, query builders)
 6. No `.unwrap()` in production code
 7. Never log sensitive data (passwords, tokens, secrets)
-8. **Update the plan** as you go — if the implementation deviates from the plan (different approach, extra complexity, changed schema, new dependencies), update the relevant `plans/` file immediately. Don't wait until the end.
+8. Keep handler functions under 100 lines (clippy `too_many_lines`). Extract helpers like `get_project_repo_path()` for repeated DB lookups or shared setup logic.
+9. For permission checks in sub-routers (`fn router() -> Router<AppState>`), use **inline checks** or a helper function like `require_project_write()` — NOT the `require_permission` route layer. The route layer needs `from_fn_with_state(state.clone(), ...)` which requires a concrete `AppState` value, unavailable at sub-router construction time.
+10. **Update the plan** as you go — if the implementation deviates from the plan (different approach, extra complexity, changed schema, new dependencies), update the relevant `plans/` file immediately. Don't wait until the end.
 
 Run `just test-unit` — all unit tests should pass (green phase).
 
@@ -106,7 +108,7 @@ Fix all issues before proceeding.
 
 Verify every item before considering the work done:
 
-- [ ] New domain IDs use newtypes, not raw `Uuid`
+- [ ] Domain IDs use raw `Uuid` consistently (newtypes are a future improvement)
 - [ ] Module error enum has variants for all failure modes
 - [ ] `From<ModuleError> for ApiError` conversion maps to correct HTTP status codes
 - [ ] All async functions with side effects have `#[tracing::instrument]` with `skip` and `fields`
@@ -118,6 +120,7 @@ Verify every item before considering the work done:
 - [ ] Request/Response types are separate from DB model types
 - [ ] Handlers follow signature convention: State, AuthUser, Path, Query, Json
 - [ ] No `.unwrap()` in production code
+- [ ] No handler function exceeds 100 lines (extract helpers for shared DB lookups, repo path resolution, etc.)
 - [ ] Sensitive data (passwords, tokens, secrets) is never logged
 - [ ] Migrations are reversible (up + down)
 - [ ] `.sqlx/` offline cache is up to date

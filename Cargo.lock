@@ -2988,6 +2988,7 @@ dependencies = [
  "clap",
  "fred",
  "hex",
+ "hmac",
  "http-body-util",
  "hyper",
  "insta",

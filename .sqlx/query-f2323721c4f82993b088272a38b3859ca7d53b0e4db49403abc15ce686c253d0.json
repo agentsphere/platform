@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE projects SET next_issue_number = next_issue_number + 1\n        WHERE id = $1 AND is_active = true\n        RETURNING next_issue_number\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_issue_number",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f2323721c4f82993b088272a38b3859ca7d53b0e4db49403abc15ce686c253d0"
+}

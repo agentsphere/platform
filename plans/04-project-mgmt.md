@@ -1,4 +1,4 @@
-# 04 — Project Management
+# 04 — Project Management ✅ Complete (2026-02-19)
 
 ## Prerequisite
 - 01-foundation complete (store, AppState)
@@ -230,3 +230,31 @@ The `require_permission` middleware auto-extracts `project_id` from `/projects/:
 - **sqlx**: After adding `sqlx::query!()` calls, run `just db-prepare` to update `.sqlx/` cache. Commit `.sqlx/` changes.
 - **Audit logging**: Use `AuditEntry` struct pattern with `write_audit()` for mutations (see `api/users.rs` or `api/admin.rs`).
 - **Pagination**: `ListParams { limit: Option<i64>, offset: Option<i64> }` and `ListResponse<T> { items: Vec<T>, total: i64 }` already used in `api/users.rs` — consider sharing or defining per-module.
+
+---
+
+## Implementation Notes (2026-02-19)
+
+### Deviations from plan
+
+1. **`require_permission` route layer not used** — Sub-routers return `Router<AppState>` without a concrete state, so `from_fn_with_state` can't be called at construction time. All permission checks are inline in handlers instead. Webhooks use a `require_project_write()` helper function pattern.
+
+2. **`src/api/health.rs` not created** — `/healthz` stays inline in `main.rs` as-is. No value in extracting a one-liner.
+
+3. **`ListParams`/`ListResponse` defined per-module** — Each API file defines its own (slightly different) `ListParams` struct with module-specific filter fields. Shared generic not worth the coupling.
+
+4. **No newtype IDs yet** — Raw `Uuid` used throughout, matching Phase 02 conventions. Can add newtypes in a later pass.
+
+5. **MR merge uses `git worktree`** — Bare repos can't merge directly. The implementation creates a temporary worktree, merges, and cleans up. Uses `origin/{source_branch}` ref syntax.
+
+6. **`hmac` crate added** — Direct dependency for webhook HMAC-SHA256 signing (was transitive before).
+
+### Files created
+- `src/api/projects.rs` — Project CRUD (~250 LOC)
+- `src/api/issues.rs` — Issues + comments (~370 LOC)
+- `src/api/merge_requests.rs` — MRs + reviews + comments + merge (~580 LOC)
+- `src/api/webhooks.rs` — Webhook CRUD + fire_webhooks (~400 LOC)
+
+### Files modified
+- `src/api/mod.rs` — Added 4 new module declarations + `.merge()` calls
+- `Cargo.toml` — Added `hmac = "0.12"`

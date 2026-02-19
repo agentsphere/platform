@@ -57,6 +57,7 @@ http-body-util = "0.1"
 # Auth / crypto
 argon2 = "0.5"
 aes-gcm = "0.10"
+hmac = "0.12"
 rand = "0.10"
 sha2 = "0.10"
 hex = "0.4"

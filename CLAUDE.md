@@ -2,7 +2,7 @@
 
 Single Rust binary (~15K LOC) replacing 8+ off-the-shelf services (Gitea, Woodpecker, Authelia, OpenObserve, Maddy, OpenBao) with a unified platform. Architecture: `plans/unified-platform.md`. Toolchain: `plans/rust-dev-process.md`. Phased delivery: `plans/01-foundation.md` through `plans/10-web-ui.md`.
 
-**Current status**: Phase 01 (Foundation) and Phase 02 (Identity & Auth) complete. Modules 03-09 can be implemented in parallel.
+**Current status**: Phases 01 (Foundation), 02 (Identity & Auth), 03 (Git Server), and 04 (Project Management) complete. Modules 05-09 can be implemented in parallel.
 
 ## Commands
 
@@ -78,13 +78,28 @@ async fn admin_handler(State(state): State<AppState>, auth: AuthUser) -> Result<
 }
 ```
 
-### Permission checks — route layer (for many endpoints sharing a permission)
+### Permission checks — helper function (preferred for sub-routers)
+
+Sub-routers (`Router<AppState>`) don't have a concrete state at construction time, so `from_fn_with_state` can't be used. Instead, define a helper:
+
+```rust
+async fn require_project_write(state: &AppState, auth: &AuthUser, project_id: Uuid) -> Result<(), ApiError> {
+    let allowed = resolver::has_permission(&state.pool, &state.valkey, auth.user_id, Some(project_id), Permission::ProjectWrite)
+        .await.map_err(ApiError::Internal)?;
+    if !allowed { return Err(ApiError::Forbidden); }
+    Ok(())
+}
+// Then call in each handler: require_project_write(&state, &auth, id).await?;
+```
+
+### Permission checks — route layer (only when state is available)
 
 ```rust
 use crate::rbac::middleware::require_permission;
 use crate::rbac::Permission;
 
-pub fn router() -> Router<AppState> {
+// Only works if you have a concrete `state` value at construction time
+pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/projects", get(list).post(create))
         .route_layer(axum::middleware::from_fn_with_state(state, require_permission(Permission::ProjectRead)))
@@ -115,6 +130,45 @@ After any role or delegation change, invalidate the affected user's permission c
 ```rust
 resolver::invalidate_permissions(&state.valkey, user_id, project_id).await;
 ```
+
+## Project Management Patterns (Phase 04)
+
+### Auto-incrementing project-scoped numbers
+
+Issues and MRs use project-scoped auto-incrementing numbers (not UUIDs in URLs):
+
+```rust
+let number = sqlx::query_scalar!(
+    r#"UPDATE projects SET next_issue_number = next_issue_number + 1
+    WHERE id = $1 AND is_active = true RETURNING next_issue_number"#,
+    project_id,
+).fetch_optional(&state.pool).await?
+.ok_or_else(|| ApiError::NotFound("project".into()))?;
+```
+
+### Webhook dispatch
+
+Use `fire_webhooks()` from `api::webhooks` after mutations that external systems care about:
+
+```rust
+crate::api::webhooks::fire_webhooks(
+    &state.pool, project_id, "issue",  // event name: push, mr, issue, build, deploy
+    &serde_json::json!({"action": "created", "issue": {...}}),
+).await;
+```
+
+Webhooks use HMAC-SHA256 signing (`X-Platform-Signature` header) when a secret is configured.
+
+### Soft-delete pattern
+
+Projects use soft-delete (`is_active = false`). Always filter with `AND is_active = true` in queries.
+
+### API module files
+
+- `src/api/projects.rs` — Project CRUD
+- `src/api/issues.rs` — Issues + comments
+- `src/api/merge_requests.rs` — MRs + reviews + comments + merge
+- `src/api/webhooks.rs` — Webhook CRUD + `fire_webhooks()` utility
 
 ## Type System Patterns
 
@@ -408,7 +462,10 @@ pub struct ListResponse<T: serde::Serialize> {
 - **axum 0.8**: `.patch()`, `.put()`, `.delete()` are `MethodRouter` methods, not standalone `axum::routing` functions. Chain on routes directly.
 - **sqlx INET**: Postgres `INET` columns need the `ipnetwork` crate + sqlx feature. Without it, skip binding those columns.
 - **Clippy `too_many_arguments`**: Threshold is 7 params. Use a params struct (e.g., `AuditEntry`, `CreateDelegationParams`) from the start.
+- **Clippy `too_many_lines`**: Threshold is 100 lines per function. Extract helpers (e.g., `get_project_repo_path()`) when handlers grow large.
+- **Clippy `collapsible_if`**: Use `if let ... && condition { }` instead of nested `if let { if { } }`.
 - **Clippy `trivially_copy_pass_by_ref`**: For `Copy` types, use `self` not `&self` (e.g., `fn as_str(self)`).
+- **`require_permission` route layer**: Requires `from_fn_with_state(state.clone(), ...)` — won't work in sub-routers that return `Router<AppState>` without a concrete state. Use inline permission checks instead.
 
 ## Git Workflow
 
