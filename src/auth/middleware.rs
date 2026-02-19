@@ -184,3 +184,111 @@ async fn lookup_session(pool: &PgPool, raw_token: &str) -> Result<Option<AuthLoo
 
     Ok(row)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    fn make_parts(headers: &[(&str, &str)]) -> Parts {
+        let mut builder = Request::builder().uri("/test");
+        for &(k, v) in headers {
+            builder = builder.header(k, v);
+        }
+        let (parts, _) = builder.body(()).unwrap().into_parts();
+        parts
+    }
+
+    // -- extract_bearer_token --
+
+    #[test]
+    fn bearer_token_valid() {
+        let parts = make_parts(&[("authorization", "Bearer abc123")]);
+        assert_eq!(extract_bearer_token(&parts), Some("abc123".into()));
+    }
+
+    #[test]
+    fn bearer_token_missing_header() {
+        let parts = make_parts(&[]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    #[test]
+    fn bearer_token_wrong_scheme() {
+        let parts = make_parts(&[("authorization", "Basic dXNlcjpwYXNz")]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    #[test]
+    fn bearer_token_empty_after_prefix() {
+        let parts = make_parts(&[("authorization", "Bearer ")]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    #[test]
+    fn bearer_token_preserves_full_value() {
+        let token = "plat_aVeryLongToken1234567890abcdefghijklmnop";
+        let parts = make_parts(&[("authorization", &format!("Bearer {token}"))]);
+        assert_eq!(extract_bearer_token(&parts), Some(token.into()));
+    }
+
+    #[test]
+    fn bearer_token_case_sensitive_prefix() {
+        let parts = make_parts(&[("authorization", "bearer abc123")]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    // -- extract_session_cookie --
+
+    #[test]
+    fn session_cookie_valid() {
+        let parts = make_parts(&[("cookie", "session=tok123")]);
+        assert_eq!(extract_session_cookie(&parts), Some("tok123".into()));
+    }
+
+    #[test]
+    fn session_cookie_among_others() {
+        let parts = make_parts(&[("cookie", "foo=bar; session=tok123; baz=qux")]);
+        assert_eq!(extract_session_cookie(&parts), Some("tok123".into()));
+    }
+
+    #[test]
+    fn session_cookie_missing() {
+        let parts = make_parts(&[("cookie", "foo=bar; other=val")]);
+        assert_eq!(extract_session_cookie(&parts), None);
+    }
+
+    #[test]
+    fn session_cookie_empty_value() {
+        let parts = make_parts(&[("cookie", "session=")]);
+        assert_eq!(extract_session_cookie(&parts), None);
+    }
+
+    #[test]
+    fn session_cookie_no_header() {
+        let parts = make_parts(&[]);
+        assert_eq!(extract_session_cookie(&parts), None);
+    }
+
+    // -- extract_ip --
+
+    #[test]
+    fn ip_from_forwarded_for_trusted() {
+        let parts = make_parts(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")]);
+        assert_eq!(extract_ip(&parts, true), Some("1.2.3.4".into()));
+    }
+
+    #[test]
+    fn ip_forwarded_for_ignored_when_not_trusted() {
+        let parts = make_parts(&[("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(extract_ip(&parts, false), None);
+    }
+
+    #[test]
+    fn ip_from_connect_info() {
+        let mut parts = make_parts(&[]);
+        let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        parts.extensions.insert(axum::extract::ConnectInfo(addr));
+        assert_eq!(extract_ip(&parts, false), Some("127.0.0.1".into()));
+    }
+}

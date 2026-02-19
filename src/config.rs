@@ -24,6 +24,10 @@ pub struct Config {
     pub dev_mode: bool,
 }
 
+fn parse_cors_origins(s: &str) -> Vec<String> {
+    s.split(',').map(|s| s.trim().to_owned()).collect()
+}
+
 impl Config {
     pub fn load() -> Self {
         Self {
@@ -54,13 +58,51 @@ impl Config {
                 .is_some_and(|v| v == "true"),
             cors_origins: env::var("PLATFORM_CORS_ORIGINS")
                 .ok()
-                .map_or_else(Vec::new, |v| {
-                    v.split(',').map(|s| s.trim().to_owned()).collect()
-                }),
+                .map_or_else(Vec::new, |v| parse_cors_origins(&v)),
             trust_proxy_headers: env::var("PLATFORM_TRUST_PROXY")
                 .ok()
                 .is_some_and(|v| v == "true"),
             dev_mode: env::var("PLATFORM_DEV").ok().is_some_and(|v| v == "true"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cors_origins_single() {
+        let result = parse_cors_origins("http://localhost:3000");
+        assert_eq!(result, vec!["http://localhost:3000"]);
+    }
+
+    #[test]
+    fn parse_cors_origins_multiple_with_spaces() {
+        let result = parse_cors_origins("http://a.com, http://b.com , http://c.com");
+        assert_eq!(result, vec!["http://a.com", "http://b.com", "http://c.com"]);
+    }
+
+    #[test]
+    fn parse_cors_origins_empty_string() {
+        let result = parse_cors_origins("");
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn default_smtp_port() {
+        // Only reliable when PLATFORM_SMTP_PORT is unset (typical in test/CI)
+        let config = Config::load();
+        if env::var("PLATFORM_SMTP_PORT").is_err() {
+            assert_eq!(config.smtp_port, 587);
+        }
+    }
+
+    #[test]
+    fn default_pipeline_namespace() {
+        let config = Config::load();
+        if env::var("PLATFORM_PIPELINE_NAMESPACE").is_err() {
+            assert_eq!(config.pipeline_namespace, "platform-pipelines");
         }
     }
 }

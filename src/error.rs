@@ -111,3 +111,95 @@ impl From<opendal::Error> for ApiError {
         Self::Internal(err.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn not_found_returns_404() {
+        let resp = ApiError::NotFound("thing".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn unauthorized_returns_401() {
+        let resp = ApiError::Unauthorized.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn forbidden_returns_403() {
+        let resp = ApiError::Forbidden.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn bad_request_returns_400() {
+        let resp = ApiError::BadRequest("msg".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn conflict_returns_409() {
+        let resp = ApiError::Conflict("msg".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn too_many_requests_returns_429() {
+        let resp = ApiError::TooManyRequests.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn validation_returns_422() {
+        let resp = ApiError::Validation(vec!["field".into()]).into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn service_unavailable_returns_503() {
+        let resp = ApiError::ServiceUnavailable("down".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn internal_returns_500() {
+        let resp = ApiError::Internal(anyhow::anyhow!("boom")).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn not_found_body_contains_message() {
+        let resp = ApiError::NotFound("widget".into()).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "widget");
+    }
+
+    #[tokio::test]
+    async fn validation_body_has_fields() {
+        let resp = ApiError::Validation(vec!["name required".into()]).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "validation error");
+        assert_eq!(json["fields"][0], "name required");
+    }
+
+    #[tokio::test]
+    async fn internal_hides_details() {
+        let resp = ApiError::Internal(anyhow::anyhow!("secret info")).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "internal server error");
+        assert!(!body.iter().any(|_| false) || !json.to_string().contains("secret"));
+    }
+}

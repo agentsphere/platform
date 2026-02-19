@@ -129,3 +129,30 @@ pub async fn invalidate_permissions(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_with_project() {
+        let user = Uuid::nil();
+        let project = Uuid::max();
+        let key = cache_key(user, Some(project));
+        assert_eq!(key, format!("perms:{user}:{project}"));
+    }
+
+    #[test]
+    fn cache_key_without_project() {
+        let user = Uuid::nil();
+        let key = cache_key(user, None);
+        assert_eq!(key, format!("perms:{user}:global"));
+    }
+
+    #[test]
+    fn cache_key_deterministic() {
+        let user = Uuid::nil();
+        let project = Some(Uuid::nil());
+        assert_eq!(cache_key(user, project), cache_key(user, project));
+    }
+}

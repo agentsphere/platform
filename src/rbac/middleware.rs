@@ -80,3 +80,63 @@ fn extract_project_id_from_path(req: &Request) -> Option<Uuid> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn req_with_path(path: &str) -> Request {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn project_id_from_api_path() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let req = req_with_path(&format!("/api/projects/{id}/issues"));
+        let result = extract_project_id_from_path(&req);
+        assert_eq!(result, Some(id.parse().unwrap()));
+    }
+
+    #[test]
+    fn project_id_from_root_path() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let req = req_with_path(&format!("/projects/{id}"));
+        assert_eq!(
+            extract_project_id_from_path(&req),
+            Some(id.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn project_id_not_present() {
+        let req = req_with_path("/api/users/123");
+        assert_eq!(extract_project_id_from_path(&req), None);
+    }
+
+    #[test]
+    fn project_id_invalid_uuid() {
+        let req = req_with_path("/api/projects/not-a-uuid/issues");
+        assert_eq!(extract_project_id_from_path(&req), None);
+    }
+
+    #[test]
+    fn project_id_trailing_slash() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let req = req_with_path(&format!("/api/projects/{id}/"));
+        assert_eq!(
+            extract_project_id_from_path(&req),
+            Some(id.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn project_id_from_nested_path() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let req = req_with_path(&format!("/api/projects/{id}/pipelines/abc"));
+        assert_eq!(
+            extract_project_id_from_path(&req),
+            Some(id.parse().unwrap())
+        );
+    }
+}

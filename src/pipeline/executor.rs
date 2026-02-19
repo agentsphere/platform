@@ -685,3 +685,176 @@ fn slug(name: &str) -> String {
         .trim_matches('-')
         .to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+    };
+
+    // -- slug --
+
+    #[test]
+    fn slug_simple() {
+        assert_eq!(slug("test"), "test");
+    }
+
+    #[test]
+    fn slug_uppercase() {
+        assert_eq!(slug("Build-Image"), "build-image");
+    }
+
+    #[test]
+    fn slug_special_chars() {
+        assert_eq!(slug("my step (1)"), "my-step--1");
+    }
+
+    #[test]
+    fn slug_leading_trailing_special() {
+        assert_eq!(slug("--test--"), "test");
+    }
+
+    #[test]
+    fn slug_empty() {
+        assert_eq!(slug(""), "");
+    }
+
+    #[test]
+    fn slug_all_special() {
+        assert_eq!(slug("!!!"), "");
+    }
+
+    // -- extract_exit_code --
+
+    #[test]
+    fn exit_code_from_terminated_container() {
+        let status = PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "step".into(),
+                ready: false,
+                restart_count: 0,
+                image: String::new(),
+                image_id: String::new(),
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 42,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(&status), Some(42));
+    }
+
+    #[test]
+    fn exit_code_none_when_no_container_statuses() {
+        let status = PodStatus {
+            container_statuses: None,
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(&status), None);
+    }
+
+    #[test]
+    fn exit_code_none_when_empty_statuses() {
+        let status = PodStatus {
+            container_statuses: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(&status), None);
+    }
+
+    #[test]
+    fn exit_code_none_when_no_terminated_state() {
+        let status = PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "step".into(),
+                ready: false,
+                restart_count: 0,
+                image: String::new(),
+                image_id: String::new(),
+                state: Some(ContainerState {
+                    running: Some(Default::default()),
+                    terminated: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(&status), None);
+    }
+
+    #[test]
+    fn exit_code_none_when_no_state() {
+        let status = PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "step".into(),
+                ready: false,
+                restart_count: 0,
+                image: String::new(),
+                image_id: String::new(),
+                state: None,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(&status), None);
+    }
+
+    // -- build_pod_spec --
+
+    #[test]
+    fn build_pod_spec_structure() {
+        let pipeline_id = Uuid::nil();
+        let project_id = Uuid::nil();
+        let pod = build_pod_spec(
+            "pl-test-build",
+            pipeline_id,
+            project_id,
+            "build",
+            "rust:latest",
+            &["cargo build".into(), "cargo test".into()],
+            &[env_var("FOO", "bar")],
+            "/data/repos/owner/repo.git",
+            "refs/heads/main",
+        );
+
+        assert_eq!(pod.metadata.name.as_deref(), Some("pl-test-build"));
+
+        let labels = pod.metadata.labels.as_ref().unwrap();
+        assert_eq!(labels["platform.io/step"], "build");
+
+        let spec = pod.spec.as_ref().unwrap();
+        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+
+        let init = &spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(init.image.as_deref(), Some("alpine/git:latest"));
+
+        let container = &spec.containers[0];
+        assert_eq!(container.image.as_deref(), Some("rust:latest"));
+        assert_eq!(
+            container.args.as_ref().unwrap()[0],
+            "cargo build && cargo test"
+        );
+
+        let limits = container
+            .resources
+            .as_ref()
+            .unwrap()
+            .limits
+            .as_ref()
+            .unwrap();
+        assert_eq!(limits["cpu"], Quantity("1".into()));
+        assert_eq!(limits["memory"], Quantity("1Gi".into()));
+
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].name, "workspace");
+        assert_eq!(volumes[1].name, "repos");
+    }
+}

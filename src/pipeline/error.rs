@@ -38,3 +38,47 @@ impl From<PipelineError> for ApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_definition_maps_to_bad_request() {
+        let api: ApiError = PipelineError::InvalidDefinition("bad yaml".into()).into();
+        assert!(matches!(api, ApiError::BadRequest(msg) if msg == "bad yaml"));
+    }
+
+    #[test]
+    fn not_found_maps_to_not_found() {
+        let api: ApiError = PipelineError::NotFound.into();
+        assert!(matches!(api, ApiError::NotFound(msg) if msg == "pipeline"));
+    }
+
+    #[test]
+    fn step_failed_maps_to_internal() {
+        let api: ApiError = PipelineError::StepFailed {
+            name: "build".into(),
+            exit_code: 1,
+        }
+        .into();
+        assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn other_maps_to_internal() {
+        let api: ApiError = PipelineError::Other(anyhow::anyhow!("boom")).into();
+        assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn display_step_failed() {
+        let err = PipelineError::StepFailed {
+            name: "build".into(),
+            exit_code: 42,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("build"));
+        assert!(msg.contains("42"));
+    }
+}
