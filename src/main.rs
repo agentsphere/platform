@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod audit;
 mod config;
 mod error;
 mod store;
@@ -13,8 +14,10 @@ mod api;
 mod auth;
 mod rbac;
 
+// Phase 03 — Git Server
+mod git;
+
 // Module stubs — populated in later phases
-mod git {}
 mod pipeline {}
 mod deployer {}
 mod agent {}

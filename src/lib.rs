@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod config;
 pub mod error;
 pub mod store;
@@ -7,8 +8,10 @@ pub mod api;
 pub mod auth;
 pub mod rbac;
 
+// Phase 03 — Git Server
+pub mod git;
+
 // Module stubs — populated in later phases
-pub mod git {}
 pub mod pipeline {}
 pub mod deployer {}
 pub mod agent {}

@@ -97,7 +97,7 @@ pub async fn create_delegation(
     })
 }
 
-/// Revoke a delegation by setting `revoked_at`. Returns the delegate's user_id for cache invalidation.
+/// Revoke a delegation by setting `revoked_at`. Returns the delegate's `user_id` for cache invalidation.
 #[tracing::instrument(skip(pool, valkey), fields(%delegation_id), err)]
 pub async fn revoke_delegation(
     pool: &PgPool,

@@ -97,3 +97,10 @@ impl From<kube::Error> for ApiError {
         Self::Internal(err.into())
     }
 }
+
+impl From<opendal::Error> for ApiError {
+    fn from(err: opendal::Error) -> Self {
+        tracing::error!(error = %err, "opendal error");
+        Self::Internal(err.into())
+    }
+}

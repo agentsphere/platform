@@ -5,9 +5,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
 use crate::rbac::{Permission, delegation, resolver};
@@ -93,42 +93,6 @@ pub fn router() -> Router<AppState> {
             "/api/admin/delegations/{id}",
             delete(revoke_delegation_handler),
         )
-}
-
-// ---------------------------------------------------------------------------
-// Audit helper (shared with users.rs — could be extracted)
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)] // ip_addr stored for future ipnetwork support
-struct AuditEntry<'a> {
-    actor_id: Uuid,
-    actor_name: &'a str,
-    action: &'a str,
-    resource: &'a str,
-    resource_id: Option<Uuid>,
-    project_id: Option<Uuid>,
-    detail: Option<serde_json::Value>,
-    ip_addr: Option<&'a str>,
-}
-
-async fn write_audit(pool: &PgPool, entry: &AuditEntry<'_>) {
-    // Note: ip_addr is INET in postgres; we skip binding it to avoid needing the
-    // ipnetwork crate. The column stays NULL. A future pass can add ipnetwork to Cargo.toml.
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO audit_log (actor_id, actor_name, action, resource, resource_id, project_id, detail)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-        entry.actor_id,
-        entry.actor_name,
-        entry.action,
-        entry.resource,
-        entry.resource_id,
-        entry.project_id,
-        entry.detail,
-    )
-    .execute(pool)
-    .await;
 }
 
 /// Check the caller has admin:users permission, return Forbidden otherwise.

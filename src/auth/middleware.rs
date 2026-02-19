@@ -34,31 +34,31 @@ impl FromRequestParts<AppState> for AuthUser {
         let ip_addr = extract_ip(parts);
 
         // Try Bearer token first
-        if let Some(raw_token) = extract_bearer_token(parts) {
-            if let Some(user) = lookup_api_token(&state.pool, &raw_token).await? {
-                if !user.is_active {
-                    return Err(ApiError::Unauthorized);
-                }
-                return Ok(Self {
-                    user_id: user.user_id,
-                    user_name: user.user_name,
-                    ip_addr,
-                });
+        if let Some(raw_token) = extract_bearer_token(parts)
+            && let Some(user) = lookup_api_token(&state.pool, &raw_token).await?
+        {
+            if !user.is_active {
+                return Err(ApiError::Unauthorized);
             }
+            return Ok(Self {
+                user_id: user.user_id,
+                user_name: user.user_name,
+                ip_addr,
+            });
         }
 
         // Try session cookie
-        if let Some(session_token) = extract_session_cookie(parts) {
-            if let Some(user) = lookup_session(&state.pool, &session_token).await? {
-                if !user.is_active {
-                    return Err(ApiError::Unauthorized);
-                }
-                return Ok(Self {
-                    user_id: user.user_id,
-                    user_name: user.user_name,
-                    ip_addr,
-                });
+        if let Some(session_token) = extract_session_cookie(parts)
+            && let Some(user) = lookup_session(&state.pool, &session_token).await?
+        {
+            if !user.is_active {
+                return Err(ApiError::Unauthorized);
             }
+            return Ok(Self {
+                user_id: user.user_id,
+                user_name: user.user_name,
+                ip_addr,
+            });
         }
 
         Err(ApiError::Unauthorized)
@@ -102,10 +102,10 @@ fn extract_session_cookie(parts: &Parts) -> Option<String> {
         .ok()?;
     for cookie in cookies.split(';') {
         let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("session=") {
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
+        if let Some(value) = cookie.strip_prefix("session=")
+            && !value.is_empty()
+        {
+            return Some(value.to_owned());
         }
     }
     None
@@ -113,12 +113,11 @@ fn extract_session_cookie(parts: &Parts) -> Option<String> {
 
 fn extract_ip(parts: &Parts) -> Option<String> {
     // Try x-forwarded-for first (proxied requests)
-    if let Some(forwarded) = parts.headers.get("x-forwarded-for") {
-        if let Ok(val) = forwarded.to_str() {
-            if let Some(first_ip) = val.split(',').next() {
-                return Some(first_ip.trim().to_owned());
-            }
-        }
+    if let Some(forwarded) = parts.headers.get("x-forwarded-for")
+        && let Ok(val) = forwarded.to_str()
+        && let Some(first_ip) = val.split(',').next()
+    {
+        return Some(first_ip.trim().to_owned());
     }
     // Fall back to ConnectInfo if available
     parts

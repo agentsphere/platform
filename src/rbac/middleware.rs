@@ -72,10 +72,10 @@ fn extract_project_id_from_path(req: &Request) -> Option<Uuid> {
 
     // Look for /projects/:id or /api/projects/:id pattern
     for window in segments.windows(2) {
-        if window[0] == "projects" {
-            if let Ok(id) = window[1].parse::<Uuid>() {
-                return Some(id);
-            }
+        if window[0] == "projects"
+            && let Ok(id) = window[1].parse::<Uuid>()
+        {
+            return Some(id);
         }
     }
     None
