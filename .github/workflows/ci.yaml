@@ -27,6 +27,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: mkdir -p ui/dist && touch ui/dist/index.html
       - run: cargo clippy --all-features -- -D warnings
 
   test-unit:
@@ -36,6 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - run: mkdir -p ui/dist && touch ui/dist/index.html
       - run: cargo nextest run --lib --profile ci --no-tests=pass
 
   test-integration:
@@ -61,6 +63,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - run: mkdir -p ui/dist && touch ui/dist/index.html
       - run: cargo nextest run --profile ci --no-tests=pass
 
   deny:
@@ -85,4 +88,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: build-${{ matrix.arch }}
+      - run: mkdir -p ui/dist && touch ui/dist/index.html
       - run: cargo build --release
