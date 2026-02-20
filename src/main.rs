@@ -31,11 +31,13 @@ mod deployer;
 // Phase 07 — Agent Orchestration
 mod agent;
 
+// Phase 08 — Observability
+mod observe;
+
 // Phase 10 — Web UI
 mod ui;
 
 // Module stubs — populated in later phases
-mod observe {}
 mod secrets {}
 mod notify {}
 
@@ -85,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start background tasks
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx));
+    tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx.clone()));
     let deployer_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(deployer::reconciler::run(
         state.clone(),
@@ -95,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
     // Start agent session reaper background task
     let agent_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(agent::service::run_reaper(state.clone(), agent_shutdown_rx));
+
+    // Start observe background tasks (flush, rotation, alert evaluation)
+    let observe_shutdown_rx = shutdown_tx.subscribe();
+    let observe_channels = observe::spawn_background_tasks(state.clone(), observe_shutdown_rx);
 
     // Spawn expired session/token cleanup task (hourly)
     let cleanup_pool = pool.clone();
@@ -118,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
+        .merge(observe::router(observe_channels))
         // Git routes get a higher body limit (500 MB for push/LFS)
         .merge(git::git_protocol_router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
         .with_state(state)
