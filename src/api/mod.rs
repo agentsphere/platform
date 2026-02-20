@@ -1,8 +1,10 @@
 pub mod admin;
 pub mod deployments;
+pub mod helpers;
 pub mod issues;
 pub mod merge_requests;
 pub mod notifications;
+pub mod passkeys;
 pub mod pipelines;
 pub mod projects;
 pub mod secrets;
@@ -27,5 +29,6 @@ pub fn router() -> Router<AppState> {
         .merge(sessions::router())
         .merge(secrets::router())
         .merge(notifications::router())
+        .merge(passkeys::router())
         .merge(crate::git::browser_router())
 }

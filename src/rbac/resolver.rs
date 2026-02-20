@@ -31,7 +31,12 @@ pub async fn effective_permissions(
     if let Some(cached) = valkey::get_cached::<Vec<String>>(valkey, &key).await {
         let perms = cached
             .iter()
-            .filter_map(|s| Permission::from_str(s).ok())
+            .filter_map(|s| if let Ok(p) = Permission::from_str(s) {
+                Some(p)
+            } else {
+                tracing::warn!(permission = %s, "unparseable permission string in cache, ignoring");
+                None
+            })
             .collect();
         return Ok(perms);
     }
@@ -114,6 +119,41 @@ pub async fn has_permission(
     Ok(perms.contains(&perm))
 }
 
+/// Check whether a user has a specific permission, intersected with optional
+/// API token scopes. If `token_scopes` is `None` (session auth), checks full
+/// role-based permissions. Otherwise, the permission must be both granted by
+/// roles AND included in the token's scopes.
+#[tracing::instrument(skip(pool, valkey), fields(%user_id, %perm), err)]
+pub async fn has_permission_scoped(
+    pool: &PgPool,
+    valkey: &fred::clients::Pool,
+    user_id: Uuid,
+    project_id: Option<Uuid>,
+    perm: Permission,
+    token_scopes: Option<&[String]>,
+) -> anyhow::Result<bool> {
+    if !scope_allows(token_scopes, perm) {
+        return Ok(false);
+    }
+    has_permission(pool, valkey, user_id, project_id, perm).await
+}
+
+/// Check whether a set of token scopes allows a given permission.
+/// Returns `true` if:
+/// - `token_scopes` is `None` (session auth, no restriction)
+/// - scopes is empty (backward-compatible unrestricted token)
+/// - scopes contains `"*"` (unrestricted token)
+/// - scopes contains the permission's string representation
+fn scope_allows(token_scopes: Option<&[String]>, perm: Permission) -> bool {
+    let Some(scopes) = token_scopes else {
+        return true; // session auth
+    };
+    if scopes.is_empty() || scopes.iter().any(|s| s == "*") {
+        return true; // unrestricted token
+    }
+    scopes.iter().any(|s| s == perm.as_str())
+}
+
 /// Invalidate all cached permissions for a user.
 /// Called when roles or delegations change.
 #[tracing::instrument(skip(valkey), fields(%user_id), err)]
@@ -154,5 +194,47 @@ mod tests {
         let user = Uuid::nil();
         let project = Some(Uuid::nil());
         assert_eq!(cache_key(user, project), cache_key(user, project));
+    }
+
+    // -- scope_allows --
+
+    #[test]
+    fn scope_allows_none_is_unrestricted() {
+        assert!(scope_allows(None, Permission::ProjectRead));
+        assert!(scope_allows(None, Permission::AdminUsers));
+    }
+
+    #[test]
+    fn scope_allows_empty_is_unrestricted() {
+        let scopes: Vec<String> = vec![];
+        assert!(scope_allows(Some(&scopes), Permission::ProjectRead));
+    }
+
+    #[test]
+    fn scope_allows_wildcard_is_unrestricted() {
+        let scopes = vec!["*".to_string()];
+        assert!(scope_allows(Some(&scopes), Permission::ProjectRead));
+        assert!(scope_allows(Some(&scopes), Permission::AdminUsers));
+    }
+
+    #[test]
+    fn scope_allows_matching_permission() {
+        let scopes = vec!["project:read".to_string(), "project:write".to_string()];
+        assert!(scope_allows(Some(&scopes), Permission::ProjectRead));
+        assert!(scope_allows(Some(&scopes), Permission::ProjectWrite));
+    }
+
+    #[test]
+    fn scope_denies_non_matching_permission() {
+        let scopes = vec!["project:read".to_string()];
+        assert!(!scope_allows(Some(&scopes), Permission::ProjectWrite));
+        assert!(!scope_allows(Some(&scopes), Permission::AdminUsers));
+    }
+
+    #[test]
+    fn scope_ignores_unknown_scopes() {
+        let scopes = vec!["project:read".to_string(), "nonexistent:perm".to_string()];
+        assert!(scope_allows(Some(&scopes), Permission::ProjectRead));
+        assert!(!scope_allows(Some(&scopes), Permission::ProjectWrite));
     }
 }

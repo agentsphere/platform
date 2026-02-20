@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, display_name, email, is_active, created_at, updated_at\n        FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2\n        ",
+  "query": "\n        INSERT INTO users (name, display_name, email, password_hash, user_type, metadata)\n        VALUES ($1, $2, $3, '!disabled', 'service_account', $4)\n        RETURNING id, name, display_name, email, user_type, is_active, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -25,24 +25,31 @@
       },
       {
         "ordinal": 4,
+        "name": "user_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "is_active",
         "type_info": "Bool"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8"
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb"
       ]
     },
     "nullable": [
@@ -52,8 +59,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "f8d8df7d5490eed3fa0be1efbae3cc5316b7b9dcda456d2799d1863f4e82ef10"
+  "hash": "5466e68df113e832de73dc959de605170d9bb026482d8017cd2665ab3481f2ce"
 }

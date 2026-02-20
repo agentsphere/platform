@@ -90,7 +90,7 @@ pub async fn authenticate_basic(headers: &HeaderMap, pool: &PgPool) -> Result<Gi
     let (username, password_raw) = extract_basic_credentials(headers)?;
 
     // Look up user by name
-    let user = sqlx::query!(
+    let user_row = sqlx::query!(
         r#"
         SELECT id, name, password_hash, is_active
         FROM users WHERE name = $1
@@ -98,30 +98,33 @@ pub async fn authenticate_basic(headers: &HeaderMap, pool: &PgPool) -> Result<Gi
         username,
     )
     .fetch_optional(pool)
-    .await?
-    .ok_or(ApiError::Unauthorized)?;
+    .await?;
 
-    if !user.is_active {
-        return Err(ApiError::Unauthorized);
-    }
-
-    // Try password as API token first
+    // Try password as API token first (SHA-256 is constant-time relative to user existence)
     let token_hash = token::hash_token(&password_raw);
-    let token_match = sqlx::query_scalar!(
-        r#"
+    let token_match = if let Some(ref user) = user_row {
+        sqlx::query_scalar!(
+            r#"
         SELECT COUNT(*) as "count!: i64"
         FROM api_tokens
         WHERE token_hash = $1
           AND user_id = $2
           AND (expires_at IS NULL OR expires_at > now())
         "#,
-        token_hash,
-        user.id,
-    )
-    .fetch_one(pool)
-    .await?;
+            token_hash,
+            user.id,
+        )
+        .fetch_one(pool)
+        .await?
+    } else {
+        0
+    };
 
     if token_match > 0 {
+        let user = user_row.expect("token_match > 0 implies user exists");
+        if !user.is_active {
+            return Err(ApiError::Unauthorized);
+        }
         return Ok(GitUser {
             user_id: user.id,
             user_name: user.name,
@@ -129,10 +132,18 @@ pub async fn authenticate_basic(headers: &HeaderMap, pool: &PgPool) -> Result<Gi
         });
     }
 
-    // Fall back to password verification
-    let valid = password::verify_password(&password_raw, &user.password_hash)
-        .map_err(ApiError::Internal)?;
-    if !valid {
+    // Always run argon2 verify to prevent timing oracle (user enumeration)
+    let hash_to_verify = user_row
+        .as_ref()
+        .map_or_else(|| password::dummy_hash(), |u| u.password_hash.as_str());
+
+    let valid =
+        password::verify_password(&password_raw, hash_to_verify).map_err(ApiError::Internal)?;
+
+    let Some(user) = user_row else {
+        return Err(ApiError::Unauthorized);
+    };
+    if !user.is_active || !valid {
         return Err(ApiError::Unauthorized);
     }
 
@@ -429,7 +440,7 @@ async fn check_access(
     .map_err(ApiError::Internal)?;
 
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("repository".into()));
     }
 
     Ok(Some(git_user))

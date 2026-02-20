@@ -73,30 +73,7 @@ mod tests {
     use super::*;
 
     fn test_config() -> Config {
-        Config {
-            listen: String::new(),
-            database_url: String::new(),
-            valkey_url: String::new(),
-            minio_endpoint: String::new(),
-            minio_access_key: String::new(),
-            minio_secret_key: String::new(),
-            master_key: None,
-            git_repos_path: std::path::PathBuf::new(),
-            ops_repos_path: std::path::PathBuf::new(),
-            smtp_host: None,
-            smtp_port: 587,
-            smtp_from: "test@example.com".into(),
-            smtp_username: None,
-            smtp_password: None,
-            admin_password: None,
-            pipeline_namespace: String::new(),
-            agent_namespace: String::new(),
-            registry_url: None,
-            secure_cookies: false,
-            cors_origins: Vec::new(),
-            trust_proxy_headers: false,
-            dev_mode: true,
-        }
+        Config::test_default()
     }
 
     #[tokio::test]

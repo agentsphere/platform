@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
+use crate::auth::user_type::UserType;
 use crate::auth::{password, token};
 use crate::error::ApiError;
 use crate::rbac::Permission;
@@ -23,8 +24,9 @@ use crate::validation;
 pub struct CreateUserRequest {
     pub name: String,
     pub email: String,
-    pub password: String,
+    pub password: Option<String>,
     pub display_name: Option<String>,
+    pub user_type: Option<UserType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,16 +54,13 @@ pub struct UserResponse {
     pub name: String,
     pub display_name: Option<String>,
     pub email: String,
+    pub user_type: UserType,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::ListResponse;
 
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
@@ -120,6 +119,33 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Check admin:users permission with scope awareness.
+async fn require_admin_scoped(state: &AppState, auth: &AuthUser) -> Result<(), ApiError> {
+    let allowed = crate::rbac::resolver::has_permission_scoped(
+        &state.pool,
+        &state.valkey,
+        auth.user_id,
+        None,
+        Permission::AdminUsers,
+        auth.token_scopes.as_deref(),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    if !allowed {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn parse_user_type(s: &str) -> Result<UserType, ApiError> {
+    s.parse::<UserType>()
+        .map_err(|e: anyhow::Error| ApiError::Internal(e))
+}
+
+// ---------------------------------------------------------------------------
 // Auth handlers
 // ---------------------------------------------------------------------------
 
@@ -131,11 +157,11 @@ async fn login(
     // Rate-limit login attempts (10 per 5 minutes per username)
     crate::auth::rate_limit::check_rate(&state.valkey, "login", &body.name, 10, 300).await?;
 
-    // Look up user by name
+    // Look up user by name (include user_type for login gate)
     let user = sqlx::query!(
         r#"
         SELECT id, name, display_name, email, password_hash, is_active,
-               created_at, updated_at
+               user_type, created_at, updated_at
         FROM users
         WHERE name = $1
         "#,
@@ -158,6 +184,19 @@ async fn login(
         _ => return Err(ApiError::Unauthorized),
     };
 
+    // Reject non-human users (timing-safe: check after password verify)
+    let user_type = parse_user_type(&user.user_type)?;
+    if !user_type.can_login() {
+        return Err(ApiError::Unauthorized);
+    }
+
+    // Check for disabled password (passkey-only accounts)
+    if user.password_hash == "!disabled" {
+        return Err(ApiError::BadRequest(
+            "this account uses passkey authentication — use the passkey login flow".into(),
+        ));
+    }
+
     // Create session
     let session = create_login_session(&state, user.id, &user.name).await?;
 
@@ -169,6 +208,7 @@ async fn login(
             name: user.name,
             display_name: user.display_name,
             email: user.email,
+            user_type,
             is_active: user.is_active,
             created_at: user.created_at,
             updated_at: user.updated_at,
@@ -243,9 +283,6 @@ async fn logout(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Delete all sessions for this user (logout everywhere)
-    // A more targeted approach would delete only the current session,
-    // but we'd need to pass the token hash through. This is simpler.
     sqlx::query!("DELETE FROM auth_sessions WHERE user_id = $1", auth.user_id,)
         .execute(&state.pool)
         .await?;
@@ -265,7 +302,6 @@ async fn logout(
     )
     .await;
 
-    // Clear cookie
     let cookie = "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
     Ok((
         StatusCode::OK,
@@ -277,7 +313,7 @@ async fn logout(
 async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<UserResponse>, ApiError> {
     let user = sqlx::query!(
         r#"
-        SELECT id, name, display_name, email, is_active, created_at, updated_at
+        SELECT id, name, display_name, email, user_type, is_active, created_at, updated_at
         FROM users WHERE id = $1
         "#,
         auth.user_id,
@@ -290,6 +326,7 @@ async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<UserRe
         name: user.name,
         display_name: user.display_name,
         email: user.email,
+        user_type: parse_user_type(&user.user_type)?,
         is_active: user.is_active,
         created_at: user.created_at,
         updated_at: user.updated_at,
@@ -306,41 +343,45 @@ async fn create_user(
     auth: AuthUser,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Check admin permission
-    let is_admin = crate::rbac::resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        None,
-        Permission::AdminUsers,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
+    require_admin_scoped(&state, &auth).await?;
 
-    if !is_admin {
-        return Err(ApiError::Forbidden);
-    }
+    let user_type = body.user_type.unwrap_or(UserType::Human);
 
     // Validate inputs
     validation::check_name(&body.name)?;
     validation::check_email(&body.email)?;
-    validation::check_length("password", &body.password, 8, 1024)?;
     if let Some(ref dn) = body.display_name {
         validation::check_length("display_name", dn, 1, 255)?;
     }
 
-    let hash = password::hash_password(&body.password).map_err(ApiError::Internal)?;
+    // Password handling based on user type
+    let hash = if user_type.requires_password() {
+        let pw = body
+            .password
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("password is required for human users".into()))?;
+        validation::check_length("password", pw, 8, 1024)?;
+        password::hash_password(pw).map_err(ApiError::Internal)?
+    } else {
+        if body.password.is_some() {
+            return Err(ApiError::BadRequest(format!(
+                "password must not be provided for {user_type} users"
+            )));
+        }
+        "!disabled".to_owned()
+    };
 
     let user = sqlx::query!(
         r#"
-        INSERT INTO users (name, display_name, email, password_hash)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, name, display_name, email, is_active, created_at, updated_at
+        INSERT INTO users (name, display_name, email, password_hash, user_type)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, name, display_name, email, user_type, is_active, created_at, updated_at
         "#,
         body.name,
         body.display_name,
         body.email,
         hash,
+        user_type.as_str(),
     )
     .fetch_one(&state.pool)
     .await?;
@@ -354,7 +395,7 @@ async fn create_user(
             resource: "user",
             resource_id: Some(user.id),
             project_id: None,
-            detail: Some(serde_json::json!({"name": body.name})),
+            detail: Some(serde_json::json!({"name": body.name, "user_type": user_type.as_str()})),
             ip_addr: auth.ip_addr.as_deref(),
         },
     )
@@ -367,6 +408,7 @@ async fn create_user(
             name: user.name,
             display_name: user.display_name,
             email: user.email,
+            user_type: parse_user_type(&user.user_type)?,
             is_active: user.is_active,
             created_at: user.created_at,
             updated_at: user.updated_at,
@@ -379,19 +421,7 @@ async fn list_users(
     auth: AuthUser,
     Query(params): Query<ListParams>,
 ) -> Result<Json<ListResponse<UserResponse>>, ApiError> {
-    let is_admin = crate::rbac::resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        None,
-        Permission::AdminUsers,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !is_admin {
-        return Err(ApiError::Forbidden);
-    }
+    require_admin_scoped(&state, &auth).await?;
 
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
@@ -402,7 +432,7 @@ async fn list_users(
 
     let users = sqlx::query!(
         r#"
-        SELECT id, name, display_name, email, is_active, created_at, updated_at
+        SELECT id, name, display_name, email, user_type, is_active, created_at, updated_at
         FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2
         "#,
         limit,
@@ -411,18 +441,19 @@ async fn list_users(
     .fetch_all(&state.pool)
     .await?;
 
-    let items = users
-        .into_iter()
-        .map(|u| UserResponse {
+    let mut items = Vec::with_capacity(users.len());
+    for u in users {
+        items.push(UserResponse {
             id: u.id,
             name: u.name,
             display_name: u.display_name,
             email: u.email,
+            user_type: parse_user_type(&u.user_type)?,
             is_active: u.is_active,
             created_at: u.created_at,
             updated_at: u.updated_at,
-        })
-        .collect();
+        });
+    }
 
     Ok(Json(ListResponse { items, total }))
 }
@@ -432,26 +463,13 @@ async fn get_user(
     auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    // Self or admin
     if auth.user_id != id {
-        let is_admin = crate::rbac::resolver::has_permission(
-            &state.pool,
-            &state.valkey,
-            auth.user_id,
-            None,
-            Permission::AdminUsers,
-        )
-        .await
-        .map_err(ApiError::Internal)?;
-
-        if !is_admin {
-            return Err(ApiError::Forbidden);
-        }
+        require_admin_scoped(&state, &auth).await?;
     }
 
     let user = sqlx::query!(
         r#"
-        SELECT id, name, display_name, email, is_active, created_at, updated_at
+        SELECT id, name, display_name, email, user_type, is_active, created_at, updated_at
         FROM users WHERE id = $1
         "#,
         id,
@@ -465,6 +483,7 @@ async fn get_user(
         name: user.name,
         display_name: user.display_name,
         email: user.email,
+        user_type: parse_user_type(&user.user_type)?,
         is_active: user.is_active,
         created_at: user.created_at,
         updated_at: user.updated_at,
@@ -478,21 +497,8 @@ async fn update_user(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    // Self or admin
     if auth.user_id != id {
-        let is_admin = crate::rbac::resolver::has_permission(
-            &state.pool,
-            &state.valkey,
-            auth.user_id,
-            None,
-            Permission::AdminUsers,
-        )
-        .await
-        .map_err(ApiError::Internal)?;
-
-        if !is_admin {
-            return Err(ApiError::Forbidden);
-        }
+        require_admin_scoped(&state, &auth).await?;
     }
 
     // Validate inputs
@@ -506,7 +512,6 @@ async fn update_user(
         validation::check_length("password", pw, 8, 1024)?;
     }
 
-    // Build update — only set fields that are provided
     let password_hash = match &body.password {
         Some(pw) => Some(password::hash_password(pw).map_err(ApiError::Internal)?),
         None => None,
@@ -519,7 +524,7 @@ async fn update_user(
             email = COALESCE($3, email),
             password_hash = COALESCE($4, password_hash)
         WHERE id = $1
-        RETURNING id, name, display_name, email, is_active, created_at, updated_at
+        RETURNING id, name, display_name, email, user_type, is_active, created_at, updated_at
         "#,
         id,
         body.display_name,
@@ -550,6 +555,7 @@ async fn update_user(
         name: user.name,
         display_name: user.display_name,
         email: user.email,
+        user_type: parse_user_type(&user.user_type)?,
         is_active: user.is_active,
         created_at: user.created_at,
         updated_at: user.updated_at,
@@ -562,19 +568,7 @@ async fn deactivate_user(
     auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let is_admin = crate::rbac::resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        None,
-        Permission::AdminUsers,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !is_admin {
-        return Err(ApiError::Forbidden);
-    }
+    require_admin_scoped(&state, &auth).await?;
 
     sqlx::query!("UPDATE users SET is_active = false WHERE id = $1", id,)
         .execute(&state.pool)
@@ -625,6 +619,11 @@ async fn create_api_token(
     let (raw_token, token_hash) = token::generate_api_token();
 
     let scopes = body.scopes.unwrap_or_default();
+
+    // Validate that requested scopes are real permissions and subset of user's
+    if !scopes.is_empty() && !scopes.contains(&"*".to_string()) {
+        validate_token_scopes(&state, &auth, &scopes, body.project_id).await?;
+    }
 
     const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
     const MAX_TOKEN_EXPIRY_DAYS: i64 = 365;
@@ -685,6 +684,44 @@ async fn create_api_token(
     ))
 }
 
+/// Validate that each scope string is a known permission and the user actually
+/// holds that permission. Prevents scope escalation.
+async fn validate_token_scopes(
+    state: &AppState,
+    auth: &AuthUser,
+    scopes: &[String],
+    project_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let user_perms = crate::rbac::resolver::effective_permissions(
+        &state.pool,
+        &state.valkey,
+        auth.user_id,
+        project_id,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    let user_perm_strings: std::collections::HashSet<&str> =
+        user_perms.iter().map(|p| p.as_str()).collect();
+
+    for scope in scopes {
+        if scope == "*" {
+            continue;
+        }
+        // Validate it's a known permission
+        if scope.parse::<Permission>().is_err() {
+            return Err(ApiError::BadRequest(format!("unknown scope '{scope}'")));
+        }
+        // Validate user has this permission
+        if !user_perm_strings.contains(scope.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "scope '{scope}' exceeds your permissions"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn list_api_tokens(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -722,7 +759,6 @@ async fn revoke_api_token(
     auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Only allow revoking own tokens
     let result = sqlx::query!(
         "DELETE FROM api_tokens WHERE id = $1 AND user_id = $2",
         id,

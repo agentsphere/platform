@@ -40,12 +40,13 @@ pub fn require_permission(
             // Try to extract project_id from path
             let project_id = extract_project_id_from_path(&req);
 
-            let allowed = resolver::has_permission(
+            let allowed = resolver::has_permission_scoped(
                 &state.pool,
                 &state.valkey,
                 auth.user_id,
                 project_id,
                 perm,
+                auth.token_scopes.as_deref(),
             )
             .await
             .map_err(ApiError::Internal)?;

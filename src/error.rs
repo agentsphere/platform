@@ -200,6 +200,9 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "internal server error");
-        assert!(!body.iter().any(|_| false) || !json.to_string().contains("secret"));
+        assert!(
+            !json.to_string().contains("secret info"),
+            "Internal error response must not leak error details"
+        );
     }
 }

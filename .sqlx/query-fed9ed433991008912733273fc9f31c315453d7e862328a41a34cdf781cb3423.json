@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT pc.id, pc.user_id, pc.credential_id, pc.public_key, pc.sign_count,\n               u.is_active, u.name as user_name, u.user_type,\n               u.display_name, u.email, u.created_at as user_created_at,\n               u.updated_at as user_updated_at\n        FROM passkey_credentials pc\n        JOIN users u ON u.id = pc.user_id\n        WHERE u.is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "credential_id",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "public_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "sign_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "user_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "user_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "user_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "user_updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fed9ed433991008912733273fc9f31c315453d7e862328a41a34cdf781cb3423"
+}

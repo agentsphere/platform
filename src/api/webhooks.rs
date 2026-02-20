@@ -17,9 +17,10 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
-use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
 use crate::validation;
+
+use super::helpers::require_project_write;
 
 /// Shared HTTP client for webhook dispatch (with timeouts).
 pub(crate) static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -95,27 +96,6 @@ fn is_private_ip(ip: IpAddr) -> bool {
         }
     }
 }
-async fn require_project_write(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectWrite,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------

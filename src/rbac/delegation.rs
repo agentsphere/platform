@@ -38,6 +38,13 @@ pub async fn create_delegation(
     valkey: &fred::clients::Pool,
     req: &CreateDelegationParams,
 ) -> Result<Delegation, ApiError> {
+    // Prevent self-delegation
+    if req.delegator_id == req.delegate_id {
+        return Err(ApiError::BadRequest(
+            "cannot delegate permissions to yourself".into(),
+        ));
+    }
+
     // Validate delegator holds this permission
     let delegator_has = resolver::has_permission(
         pool,
@@ -124,7 +131,12 @@ pub async fn revoke_delegation(
 
 /// List delegations for a user (both granted by and received).
 #[tracing::instrument(skip(pool), fields(%user_id), err)]
-pub async fn list_delegations(pool: &PgPool, user_id: Uuid) -> Result<Vec<Delegation>, ApiError> {
+pub async fn list_delegations(
+    pool: &PgPool,
+    user_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Delegation>, ApiError> {
     let rows = sqlx::query_as!(
         Delegation,
         r#"
@@ -143,8 +155,11 @@ pub async fn list_delegations(pool: &PgPool, user_id: Uuid) -> Result<Vec<Delega
         JOIN permissions p ON p.id = d.permission_id
         WHERE d.delegator_id = $1 OR d.delegate_id = $1
         ORDER BY d.created_at DESC
+        LIMIT $2 OFFSET $3
         "#,
         user_id,
+        limit,
+        offset,
     )
     .fetch_all(pool)
     .await?;

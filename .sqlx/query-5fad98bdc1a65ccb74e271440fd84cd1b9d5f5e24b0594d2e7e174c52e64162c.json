@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, display_name, email, password_hash, is_active,\n               created_at, updated_at\n        FROM users\n        WHERE name = $1\n        ",
+  "query": "\n        UPDATE users SET\n            display_name = COALESCE($2, display_name),\n            email = COALESCE($3, email),\n            password_hash = COALESCE($4, password_hash)\n        WHERE id = $1\n        RETURNING id, name, display_name, email, user_type, is_active, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -25,7 +25,7 @@
       },
       {
         "ordinal": 4,
-        "name": "password_hash",
+        "name": "user_type",
         "type_info": "Text"
       },
       {
@@ -46,6 +46,9 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Text",
+        "Text",
         "Text"
       ]
     },
@@ -60,5 +63,5 @@
       false
     ]
   },
-  "hash": "7b6814644fc879de1dc69eb7e680a0bc636d43222432d6578e272dae822425fe"
+  "hash": "5fad98bdc1a65ccb74e271440fd84cd1b9d5f5e24b0594d2e7e174c52e64162c"
 }

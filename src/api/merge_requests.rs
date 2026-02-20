@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
-use crate::rbac::{Permission, resolver};
+use crate::rbac::Permission;
 use crate::store::AppState;
 use crate::validation;
 
@@ -95,11 +95,7 @@ pub struct CommentResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::{ListResponse, require_project_read, require_project_write};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -131,63 +127,6 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{id}/merge-requests/{number}/comments/{comment_id}",
             axum::routing::patch(update_comment),
         )
-}
-
-async fn require_project_read(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let project = sqlx::query!(
-        "SELECT visibility, owner_id FROM projects WHERE id = $1 AND is_active = true",
-        project_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("project".into()))?;
-
-    if project.visibility == "public"
-        || project.visibility == "internal"
-        || project.owner_id == auth.user_id
-    {
-        return Ok(());
-    }
-
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectRead,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::NotFound("project".into()));
-    }
-    Ok(())
-}
-
-async fn require_project_write(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectWrite,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

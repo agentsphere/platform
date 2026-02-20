@@ -16,4 +16,5 @@ pub struct AppState {
     pub minio: opendal::Operator,
     pub kube: kube::Client,
     pub config: Arc<Config>,
+    pub webauthn: Arc<webauthn_rs::prelude::Webauthn>,
 }

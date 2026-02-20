@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
-use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
 
 // ---------------------------------------------------------------------------
@@ -76,11 +75,7 @@ pub struct ArtifactResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::{ListResponse, require_project_read, require_project_write};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -112,52 +107,6 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{id}/pipelines/{pipeline_id}/artifacts/{artifact_id}/download",
             get(download_artifact),
         )
-}
-
-// ---------------------------------------------------------------------------
-// Permission helper
-// ---------------------------------------------------------------------------
-
-async fn require_project_read(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectRead,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
-}
-
-async fn require_project_write(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectWrite,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +480,10 @@ async fn download_artifact(
         .header("content-type", content_type)
         .header(
             "content-disposition",
-            format!("attachment; filename=\"{}\"", artifact.name),
+            format!(
+                "attachment; filename=\"{}\"",
+                sanitize_filename(&artifact.name)
+            ),
         )
         .body(Body::from(data.to_vec()))
         .unwrap())
@@ -568,11 +520,42 @@ async fn fetch_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<PipelineR
     })
 }
 
-fn slug(name: &str) -> String {
-    name.to_lowercase()
+use crate::pipeline::slug;
+
+/// Sanitize a filename for use in Content-Disposition headers.
+/// Only allows alphanumeric characters, hyphens, underscores, and dots.
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect();
+    if sanitized.is_empty() {
+        "download".into()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_filename_preserves_normal() {
+        assert_eq!(sanitize_filename("report.tar.gz"), "report.tar.gz");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_injection() {
+        assert_eq!(
+            sanitize_filename("file\".html\r\nX-Bad: injected"),
+            "file.htmlX-Badinjected"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_fallback_on_empty() {
+        assert_eq!(sanitize_filename(""), "download");
+        assert_eq!(sanitize_filename("///"), "download");
+    }
 }

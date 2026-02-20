@@ -71,11 +71,7 @@ pub struct MessageResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::ListResponse;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -106,43 +102,7 @@ pub fn router() -> Router<AppState> {
 // Permission helpers
 // ---------------------------------------------------------------------------
 
-/// Check project-level read access. Returns 404 (not 403) for unauthorized
-/// private projects to avoid leaking resource existence.
-async fn require_project_read(
-    state: &AppState,
-    auth: &AuthUser,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let project = sqlx::query!(
-        "SELECT visibility, owner_id FROM projects WHERE id = $1 AND is_active = true",
-        project_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("project".into()))?;
-
-    if project.visibility == "public"
-        || project.visibility == "internal"
-        || project.owner_id == auth.user_id
-    {
-        return Ok(());
-    }
-
-    let allowed = resolver::has_permission(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        Some(project_id),
-        Permission::ProjectRead,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    if !allowed {
-        return Err(ApiError::NotFound("project".into()));
-    }
-    Ok(())
-}
+use super::helpers::require_project_read;
 
 async fn require_agent_run(
     state: &AppState,

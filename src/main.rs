@@ -85,6 +85,10 @@ async fn main() -> anyhow::Result<()> {
     let kube = kube::Client::try_default().await?;
     tracing::info!("kubernetes client created");
 
+    // Initialize WebAuthn relying party
+    let webauthn = auth::passkey::build_webauthn(&cfg)?;
+    tracing::info!(rp_id = %cfg.webauthn_rp_id, "webauthn initialized");
+
     // Build AppState
     let state = store::AppState {
         pool: pool.clone(),
@@ -92,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         minio,
         kube,
         config: Arc::new(cfg.clone()),
+        webauthn: Arc::new(webauthn),
     };
 
     // Bootstrap system roles, permissions, and admin user on first run
@@ -115,22 +120,7 @@ async fn main() -> anyhow::Result<()> {
     let observe_channels = observe::spawn_background_tasks(state.clone(), observe_shutdown_rx);
 
     // Spawn expired session/token cleanup task (hourly)
-    let cleanup_pool = pool.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-        loop {
-            interval.tick().await;
-            let _ = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < now()")
-                .execute(&cleanup_pool)
-                .await;
-            let _ = sqlx::query(
-                "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < now()",
-            )
-            .execute(&cleanup_pool)
-            .await;
-            tracing::debug!("expired sessions/tokens cleanup complete");
-        }
-    });
+    tokio::spawn(run_session_cleanup(pool.clone()));
 
     // Build router
     let app = axum::Router::new()
@@ -173,6 +163,28 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_session_cleanup(pool: sqlx::PgPool) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        if let Err(e) = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < now()")
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(error = %e, "expired sessions cleanup failed");
+        }
+        if let Err(e) = sqlx::query(
+            "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < now()",
+        )
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(error = %e, "expired tokens cleanup failed");
+        }
+        tracing::debug!("expired sessions/tokens cleanup complete");
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -209,7 +221,12 @@ fn build_cors_layer(cfg: &config::Config) -> CorsLayer {
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
-        .allow_headers(tower_http::cors::Any)
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::ACCEPT,
+            axum::http::header::COOKIE,
+        ])
         .allow_credentials(true);
 
     if cfg.cors_origins.is_empty() {

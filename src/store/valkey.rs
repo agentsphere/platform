@@ -14,7 +14,14 @@ pub async fn connect(url: &str) -> anyhow::Result<fred::clients::Pool> {
 
 pub async fn get_cached<T: DeserializeOwned>(pool: &fred::clients::Pool, key: &str) -> Option<T> {
     let value: Option<String> = pool.get(key).await.ok()?;
-    value.and_then(|v| serde_json::from_str(&v).ok())
+    let raw = value?;
+    match serde_json::from_str(&raw) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, %key, "cache deserialization failed, treating as miss");
+            None
+        }
+    }
 }
 
 pub async fn set_cached<T: Serialize>(

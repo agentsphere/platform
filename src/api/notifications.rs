@@ -22,11 +22,7 @@ pub struct ListParams {
     pub notification_type: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::ListResponse;
 
 #[derive(Debug, Serialize)]
 pub struct NotificationResponse {

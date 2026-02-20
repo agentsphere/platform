@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::token;
+use crate::auth::user_type::UserType;
 use crate::error::ApiError;
 use crate::store::AppState;
 
@@ -14,13 +15,29 @@ use crate::store::AppState;
 pub struct AuthUser {
     pub user_id: Uuid,
     pub user_name: String,
+    pub user_type: UserType,
     pub ip_addr: Option<String>,
+    /// Token scopes if authenticated via API token.
+    /// None = session auth (no scope restriction).
+    /// Some(vec![]) or Some(vec!["*"]) = unrestricted token.
+    /// Some(vec!["project:read", ...]) = scoped token.
+    pub token_scopes: Option<Vec<String>>,
 }
 
-/// Row returned when looking up an API token or session.
-struct AuthLookup {
+/// Row returned when looking up an API token.
+struct TokenAuthLookup {
     user_id: Uuid,
     user_name: String,
+    user_type: String,
+    is_active: bool,
+    scopes: Vec<String>,
+}
+
+/// Row returned when looking up a session.
+struct SessionAuthLookup {
+    user_id: Uuid,
+    user_name: String,
+    user_type: String,
     is_active: bool,
 }
 
@@ -41,10 +58,16 @@ impl FromRequestParts<AppState> for AuthUser {
             if !user.is_active {
                 return Err(ApiError::Unauthorized);
             }
+            let user_type: UserType = user
+                .user_type
+                .parse()
+                .map_err(|e: anyhow::Error| ApiError::Internal(e))?;
             return Ok(Self {
                 user_id: user.user_id,
                 user_name: user.user_name,
+                user_type,
                 ip_addr,
+                token_scopes: Some(user.scopes),
             });
         }
 
@@ -55,10 +78,20 @@ impl FromRequestParts<AppState> for AuthUser {
             if !user.is_active {
                 return Err(ApiError::Unauthorized);
             }
+            let user_type: UserType = user
+                .user_type
+                .parse()
+                .map_err(|e: anyhow::Error| ApiError::Internal(e))?;
+            // Non-human users cannot use session-based auth
+            if !user_type.can_login() {
+                return Err(ApiError::Unauthorized);
+            }
             return Ok(Self {
                 user_id: user.user_id,
                 user_name: user.user_name,
+                user_type,
                 ip_addr,
+                token_scopes: None,
             });
         }
 
@@ -129,13 +162,18 @@ fn extract_ip(parts: &Parts, trust_proxy: bool) -> Option<String> {
 }
 
 /// Look up an API token by its raw value. Updates `last_used_at` on success.
-async fn lookup_api_token(pool: &PgPool, raw_token: &str) -> Result<Option<AuthLookup>, ApiError> {
+async fn lookup_api_token(
+    pool: &PgPool,
+    raw_token: &str,
+) -> Result<Option<TokenAuthLookup>, ApiError> {
     let hash = token::hash_token(raw_token);
 
     let row = sqlx::query_as!(
-        AuthLookup,
+        TokenAuthLookup,
         r#"
-        SELECT u.id as "user_id!", u.name as "user_name!", u.is_active as "is_active!"
+        SELECT u.id as "user_id!", u.name as "user_name!",
+               u.user_type as "user_type!", u.is_active as "is_active!",
+               t.scopes as "scopes!"
         FROM api_tokens t
         JOIN users u ON u.id = t.user_id
         WHERE t.token_hash = $1
@@ -164,14 +202,17 @@ async fn lookup_api_token(pool: &PgPool, raw_token: &str) -> Result<Option<AuthL
 }
 
 /// Look up a session by its raw cookie value.
-async fn lookup_session(pool: &PgPool, raw_token: &str) -> Result<Option<AuthLookup>, ApiError> {
+async fn lookup_session(
+    pool: &PgPool,
+    raw_token: &str,
+) -> Result<Option<SessionAuthLookup>, ApiError> {
     let hash = token::hash_token(raw_token);
 
-    // Query type override: expires_at is TIMESTAMPTZ, compare with now()
     let row = sqlx::query_as!(
-        AuthLookup,
+        SessionAuthLookup,
         r#"
-        SELECT u.id as "user_id!", u.name as "user_name!", u.is_active as "is_active!"
+        SELECT u.id as "user_id!", u.name as "user_name!",
+               u.user_type as "user_type!", u.is_active as "is_active!"
         FROM auth_sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = $1

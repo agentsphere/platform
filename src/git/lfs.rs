@@ -104,7 +104,7 @@ async fn batch(
     .map_err(ApiError::Internal)?;
 
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("repository".into()));
     }
 
     // Generate presigned URLs for each object

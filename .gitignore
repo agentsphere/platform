@@ -19,3 +19,4 @@ ui/dist/
 
 # Kind kubeconfig
 kind-platform.kubeconfig
+.claude/worktrees/

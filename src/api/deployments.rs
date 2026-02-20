@@ -92,11 +92,7 @@ pub struct ListParams {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::ListResponse;
 
 // ---------------------------------------------------------------------------
 // Router

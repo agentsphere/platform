@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE passkey_credentials SET sign_count = $1, last_used_at = now() WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6a9b8322091aaf09d7a25e4e88756d98bb4425e316c31cdb91f338727a71fb50"
+}

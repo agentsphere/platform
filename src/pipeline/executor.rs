@@ -209,17 +209,17 @@ async fn execute_single_step(
     );
 
     let pod_name = format!("pl-{}-{}", &pipeline_id.to_string()[..8], slug(&step.name));
-    let pod_spec = build_pod_spec(
-        &pod_name,
+    let pod_spec = build_pod_spec(&PodSpecParams {
+        pod_name: &pod_name,
         pipeline_id,
         project_id,
-        &step.name,
-        &step.image,
-        &step.commands,
-        &env_vars,
-        &pipeline.repo_path,
-        &pipeline.git_ref,
-    );
+        step_name: &step.name,
+        image: &step.image,
+        commands: &step.commands,
+        env_vars: &env_vars,
+        repo_path: &pipeline.repo_path,
+        git_ref: &pipeline.git_ref,
+    });
 
     sqlx::query!(
         "UPDATE pipeline_steps SET status = 'running' WHERE id = $1",
@@ -363,36 +363,38 @@ async fn capture_logs(
 // Pod spec builder
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn build_pod_spec(
-    pod_name: &str,
+struct PodSpecParams<'a> {
+    pod_name: &'a str,
     pipeline_id: Uuid,
     project_id: Uuid,
-    step_name: &str,
-    image: &str,
-    commands: &[String],
-    env_vars: &[EnvVar],
-    repo_path: &str,
-    git_ref: &str,
-) -> Pod {
+    step_name: &'a str,
+    image: &'a str,
+    commands: &'a [String],
+    env_vars: &'a [EnvVar],
+    repo_path: &'a str,
+    git_ref: &'a str,
+}
+
+fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
     // Build the shell script from commands
-    let script = commands.join(" && ");
+    let script = p.commands.join(" && ");
 
     let labels = BTreeMap::from([
-        ("platform.io/pipeline".into(), pipeline_id.to_string()),
-        ("platform.io/step".into(), slug(step_name)),
-        ("platform.io/project".into(), project_id.to_string()),
+        ("platform.io/pipeline".into(), p.pipeline_id.to_string()),
+        ("platform.io/step".into(), slug(p.step_name)),
+        ("platform.io/project".into(), p.project_id.to_string()),
     ]);
 
     // Strip refs/heads/ prefix for git clone --branch
-    let branch = git_ref
+    let branch = p
+        .git_ref
         .strip_prefix("refs/heads/")
-        .or_else(|| git_ref.strip_prefix("refs/tags/"))
-        .unwrap_or(git_ref);
+        .or_else(|| p.git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(p.git_ref);
 
     Pod {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(pod_name.into()),
+            name: Some(p.pod_name.into()),
             labels: Some(labels),
             ..Default::default()
         },
@@ -403,7 +405,8 @@ fn build_pod_spec(
                 image: Some("alpine/git:latest".into()),
                 command: Some(vec!["sh".into(), "-c".into()]),
                 args: Some(vec![format!(
-                    "git clone --depth 1 --branch {branch} file://{repo_path} /workspace"
+                    "git clone --depth 1 --branch {branch} file://{} /workspace",
+                    p.repo_path
                 )]),
                 volume_mounts: Some(vec![
                     VolumeMount {
@@ -413,7 +416,7 @@ fn build_pod_spec(
                     },
                     VolumeMount {
                         name: "repos".into(),
-                        mount_path: repo_path.into(),
+                        mount_path: p.repo_path.into(),
                         read_only: Some(true),
                         ..Default::default()
                     },
@@ -422,11 +425,11 @@ fn build_pod_spec(
             }]),
             containers: vec![Container {
                 name: "step".into(),
-                image: Some(image.into()),
+                image: Some(p.image.into()),
                 command: Some(vec!["sh".into(), "-c".into()]),
                 args: Some(vec![script]),
                 working_dir: Some("/workspace".into()),
-                env: Some(env_vars.to_vec()),
+                env: Some(p.env_vars.to_vec()),
                 volume_mounts: Some(vec![VolumeMount {
                     name: "workspace".into(),
                     mount_path: "/workspace".into(),
@@ -454,7 +457,7 @@ fn build_pod_spec(
                 Volume {
                     name: "repos".into(),
                     host_path: Some(k8s_openapi::api::core::v1::HostPathVolumeSource {
-                        path: repo_path.into(),
+                        path: p.repo_path.into(),
                         type_: Some("Directory".into()),
                     }),
                     ..Default::default()
@@ -676,15 +679,7 @@ pub async fn cancel_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), 
 // Utilities
 // ---------------------------------------------------------------------------
 
-/// Create a K8s-safe slug from a name.
-fn slug(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned()
-}
+use super::slug;
 
 #[cfg(test)]
 mod tests {
@@ -812,17 +807,17 @@ mod tests {
     fn build_pod_spec_structure() {
         let pipeline_id = Uuid::nil();
         let project_id = Uuid::nil();
-        let pod = build_pod_spec(
-            "pl-test-build",
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test-build",
             pipeline_id,
             project_id,
-            "build",
-            "rust:latest",
-            &["cargo build".into(), "cargo test".into()],
-            &[env_var("FOO", "bar")],
-            "/data/repos/owner/repo.git",
-            "refs/heads/main",
-        );
+            step_name: "build",
+            image: "rust:latest",
+            commands: &["cargo build".into(), "cargo test".into()],
+            env_vars: &[env_var("FOO", "bar")],
+            repo_path: "/data/repos/owner/repo.git",
+            git_ref: "refs/heads/main",
+        });
 
         assert_eq!(pod.metadata.name.as_deref(), Some("pl-test-build"));
 

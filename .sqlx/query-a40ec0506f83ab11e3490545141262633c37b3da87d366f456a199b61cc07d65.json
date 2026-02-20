@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, display_name, email, is_active, created_at, updated_at\n        FROM users WHERE id = $1\n        ",
+  "query": "\n        SELECT id, name, display_name, email, user_type, is_active, created_at, updated_at\n        FROM users\n        WHERE user_type = 'service_account'\n        ORDER BY created_at DESC LIMIT $1 OFFSET $2\n        ",
   "describe": {
     "columns": [
       {
@@ -25,23 +25,29 @@
       },
       {
         "ordinal": 4,
+        "name": "user_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "is_active",
         "type_info": "Bool"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -51,8 +57,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "62c2ac52f95cbb65eaf94b437aff7801cf54ce0167cdd9cb0f1b141b0f90dbb7"
+  "hash": "a40ec0506f83ab11e3490545141262633c37b3da87d366f456a199b61cc07d65"
 }

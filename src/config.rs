@@ -26,6 +26,12 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub trust_proxy_headers: bool,
     pub dev_mode: bool,
+    /// `WebAuthn` Relying Party ID (domain, no protocol).
+    pub webauthn_rp_id: String,
+    /// `WebAuthn` Relying Party Origin (full URL).
+    pub webauthn_rp_origin: String,
+    /// `WebAuthn` Relying Party display name.
+    pub webauthn_rp_name: String,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -73,6 +79,45 @@ impl Config {
                 .ok()
                 .is_some_and(|v| v == "true"),
             dev_mode: env::var("PLATFORM_DEV").ok().is_some_and(|v| v == "true"),
+            webauthn_rp_id: env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into()),
+            webauthn_rp_origin: env::var("WEBAUTHN_RP_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
+            webauthn_rp_name: env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Platform".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    /// Sensible defaults for unit tests. Override specific fields with struct update syntax:
+    /// `Config { smtp_host: Some("localhost".into()), ..Config::test_default() }`
+    pub fn test_default() -> Self {
+        Self {
+            listen: "127.0.0.1:0".into(),
+            database_url: "postgres://localhost/test".into(),
+            valkey_url: "redis://localhost:6379".into(),
+            minio_endpoint: "http://localhost:9000".into(),
+            minio_access_key: "test".into(),
+            minio_secret_key: "test".into(),
+            master_key: None,
+            git_repos_path: "/tmp/repos".into(),
+            ops_repos_path: "/tmp/ops-repos".into(),
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_from: "test@localhost".into(),
+            smtp_username: None,
+            smtp_password: None,
+            admin_password: None,
+            pipeline_namespace: "test-pipelines".into(),
+            agent_namespace: "test-agents".into(),
+            registry_url: None,
+            secure_cookies: false,
+            cors_origins: vec![],
+            trust_proxy_headers: false,
+            dev_mode: true,
+            webauthn_rp_id: "localhost".into(),
+            webauthn_rp_origin: "http://localhost:8080".into(),
+            webauthn_rp_name: "Test Platform".into(),
         }
     }
 }
