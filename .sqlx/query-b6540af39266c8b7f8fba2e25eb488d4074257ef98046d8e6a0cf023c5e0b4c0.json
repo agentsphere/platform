@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_messages (session_id, role, content) VALUES ($1, 'user', $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6540af39266c8b7f8fba2e25eb488d4074257ef98046d8e6a0cf023c5e0b4c0"
+}

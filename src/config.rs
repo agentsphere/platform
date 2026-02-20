@@ -18,6 +18,7 @@ pub struct Config {
     pub smtp_from: String,
     pub admin_password: Option<String>,
     pub pipeline_namespace: String,
+    pub agent_namespace: String,
     pub registry_url: Option<String>,
     pub secure_cookies: bool,
     pub cors_origins: Vec<String>,
@@ -55,6 +56,8 @@ impl Config {
             admin_password: env::var("PLATFORM_ADMIN_PASSWORD").ok(),
             pipeline_namespace: env::var("PLATFORM_PIPELINE_NAMESPACE")
                 .unwrap_or_else(|_| "platform-pipelines".into()),
+            agent_namespace: env::var("PLATFORM_AGENT_NAMESPACE")
+                .unwrap_or_else(|_| "platform-agents".into()),
             registry_url: env::var("PLATFORM_REGISTRY_URL").ok(),
             secure_cookies: env::var("PLATFORM_SECURE_COOKIES")
                 .ok()

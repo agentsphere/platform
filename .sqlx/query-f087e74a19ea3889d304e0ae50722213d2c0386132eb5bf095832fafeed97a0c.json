@@ -1,0 +1,85 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, project_id, user_id, prompt, status, branch, pod_name,\n               provider, cost_tokens, created_at, finished_at\n        FROM agent_sessions\n        WHERE project_id = $1 AND ($2::text IS NULL OR status = $2)\n        ORDER BY created_at DESC\n        LIMIT $3 OFFSET $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "prompt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "pod_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "cost_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "f087e74a19ea3889d304e0ae50722213d2c0386132eb5bf095832fafeed97a0c"
+}

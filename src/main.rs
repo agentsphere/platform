@@ -28,11 +28,13 @@ mod pipeline;
 // Phase 06 — Continuous Deployer
 mod deployer;
 
+// Phase 07 — Agent Orchestration
+mod agent;
+
 // Phase 10 — Web UI
 mod ui;
 
 // Module stubs — populated in later phases
-mod agent {}
 mod observe {}
 mod secrets {}
 mod notify {}
@@ -89,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         deployer_shutdown_rx,
     ));
+
+    // Start agent session reaper background task
+    let agent_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(agent::service::run_reaper(state.clone(), agent_shutdown_rx));
 
     // Spawn expired session/token cleanup task (hourly)
     let cleanup_pool = pool.clone();

@@ -18,11 +18,13 @@ pub mod pipeline;
 // Phase 06 — Continuous Deployer
 pub mod deployer;
 
+// Phase 07 — Agent Orchestration
+pub mod agent;
+
 // Phase 10 — Web UI
 pub mod ui;
 
 // Module stubs — populated in later phases
-pub mod agent {}
 pub mod observe {}
 pub mod secrets {}
 pub mod notify {}

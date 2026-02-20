@@ -129,7 +129,7 @@ async fn create_webhook(
     if body.events.len() > 20 {
         return Err(ApiError::BadRequest("max 20 events".into()));
     }
-    let valid_events = ["push", "mr", "issue", "build", "deploy"];
+    let valid_events = ["push", "mr", "issue", "build", "deploy", "agent"];
     for event in &body.events {
         if !valid_events.contains(&event.as_str()) {
             return Err(ApiError::BadRequest(format!(
@@ -263,7 +263,7 @@ async fn update_webhook(
         if events.len() > 20 {
             return Err(ApiError::BadRequest("max 20 events".into()));
         }
-        let valid_events = ["push", "mr", "issue", "build", "deploy"];
+        let valid_events = ["push", "mr", "issue", "build", "deploy", "agent"];
         for event in events {
             if !valid_events.contains(&event.as_str()) {
                 return Err(ApiError::BadRequest(format!(
