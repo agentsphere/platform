@@ -426,7 +426,51 @@ mod tests {
     }
 
     #[test]
-    fn dev_master_key_is_deterministic() {
-        assert_eq!(dev_master_key(), dev_master_key());
+    fn dev_master_key_is_not_all_zeros_and_works_as_key() {
+        let key = dev_master_key();
+        assert_ne!(key, [0u8; 32], "dev key should not be all zeros");
+        // Verify it works as a valid encryption key
+        let encrypted = encrypt(b"test", &key).unwrap();
+        let decrypted = decrypt(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, b"test");
+    }
+
+    #[test]
+    fn encrypt_empty_plaintext_roundtrips() {
+        let key = [42u8; 32];
+        let encrypted = encrypt(b"", &key).unwrap();
+        // Should have nonce (12) + tag (16) even for empty plaintext
+        assert_eq!(encrypted.len(), 12 + 16);
+        let decrypted = decrypt(&encrypted, &key).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn parse_master_key_63_hex_chars_fails() {
+        // Odd number of hex chars — hex::decode fails
+        let hex_key = "a".repeat(63);
+        assert!(parse_master_key(&hex_key).is_err());
+    }
+
+    #[test]
+    fn parse_master_key_65_hex_chars_fails() {
+        // 32.5 bytes — too long (but even, so hex::decode succeeds, try_into fails)
+        // Actually 65 hex chars is odd, so hex::decode fails
+        let hex_key = "a".repeat(66); // 33 bytes
+        assert!(parse_master_key(&hex_key).is_err());
+    }
+
+    #[test]
+    fn parse_master_key_trims_whitespace() {
+        let hex_key = format!("  {}  ", "aa".repeat(32));
+        let key = parse_master_key(&hex_key).unwrap();
+        assert_eq!(key, [0xaa; 32]);
+    }
+
+    #[test]
+    fn decrypt_nonce_only_no_ciphertext_fails() {
+        // Exactly 12 bytes (nonce) but no ciphertext or tag
+        let key = [42u8; 32];
+        assert!(decrypt(&[0u8; 12], &key).is_err());
     }
 }

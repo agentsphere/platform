@@ -205,4 +205,108 @@ mod tests {
             "Internal error response must not leak error details"
         );
     }
+
+    // -- sqlx error conversion tests --
+
+    #[test]
+    fn sqlx_row_not_found_maps_to_404() {
+        let err: ApiError = sqlx::Error::RowNotFound.into();
+        assert!(
+            matches!(err, ApiError::NotFound(ref msg) if msg == "resource not found"),
+            "RowNotFound should map to NotFound, got {err:?}"
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn sqlx_unique_violation_maps_to_409() {
+        // Simulate a unique constraint violation (Postgres error code 23505)
+        let db_err = sqlx::Error::Database(Box::new(TestDbError {
+            code: Some("23505".into()),
+            message: "duplicate key value violates unique constraint".into(),
+        }));
+        let err: ApiError = db_err.into();
+        assert!(
+            matches!(err, ApiError::Conflict(ref msg) if msg.contains("already exists")),
+            "unique violation should map to Conflict, got {err:?}"
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn sqlx_other_db_error_maps_to_500() {
+        let db_err = sqlx::Error::Database(Box::new(TestDbError {
+            code: Some("42P01".into()), // undefined table
+            message: "relation does not exist".into(),
+        }));
+        let err: ApiError = db_err.into();
+        assert!(matches!(err, ApiError::Internal(_)));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn conflict_body_contains_message() {
+        let resp = ApiError::Conflict("duplicate email".into()).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "duplicate email");
+    }
+
+    #[tokio::test]
+    async fn validation_body_has_multiple_fields() {
+        let resp = ApiError::Validation(vec!["name required".into(), "email invalid".into()])
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["fields"][0], "name required");
+        assert_eq!(json["fields"][1], "email invalid");
+    }
+
+    /// Minimal implementation of sqlx::DatabaseError for testing From<sqlx::Error>.
+    #[derive(Debug)]
+    struct TestDbError {
+        code: Option<String>,
+        message: String,
+    }
+
+    impl std::fmt::Display for TestDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestDbError {}
+
+    impl sqlx::error::DatabaseError for TestDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.as_deref().map(std::borrow::Cow::Borrowed)
+        }
+    }
 }

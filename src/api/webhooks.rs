@@ -69,9 +69,13 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
         ));
     }
 
-    // Block private/reserved IPs
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_ip(ip)
+    // Block private/reserved IPs (strip brackets for IPv6 literals like [::1])
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare_ip.parse::<IpAddr>()
+        && validation::is_private_ip(ip)
     {
         return Err(ApiError::BadRequest(
             "webhook URL must not target private/reserved IP addresses".into(),
@@ -79,22 +83,6 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
     }
 
     Ok(())
-}
-
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()          // 127.0.0.0/8
-                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local() // 169.254/16
-                || v4.is_broadcast()  // 255.255.255.255
-                || v4.is_unspecified() // 0.0.0.0
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()          // ::1
-                || v6.is_unspecified() // ::
-        }
-    }
 }
 // ---------------------------------------------------------------------------
 // Types

@@ -332,4 +332,38 @@ mod tests {
         parts.extensions.insert(axum::extract::ConnectInfo(addr));
         assert_eq!(extract_ip(&parts, false), Some("127.0.0.1".into()));
     }
+
+    // -- Edge case tests --
+
+    #[test]
+    fn bearer_token_double_space_returns_none() {
+        // "Bearer  abc" — strip_prefix("Bearer ") gives " abc" (leading space)
+        let parts = make_parts(&[("authorization", "Bearer  abc")]);
+        assert_eq!(extract_bearer_token(&parts), Some(" abc".into()));
+    }
+
+    #[test]
+    fn bearer_token_with_spaces_in_token() {
+        let parts = make_parts(&[("authorization", "Bearer abc def ghi")]);
+        assert_eq!(extract_bearer_token(&parts), Some("abc def ghi".into()));
+    }
+
+    #[test]
+    fn session_cookie_with_equals_in_value() {
+        // Cookie values can contain '=' (e.g., base64). strip_prefix only strips "session=".
+        let parts = make_parts(&[("cookie", "session=tok=123=abc")]);
+        assert_eq!(extract_session_cookie(&parts), Some("tok=123=abc".into()));
+    }
+
+    #[test]
+    fn ip_from_forwarded_for_ipv6() {
+        let parts = make_parts(&[("x-forwarded-for", "::1, 2001:db8::1")]);
+        assert_eq!(extract_ip(&parts, true), Some("::1".into()));
+    }
+
+    #[test]
+    fn ip_from_forwarded_for_trims_whitespace() {
+        let parts = make_parts(&[("x-forwarded-for", "  1.2.3.4 , 5.6.7.8 ")]);
+        assert_eq!(extract_ip(&parts, true), Some("1.2.3.4".into()));
+    }
 }

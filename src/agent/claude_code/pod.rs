@@ -74,6 +74,8 @@ fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> 
         "stream-json".to_owned(),
         "--permission-mode".to_owned(),
         "auto-accept-only".to_owned(),
+        "--mcp-config".to_owned(),
+        "/tmp/mcp-config.json".to_owned(),
     ];
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
@@ -92,6 +94,8 @@ fn build_env_vars(
     session_id: uuid::Uuid,
     branch: &str,
 ) -> Vec<EnvVar> {
+    let role = params.config.role.as_deref().unwrap_or("dev");
+
     vec![
         EnvVar {
             name: "ANTHROPIC_API_KEY".into(),
@@ -109,6 +113,8 @@ fn build_env_vars(
         env_var("PLATFORM_API_TOKEN", params.agent_api_token),
         env_var("PLATFORM_API_URL", params.platform_api_url),
         env_var("BRANCH", branch),
+        env_var("PROJECT_ID", &params.session.project_id.to_string()),
+        env_var("AGENT_ROLE", role),
     ]
 }
 
@@ -308,6 +314,49 @@ mod tests {
         assert_eq!(get("PLATFORM_API_TOKEN"), Some("plat_api_xyz"));
         assert_eq!(get("PLATFORM_API_URL"), Some("http://platform:8080"));
         assert_eq!(get("BRANCH"), Some("agent/12345678"));
+        assert_eq!(get("PROJECT_ID"), Some(&*session.project_id.to_string()));
+        assert_eq!(get("AGENT_ROLE"), Some("dev"));
+    }
+
+    #[test]
+    fn agent_role_from_config() {
+        let session = test_session();
+        let config = ProviderConfig {
+            role: Some("ops".into()),
+            ..Default::default()
+        };
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let role = env
+            .iter()
+            .find(|e| e.name == "AGENT_ROLE")
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(role, Some("ops"));
+    }
+
+    #[test]
+    fn mcp_config_in_claude_args() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+        });
+        let spec = pod.spec.unwrap();
+        let args = spec.containers[0].args.as_ref().unwrap();
+        assert!(args.contains(&"--mcp-config".to_owned()));
+        assert!(args.contains(&"/tmp/mcp-config.json".to_owned()));
     }
 
     #[test]
@@ -316,6 +365,7 @@ mod tests {
         let config = ProviderConfig {
             model: Some("claude-sonnet-4-5-20250929".into()),
             max_turns: Some(25),
+            ..Default::default()
         };
         let pod = build_agent_pod(&PodBuildParams {
             session: &session,

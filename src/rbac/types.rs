@@ -129,4 +129,50 @@ mod tests {
         let parsed: Permission = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, perm);
     }
+
+    #[test]
+    fn serde_roundtrip_all_permissions() {
+        for perm in ALL_PERMISSIONS {
+            let json = serde_json::to_string(perm).unwrap();
+            let parsed: Permission = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                *perm,
+                parsed,
+                "serde roundtrip failed for {}",
+                perm.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        for perm in ALL_PERMISSIONS {
+            assert_eq!(perm.to_string(), perm.as_str());
+        }
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_permission() -> impl Strategy<Value = Permission> {
+            (0..ALL_PERMISSIONS.len()).prop_map(|i| ALL_PERMISSIONS[i])
+        }
+
+        proptest! {
+            #[test]
+            fn permission_as_str_from_str_roundtrip(perm in arb_permission()) {
+                let s = perm.as_str();
+                let parsed: Permission = s.parse().unwrap();
+                prop_assert_eq!(perm, parsed);
+            }
+
+            #[test]
+            fn permission_serde_roundtrip(perm in arb_permission()) {
+                let json = serde_json::to_string(&perm).unwrap();
+                let parsed: Permission = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(perm, parsed);
+            }
+        }
+    }
 }

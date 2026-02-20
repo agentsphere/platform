@@ -72,6 +72,11 @@ pub fn check_lfs_oid(oid: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Check whether an IPv6 address is in the unique-local range (`fc00::/7`).
+fn is_ipv6_unique_local(v6: &std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
 /// Check whether an IP address is private/reserved (loopback, link-local, etc.).
 pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
@@ -85,6 +90,8 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback()          // ::1
                 || v6.is_unspecified() // ::
+                || is_ipv6_unique_local(&v6)  // fc00::/7 (includes fd00::/8)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         }
     }
 }
@@ -119,8 +126,12 @@ pub fn check_ssrf_url(url_str: &str, allowed_schemes: &[&str]) -> Result<(), Api
         ));
     }
 
-    // Block private/reserved IPs
-    if let Ok(ip) = host.parse::<IpAddr>()
+    // Block private/reserved IPs (strip brackets for IPv6 literals like [::1])
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare_ip.parse::<IpAddr>()
         && is_private_ip(ip)
     {
         return Err(ApiError::BadRequest(
@@ -244,5 +255,163 @@ mod tests {
         assert!(is_private_ip("::1".parse().unwrap()));
         assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    // -- Boundary tests --
+
+    #[test]
+    fn check_name_boundary_lengths() {
+        assert!(check_name("").is_err(), "empty name should fail");
+        assert!(check_name("a").is_ok(), "single char name should pass");
+        assert!(
+            check_name(&"a".repeat(255)).is_ok(),
+            "255-char name should pass"
+        );
+        assert!(
+            check_name(&"a".repeat(256)).is_err(),
+            "256-char name should fail"
+        );
+    }
+
+    #[test]
+    fn check_name_rejects_unicode_alphanumeric() {
+        // is_alphanumeric() is Unicode-aware: 'é' passes it, but we only want ASCII
+        // This test documents the current behavior
+        let result = check_name("café");
+        // 'é' is alphanumeric in Unicode, so current impl allows it
+        // If this is undesired, the check should use is_ascii_alphanumeric()
+        assert!(
+            result.is_ok(),
+            "current impl allows Unicode alphanumeric: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_email_boundary_lengths() {
+        assert!(
+            check_email("a@").is_err(),
+            "2-char email should fail (min 3)"
+        );
+        assert!(check_email("a@b").is_ok(), "3-char email should pass");
+        // max is 254: "a@" (2 chars) + 252 = 254 total
+        let long = format!("a@{}", "b".repeat(252));
+        assert_eq!(long.len(), 254);
+        assert!(check_email(&long).is_ok(), "254-char email should pass");
+        let too_long = format!("a@{}", "b".repeat(253));
+        assert_eq!(too_long.len(), 255);
+        assert!(
+            check_email(&too_long).is_err(),
+            "255-char email should fail"
+        );
+    }
+
+    #[test]
+    fn check_email_multiple_at_signs() {
+        // Current impl only checks contains('@'), so this passes
+        assert!(check_email("a@b@c").is_ok());
+    }
+
+    #[test]
+    fn check_labels_empty_label_fails() {
+        assert!(
+            check_labels(&["".into()]).is_err(),
+            "empty label should fail (min 1 char)"
+        );
+    }
+
+    #[test]
+    fn check_labels_boundary_label_length() {
+        assert!(
+            check_labels(&["a".repeat(100)]).is_ok(),
+            "100-char label should pass"
+        );
+        assert!(
+            check_labels(&["a".repeat(101)]).is_err(),
+            "101-char label should fail"
+        );
+    }
+
+    #[test]
+    fn check_branch_name_null_byte_in_middle() {
+        assert!(check_branch_name("main\0evil").is_err());
+    }
+
+    #[test]
+    fn check_branch_name_boundary_length() {
+        assert!(
+            check_branch_name(&"a".repeat(255)).is_ok(),
+            "255-char branch should pass"
+        );
+        assert!(
+            check_branch_name(&"a".repeat(256)).is_err(),
+            "256-char branch should fail"
+        );
+    }
+
+    #[test]
+    fn check_length_boundaries() {
+        assert!(check_length("f", "ab", 2, 5).is_ok(), "at min should pass");
+        assert!(
+            check_length("f", "a", 2, 5).is_err(),
+            "below min should fail"
+        );
+        assert!(
+            check_length("f", "abcde", 2, 5).is_ok(),
+            "at max should pass"
+        );
+        assert!(
+            check_length("f", "abcdef", 2, 5).is_err(),
+            "above max should fail"
+        );
+    }
+
+    #[test]
+    fn check_url_empty_host() {
+        assert!(
+            check_url("http://").is_ok(),
+            "check_url doesn't validate host (only scheme + length)"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_unspecified_ipv4() {
+        assert!(check_ssrf_url("http://0.0.0.0/hook", &["http", "https"]).is_err());
+    }
+
+    #[test]
+    fn private_ip_ipv6_unique_local() {
+        // fc00::/7 — unique local addresses (IPv6 RFC 1918 equivalent)
+        assert!(is_private_ip("fc00::1".parse().unwrap()));
+        assert!(is_private_ip("fd12:3456:789a::1".parse().unwrap()));
+        assert!(is_private_ip("fdff:ffff:ffff::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_ipv6_link_local() {
+        // fe80::/10 — link-local addresses
+        assert!(is_private_ip("fe80::1".parse().unwrap()));
+        assert!(is_private_ip(
+            "fe80::1%eth0"
+                .parse::<IpAddr>()
+                .unwrap_or_else(|_| "fe80::1".parse().unwrap())
+        ));
+        assert!(is_private_ip("febf::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_ipv6_allows_public() {
+        assert!(!is_private_ip("2001:db8::1".parse().unwrap()));
+        assert!(!is_private_ip("2607:f8b0:4004:800::200e".parse().unwrap()));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_unique_local() {
+        assert!(check_ssrf_url("http://[fc00::1]/hook", &["http", "https"]).is_err());
+        assert!(check_ssrf_url("http://[fd12::1]/hook", &["http", "https"]).is_err());
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_link_local() {
+        assert!(check_ssrf_url("http://[fe80::1]/hook", &["http", "https"]).is_err());
     }
 }

@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install MCP servers and dependencies
+COPY mcp/ /usr/local/lib/mcp/
+RUN cd /usr/local/lib/mcp && npm install --production
+
 RUN useradd -m -s /bin/bash agent
 USER agent
 WORKDIR /workspace

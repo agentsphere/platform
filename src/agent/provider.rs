@@ -39,6 +39,10 @@ pub struct ProviderConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub max_turns: Option<i32>,
+    /// Agent role controls which MCP servers are loaded.
+    /// One of: "dev" (default), "ops", "admin", "ui".
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,15 +105,18 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str("{}").unwrap();
         assert!(config.model.is_none());
         assert!(config.max_turns.is_none());
+        assert!(config.role.is_none());
     }
 
     #[test]
     fn provider_config_full() {
-        let config: ProviderConfig =
-            serde_json::from_str(r#"{"model":"claude-sonnet-4-5-20250929","max_turns":10}"#)
-                .unwrap();
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4-5-20250929","max_turns":10,"role":"ops"}"#,
+        )
+        .unwrap();
         assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
         assert_eq!(config.max_turns, Some(10));
+        assert_eq!(config.role.as_deref(), Some("ops"));
     }
 
     #[test]

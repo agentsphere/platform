@@ -145,19 +145,30 @@ mod tests {
     }
 
     #[test]
-    fn default_smtp_port() {
-        // Only reliable when PLATFORM_SMTP_PORT is unset (typical in test/CI)
-        let config = Config::load();
-        if env::var("PLATFORM_SMTP_PORT").is_err() {
-            assert_eq!(config.smtp_port, 587);
-        }
+    fn test_default_smtp_port() {
+        let config = Config::test_default();
+        assert_eq!(config.smtp_port, 587);
     }
 
     #[test]
-    fn default_pipeline_namespace() {
-        let config = Config::load();
-        if env::var("PLATFORM_PIPELINE_NAMESPACE").is_err() {
-            assert_eq!(config.pipeline_namespace, "platform-pipelines");
-        }
+    fn test_default_pipeline_namespace() {
+        let config = Config::test_default();
+        assert_eq!(config.pipeline_namespace, "test-pipelines");
+    }
+
+    #[test]
+    fn test_default_has_dev_mode() {
+        let config = Config::test_default();
+        assert!(config.dev_mode);
+        assert!(!config.secure_cookies);
+        assert!(!config.trust_proxy_headers);
+    }
+
+    #[test]
+    fn parse_cors_origins_empty_produces_single_empty_string() {
+        // Documenting current behavior: empty string produces vec![""]
+        // This may be a bug — callers should handle empty CORS gracefully
+        let result = parse_cors_origins("");
+        assert_eq!(result, vec![""]);
     }
 }

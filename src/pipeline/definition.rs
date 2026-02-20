@@ -329,4 +329,108 @@ pipeline:
     fn matches_mr_no_trigger() {
         assert!(matches_mr(None, "any-action"));
     }
+
+    // -- Pattern matching edge cases --
+
+    #[test]
+    fn match_pattern_exact_no_wildcard() {
+        assert!(match_pattern("main", "main"));
+        assert!(!match_pattern("main", "develop"));
+    }
+
+    #[test]
+    fn match_pattern_prefix_wildcard() {
+        // "*-release" should match "v1-release"
+        assert!(match_pattern("*-release", "v1-release"));
+        assert!(match_pattern("*-release", "hotfix-release"));
+        assert!(!match_pattern("*-release", "release-v1"));
+    }
+
+    #[test]
+    fn match_pattern_suffix_wildcard() {
+        assert!(match_pattern("release/*", "release/v1"));
+        assert!(match_pattern("release/*", "release/"));
+        assert!(!match_pattern("release/*", "hotfix/v1"));
+    }
+
+    #[test]
+    fn match_pattern_multi_wildcard_falls_to_exact() {
+        // Complex patterns with 2+ wildcards fall to exact match
+        assert!(
+            !match_pattern("a/*/b/*", "a/x/b/y"),
+            "multi-wildcard falls to exact match"
+        );
+        assert!(
+            match_pattern("a/*/b/*", "a/*/b/*"),
+            "multi-wildcard matches itself exactly"
+        );
+    }
+
+    #[test]
+    fn matches_push_empty_branches_matches_all() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    push:
+      branches: []
+"#;
+        let def = parse(yaml).unwrap();
+        assert!(matches_push(def.trigger.as_ref(), "any-branch"));
+    }
+
+    #[test]
+    fn matches_mr_empty_actions_matches_all() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    mr:
+      actions: []
+"#;
+        let def = parse(yaml).unwrap();
+        assert!(matches_mr(def.trigger.as_ref(), "any-action"));
+    }
+
+    // -- Deep field verification --
+
+    #[test]
+    fn parsed_step_environment_values() {
+        let def = parse(VALID_YAML).unwrap();
+        assert_eq!(
+            def.steps[1].environment.get("DOCKER_CONFIG"),
+            Some(&"/kaniko/.docker".to_owned()),
+        );
+    }
+
+    #[test]
+    fn parsed_step_commands_content() {
+        let def = parse(VALID_YAML).unwrap();
+        assert_eq!(def.steps[0].commands[0], "cargo nextest run");
+    }
+
+    #[test]
+    fn parsed_artifact_fields() {
+        let def = parse(VALID_YAML).unwrap();
+        assert_eq!(def.artifacts[0].path, "target/nextest/");
+        assert_eq!(def.artifacts[0].expires.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn parsed_trigger_push_branches() {
+        let def = parse(VALID_YAML).unwrap();
+        let push = def.trigger.as_ref().unwrap().push.as_ref().unwrap();
+        assert_eq!(push.branches, vec!["main", "develop"]);
+    }
+
+    #[test]
+    fn parsed_trigger_mr_actions() {
+        let def = parse(VALID_YAML).unwrap();
+        let mr = def.trigger.as_ref().unwrap().mr.as_ref().unwrap();
+        assert_eq!(mr.actions, vec!["opened", "synchronized"]);
+    }
 }

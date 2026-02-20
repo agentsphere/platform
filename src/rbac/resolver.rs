@@ -190,10 +190,27 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_deterministic() {
-        let user = Uuid::nil();
+    fn cache_key_different_users_differ() {
+        let user_a = Uuid::nil();
+        let user_b = Uuid::max();
         let project = Some(Uuid::nil());
-        assert_eq!(cache_key(user, project), cache_key(user, project));
+        assert_ne!(
+            cache_key(user_a, project),
+            cache_key(user_b, project),
+            "different users must produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_different_projects_differ() {
+        let user = Uuid::nil();
+        let project_a = Some(Uuid::nil());
+        let project_b = Some(Uuid::max());
+        assert_ne!(
+            cache_key(user, project_a),
+            cache_key(user, project_b),
+            "different projects must produce different cache keys"
+        );
     }
 
     // -- scope_allows --

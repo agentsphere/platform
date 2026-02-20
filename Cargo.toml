@@ -110,6 +110,7 @@ tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", features = ["full"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
+rstest = "0.25"
 
 [lints.rust]
 unsafe_code = "forbid"
