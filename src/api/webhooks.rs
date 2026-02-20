@@ -22,7 +22,7 @@ use crate::store::AppState;
 use crate::validation;
 
 /// Shared HTTP client for webhook dispatch (with timeouts).
-static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
@@ -32,7 +32,7 @@ static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 /// Concurrency limiter for webhook dispatch (max 50 concurrent deliveries).
-static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
+pub(crate) static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
 
 // ---------------------------------------------------------------------------
 // SSRF protection
@@ -40,7 +40,7 @@ static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(
 
 /// Validate a webhook URL to block SSRF attacks.
 /// Rejects private/loopback IPs, link-local, metadata endpoints, and non-HTTP schemes.
-fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
     let parsed =
         url::Url::parse(url_str).map_err(|_| ApiError::BadRequest("invalid URL".into()))?;
 
@@ -490,7 +490,7 @@ pub async fn fire_webhooks(
     }
 }
 
-async fn dispatch_single(url: &str, secret: Option<&str>, payload: &serde_json::Value) {
+pub(crate) async fn dispatch_single(url: &str, secret: Option<&str>, payload: &serde_json::Value) {
     // Acquire semaphore permit (concurrency limit)
     let Ok(_permit) = WEBHOOK_SEMAPHORE.try_acquire() else {
         tracing::warn!(url, "webhook dispatch dropped: concurrency limit reached");

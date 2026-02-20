@@ -19,5 +19,7 @@ pub mod pipeline;
 pub mod deployer {}
 pub mod agent {}
 pub mod observe {}
-pub mod secrets {}
-pub mod notify {}
+
+// Phase 09 — Secrets Engine & Notifications
+pub mod notify;
+pub mod secrets;

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!\"\n        FROM notifications\n        WHERE user_id = $1\n          AND ($2::text IS NULL OR status = $2)\n          AND ($3::text IS NULL OR notification_type = $3)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "b2538826aa3cf527d0c947da3f6846371105f5088d8d61648203b1f7bd43d4ad"
+}

@@ -15,6 +15,8 @@ pub struct Config {
     pub smtp_host: Option<String>,
     pub smtp_port: u16,
     pub smtp_from: String,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
     pub admin_password: Option<String>,
     pub pipeline_namespace: String,
     pub registry_url: Option<String>,
@@ -45,6 +47,8 @@ impl Config {
                 .unwrap_or(587),
             smtp_from: env::var("PLATFORM_SMTP_FROM")
                 .unwrap_or_else(|_| "platform@localhost".into()),
+            smtp_username: env::var("PLATFORM_SMTP_USERNAME").ok(),
+            smtp_password: env::var("PLATFORM_SMTP_PASSWORD").ok(),
             admin_password: env::var("PLATFORM_ADMIN_PASSWORD").ok(),
             pipeline_namespace: env::var("PLATFORM_PIPELINE_NAMESPACE")
                 .unwrap_or_else(|_| "platform-pipelines".into()),
