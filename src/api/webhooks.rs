@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use axum::extract::{Path, State};
@@ -21,7 +22,7 @@ use crate::store::AppState;
 use crate::validation;
 
 /// Shared HTTP client for webhook dispatch (with timeouts).
-static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
@@ -31,8 +32,69 @@ static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 /// Concurrency limiter for webhook dispatch (max 50 concurrent deliveries).
-static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
+pub(crate) static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
 
+// ---------------------------------------------------------------------------
+// SSRF protection
+// ---------------------------------------------------------------------------
+
+/// Validate a webhook URL to block SSRF attacks.
+/// Rejects private/loopback IPs, link-local, metadata endpoints, and non-HTTP schemes.
+pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
+    let parsed =
+        url::Url::parse(url_str).map_err(|_| ApiError::BadRequest("invalid URL".into()))?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest(
+            "webhook URL must use http or https".into(),
+        ));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("webhook URL must have a host".into()))?;
+
+    // Block well-known dangerous hostnames
+    let blocked_hosts = [
+        "localhost",
+        "169.254.169.254",
+        "metadata.google.internal",
+        "[::1]",
+    ];
+    let host_lower = host.to_lowercase();
+    if blocked_hosts.iter().any(|b| host_lower == *b) {
+        return Err(ApiError::BadRequest(
+            "webhook URL must not target internal/metadata endpoints".into(),
+        ));
+    }
+
+    // Block private/reserved IPs
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err(ApiError::BadRequest(
+            "webhook URL must not target private/reserved IP addresses".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254/16
+                || v4.is_broadcast()  // 255.255.255.255
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()          // ::1
+                || v6.is_unspecified() // ::
+        }
+    }
+}
 async fn require_project_write(
     state: &AppState,
     auth: &AuthUser,
@@ -427,7 +489,7 @@ pub async fn fire_webhooks(
     }
 }
 
-async fn dispatch_single(url: &str, secret: Option<&str>, payload: &serde_json::Value) {
+pub(crate) async fn dispatch_single(url: &str, secret: Option<&str>, payload: &serde_json::Value) {
     // Acquire semaphore permit (concurrency limit)
     let Ok(_permit) = WEBHOOK_SEMAPHORE.try_acquire() else {
         tracing::warn!(url, "webhook dispatch dropped: concurrency limit reached");

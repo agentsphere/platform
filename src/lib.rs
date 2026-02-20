@@ -27,6 +27,6 @@ pub mod observe;
 // Phase 10 — Web UI
 pub mod ui;
 
-// Module stubs — populated in later phases
-pub mod secrets {}
-pub mod notify {}
+// Phase 09 — Secrets Engine & Notifications
+pub mod notify;
+pub mod secrets;

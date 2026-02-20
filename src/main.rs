@@ -37,9 +37,9 @@ mod observe;
 // Phase 10 — Web UI
 mod ui;
 
-// Module stubs — populated in later phases
-mod secrets {}
-mod notify {}
+// Phase 09 — Secrets Engine & Notifications
+mod notify;
+mod secrets;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,6 +49,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = config::Config::load();
+
+    // Validate master key for secrets engine
+    if let Some(ref mk) = cfg.master_key {
+        secrets::engine::parse_master_key(mk).expect("PLATFORM_MASTER_KEY is invalid");
+        tracing::info!("secrets engine master key loaded");
+    } else if cfg.dev_mode {
+        tracing::warn!(
+            "PLATFORM_MASTER_KEY not set — using deterministic dev key (NOT for production)"
+        );
+    } else {
+        tracing::warn!("PLATFORM_MASTER_KEY not set — secrets engine disabled");
+    }
 
     // Connect to Postgres and run migrations
     let pool = store::pool::connect(&cfg.database_url).await?;
