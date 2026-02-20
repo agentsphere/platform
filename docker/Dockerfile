@@ -15,6 +15,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Build deps + binary
 FROM rust:1.88-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
