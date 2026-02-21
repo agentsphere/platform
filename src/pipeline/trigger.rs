@@ -233,13 +233,17 @@ async fn get_ref_sha(repo_path: &Path, git_ref: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Valkey notification
+// Executor notification
 // ---------------------------------------------------------------------------
 
 /// Notify the executor that a pipeline is ready to run.
-pub async fn notify_executor(valkey: &fred::clients::Pool, pipeline_id: Uuid) {
+///
+/// Uses an in-process `tokio::sync::Notify` for immediate wake-up,
+/// plus a Valkey pub/sub message for observability / future multi-instance support.
+pub async fn notify_executor(state: &crate::store::AppState, pipeline_id: Uuid) {
+    state.pipeline_notify.notify_one();
     let msg = pipeline_id.to_string();
-    if let Err(e) = crate::store::valkey::publish(valkey, "pipeline:run", &msg).await {
+    if let Err(e) = crate::store::valkey::publish(&state.valkey, "pipeline:run", &msg).await {
         tracing::warn!(error = %e, %pipeline_id, "failed to notify executor via valkey");
     }
 }

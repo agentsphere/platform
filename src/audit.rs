@@ -1,7 +1,6 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[allow(dead_code)] // ip_addr stored for future ipnetwork support
 pub struct AuditEntry<'a> {
     pub actor_id: Uuid,
     pub actor_name: &'a str,
@@ -14,12 +13,23 @@ pub struct AuditEntry<'a> {
 }
 
 pub async fn write_audit(pool: &PgPool, entry: &AuditEntry<'_>) {
-    // Note: ip_addr is INET in postgres; we skip binding it to avoid needing the
-    // ipnetwork crate. The column stays NULL. A future pass can add ipnetwork to Cargo.toml.
-    let _ = sqlx::query!(
+    if let Err(e) = write_audit_inner(pool, entry).await {
+        tracing::warn!(
+            error = %e,
+            action = entry.action,
+            resource = entry.resource,
+            "failed to write audit log entry"
+        );
+    }
+}
+
+async fn write_audit_inner(pool: &PgPool, entry: &AuditEntry<'_>) -> Result<(), sqlx::Error> {
+    let ip: Option<ipnetwork::IpNetwork> = entry.ip_addr.and_then(|s| s.parse().ok());
+
+    sqlx::query!(
         r#"
-        INSERT INTO audit_log (actor_id, actor_name, action, resource, resource_id, project_id, detail)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO audit_log (actor_id, actor_name, action, resource, resource_id, project_id, detail, ip_addr)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
         entry.actor_id,
         entry.actor_name,
@@ -28,7 +38,10 @@ pub async fn write_audit(pool: &PgPool, entry: &AuditEntry<'_>) {
         entry.resource_id,
         entry.project_id,
         entry.detail,
+        ip as Option<ipnetwork::IpNetwork>,
     )
     .execute(pool)
-    .await;
+    .await?;
+
+    Ok(())
 }

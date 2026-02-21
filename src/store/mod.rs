@@ -17,4 +17,6 @@ pub struct AppState {
     pub kube: kube::Client,
     pub config: Arc<Config>,
     pub webauthn: Arc<webauthn_rs::prelude::Webauthn>,
+    /// Notify the pipeline executor that a new pipeline is ready.
+    pub pipeline_notify: Arc<tokio::sync::Notify>,
 }

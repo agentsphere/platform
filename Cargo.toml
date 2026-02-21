@@ -30,7 +30,11 @@ sqlx = { version = "0.8", features = [
     "chrono",
     "json",
     "migrate",
+    "ipnetwork",
 ] }
+
+# IP address types for INET columns
+ipnetwork = "0.20"
 
 # Kubernetes
 kube = { version = "3", features = ["runtime", "client", "ws"] }
@@ -111,6 +115,8 @@ hyper = { version = "1", features = ["full"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 rstest = "0.25"
+wiremock = "0.6"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

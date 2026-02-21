@@ -1,8 +1,17 @@
+import { useState } from 'preact/hooks';
 import { useAuth } from '../lib/auth';
+import { NotificationBell } from './NotificationBell';
 
 const NAV = [
   { href: '/', label: 'Dashboard' },
   { href: '/projects', label: 'Projects' },
+];
+
+const OBSERVE_NAV = [
+  { href: '/observe/logs', label: 'Logs' },
+  { href: '/observe/traces', label: 'Traces' },
+  { href: '/observe/metrics', label: 'Metrics' },
+  { href: '/observe/alerts', label: 'Alerts' },
 ];
 
 const ADMIN_NAV = [
@@ -27,13 +36,24 @@ function NavLink({ href, label }: { href: string; label: string }) {
 
 export function Layout({ children }: { children: any }) {
   const { user, logout } = useAuth();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   return (
     <div class="layout">
-      <nav class="sidebar">
+      <button class="sidebar-toggle" onClick={() => setSidebarOpen(!sidebarOpen)}
+        aria-label="Toggle sidebar">
+        <span class="sidebar-toggle-bar" />
+        <span class="sidebar-toggle-bar" />
+        <span class="sidebar-toggle-bar" />
+      </button>
+      <nav class={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
         <div class="sidebar-brand">Platform</div>
         <div class="sidebar-section">
           {NAV.map(n => <NavLink key={n.href} href={n.href} label={n.label} />)}
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-label">Observe</div>
+          {OBSERVE_NAV.map(n => <NavLink key={n.href} href={n.href} label={n.label} />)}
         </div>
         <div class="sidebar-section">
           <div class="sidebar-label">Admin</div>
@@ -45,8 +65,10 @@ export function Layout({ children }: { children: any }) {
         </div>
         <div class="sidebar-spacer" />
       </nav>
+      {sidebarOpen && <div class="sidebar-overlay" onClick={() => setSidebarOpen(false)} />}
       <div class="main">
         <header class="topbar">
+          <NotificationBell />
           <span class="topbar-user">{user?.display_name || user?.name}</span>
           <button class="btn btn-ghost btn-sm" onClick={() => logout().then(() => { window.location.href = '/login'; })}>
             Logout

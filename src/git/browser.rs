@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -6,6 +7,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
@@ -202,16 +205,19 @@ async fn tree(
         format!("{}:{clean_path}", query.git_ref)
     };
 
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
-        .arg("ls-tree")
-        .arg("-l") // include size
-        .arg("--")
-        .arg(&treeish)
-        .output()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git ls-tree: {e}")))?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("ls-tree")
+            .arg("-l") // include size
+            .arg("--")
+            .arg(&treeish)
+            .output()
+    })
+    .await
+    .map_err(|_| ApiError::Internal(anyhow::anyhow!("git ls-tree timed out after 30s")))?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git ls-tree: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -249,15 +255,18 @@ async fn blob(
     let clean_path = query.path.trim_start_matches('/');
     let object_spec = format!("{}:{clean_path}", query.git_ref);
 
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
-        .arg("show")
-        .arg("--")
-        .arg(&object_spec)
-        .output()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git show: {e}")))?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("show")
+            .arg("--")
+            .arg(&object_spec)
+            .output()
+    })
+    .await
+    .map_err(|_| ApiError::Internal(anyhow::anyhow!("git show timed out after 30s")))?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git show: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -302,15 +311,20 @@ async fn branches(
 
     let (repo_path, _default_branch) = get_repo_path(&state.pool, &state.config, id).await?;
 
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
-        .arg("for-each-ref")
-        .arg("--format=%(refname:short)\t%(objectname:short)\t%(creatordate:iso-strict)")
-        .arg("refs/heads/")
-        .output()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git for-each-ref: {e}")))?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("for-each-ref")
+            .arg("--format=%(refname:short)\t%(objectname:short)\t%(creatordate:iso-strict)")
+            .arg("refs/heads/")
+            .output()
+    })
+    .await
+    .map_err(|_| {
+        ApiError::Internal(anyhow::anyhow!("git for-each-ref timed out after 30s"))
+    })?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git for-each-ref: {e}")))?;
 
     if !output.status.success() {
         // Empty repo — no branches yet
@@ -338,17 +352,20 @@ async fn commits(
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
-        .arg("log")
-        .arg(format!("-n{limit}"))
-        .arg("--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI")
-        .arg("--")
-        .arg(&query.git_ref)
-        .output()
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git log: {e}")))?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("log")
+            .arg(format!("-n{limit}"))
+            .arg("--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI")
+            .arg("--")
+            .arg(&query.git_ref)
+            .output()
+    })
+    .await
+    .map_err(|_| ApiError::Internal(anyhow::anyhow!("git log timed out after 30s")))?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git log: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

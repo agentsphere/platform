@@ -141,7 +141,7 @@ async fn trigger_pipeline(
             .map_err(ApiError::from)?;
 
     // Notify executor
-    crate::pipeline::trigger::notify_executor(&state.valkey, pipeline_id).await;
+    crate::pipeline::trigger::notify_executor(&state, pipeline_id).await;
 
     write_audit(
         &state.pool,
@@ -394,10 +394,17 @@ async fn stream_live_logs(
             .header("content-type", "text/plain; charset=utf-8")
             .body(Body::from(logs))
             .unwrap()),
-        Err(_) => Ok(Response::builder()
+        Err(kube::Error::Api(err_resp)) if err_resp.code == 404 => Ok(Response::builder()
             .header("content-type", "text/plain; charset=utf-8")
-            .body(Body::from("Logs not yet available"))
+            .body(Body::from("Logs not yet available — pod not started"))
             .unwrap()),
+        Err(e) => {
+            tracing::warn!(error = %e, %pipeline_id, step = step_name, "failed to stream pod logs");
+            Ok(Response::builder()
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from("Logs temporarily unavailable"))
+                .unwrap())
+        }
     }
 }
 

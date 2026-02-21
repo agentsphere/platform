@@ -7,7 +7,18 @@ use uuid::Uuid;
 use crate::rbac::types::Permission;
 use crate::store::valkey;
 
-const CACHE_TTL_SECS: i64 = 300; // 5 minutes
+static CACHE_TTL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set the permission cache TTL (seconds). Call once at startup.
+pub fn set_cache_ttl(ttl: u64) {
+    CACHE_TTL.set(ttl).ok();
+}
+
+fn cache_ttl() -> i64 {
+    #[allow(clippy::cast_possible_wrap)]
+    let ttl = *CACHE_TTL.get().unwrap_or(&300) as i64;
+    ttl
+}
 
 fn cache_key(user_id: Uuid, project_id: Option<Uuid>) -> String {
     match project_id {
@@ -101,7 +112,7 @@ pub async fn effective_permissions(
 
     // Cache result
     let cache_strings: Vec<String> = perms.iter().map(|p| p.as_str().to_owned()).collect();
-    let _ = valkey::set_cached(valkey, &key, &cache_strings, CACHE_TTL_SECS).await;
+    let _ = valkey::set_cached(valkey, &key, &cache_strings, cache_ttl()).await;
 
     Ok(perms)
 }

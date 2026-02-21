@@ -81,7 +81,7 @@ pub async fn post_receive(state: &AppState, params: &PostReceiveParams) -> Resul
 
     match crate::pipeline::trigger::on_push(&state.pool, &trigger_params).await {
         Ok(Some(pipeline_id)) => {
-            crate::pipeline::trigger::notify_executor(&state.valkey, pipeline_id).await;
+            crate::pipeline::trigger::notify_executor(&state, pipeline_id).await;
         }
         Ok(None) => {}
         Err(e) => {

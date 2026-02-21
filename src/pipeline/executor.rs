@@ -22,16 +22,26 @@ use super::error::PipelineError;
 pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) {
     tracing::info!("pipeline executor started");
 
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 tracing::info!("pipeline executor shutting down");
                 break;
             }
-            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = interval.tick() => {
                 if let Err(e) = poll_pending(&state).await {
                     tracing::error!(error = %e, "error polling pending pipelines");
                 }
+            }
+            () = state.pipeline_notify.notified() => {
+                // Immediate poll on notification
+                if let Err(e) = poll_pending(&state).await {
+                    tracing::error!(error = %e, "error polling pending pipelines (notified)");
+                }
+                // Reset interval to avoid immediate double-poll
+                interval.reset();
             }
         }
     }

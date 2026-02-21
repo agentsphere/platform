@@ -1,14 +1,16 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, qs, type ListResponse } from '../lib/api';
-import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo } from '../lib/types';
+import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { Badge } from '../components/Badge';
+import { StatusDot } from '../components/StatusDot';
 import { Pagination } from '../components/Pagination';
 import { Modal } from '../components/Modal';
+import { Sessions } from './Sessions';
 
 interface Props { id?: string; tab?: string; }
 
-const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'webhooks', 'settings'];
+const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'webhooks', 'settings'];
 
 export function ProjectDetail({ id, tab }: Props) {
   const [project, setProject] = useState<Project | null>(null);
@@ -32,7 +34,7 @@ export function ProjectDetail({ id, tab }: Props) {
       <div class="tabs">
         {TABS.map(t => (
           <a key={t} class={`tab${currentTab === t ? ' active' : ''}`}
-            href={`/projects/${id}/${t}`}>{t === 'mrs' ? 'MRs' : t[0].toUpperCase() + t.slice(1)}</a>
+            href={`/projects/${id}/${t}`}>{t === 'mrs' ? 'MRs' : t === 'sessions' ? 'Sessions' : t[0].toUpperCase() + t.slice(1)}</a>
         ))}
       </div>
       {currentTab === 'files' && <FilesTab projectId={id!} defaultBranch={project.default_branch} />}
@@ -40,6 +42,7 @@ export function ProjectDetail({ id, tab }: Props) {
       {currentTab === 'mrs' && <MRsTab projectId={id!} />}
       {currentTab === 'builds' && <BuildsTab projectId={id!} />}
       {currentTab === 'deployments' && <DeploymentsTab projectId={id!} />}
+      {currentTab === 'sessions' && <Sessions projectId={id!} />}
       {currentTab === 'webhooks' && <WebhooksTab projectId={id!} />}
       {currentTab === 'settings' && <SettingsTab project={project} onUpdate={setProject} />}
     </div>
@@ -328,30 +331,169 @@ function BuildsTab({ projectId }: { projectId: string }) {
 
 function DeploymentsTab({ projectId }: { projectId: string }) {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [previews, setPreviews] = useState<PreviewDeployment[]>([]);
+  const [selectedEnv, setSelectedEnv] = useState<string | null>(null);
+  const [showRollback, setShowRollback] = useState(false);
+  const [rollbackImage, setRollbackImage] = useState('');
 
-  useEffect(() => {
+  const load = () => {
     api.get<ListResponse<Deployment>>(`/api/projects/${projectId}/deployments?limit=50`)
       .then(r => setDeployments(r.items)).catch(() => {});
+    api.get<ListResponse<PreviewDeployment>>(`/api/projects/${projectId}/previews?limit=50`)
+      .then(r => setPreviews(r.items)).catch(() => setPreviews([]));
+  };
+
+  useEffect(() => {
+    load();
+    const interval = setInterval(load, 10000);
+    return () => clearInterval(interval);
   }, [projectId]);
 
+  // Group deployments by environment
+  const envMap = new Map<string, Deployment[]>();
+  for (const d of deployments) {
+    const list = envMap.get(d.environment) || [];
+    list.push(d);
+    envMap.set(d.environment, list);
+  }
+
+  const envNames = [...envMap.keys()].sort((a, b) => {
+    const order: Record<string, number> = { production: 0, staging: 1, preview: 2 };
+    return (order[a] ?? 99) - (order[b] ?? 99);
+  });
+
+  const rollback = async () => {
+    if (!selectedEnv || !rollbackImage) return;
+    try {
+      await api.post(`/api/projects/${projectId}/deployments`, {
+        environment: selectedEnv,
+        image_ref: rollbackImage,
+      });
+      setShowRollback(false);
+      setRollbackImage('');
+      load();
+    } catch { /* ignore */ }
+  };
+
+  const deletePreview = async (previewId: string) => {
+    if (!confirm('Delete this preview environment?')) return;
+    await api.del(`/api/projects/${projectId}/previews/${previewId}`);
+    load();
+  };
+
+  const timeRemaining = (expiresAt: string): string => {
+    const ms = new Date(expiresAt).getTime() - Date.now();
+    if (ms <= 0) return 'Expired';
+    const hours = Math.floor(ms / 3600000);
+    if (hours > 0) return `${hours}h left`;
+    const mins = Math.floor(ms / 60000);
+    return `${mins}m left`;
+  };
+
   return (
-    <div class="card">
-      {deployments.length === 0 ? <div class="empty-state">No deployments</div> : (
-        <table class="table">
-          <thead><tr><th>Environment</th><th>Image</th><th>Desired</th><th>Current</th><th>Deployed</th></tr></thead>
-          <tbody>
-            {deployments.map(d => (
-              <tr key={d.id}>
-                <td><Badge status={d.environment} /></td>
-                <td class="mono text-xs truncate" style="max-width:200px">{d.image_ref}</td>
-                <td><Badge status={d.desired_status} /></td>
-                <td><Badge status={d.current_status} /></td>
-                <td class="text-muted text-sm">{d.deployed_at ? timeAgo(d.deployed_at) : '—'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div>
+      {/* Environment cards */}
+      <div class="env-cards mb-md">
+        {envNames.map(env => {
+          const deps = envMap.get(env) || [];
+          const latest = deps[0];
+          return (
+            <div key={env} class={`env-card ${selectedEnv === env ? 'env-card-selected' : ''}`}
+              onClick={() => setSelectedEnv(selectedEnv === env ? null : env)}>
+              <div class="env-card-name">{env}</div>
+              {latest && (
+                <div>
+                  <StatusDot status={latest.current_status} label={latest.current_status} />
+                  <div class="mono text-xs mt-sm truncate">{latest.image_ref}</div>
+                  <div class="text-muted text-xs mt-sm">
+                    {latest.deployed_at ? timeAgo(latest.deployed_at) : '--'}
+                  </div>
+                </div>
+              )}
+              {env !== 'preview' && latest && (
+                <button class="btn btn-sm mt-sm" onClick={(e) => {
+                  e.stopPropagation();
+                  setSelectedEnv(env);
+                  setShowRollback(true);
+                }}>Rollback</button>
+              )}
+            </div>
+          );
+        })}
+        {envNames.length === 0 && <div class="empty-state" style="width:100%">No deployments</div>}
+      </div>
+
+      {/* Deployment history for selected environment */}
+      {selectedEnv && (
+        <div class="card mb-md">
+          <div class="card-header">
+            <span class="card-title">Deployment History ({selectedEnv})</span>
+          </div>
+          <table class="table">
+            <thead><tr><th>Time</th><th>Image</th><th>Desired</th><th>Current</th><th>Deployed By</th></tr></thead>
+            <tbody>
+              {(envMap.get(selectedEnv) || []).map(d => (
+                <tr key={d.id}>
+                  <td class="text-muted text-sm">{d.deployed_at ? timeAgo(d.deployed_at) : '--'}</td>
+                  <td class="mono text-xs truncate" style="max-width:200px">{d.image_ref}</td>
+                  <td><Badge status={d.desired_status} /></td>
+                  <td><Badge status={d.current_status} /></td>
+                  <td class="text-sm">{d.deployed_by || '--'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
+
+      {/* Preview environments */}
+      {previews.length > 0 && (
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Active Previews</span>
+          </div>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Branch</th>
+                <th>Status</th>
+                <th>Image</th>
+                <th>Expires</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {previews.map(p => (
+                <tr key={p.id}>
+                  <td class="mono text-xs">{p.branch}</td>
+                  <td><StatusDot status={p.current_status} label={p.current_status} /></td>
+                  <td class="mono text-xs truncate" style="max-width:150px">{p.image_ref}</td>
+                  <td class="text-sm">{timeRemaining(p.expires_at)}</td>
+                  <td>
+                    <button class="btn btn-danger btn-sm" onClick={() => deletePreview(p.id)}>Delete</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Modal open={showRollback} onClose={() => setShowRollback(false)} title={`Rollback ${selectedEnv}`}>
+        <div class="form-group">
+          <label>Image to deploy</label>
+          <input class="input" value={rollbackImage}
+            placeholder="Enter image reference..."
+            onInput={(e) => setRollbackImage((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="text-sm text-muted mb-md">
+          This will deploy the specified image to the {selectedEnv} environment.
+        </div>
+        <div class="modal-actions">
+          <button class="btn" onClick={() => setShowRollback(false)}>Cancel</button>
+          <button class="btn btn-primary" onClick={rollback} disabled={!rollbackImage}>Deploy</button>
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -460,36 +602,140 @@ function SettingsTab({ project, onUpdate }: { project: Project; onUpdate: (p: Pr
   };
 
   return (
+    <div>
+      <div class="card mb-md">
+        <div class="card-title mb-md">Project Settings</div>
+        <form onSubmit={save}>
+          <div class="form-group">
+            <label>Display Name</label>
+            <input class="input" value={form.display_name}
+              onInput={(e) => setForm({ ...form, display_name: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <textarea class="input" value={form.description}
+              onInput={(e) => setForm({ ...form, description: (e.target as HTMLTextAreaElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Visibility</label>
+            <select class="input" value={form.visibility}
+              onChange={(e) => setForm({ ...form, visibility: (e.target as HTMLSelectElement).value })}>
+              <option value="private">Private</option>
+              <option value="internal">Internal</option>
+              <option value="public">Public</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Default Branch</label>
+            <input class="input" value={form.default_branch}
+              onInput={(e) => setForm({ ...form, default_branch: (e.target as HTMLInputElement).value })} />
+          </div>
+          {error && <div class="error-msg">{error}</div>}
+          {saved && <div style="color:var(--success);font-size:13px">Saved</div>}
+          <button type="submit" class="btn btn-primary mt-sm">Save Settings</button>
+        </form>
+      </div>
+      <SecretsSection projectId={project.id} />
+    </div>
+  );
+}
+
+function SecretsSection({ projectId }: { projectId: string }) {
+  const [secrets, setSecrets] = useState<Secret[]>([]);
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState({ name: '', value: '', scope: 'build' });
+  const [error, setError] = useState('');
+
+  const load = () => {
+    api.get<ListResponse<Secret>>(`/api/projects/${projectId}/secrets?limit=100`)
+      .then(r => setSecrets(r.items)).catch(() => setSecrets([]));
+  };
+  useEffect(load, [projectId]);
+
+  const create = async (e: Event) => {
+    e.preventDefault();
+    setError('');
+    try {
+      await api.post(`/api/projects/${projectId}/secrets`, {
+        name: form.name,
+        value: form.value,
+        scope: form.scope,
+      });
+      setShowCreate(false);
+      setForm({ name: '', value: '', scope: 'build' });
+      load();
+    } catch (err: any) { setError(err.message); }
+  };
+
+  const deleteSecret = async (secretId: string, name: string) => {
+    if (!confirm(`Delete secret "${name}"? This action cannot be undone.`)) return;
+    await api.del(`/api/projects/${projectId}/secrets/${secretId}`);
+    load();
+  };
+
+  return (
     <div class="card">
-      <form onSubmit={save}>
-        <div class="form-group">
-          <label>Display Name</label>
-          <input class="input" value={form.display_name}
-            onInput={(e) => setForm({ ...form, display_name: (e.target as HTMLInputElement).value })} />
-        </div>
-        <div class="form-group">
-          <label>Description</label>
-          <textarea class="input" value={form.description}
-            onInput={(e) => setForm({ ...form, description: (e.target as HTMLTextAreaElement).value })} />
-        </div>
-        <div class="form-group">
-          <label>Visibility</label>
-          <select class="input" value={form.visibility}
-            onChange={(e) => setForm({ ...form, visibility: (e.target as HTMLSelectElement).value })}>
-            <option value="private">Private</option>
-            <option value="internal">Internal</option>
-            <option value="public">Public</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Default Branch</label>
-          <input class="input" value={form.default_branch}
-            onInput={(e) => setForm({ ...form, default_branch: (e.target as HTMLInputElement).value })} />
-        </div>
-        {error && <div class="error-msg">{error}</div>}
-        {saved && <div style="color:var(--success);font-size:13px">Saved</div>}
-        <button type="submit" class="btn btn-primary mt-sm">Save Settings</button>
-      </form>
+      <div class="card-header">
+        <span class="card-title">Secrets</span>
+        <button class="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>Add Secret</button>
+      </div>
+      <div class="text-sm text-muted mb-md">
+        Secret values are encrypted and cannot be displayed after creation.
+      </div>
+      {secrets.length === 0 ? (
+        <div class="empty-state">No secrets configured</div>
+      ) : (
+        <table class="table">
+          <thead><tr><th>Name</th><th>Scope</th><th>Version</th><th>Updated</th><th></th></tr></thead>
+          <tbody>
+            {secrets.map(s => (
+              <tr key={s.id}>
+                <td class="mono text-sm">{s.name}</td>
+                <td class="text-sm"><Badge status={s.scope} /></td>
+                <td class="text-sm text-muted">v{s.version}</td>
+                <td class="text-muted text-sm">{timeAgo(s.updated_at)}</td>
+                <td>
+                  <button class="btn btn-danger btn-sm" onClick={() => deleteSecret(s.id, s.name)}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Add Secret">
+        <form onSubmit={create}>
+          <div class="form-group">
+            <label>Name</label>
+            <input class="input" required value={form.name}
+              placeholder="SECRET_NAME"
+              onInput={(e) => setForm({ ...form, name: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Value</label>
+            <textarea class="input" required value={form.value}
+              rows={3}
+              onInput={(e) => setForm({ ...form, value: (e.target as HTMLTextAreaElement).value })} />
+            <div class="text-xs mt-sm" style="color:var(--warning)">
+              This value will not be shown again after creation.
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Scope</label>
+            <select class="input" value={form.scope}
+              onChange={(e) => setForm({ ...form, scope: (e.target as HTMLSelectElement).value })}>
+              <option value="build">Build</option>
+              <option value="deploy">Deploy</option>
+              <option value="all">All</option>
+            </select>
+          </div>
+          {error && <div class="error-msg">{error}</div>}
+          <div class="modal-actions">
+            <button type="button" class="btn" onClick={() => setShowCreate(false)}>Cancel</button>
+            <button type="submit" class="btn btn-primary">Create</button>
+          </div>
+        </form>
+      </Modal>
     </div>
   );
 }

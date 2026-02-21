@@ -14,6 +14,11 @@ pub fn check_length(field: &str, value: &str, min: usize, max: usize) -> Result<
 
 pub fn check_name(value: &str) -> Result<(), ApiError> {
     check_length("name", value, 1, 255)?;
+    if value.starts_with('.') || value.ends_with('.') {
+        return Err(ApiError::BadRequest(
+            "name: must not start or end with a dot".into(),
+        ));
+    }
     if !value
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -27,8 +32,11 @@ pub fn check_name(value: &str) -> Result<(), ApiError> {
 
 pub fn check_email(value: &str) -> Result<(), ApiError> {
     check_length("email", value, 3, 254)?;
-    if !value.contains('@') {
-        return Err(ApiError::BadRequest("invalid email address".into()));
+    let parts: Vec<&str> = value.splitn(3, '@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(ApiError::BadRequest(
+            "email: must have exactly one @ with non-empty local and domain parts".into(),
+        ));
     }
     Ok(())
 }
@@ -254,6 +262,21 @@ mod tests {
     }
 
     #[test]
+    fn name_leading_dot_rejected() {
+        assert!(check_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn name_trailing_dot_rejected() {
+        assert!(check_name("name.").is_err());
+    }
+
+    #[test]
+    fn name_middle_dot_ok() {
+        assert!(check_name("my.project").is_ok());
+    }
+
+    #[test]
     fn check_name_rejects_unicode_alphanumeric() {
         // is_alphanumeric() is Unicode-aware: 'é' passes it, but we only want ASCII
         // This test documents the current behavior
@@ -317,9 +340,23 @@ mod tests {
     }
 
     #[test]
-    fn check_email_multiple_at_signs() {
-        // Current impl only checks contains('@'), so this passes
-        assert!(check_email("a@b@c").is_ok());
+    fn check_email_multiple_at_signs_rejected() {
+        assert!(check_email("a@b@c").is_err());
+    }
+
+    #[test]
+    fn check_email_double_at_rejected() {
+        assert!(check_email("a@@b").is_err());
+    }
+
+    #[test]
+    fn check_email_empty_local_rejected() {
+        assert!(check_email("@domain.com").is_err());
+    }
+
+    #[test]
+    fn check_email_no_at_rejected() {
+        assert!(check_email("nodomain").is_err());
     }
 
     // -----------------------------------------------------------------------

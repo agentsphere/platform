@@ -119,16 +119,16 @@ impl FromRequestParts<AppState> for OptionalAuthUser {
     }
 }
 
-fn extract_bearer_token(parts: &Parts) -> Option<String> {
+fn extract_bearer_token(parts: &Parts) -> Option<&str> {
     let value = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?;
     if token.is_empty() {
         return None;
     }
-    Some(token.to_owned())
+    Some(token)
 }
 
-fn extract_session_cookie(parts: &Parts) -> Option<String> {
+fn extract_session_cookie(parts: &Parts) -> Option<&str> {
     let cookies = parts
         .headers
         .get(axum::http::header::COOKIE)?
@@ -139,7 +139,7 @@ fn extract_session_cookie(parts: &Parts) -> Option<String> {
         if let Some(value) = cookie.strip_prefix("session=")
             && !value.is_empty()
         {
-            return Some(value.to_owned());
+            return Some(value);
         }
     }
     None
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn bearer_token_valid() {
         let parts = make_parts(&[("authorization", "Bearer abc123")]);
-        assert_eq!(extract_bearer_token(&parts), Some("abc123".into()));
+        assert_eq!(extract_bearer_token(&parts), Some("abc123"));
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
     fn bearer_token_preserves_full_value() {
         let token = "plat_aVeryLongToken1234567890abcdefghijklmnop";
         let parts = make_parts(&[("authorization", &format!("Bearer {token}"))]);
-        assert_eq!(extract_bearer_token(&parts), Some(token.into()));
+        assert_eq!(extract_bearer_token(&parts), Some(token));
     }
 
     #[test]
@@ -320,13 +320,13 @@ mod tests {
     #[test]
     fn session_cookie_valid() {
         let parts = make_parts(&[("cookie", "session=tok123")]);
-        assert_eq!(extract_session_cookie(&parts), Some("tok123".into()));
+        assert_eq!(extract_session_cookie(&parts), Some("tok123"));
     }
 
     #[test]
     fn session_cookie_among_others() {
         let parts = make_parts(&[("cookie", "foo=bar; session=tok123; baz=qux")]);
-        assert_eq!(extract_session_cookie(&parts), Some("tok123".into()));
+        assert_eq!(extract_session_cookie(&parts), Some("tok123"));
     }
 
     #[test]
@@ -375,20 +375,20 @@ mod tests {
     fn bearer_token_double_space_returns_none() {
         // "Bearer  abc" — strip_prefix("Bearer ") gives " abc" (leading space)
         let parts = make_parts(&[("authorization", "Bearer  abc")]);
-        assert_eq!(extract_bearer_token(&parts), Some(" abc".into()));
+        assert_eq!(extract_bearer_token(&parts), Some(" abc"));
     }
 
     #[test]
     fn bearer_token_with_spaces_in_token() {
         let parts = make_parts(&[("authorization", "Bearer abc def ghi")]);
-        assert_eq!(extract_bearer_token(&parts), Some("abc def ghi".into()));
+        assert_eq!(extract_bearer_token(&parts), Some("abc def ghi"));
     }
 
     #[test]
     fn session_cookie_with_equals_in_value() {
         // Cookie values can contain '=' (e.g., base64). strip_prefix only strips "session=".
         let parts = make_parts(&[("cookie", "session=tok=123=abc")]);
-        assert_eq!(extract_session_cookie(&parts), Some("tok=123=abc".into()));
+        assert_eq!(extract_session_cookie(&parts), Some("tok=123=abc"));
     }
 
     #[test]

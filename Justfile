@@ -45,6 +45,10 @@ test-doc:
 test-integration:
     cargo nextest run --test '*_integration'
 
+test-e2e:
+    @echo "Requires Kind cluster: just cluster-up"
+    cargo nextest run --test 'e2e_*' --run-ignored ignored-only --test-threads 2
+
 # -- Database -------------------------------------------------------
 db-add name:
     cargo sqlx migrate add -r {{ name }}
@@ -79,3 +83,6 @@ deploy-local tag="platform:dev":
 # -- Full CI locally ------------------------------------------------
 ci: fmt lint deny test-unit build
     @echo "All checks passed"
+
+ci-full: fmt lint deny test-unit test-integration test-e2e build
+    @echo "All checks passed (including E2E tests)"

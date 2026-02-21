@@ -97,7 +97,11 @@ async fn main() -> anyhow::Result<()> {
         kube,
         config: Arc::new(cfg.clone()),
         webauthn: Arc::new(webauthn),
+        pipeline_notify: Arc::new(tokio::sync::Notify::new()),
     };
+
+    // Set configurable permission cache TTL
+    rbac::resolver::set_cache_ttl(cfg.permission_cache_ttl_secs);
 
     // Bootstrap system roles, permissions, and admin user on first run
     store::bootstrap::run(&pool, cfg.admin_password.as_deref()).await?;

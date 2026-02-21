@@ -26,6 +26,8 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub trust_proxy_headers: bool,
     pub dev_mode: bool,
+    /// Permission cache TTL in seconds (default 300 = 5 minutes).
+    pub permission_cache_ttl_secs: u64,
     /// `WebAuthn` Relying Party ID (domain, no protocol).
     pub webauthn_rp_id: String,
     /// `WebAuthn` Relying Party Origin (full URL).
@@ -35,7 +37,13 @@ pub struct Config {
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
-    s.split(',').map(|s| s.trim().to_owned()).collect()
+    if s.trim().is_empty() {
+        return Vec::new();
+    }
+    s.split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl Config {
@@ -79,6 +87,10 @@ impl Config {
                 .ok()
                 .is_some_and(|v| v == "true"),
             dev_mode: env::var("PLATFORM_DEV").ok().is_some_and(|v| v == "true"),
+            permission_cache_ttl_secs: env::var("PLATFORM_PERMISSION_CACHE_TTL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
             webauthn_rp_id: env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into()),
             webauthn_rp_origin: env::var("WEBAUTHN_RP_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
@@ -115,6 +127,7 @@ impl Config {
             cors_origins: vec![],
             trust_proxy_headers: false,
             dev_mode: true,
+            permission_cache_ttl_secs: 300,
             webauthn_rp_id: "localhost".into(),
             webauthn_rp_origin: "http://localhost:8080".into(),
             webauthn_rp_name: "Test Platform".into(),
@@ -141,7 +154,7 @@ mod tests {
     #[test]
     fn parse_cors_origins_empty_string() {
         let result = parse_cors_origins("");
-        assert_eq!(result, vec![""]);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -165,11 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_cors_origins_empty_produces_single_empty_string() {
-        // Documenting current behavior: empty string produces vec![""]
-        // This may be a bug — callers should handle empty CORS gracefully
-        let result = parse_cors_origins("");
-        assert_eq!(result, vec![""]);
+    fn parse_cors_origins_whitespace_only_is_empty() {
+        let result = parse_cors_origins("  ");
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -207,7 +218,6 @@ mod tests {
     #[test]
     fn parse_cors_origins_trailing_comma() {
         let result = parse_cors_origins("a.com,b.com,");
-        // Trailing comma produces an empty string at end
-        assert_eq!(result, vec!["a.com", "b.com", ""]);
+        assert_eq!(result, vec!["a.com", "b.com"]);
     }
 }
