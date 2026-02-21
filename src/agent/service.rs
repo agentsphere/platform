@@ -12,7 +12,7 @@ use crate::store::AppState;
 use super::claude_code::ClaudeCodeProvider;
 use super::error::AgentError;
 use super::identity;
-use super::provider::{AgentProvider, AgentSession, ProviderConfig};
+use super::provider::{AgentProvider, AgentSession, BuildPodParams, ProviderConfig};
 
 // ---------------------------------------------------------------------------
 // Provider resolution
@@ -89,9 +89,9 @@ pub async fn create_session(
     .execute(&state.pool)
     .await?;
 
-    // 3. Get repo clone URL for the project
+    // 3. Get repo clone URL and agent image for the project
     let project = sqlx::query!(
-        "SELECT repo_path FROM projects WHERE id = $1 AND is_active = true",
+        "SELECT repo_path, agent_image FROM projects WHERE id = $1 AND is_active = true",
         project_id,
     )
     .fetch_optional(&state.pool)
@@ -102,6 +102,7 @@ pub async fn create_session(
         .repo_path
         .ok_or_else(|| AgentError::Other(anyhow::anyhow!("project has no repo path")))?;
     let repo_clone_url = format!("file://{repo_path}");
+    let project_agent_image = project.agent_image;
 
     // 4. Build and create the K8s pod
     let namespace = &state.config.agent_namespace;
@@ -123,14 +124,15 @@ pub async fn create_session(
         finished_at: None,
     };
 
-    let pod = provider.build_pod(
-        &session_for_pod,
-        &config,
-        &agent_identity.api_token,
-        &platform_api_url,
-        &repo_clone_url,
+    let pod = provider.build_pod(BuildPodParams {
+        session: &session_for_pod,
+        config: &config,
+        agent_api_token: &agent_identity.api_token,
+        platform_api_url: &platform_api_url,
+        repo_clone_url: &repo_clone_url,
         namespace,
-    )?;
+        project_agent_image: project_agent_image.as_deref(),
+    })?;
 
     let pod_name = pod
         .metadata

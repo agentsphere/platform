@@ -142,6 +142,52 @@ pub fn check_ssrf_url(url_str: &str, allowed_schemes: &[&str]) -> Result<(), Api
     Ok(())
 }
 
+/// Validates a container image reference.
+///
+/// Accepts: `registry/image:tag`, `image:tag`, `image@sha256:abc...`,
+///          `gcr.io/project/image:tag`, `localhost:5000/image:tag`
+///
+/// Rejects: shell metacharacters, empty strings, strings > 500 chars,
+///          strings containing `;`, `&`, `|`, `$`, backtick, quotes, `\`, newlines
+pub fn check_container_image(image: &str) -> Result<(), ApiError> {
+    check_length("image", image, 1, 500)?;
+
+    // Block shell injection characters
+    let forbidden = [
+        ';', '&', '|', '$', '`', '\'', '"', '\\', '\n', '\r', ' ', '\t',
+    ];
+    if image.chars().any(|c| forbidden.contains(&c)) {
+        return Err(ApiError::BadRequest(
+            "image: contains forbidden characters".into(),
+        ));
+    }
+
+    // Must contain at least one alphanumeric character
+    if !image.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err(ApiError::BadRequest(
+            "image: must contain alphanumeric characters".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validates setup commands for agent sessions.
+///
+/// Max 20 commands, each 1-2000 characters.
+/// Commands are joined with `&&` and executed in a shell.
+pub fn check_setup_commands(commands: &[String]) -> Result<(), ApiError> {
+    if commands.len() > 20 {
+        return Err(ApiError::BadRequest(
+            "setup_commands: max 20 commands".into(),
+        ));
+    }
+    for (i, cmd) in commands.iter().enumerate() {
+        check_length(&format!("setup_commands[{i}]"), cmd, 1, 2000)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +459,60 @@ mod tests {
     #[test]
     fn ssrf_blocks_ipv6_link_local() {
         assert!(check_ssrf_url("http://[fe80::1]/hook", &["http", "https"]).is_err());
+    }
+
+    // -- Container image validation --
+
+    #[test]
+    fn valid_container_images() {
+        for img in [
+            "golang:1.23",
+            "node:22-slim",
+            "rust:1.80",
+            "ghcr.io/org/image:v1.2",
+            "localhost:5000/my-app:latest",
+            "image@sha256:abcdef1234567890",
+            "registry.example.com/team/runner:v3",
+        ] {
+            assert!(check_container_image(img).is_ok(), "should accept: {img}");
+        }
+    }
+
+    #[test]
+    fn rejected_container_images() {
+        assert!(check_container_image("").is_err(), "empty");
+        assert!(check_container_image(&"a".repeat(501)).is_err(), "too long");
+        assert!(
+            check_container_image("image;rm -rf /").is_err(),
+            "semicolon"
+        );
+        assert!(check_container_image("img & echo").is_err(), "ampersand");
+        assert!(check_container_image("img | cat").is_err(), "pipe");
+        assert!(check_container_image("$(evil)").is_err(), "dollar");
+        assert!(check_container_image("`evil`").is_err(), "backtick");
+        assert!(check_container_image("img\nevil").is_err(), "newline");
+        assert!(check_container_image("has space").is_err(), "space");
+        assert!(
+            check_container_image("---/.../:").is_err(),
+            "no alphanumeric"
+        );
+    }
+
+    // -- Setup commands validation --
+
+    #[test]
+    fn valid_setup_commands() {
+        assert!(check_setup_commands(&["npm install".into()]).is_ok());
+        assert!(check_setup_commands(&vec!["cmd".into(); 20]).is_ok());
+    }
+
+    #[test]
+    fn rejected_setup_commands() {
+        // Too many commands
+        assert!(check_setup_commands(&vec!["cmd".into(); 21]).is_err());
+        // Empty command
+        assert!(check_setup_commands(&["".into()]).is_err());
+        // Command too long
+        assert!(check_setup_commands(&["a".repeat(2001)]).is_err());
     }
 }

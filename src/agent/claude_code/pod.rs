@@ -17,6 +17,29 @@ pub struct PodBuildParams<'a> {
     pub platform_api_url: &'a str,
     pub repo_clone_url: &'a str,
     pub namespace: &'a str,
+    /// Project-level default agent image (from `projects.agent_image` column).
+    pub project_agent_image: Option<&'a str>,
+}
+
+/// Resolves the container image for an agent pod.
+///
+/// Priority: session config > project default > platform default
+fn resolve_image(config: &ProviderConfig, project_image: Option<&str>) -> String {
+    config
+        .image
+        .as_deref()
+        .or(project_image)
+        .unwrap_or("platform-claude-runner:latest")
+        .to_string()
+}
+
+/// Determines the image pull policy based on the image tag.
+fn image_pull_policy(image: &str) -> String {
+    if image.ends_with(":latest") || !image.contains(':') {
+        "Always".to_string()
+    } else {
+        "IfNotPresent".to_string()
+    }
 }
 
 /// Build the K8s Pod object for a Claude Code agent session.
@@ -40,8 +63,10 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
 
     let claude_args = build_claude_args(params, &branch);
     let env_vars = build_env_vars(params, session_id, &branch);
-    let init_container = build_init_container(params.repo_clone_url, &branch);
-    let main_container = build_main_container(claude_args, env_vars);
+    let init_containers = build_init_containers(params, &branch);
+    let resolved_image = resolve_image(params.config, params.project_agent_image);
+    let pull_policy = image_pull_policy(&resolved_image);
+    let main_container = build_main_container(claude_args, env_vars, &resolved_image, &pull_policy);
 
     Pod {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
@@ -52,7 +77,7 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         },
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
-            init_containers: Some(vec![init_container]),
+            init_containers: Some(init_containers),
             containers: vec![main_container],
             volumes: Some(vec![Volume {
                 name: "workspace".into(),
@@ -118,7 +143,40 @@ fn build_env_vars(
     ]
 }
 
-fn build_init_container(repo_clone_url: &str, branch: &str) -> Container {
+fn build_init_containers(params: &PodBuildParams<'_>, branch: &str) -> Vec<Container> {
+    let mut containers = vec![build_git_clone_container(params.repo_clone_url, branch)];
+
+    // Optional setup container (runs after clone, before claude)
+    if let Some(ref commands) = params.config.setup_commands
+        && !commands.is_empty()
+    {
+        let resolved_image = resolve_image(params.config, params.project_agent_image);
+        let joined = commands.join(" && ");
+        containers.push(Container {
+            name: "setup".into(),
+            image: Some(resolved_image),
+            command: Some(vec!["sh".into(), "-c".into(), joined]),
+            working_dir: Some("/workspace".into()),
+            volume_mounts: Some(vec![workspace_mount()]),
+            resources: Some(ResourceRequirements {
+                requests: Some(BTreeMap::from([
+                    ("cpu".into(), Quantity("200m".into())),
+                    ("memory".into(), Quantity("256Mi".into())),
+                ])),
+                limits: Some(BTreeMap::from([
+                    ("cpu".into(), Quantity("500m".into())),
+                    ("memory".into(), Quantity("512Mi".into())),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
+    containers
+}
+
+fn build_git_clone_container(repo_clone_url: &str, branch: &str) -> Container {
     Container {
         name: "git-clone".into(),
         image: Some("alpine/git:latest".into()),
@@ -145,10 +203,16 @@ fn build_init_container(repo_clone_url: &str, branch: &str) -> Container {
     }
 }
 
-fn build_main_container(claude_args: Vec<String>, env_vars: Vec<EnvVar>) -> Container {
+fn build_main_container(
+    claude_args: Vec<String>,
+    env_vars: Vec<EnvVar>,
+    image: &str,
+    pull_policy: &str,
+) -> Container {
     Container {
         name: "claude".into(),
-        image: Some("platform-claude-runner:latest".into()),
+        image: Some(image.to_owned()),
+        image_pull_policy: Some(pull_policy.to_owned()),
         args: Some(claude_args),
         stdin: Some(true),
         tty: Some(false),
@@ -222,6 +286,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "platform-agents",
+            project_agent_image: None,
         });
         assert_eq!(pod.metadata.name.as_deref(), Some("agent-12345678"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("platform-agents"));
@@ -237,6 +302,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["platform.io/component"], "agent-session");
@@ -257,6 +323,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let claude_container = &spec.containers[0];
@@ -275,6 +342,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -302,6 +370,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -332,6 +401,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -352,6 +422,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -374,6 +445,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -393,6 +465,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/myproject",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -412,6 +485,7 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         let resources = spec.containers[0].resources.as_ref().unwrap();
@@ -430,8 +504,150 @@ mod tests {
             platform_api_url: "http://platform:8080",
             repo_clone_url: "file:///data/repos/test",
             namespace: "ns",
+            project_agent_image: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+    }
+
+    // -- Image resolution tests --
+
+    #[test]
+    fn resolve_image_session_override() {
+        let config = ProviderConfig {
+            image: Some("golang:1.23".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_image(&config, Some("rust:1.80")), "golang:1.23");
+    }
+
+    #[test]
+    fn resolve_image_project_default() {
+        let config = ProviderConfig::default();
+        assert_eq!(resolve_image(&config, Some("rust:1.80")), "rust:1.80");
+    }
+
+    #[test]
+    fn resolve_image_platform_fallback() {
+        let config = ProviderConfig::default();
+        assert_eq!(
+            resolve_image(&config, None),
+            "platform-claude-runner:latest"
+        );
+    }
+
+    #[test]
+    fn pull_policy_latest_is_always() {
+        assert_eq!(image_pull_policy("golang:latest"), "Always");
+        assert_eq!(image_pull_policy("golang"), "Always"); // no tag = latest
+    }
+
+    #[test]
+    fn pull_policy_tagged_is_if_not_present() {
+        assert_eq!(image_pull_policy("golang:1.23"), "IfNotPresent");
+        assert_eq!(image_pull_policy("image@sha256:abc123"), "IfNotPresent");
+    }
+
+    #[test]
+    fn main_container_uses_resolved_image() {
+        let session = test_session();
+        let config = ProviderConfig {
+            image: Some("golang:1.23".into()),
+            ..Default::default()
+        };
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+        });
+        let spec = pod.spec.unwrap();
+        let main = &spec.containers[0];
+        assert_eq!(main.image.as_deref(), Some("golang:1.23"));
+        assert_eq!(main.image_pull_policy.as_deref(), Some("IfNotPresent"));
+    }
+
+    #[test]
+    fn main_container_uses_project_image() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: Some("rust:1.80"),
+        });
+        let spec = pod.spec.unwrap();
+        let main = &spec.containers[0];
+        assert_eq!(main.image.as_deref(), Some("rust:1.80"));
+        assert_eq!(main.image_pull_policy.as_deref(), Some("IfNotPresent"));
+    }
+
+    #[test]
+    fn setup_container_added_when_commands_present() {
+        let session = test_session();
+        let config = ProviderConfig {
+            setup_commands: Some(vec!["npm install".into(), "npm run build".into()]),
+            ..Default::default()
+        };
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+        });
+        let spec = pod.spec.unwrap();
+        let init = spec.init_containers.unwrap();
+        assert_eq!(init.len(), 2); // git-clone + setup
+        assert_eq!(init[0].name, "git-clone");
+        assert_eq!(init[1].name, "setup");
+        let cmd = init[1].command.as_ref().unwrap();
+        assert_eq!(cmd[2], "npm install && npm run build");
+    }
+
+    #[test]
+    fn no_setup_container_when_commands_empty() {
+        let session = test_session();
+        let config = ProviderConfig {
+            setup_commands: Some(vec![]),
+            ..Default::default()
+        };
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+        });
+        let spec = pod.spec.unwrap();
+        let init = spec.init_containers.unwrap();
+        assert_eq!(init.len(), 1); // git-clone only
+    }
+
+    #[test]
+    fn no_setup_container_when_commands_none() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+        });
+        let spec = pod.spec.unwrap();
+        let init = spec.init_containers.unwrap();
+        assert_eq!(init.len(), 1); // git-clone only
     }
 }

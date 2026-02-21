@@ -1,0 +1,87 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE projects SET\n            display_name = COALESCE($2, display_name),\n            description = COALESCE($3, description),\n            visibility = COALESCE($4, visibility),\n            default_branch = COALESCE($5, default_branch),\n            agent_image = COALESCE($6, agent_image),\n            updated_at = now()\n        WHERE id = $1 AND is_active = true\n        RETURNING id, owner_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "visibility",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "default_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f09ed5802c8711ceef7403ffbdaafe5404a4d1a628020d7e0786f0c08d34f415"
+}

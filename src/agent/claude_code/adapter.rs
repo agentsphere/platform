@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::Pod;
 
 use crate::agent::error::AgentError;
-use crate::agent::provider::{AgentProvider, AgentSession, ProgressEvent, ProviderConfig};
+use crate::agent::provider::{AgentProvider, BuildPodParams, ProgressEvent};
 
 use super::pod::{PodBuildParams, build_agent_pod};
 use super::progress;
@@ -10,22 +10,15 @@ use super::progress;
 pub struct ClaudeCodeProvider;
 
 impl AgentProvider for ClaudeCodeProvider {
-    fn build_pod(
-        &self,
-        session: &AgentSession,
-        config: &ProviderConfig,
-        agent_api_token: &str,
-        platform_api_url: &str,
-        repo_clone_url: &str,
-        namespace: &str,
-    ) -> Result<Pod, AgentError> {
+    fn build_pod(&self, params: BuildPodParams<'_>) -> Result<Pod, AgentError> {
         Ok(build_agent_pod(&PodBuildParams {
-            session,
-            config,
-            agent_api_token,
-            platform_api_url,
-            repo_clone_url,
-            namespace,
+            session: params.session,
+            config: params.config,
+            agent_api_token: params.agent_api_token,
+            platform_api_url: params.platform_api_url,
+            repo_clone_url: params.repo_clone_url,
+            namespace: params.namespace,
+            project_agent_image: params.project_agent_image,
         }))
     }
 

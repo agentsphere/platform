@@ -182,6 +182,19 @@ async fn create_session(
         validation::check_branch_name(branch)?;
     }
 
+    // Validate container image and setup commands if provided
+    if let Some(ref config) = body.config
+        && let Ok(parsed) =
+            serde_json::from_value::<crate::agent::provider::ProviderConfig>(config.clone())
+    {
+        if let Some(ref image) = parsed.image {
+            validation::check_container_image(image)?;
+        }
+        if let Some(ref commands) = parsed.setup_commands {
+            validation::check_setup_commands(commands)?;
+        }
+    }
+
     // Verify project exists
     sqlx::query!(
         "SELECT id FROM projects WHERE id = $1 AND is_active = true",

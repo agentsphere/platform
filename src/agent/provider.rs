@@ -43,6 +43,12 @@ pub struct ProviderConfig {
     /// One of: "dev" (default), "ops", "admin", "ui".
     #[serde(default)]
     pub role: Option<String>,
+    /// Container image override for this session.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Shell commands to run after git clone but before the agent starts.
+    #[serde(default)]
+    pub setup_commands: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,19 +80,22 @@ pub enum ProgressKind {
 // AgentProvider trait
 // ---------------------------------------------------------------------------
 
+/// Parameters for building an agent pod at the provider trait boundary.
+pub struct BuildPodParams<'a> {
+    pub session: &'a AgentSession,
+    pub config: &'a ProviderConfig,
+    pub agent_api_token: &'a str,
+    pub platform_api_url: &'a str,
+    pub repo_clone_url: &'a str,
+    pub namespace: &'a str,
+    pub project_agent_image: Option<&'a str>,
+}
+
 /// Trait for agent provider implementations.
 /// Uses native async fn in trait (Rust 2024 edition).
 pub trait AgentProvider: Send + Sync {
     /// Build the K8s Pod object for this agent session.
-    fn build_pod(
-        &self,
-        session: &AgentSession,
-        config: &ProviderConfig,
-        agent_api_token: &str,
-        platform_api_url: &str,
-        repo_clone_url: &str,
-        namespace: &str,
-    ) -> Result<Pod, AgentError>;
+    fn build_pod(&self, params: BuildPodParams<'_>) -> Result<Pod, AgentError>;
 
     /// Parse a single line of streaming output into a structured progress event.
     fn parse_progress(&self, line: &str) -> Option<ProgressEvent>;
@@ -106,6 +115,8 @@ mod tests {
         assert!(config.model.is_none());
         assert!(config.max_turns.is_none());
         assert!(config.role.is_none());
+        assert!(config.image.is_none());
+        assert!(config.setup_commands.is_none());
     }
 
     #[test]
@@ -124,6 +135,18 @@ mod tests {
         let config: ProviderConfig =
             serde_json::from_str(r#"{"model":"opus","unknown_field":true}"#).unwrap();
         assert_eq!(config.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn provider_config_with_image_and_setup() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"image":"golang:1.23","setup_commands":["go mod download","go build ./..."]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.image.as_deref(), Some("golang:1.23"));
+        let cmds = config.setup_commands.unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0], "go mod download");
     }
 
     #[test]

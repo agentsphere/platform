@@ -33,6 +33,7 @@ pub struct UpdateProjectRequest {
     pub description: Option<String>,
     pub visibility: Option<String>,
     pub default_branch: Option<String>,
+    pub agent_image: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,7 @@ pub struct ProjectResponse {
     pub description: Option<String>,
     pub visibility: String,
     pub default_branch: String,
+    pub agent_image: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -142,7 +144,7 @@ async fn create_project(
         r#"
         INSERT INTO projects (owner_id, name, display_name, description, visibility, default_branch, repo_path)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, owner_id, name, display_name, description, visibility, default_branch, is_active, created_at, updated_at
+        RETURNING id, owner_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
         "#,
         auth.user_id,
         body.name,
@@ -180,6 +182,7 @@ async fn create_project(
             description: project.description,
             visibility: project.visibility,
             default_branch: project.default_branch,
+            agent_image: project.agent_image,
             is_active: project.is_active,
             created_at: project.created_at,
             updated_at: project.updated_at,
@@ -221,7 +224,7 @@ async fn list_projects(
 
     let rows = sqlx::query!(
         r#"
-        SELECT id, owner_id, name, display_name, description, visibility, default_branch, is_active, created_at, updated_at
+        SELECT id, owner_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
         FROM projects
         WHERE is_active = true
           AND ($1::uuid IS NULL OR owner_id = $1)
@@ -255,6 +258,7 @@ async fn list_projects(
             description: p.description,
             visibility: p.visibility,
             default_branch: p.default_branch,
+            agent_image: p.agent_image,
             is_active: p.is_active,
             created_at: p.created_at,
             updated_at: p.updated_at,
@@ -271,7 +275,7 @@ async fn get_project(
 ) -> Result<Json<ProjectResponse>, ApiError> {
     let project = sqlx::query!(
         r#"
-        SELECT id, owner_id, name, display_name, description, visibility, default_branch, is_active, created_at, updated_at
+        SELECT id, owner_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
         FROM projects WHERE id = $1 AND is_active = true
         "#,
         id,
@@ -305,6 +309,7 @@ async fn get_project(
         description: project.description,
         visibility: project.visibility,
         default_branch: project.default_branch,
+        agent_image: project.agent_image,
         is_active: project.is_active,
         created_at: project.created_at,
         updated_at: project.updated_at,
@@ -361,6 +366,9 @@ async fn update_project(
             "visibility must be private, internal, or public".into(),
         ));
     }
+    if let Some(ref image) = body.agent_image {
+        validation::check_container_image(image)?;
+    }
 
     let project = sqlx::query!(
         r#"
@@ -368,15 +376,18 @@ async fn update_project(
             display_name = COALESCE($2, display_name),
             description = COALESCE($3, description),
             visibility = COALESCE($4, visibility),
-            default_branch = COALESCE($5, default_branch)
+            default_branch = COALESCE($5, default_branch),
+            agent_image = COALESCE($6, agent_image),
+            updated_at = now()
         WHERE id = $1 AND is_active = true
-        RETURNING id, owner_id, name, display_name, description, visibility, default_branch, is_active, created_at, updated_at
+        RETURNING id, owner_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
         "#,
         id,
         body.display_name,
         body.description,
         body.visibility,
         body.default_branch,
+        body.agent_image,
     )
     .fetch_optional(&state.pool)
     .await?
@@ -405,6 +416,7 @@ async fn update_project(
         description: project.description,
         visibility: project.visibility,
         default_branch: project.default_branch,
+        agent_image: project.agent_image,
         is_active: project.is_active,
         created_at: project.created_at,
         updated_at: project.updated_at,
