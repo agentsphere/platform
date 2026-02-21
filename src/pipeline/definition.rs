@@ -238,7 +238,10 @@ pipeline:
   steps: []
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("at least one step"));
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("at least one step")),
+            "empty steps should produce InvalidDefinition, got: {err:?}"
+        );
     }
 
     #[test]
@@ -250,7 +253,10 @@ pipeline:
       image: ""
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("missing an image"));
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("missing an image")),
+            "empty image should produce InvalidDefinition, got: {err:?}"
+        );
     }
 
     #[test]
@@ -262,13 +268,19 @@ pipeline:
       image: alpine
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("missing a name"));
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("missing a name")),
+            "empty name should produce InvalidDefinition, got: {err:?}"
+        );
     }
 
     #[test]
     fn parse_invalid_yaml() {
         let err = parse("not valid yaml: [").unwrap_err();
-        assert!(matches!(err, PipelineError::InvalidDefinition(_)));
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(_)),
+            "invalid YAML should produce InvalidDefinition, got: {err:?}"
+        );
     }
 
     #[test]
@@ -432,5 +444,131 @@ pipeline:
         let def = parse(VALID_YAML).unwrap();
         let mr = def.trigger.as_ref().unwrap().mr.as_ref().unwrap();
         assert_eq!(mr.actions, vec!["opened", "synchronized"]);
+    }
+
+    // -- Additional trigger matching tests --
+
+    #[test]
+    fn matches_push_multiple_branches_any_match() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    push:
+      branches: [main, develop, staging]
+"#;
+        let def = parse(yaml).unwrap();
+        assert!(matches_push(def.trigger.as_ref(), "main"));
+        assert!(matches_push(def.trigger.as_ref(), "develop"));
+        assert!(matches_push(def.trigger.as_ref(), "staging"));
+        assert!(!matches_push(def.trigger.as_ref(), "feature/foo"));
+    }
+
+    #[test]
+    fn matches_push_suffix_wildcard() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    push:
+      branches: ["*-release"]
+"#;
+        let def = parse(yaml).unwrap();
+        assert!(matches_push(def.trigger.as_ref(), "v2-release"));
+        assert!(matches_push(def.trigger.as_ref(), "hotfix-release"));
+        assert!(!matches_push(def.trigger.as_ref(), "release-v1"));
+    }
+
+    #[test]
+    fn matches_push_no_push_trigger_matches_all() {
+        // Only MR trigger configured, no push trigger
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    mr:
+      actions: [opened]
+"#;
+        let def = parse(yaml).unwrap();
+        // No push trigger means all branches match
+        assert!(matches_push(def.trigger.as_ref(), "any-branch"));
+    }
+
+    #[test]
+    fn matches_mr_no_mr_trigger_matches_all() {
+        // Only push trigger configured, no MR trigger
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    push:
+      branches: [main]
+"#;
+        let def = parse(yaml).unwrap();
+        // No MR trigger means all actions match
+        assert!(matches_mr(def.trigger.as_ref(), "any-action"));
+    }
+
+    #[test]
+    fn complex_definition_parsing() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: lint
+      image: rust:1.85
+      commands:
+        - cargo clippy --all-features
+    - name: test
+      image: rust:1.85
+      commands:
+        - cargo nextest run
+      depends_on:
+        - lint
+    - name: build
+      image: rust:1.85
+      commands:
+        - cargo build --release
+      depends_on:
+        - test
+      environment:
+        CARGO_INCREMENTAL: "0"
+        RUSTFLAGS: "-C link-arg=-s"
+  artifacts:
+    - name: binary
+      path: target/release/platform
+      expires: 30d
+    - name: test-results
+      path: target/nextest/
+  on:
+    push:
+      branches: [main, "release/*"]
+    mr:
+      actions: [opened, synchronized, reopened]
+"#;
+        let def = parse(yaml).unwrap();
+        assert_eq!(def.steps.len(), 3);
+        assert_eq!(def.steps[0].name, "lint");
+        assert_eq!(def.steps[1].depends_on, vec!["lint"]);
+        assert_eq!(def.steps[2].depends_on, vec!["test"]);
+        assert_eq!(def.steps[2].environment.len(), 2);
+        assert_eq!(def.artifacts.len(), 2);
+        assert_eq!(def.artifacts[0].expires.as_deref(), Some("30d"));
+        assert!(def.artifacts[1].expires.is_none());
+
+        // Trigger matching
+        assert!(matches_push(def.trigger.as_ref(), "main"));
+        assert!(matches_push(def.trigger.as_ref(), "release/v1.0"));
+        assert!(!matches_push(def.trigger.as_ref(), "feature/foo"));
+        assert!(matches_mr(def.trigger.as_ref(), "opened"));
+        assert!(matches_mr(def.trigger.as_ref(), "reopened"));
+        assert!(!matches_mr(def.trigger.as_ref(), "closed"));
     }
 }

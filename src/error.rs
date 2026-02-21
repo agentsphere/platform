@@ -248,6 +248,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlx_generic_error_hides_details() {
+        let db_err = sqlx::Error::Database(Box::new(TestDbError {
+            code: Some("42P01".into()),
+            message: "secret_table does not exist".into(),
+        }));
+        let err: ApiError = db_err.into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "internal server error");
+        assert!(
+            !json.to_string().contains("secret_table"),
+            "internal error response must not leak database error details"
+        );
+    }
+
+    #[tokio::test]
     async fn conflict_body_contains_message() {
         let resp = ApiError::Conflict("duplicate email".into()).into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

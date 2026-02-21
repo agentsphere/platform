@@ -566,6 +566,8 @@ async fn mark_pipeline_failed(pool: &PgPool, pipeline_id: Uuid) -> Result<(), Pi
 // ---------------------------------------------------------------------------
 
 /// If any step used a kaniko-like image, write/update the deployments table.
+/// For main/master branches, creates a production deployment.
+/// For other branches, creates a preview deployment.
 async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, project_id: Uuid) {
     let image_steps = sqlx::query!(
         r#"
@@ -585,18 +587,21 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
         return;
     }
 
-    // Get the commit SHA for the image tag
-    let commit_sha = sqlx::query_scalar!(
-        "SELECT commit_sha FROM pipelines WHERE id = $1",
+    // Get the git_ref, commit SHA, and triggered_by for the pipeline
+    let pipeline_meta = sqlx::query!(
+        "SELECT git_ref, commit_sha, triggered_by FROM pipelines WHERE id = $1",
         pipeline_id,
     )
     .fetch_optional(&state.pool)
     .await
     .ok()
-    .flatten()
     .flatten();
 
-    let project_name = sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id,)
+    let Some(pipeline_meta) = pipeline_meta else {
+        return;
+    };
+
+    let project_name = sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id)
         .fetch_optional(&state.pool)
         .await
         .ok()
@@ -608,24 +613,107 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
         .as_deref()
         .unwrap_or("localhost:5000");
     let name = project_name.as_deref().unwrap_or("unknown");
-    let tag = commit_sha.as_deref().unwrap_or("latest");
+    let tag = pipeline_meta.commit_sha.as_deref().unwrap_or("latest");
     let image_ref = format!("{registry}/{name}:{tag}");
 
-    // Upsert deployment for production environment
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status)
-        VALUES ($1, 'production', $2, 'active', 'pending')
-        ON CONFLICT (project_id, environment)
-        DO UPDATE SET image_ref = $2, desired_status = 'active', current_status = 'pending'
-        "#,
+    // Extract branch from git_ref
+    let branch = pipeline_meta
+        .git_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&pipeline_meta.git_ref);
+
+    let is_main = matches!(branch, "main" | "master");
+
+    if is_main {
+        // Upsert deployment for production environment
+        let _ = sqlx::query!(
+            r#"
+            INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status)
+            VALUES ($1, 'production', $2, 'active', 'pending')
+            ON CONFLICT (project_id, environment)
+            DO UPDATE SET image_ref = $2, desired_status = 'active', current_status = 'pending'
+            "#,
+            project_id,
+            image_ref,
+        )
+        .execute(&state.pool)
+        .await;
+
+        tracing::info!(%project_id, %image_ref, "deployment updated from pipeline");
+    } else {
+        // Create/update preview deployment for non-main branches
+        if let Err(e) = upsert_preview_deployment(
+            state,
+            pipeline_id,
+            project_id,
+            branch,
+            &image_ref,
+            pipeline_meta.triggered_by,
+        )
+        .await
+        {
+            tracing::error!(error = %e, %project_id, %branch, "failed to upsert preview deployment");
+        }
+    }
+}
+
+/// Create or update a preview deployment for a non-main branch.
+#[tracing::instrument(skip(state), fields(%pipeline_id, %project_id, %branch), err)]
+async fn upsert_preview_deployment(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    branch: &str,
+    image_ref: &str,
+    triggered_by: Option<Uuid>,
+) -> Result<(), anyhow::Error> {
+    let branch_slug = crate::pipeline::slugify_branch(branch);
+
+    sqlx::query!(
+        r#"INSERT INTO preview_deployments
+            (project_id, branch, branch_slug, image_ref, pipeline_id, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (project_id, branch_slug) DO UPDATE SET
+            image_ref = EXCLUDED.image_ref,
+            pipeline_id = EXCLUDED.pipeline_id,
+            desired_status = 'active',
+            current_status = 'pending',
+            expires_at = now() + (preview_deployments.ttl_hours || ' hours')::interval,
+            updated_at = now()"#,
         project_id,
+        branch,
+        branch_slug,
         image_ref,
+        pipeline_id,
+        triggered_by,
     )
     .execute(&state.pool)
+    .await?;
+
+    tracing::info!(
+        %project_id,
+        %branch,
+        slug = %branch_slug,
+        image = %image_ref,
+        "preview deployment upserted"
+    );
+
+    // Fire webhook for preview event
+    crate::api::webhooks::fire_webhooks(
+        &state.pool,
+        project_id,
+        "deploy",
+        &serde_json::json!({
+            "action": "preview_created",
+            "branch": branch,
+            "branch_slug": branch_slug,
+            "image_ref": image_ref,
+            "pipeline_id": pipeline_id,
+        }),
+    )
     .await;
 
-    tracing::info!(%project_id, %image_ref, "deployment updated from pipeline");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

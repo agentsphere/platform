@@ -17,6 +17,8 @@ pub enum Permission {
     SecretRead,
     SecretWrite,
     AdminUsers,
+    AdminRoles,
+    AdminConfig,
     AdminDelegate,
 }
 
@@ -35,6 +37,8 @@ impl Permission {
             Self::SecretRead => "secret:read",
             Self::SecretWrite => "secret:write",
             Self::AdminUsers => "admin:users",
+            Self::AdminRoles => "admin:roles",
+            Self::AdminConfig => "admin:config",
             Self::AdminDelegate => "admin:delegate",
         }
     }
@@ -63,6 +67,8 @@ impl FromStr for Permission {
             "secret:read" => Ok(Self::SecretRead),
             "secret:write" => Ok(Self::SecretWrite),
             "admin:users" => Ok(Self::AdminUsers),
+            "admin:roles" => Ok(Self::AdminRoles),
+            "admin:config" => Ok(Self::AdminConfig),
             "admin:delegate" => Ok(Self::AdminDelegate),
             other => anyhow::bail!("unknown permission: {other}"),
         }
@@ -99,6 +105,8 @@ mod tests {
         Permission::SecretRead,
         Permission::SecretWrite,
         Permission::AdminUsers,
+        Permission::AdminRoles,
+        Permission::AdminConfig,
         Permission::AdminDelegate,
     ];
 
@@ -113,12 +121,16 @@ mod tests {
 
     #[test]
     fn all_permissions_counted() {
-        assert_eq!(ALL_PERMISSIONS.len(), 13);
+        assert_eq!(ALL_PERMISSIONS.len(), 15);
     }
 
     #[test]
     fn unknown_permission_errors() {
-        assert!("foo:bar".parse::<Permission>().is_err());
+        let err = "foo:bar".parse::<Permission>().unwrap_err();
+        assert!(
+            err.to_string().contains("unknown permission"),
+            "unknown permission should produce descriptive error, got: {err}"
+        );
     }
 
     #[test]
@@ -172,6 +184,13 @@ mod tests {
                 let json = serde_json::to_string(&perm).unwrap();
                 let parsed: Permission = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(perm, parsed);
+            }
+
+            #[test]
+            fn permission_as_str_not_empty(perm in arb_permission()) {
+                let s = perm.as_str();
+                prop_assert!(!s.is_empty());
+                prop_assert!(s.contains(':'), "permission string should contain ':'");
             }
         }
     }

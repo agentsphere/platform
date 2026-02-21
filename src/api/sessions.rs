@@ -32,6 +32,9 @@ pub struct CreateSessionRequest {
     /// Delegate observe:read to the agent.
     #[serde(default)]
     pub delegate_observe: bool,
+    /// Delegate admin:users + admin:roles + admin:config to the agent.
+    #[serde(default)]
+    pub delegate_admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +202,14 @@ async fn create_session(
         if let Some(ref commands) = parsed.setup_commands {
             validation::check_setup_commands(commands)?;
         }
+
+        // Warn if admin role requested without delegate_admin flag
+        if parsed.role.as_deref() == Some("admin") && !body.delegate_admin {
+            tracing::warn!(
+                user_id = %auth.user_id,
+                "agent session requested admin role without delegate_admin flag — admin MCP tools will get 403"
+            );
+        }
     }
 
     // Verify project exists
@@ -218,6 +229,11 @@ async fn create_session(
     }
     if body.delegate_observe {
         extra_permissions.push(Permission::ObserveRead);
+    }
+    if body.delegate_admin {
+        extra_permissions.push(Permission::AdminUsers);
+        extra_permissions.push(Permission::AdminRoles);
+        extra_permissions.push(Permission::AdminConfig);
     }
 
     // Create session (identity + pod)

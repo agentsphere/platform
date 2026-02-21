@@ -57,4 +57,24 @@ mod tests {
         let h2 = hash_password("same").unwrap();
         assert_ne!(h1, h2); // different salts
     }
+
+    #[test]
+    fn dummy_hash_is_valid_argon2() {
+        let hash = dummy_hash();
+        assert!(
+            hash.starts_with("$argon2"),
+            "dummy hash should be a valid argon2 hash"
+        );
+        // The dummy hash should not verify against a random password
+        assert!(!verify_password("random_password", hash).unwrap());
+    }
+
+    #[test]
+    fn verify_against_invalid_hash_returns_error() {
+        let err = verify_password("anything", "not_a_valid_hash").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid password hash"),
+            "invalid hash should produce descriptive error, got: {err}"
+        );
+    }
 }

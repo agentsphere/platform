@@ -378,7 +378,11 @@ mod tests {
         let key1 = [42u8; 32];
         let key2 = [99u8; 32];
         let encrypted = encrypt(b"secret", &key1).unwrap();
-        assert!(decrypt(&encrypted, &key2).is_err());
+        let err = decrypt(&encrypted, &key2).unwrap_err();
+        assert!(
+            err.to_string().contains("decryption failed"),
+            "wrong key should produce decryption failure, got: {err}"
+        );
     }
 
     #[test]
@@ -389,13 +393,21 @@ mod tests {
         if let Some(byte) = encrypted.last_mut() {
             *byte ^= 0xFF;
         }
-        assert!(decrypt(&encrypted, &key).is_err());
+        let err = decrypt(&encrypted, &key).unwrap_err();
+        assert!(
+            err.to_string().contains("decryption failed"),
+            "corrupted data should produce decryption failure, got: {err}"
+        );
     }
 
     #[test]
     fn decrypt_too_short_fails() {
         let key = [42u8; 32];
-        assert!(decrypt(&[0u8; 5], &key).is_err());
+        let err = decrypt(&[0u8; 5], &key).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "too-short data should mention 'too short', got: {err}"
+        );
     }
 
     #[test]
@@ -416,13 +428,21 @@ mod tests {
 
     #[test]
     fn parse_master_key_wrong_length() {
-        assert!(parse_master_key("aabb").is_err());
+        let err = parse_master_key("aabb").unwrap_err();
+        assert!(
+            err.to_string().contains("32 bytes"),
+            "wrong-length key should mention '32 bytes', got: {err}"
+        );
     }
 
     #[test]
     fn parse_master_key_invalid_hex() {
         let bad = "zz".repeat(32);
-        assert!(parse_master_key(&bad).is_err());
+        let err = parse_master_key(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("hex"),
+            "invalid hex should mention 'hex', got: {err}"
+        );
     }
 
     #[test]
@@ -449,15 +469,33 @@ mod tests {
     fn parse_master_key_63_hex_chars_fails() {
         // Odd number of hex chars — hex::decode fails
         let hex_key = "a".repeat(63);
-        assert!(parse_master_key(&hex_key).is_err());
+        let err = parse_master_key(&hex_key).unwrap_err();
+        assert!(
+            err.to_string().contains("hex"),
+            "63-char hex key should fail with hex error, got: {err}"
+        );
     }
 
     #[test]
     fn parse_master_key_65_hex_chars_fails() {
-        // 32.5 bytes — too long (but even, so hex::decode succeeds, try_into fails)
-        // Actually 65 hex chars is odd, so hex::decode fails
-        let hex_key = "a".repeat(66); // 33 bytes
-        assert!(parse_master_key(&hex_key).is_err());
+        // 65 hex chars is odd, so hex::decode fails
+        let hex_key = "a".repeat(65);
+        let err = parse_master_key(&hex_key).unwrap_err();
+        assert!(
+            err.to_string().contains("hex"),
+            "65-char hex key should fail with hex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_master_key_66_hex_chars_fails() {
+        // 66 hex chars = 33 bytes, hex::decode succeeds but try_into fails
+        let hex_key = "a".repeat(66);
+        let err = parse_master_key(&hex_key).unwrap_err();
+        assert!(
+            err.to_string().contains("32 bytes"),
+            "66-char hex key should fail with length error, got: {err}"
+        );
     }
 
     #[test]
@@ -471,6 +509,19 @@ mod tests {
     fn decrypt_nonce_only_no_ciphertext_fails() {
         // Exactly 12 bytes (nonce) but no ciphertext or tag
         let key = [42u8; 32];
-        assert!(decrypt(&[0u8; 12], &key).is_err());
+        let err = decrypt(&[0u8; 12], &key).unwrap_err();
+        assert!(
+            err.to_string().contains("decryption failed"),
+            "nonce-only data should fail decryption, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypt_large_plaintext_roundtrip() {
+        let key = [42u8; 32];
+        let large = "x".repeat(100_000); // 100KB
+        let encrypted = encrypt(large.as_bytes(), &key).unwrap();
+        let decrypted = decrypt(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, large.as_bytes());
     }
 }

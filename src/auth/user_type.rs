@@ -59,6 +59,7 @@ impl FromStr for UserType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn roundtrip_all_types() {
@@ -69,30 +70,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn can_login_only_human() {
-        assert!(UserType::Human.can_login());
-        assert!(!UserType::Agent.can_login());
-        assert!(!UserType::ServiceAccount.can_login());
+    #[rstest]
+    #[case(UserType::Human, true, true, true)]
+    #[case(UserType::Agent, false, false, false)]
+    #[case(UserType::ServiceAccount, false, false, false)]
+    fn user_type_capabilities(
+        #[case] user_type: UserType,
+        #[case] can_login: bool,
+        #[case] can_spawn_agents: bool,
+        #[case] requires_password: bool,
+    ) {
+        assert_eq!(
+            user_type.can_login(),
+            can_login,
+            "{user_type:?}.can_login()"
+        );
+        assert_eq!(
+            user_type.can_spawn_agents(),
+            can_spawn_agents,
+            "{user_type:?}.can_spawn_agents()"
+        );
+        assert_eq!(
+            user_type.requires_password(),
+            requires_password,
+            "{user_type:?}.requires_password()"
+        );
     }
 
-    #[test]
-    fn can_spawn_agents_only_human() {
-        assert!(UserType::Human.can_spawn_agents());
-        assert!(!UserType::Agent.can_spawn_agents());
-        assert!(!UserType::ServiceAccount.can_spawn_agents());
-    }
-
-    #[test]
-    fn requires_password_only_human() {
-        assert!(UserType::Human.requires_password());
-        assert!(!UserType::Agent.requires_password());
-        assert!(!UserType::ServiceAccount.requires_password());
+    #[rstest]
+    #[case(UserType::Human, "human")]
+    #[case(UserType::Agent, "agent")]
+    #[case(UserType::ServiceAccount, "service_account")]
+    fn as_str_values(#[case] user_type: UserType, #[case] expected: &str) {
+        assert_eq!(user_type.as_str(), expected);
     }
 
     #[test]
     fn unknown_type_errors() {
-        assert!("robot".parse::<UserType>().is_err());
+        let err = "robot".parse::<UserType>().unwrap_err();
+        assert!(
+            err.to_string().contains("unknown user type"),
+            "unknown type should produce descriptive error, got: {err}"
+        );
     }
 
     #[test]

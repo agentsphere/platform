@@ -132,6 +132,18 @@ const SYSTEM_PERMISSIONS: &[PermDef] = &[
         description: "Manage users and roles",
     },
     PermDef {
+        name: "admin:roles",
+        resource: "admin",
+        action: "roles",
+        description: "Manage role definitions and assignments",
+    },
+    PermDef {
+        name: "admin:config",
+        resource: "admin",
+        action: "config",
+        description: "Manage platform configuration",
+    },
+    PermDef {
         name: "admin:delegate",
         resource: "admin",
         action: "delegate",

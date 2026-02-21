@@ -191,6 +191,11 @@ pub fn check_setup_commands(commands: &[String]) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    // -----------------------------------------------------------------------
+    // check_name — boundary & edge-case tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_name() {
@@ -198,16 +203,72 @@ mod tests {
     }
 
     #[test]
-    fn name_too_long() {
-        let long = "a".repeat(256);
-        assert!(check_name(&long).is_err());
+    fn name_empty_rejected() {
+        let err = check_name("").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("name")),
+            "empty name should produce BadRequest mentioning 'name', got: {err:?}"
+        );
     }
 
     #[test]
-    fn name_bad_chars() {
-        assert!(check_name("foo bar").is_err());
-        assert!(check_name("foo/bar").is_err());
+    fn name_single_char_ok() {
+        assert!(check_name("a").is_ok());
     }
+
+    #[test]
+    fn name_at_max_length() {
+        assert!(check_name(&"a".repeat(255)).is_ok());
+    }
+
+    #[test]
+    fn name_over_max_length() {
+        let err = check_name(&"a".repeat(256)).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("name")),
+            "over-max name should produce BadRequest mentioning 'name', got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn name_with_hyphen_underscore_dot() {
+        assert!(check_name("my-app_v1.0").is_ok());
+    }
+
+    #[test]
+    fn name_with_spaces_rejected() {
+        let err = check_name("has space").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("name")),
+            "name with spaces should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn name_with_slash_rejected() {
+        let err = check_name("foo/bar").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("name")),
+            "name with slash should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_name_rejects_unicode_alphanumeric() {
+        // is_alphanumeric() is Unicode-aware: 'é' passes it, but we only want ASCII
+        // This test documents the current behavior
+        let result = check_name("café");
+        // 'é' is alphanumeric in Unicode, so current impl allows it
+        // If this is undesired, the check should use is_ascii_alphanumeric()
+        assert!(
+            result.is_ok(),
+            "current impl allows Unicode alphanumeric: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_email — boundary & edge-case tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_email() {
@@ -215,39 +276,345 @@ mod tests {
     }
 
     #[test]
-    fn email_missing_at() {
-        assert!(check_email("nope").is_err());
+    fn email_minimum_valid() {
+        assert!(check_email("a@b").is_ok(), "3-char email should pass");
     }
 
     #[test]
-    fn valid_lfs_oid() {
-        let oid = "a".repeat(64);
-        assert!(check_lfs_oid(&oid).is_ok());
+    fn email_too_short_rejected() {
+        let err = check_email("a@").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("email")),
+            "2-char email should produce BadRequest mentioning 'email', got: {err:?}"
+        );
     }
 
     #[test]
-    fn invalid_lfs_oid_short() {
-        assert!(check_lfs_oid("abc").is_err());
+    fn email_no_at_rejected() {
+        let err = check_email("nope").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("email")),
+            "email without @ should produce BadRequest, got: {err:?}"
+        );
     }
 
     #[test]
-    fn invalid_lfs_oid_nonhex() {
-        let oid = "g".repeat(64);
-        assert!(check_lfs_oid(&oid).is_err());
+    fn email_at_max_length() {
+        let long = format!("a@{}", "b".repeat(252));
+        assert_eq!(long.len(), 254);
+        assert!(check_email(&long).is_ok(), "254-char email should pass");
     }
 
     #[test]
-    fn branch_name_traversal() {
-        assert!(check_branch_name("main").is_ok());
-        assert!(check_branch_name("feature/..evil").is_err());
+    fn email_over_max_length() {
+        let too_long = format!("a@{}", "b".repeat(253));
+        assert_eq!(too_long.len(), 255);
+        let err = check_email(&too_long).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("email")),
+            "255-char email should produce BadRequest, got: {err:?}"
+        );
     }
 
     #[test]
-    fn labels_max() {
-        let labels: Vec<String> = (0..51).map(|i| format!("label-{i}")).collect();
-        assert!(check_labels(&labels).is_err());
+    fn check_email_multiple_at_signs() {
+        // Current impl only checks contains('@'), so this passes
+        assert!(check_email("a@b@c").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_branch_name — boundary & edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn branch_name_normal() {
+        assert!(check_branch_name("feature/add-login").is_ok());
+    }
+
+    #[test]
+    fn branch_name_with_double_dot_rejected() {
+        let err = check_branch_name("main..evil").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("branch")),
+            "double-dot branch should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_name_traversal_rejected() {
+        let err = check_branch_name("feature/..evil").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("branch")),
+            "traversal branch should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_name_with_null_byte_rejected() {
+        let err = check_branch_name("main\0evil").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("branch")),
+            "null-byte branch should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_name_empty_rejected() {
+        let err = check_branch_name("").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("branch")),
+            "empty branch should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_branch_name_at_max_length() {
+        assert!(
+            check_branch_name(&"a".repeat(255)).is_ok(),
+            "255-char branch should pass"
+        );
+    }
+
+    #[test]
+    fn check_branch_name_over_max_length() {
+        let err = check_branch_name(&"a".repeat(256)).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("branch")),
+            "256-char branch should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_labels — boundary & edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn labels_empty_vec_ok() {
+        assert!(check_labels(&[]).is_ok());
+    }
+
+    #[test]
+    fn labels_at_max_count() {
         let labels: Vec<String> = (0..50).map(|i| format!("label-{i}")).collect();
         assert!(check_labels(&labels).is_ok());
+    }
+
+    #[test]
+    fn labels_over_max_count() {
+        let labels: Vec<String> = (0..51).map(|i| format!("label-{i}")).collect();
+        let err = check_labels(&labels).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("label")),
+            "51 labels should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn labels_empty_string_rejected() {
+        let err = check_labels(&["".into()]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("label")),
+            "empty label should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn labels_at_max_char_length() {
+        assert!(check_labels(&["a".repeat(100)]).is_ok());
+    }
+
+    #[test]
+    fn labels_over_max_char_length() {
+        let err = check_labels(&["a".repeat(101)]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("label")),
+            "101-char label should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_url — boundary & edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn url_http_ok() {
+        assert!(check_url("http://example.com").is_ok());
+    }
+
+    #[test]
+    fn url_https_ok() {
+        assert!(check_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn url_ftp_rejected() {
+        let err = check_url("ftp://example.com").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("url")),
+            "ftp URL should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn url_over_max_length() {
+        let long_url = format!("https://example.com/{}", "a".repeat(2030));
+        assert!(long_url.len() > 2048);
+        let err = check_url(&long_url).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("url")),
+            "over-max URL should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn url_empty_rejected() {
+        let err = check_url("").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("url")),
+            "empty URL should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_url_empty_host() {
+        assert!(
+            check_url("http://").is_ok(),
+            "check_url doesn't validate host (only scheme + length)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_lfs_oid — boundary & edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lfs_oid_valid_64_hex() {
+        assert!(check_lfs_oid(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn lfs_oid_63_chars_rejected() {
+        let err = check_lfs_oid(&"a".repeat(63)).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("LFS OID")),
+            "63-char OID should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lfs_oid_65_chars_rejected() {
+        let err = check_lfs_oid(&"a".repeat(65)).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("LFS OID")),
+            "65-char OID should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lfs_oid_non_hex_rejected() {
+        let err = check_lfs_oid(&"g".repeat(64)).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("LFS OID")),
+            "non-hex OID should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lfs_oid_short_rejected() {
+        let err = check_lfs_oid("abc").unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("LFS OID")),
+            "short OID should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lfs_oid_uppercase_hex_accepted() {
+        // A-F are valid hex digits
+        assert!(check_lfs_oid(&"A".repeat(64)).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_length — boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_length_at_min_passes() {
+        assert!(check_length("f", "ab", 2, 5).is_ok());
+    }
+
+    #[test]
+    fn check_length_below_min_fails() {
+        let err = check_length("f", "a", 2, 5).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("f")),
+            "below-min should produce BadRequest with field name, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_length_at_max_passes() {
+        assert!(check_length("f", "abcde", 2, 5).is_ok());
+    }
+
+    #[test]
+    fn check_length_above_max_fails() {
+        let err = check_length("f", "abcdef", 2, 5).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("f")),
+            "above-max should produce BadRequest with field name, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_length_zero_min_allows_empty() {
+        assert!(check_length("f", "", 0, 100).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF — rstest parameterized tests for private/blocked IPs
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case("127.0.0.1")]
+    #[case("10.0.0.1")]
+    #[case("10.255.255.255")]
+    #[case("172.16.0.1")]
+    #[case("172.31.255.255")]
+    #[case("192.168.0.1")]
+    #[case("192.168.255.255")]
+    #[case("169.254.0.1")]
+    #[case("169.254.169.254")]
+    fn ssrf_blocks_private_ips(#[case] ip: &str) {
+        let url = format!("http://{ip}/webhook");
+        assert!(
+            check_ssrf_url(&url, &["http", "https"]).is_err(),
+            "SSRF should block {ip}"
+        );
+    }
+
+    #[rstest]
+    #[case("[::1]")]
+    #[case("[fc00::1]")]
+    #[case("[fd12::1]")]
+    #[case("[fe80::1]")]
+    fn ssrf_blocks_private_ipv6(#[case] ip: &str) {
+        let url = format!("http://{ip}/webhook");
+        assert!(
+            check_ssrf_url(&url, &["http", "https"]).is_err(),
+            "SSRF should block {ip}"
+        );
+    }
+
+    #[rstest]
+    #[case("93.184.216.34")]
+    #[case("8.8.8.8")]
+    fn ssrf_allows_public_ips(#[case] ip: &str) {
+        let url = format!("http://{ip}/webhook");
+        assert!(
+            check_ssrf_url(&url, &["http", "https"]).is_ok(),
+            "SSRF should allow public IP {ip}"
+        );
     }
 
     #[test]
@@ -267,22 +634,21 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_blocks_private_ip() {
-        assert!(check_ssrf_url("http://10.0.0.1/hook", &["http", "https"]).is_err());
-        assert!(check_ssrf_url("http://192.168.1.1/hook", &["http", "https"]).is_err());
-        assert!(check_ssrf_url("http://172.16.0.1/hook", &["http", "https"]).is_err());
-        assert!(check_ssrf_url("http://127.0.0.1/hook", &["http", "https"]).is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_loopback_v6() {
-        assert!(check_ssrf_url("http://[::1]/hook", &["http", "https"]).is_err());
-    }
-
-    #[test]
     fn ssrf_blocks_non_http() {
-        assert!(check_ssrf_url("ftp://example.com/hook", &["http", "https"]).is_err());
-        assert!(check_ssrf_url("file:///etc/passwd", &["http", "https"]).is_err());
+        let err = check_ssrf_url("ftp://example.com/hook", &["http", "https"]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("scheme")),
+            "non-http scheme should produce BadRequest mentioning 'scheme', got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_file_scheme() {
+        let err = check_ssrf_url("file:///etc/passwd", &["http", "https"]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("scheme")),
+            "file scheme should produce BadRequest, got: {err:?}"
+        );
     }
 
     #[test]
@@ -292,176 +658,43 @@ mod tests {
     }
 
     #[test]
-    fn private_ip_detection() {
-        assert!(is_private_ip("127.0.0.1".parse().unwrap()));
-        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
-        assert!(is_private_ip("192.168.0.1".parse().unwrap()));
-        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
-        assert!(is_private_ip("169.254.1.1".parse().unwrap()));
-        assert!(is_private_ip("::1".parse().unwrap()));
-        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
-    }
-
-    // -- Boundary tests --
-
-    #[test]
-    fn check_name_boundary_lengths() {
-        assert!(check_name("").is_err(), "empty name should fail");
-        assert!(check_name("a").is_ok(), "single char name should pass");
-        assert!(
-            check_name(&"a".repeat(255)).is_ok(),
-            "255-char name should pass"
-        );
-        assert!(
-            check_name(&"a".repeat(256)).is_err(),
-            "256-char name should fail"
-        );
-    }
-
-    #[test]
-    fn check_name_rejects_unicode_alphanumeric() {
-        // is_alphanumeric() is Unicode-aware: 'é' passes it, but we only want ASCII
-        // This test documents the current behavior
-        let result = check_name("café");
-        // 'é' is alphanumeric in Unicode, so current impl allows it
-        // If this is undesired, the check should use is_ascii_alphanumeric()
-        assert!(
-            result.is_ok(),
-            "current impl allows Unicode alphanumeric: {result:?}"
-        );
-    }
-
-    #[test]
-    fn check_email_boundary_lengths() {
-        assert!(
-            check_email("a@").is_err(),
-            "2-char email should fail (min 3)"
-        );
-        assert!(check_email("a@b").is_ok(), "3-char email should pass");
-        // max is 254: "a@" (2 chars) + 252 = 254 total
-        let long = format!("a@{}", "b".repeat(252));
-        assert_eq!(long.len(), 254);
-        assert!(check_email(&long).is_ok(), "254-char email should pass");
-        let too_long = format!("a@{}", "b".repeat(253));
-        assert_eq!(too_long.len(), 255);
-        assert!(
-            check_email(&too_long).is_err(),
-            "255-char email should fail"
-        );
-    }
-
-    #[test]
-    fn check_email_multiple_at_signs() {
-        // Current impl only checks contains('@'), so this passes
-        assert!(check_email("a@b@c").is_ok());
-    }
-
-    #[test]
-    fn check_labels_empty_label_fails() {
-        assert!(
-            check_labels(&["".into()]).is_err(),
-            "empty label should fail (min 1 char)"
-        );
-    }
-
-    #[test]
-    fn check_labels_boundary_label_length() {
-        assert!(
-            check_labels(&["a".repeat(100)]).is_ok(),
-            "100-char label should pass"
-        );
-        assert!(
-            check_labels(&["a".repeat(101)]).is_err(),
-            "101-char label should fail"
-        );
-    }
-
-    #[test]
-    fn check_branch_name_null_byte_in_middle() {
-        assert!(check_branch_name("main\0evil").is_err());
-    }
-
-    #[test]
-    fn check_branch_name_boundary_length() {
-        assert!(
-            check_branch_name(&"a".repeat(255)).is_ok(),
-            "255-char branch should pass"
-        );
-        assert!(
-            check_branch_name(&"a".repeat(256)).is_err(),
-            "256-char branch should fail"
-        );
-    }
-
-    #[test]
-    fn check_length_boundaries() {
-        assert!(check_length("f", "ab", 2, 5).is_ok(), "at min should pass");
-        assert!(
-            check_length("f", "a", 2, 5).is_err(),
-            "below min should fail"
-        );
-        assert!(
-            check_length("f", "abcde", 2, 5).is_ok(),
-            "at max should pass"
-        );
-        assert!(
-            check_length("f", "abcdef", 2, 5).is_err(),
-            "above max should fail"
-        );
-    }
-
-    #[test]
-    fn check_url_empty_host() {
-        assert!(
-            check_url("http://").is_ok(),
-            "check_url doesn't validate host (only scheme + length)"
-        );
-    }
-
-    #[test]
     fn ssrf_blocks_unspecified_ipv4() {
         assert!(check_ssrf_url("http://0.0.0.0/hook", &["http", "https"]).is_err());
     }
 
-    #[test]
-    fn private_ip_ipv6_unique_local() {
-        // fc00::/7 — unique local addresses (IPv6 RFC 1918 equivalent)
-        assert!(is_private_ip("fc00::1".parse().unwrap()));
-        assert!(is_private_ip("fd12:3456:789a::1".parse().unwrap()));
-        assert!(is_private_ip("fdff:ffff:ffff::1".parse().unwrap()));
+    // -----------------------------------------------------------------------
+    // is_private_ip — rstest parameterized
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case("127.0.0.1", true)]
+    #[case("10.0.0.1", true)]
+    #[case("192.168.0.1", true)]
+    #[case("172.16.0.1", true)]
+    #[case("169.254.1.1", true)]
+    #[case("0.0.0.0", true)]
+    #[case("::1", true)]
+    #[case("fc00::1", true)]
+    #[case("fd12:3456:789a::1", true)]
+    #[case("fdff:ffff:ffff::1", true)]
+    #[case("fe80::1", true)]
+    #[case("febf::1", true)]
+    #[case("8.8.8.8", false)]
+    #[case("1.1.1.1", false)]
+    #[case("2001:db8::1", false)]
+    #[case("2607:f8b0:4004:800::200e", false)]
+    fn private_ip_detection(#[case] ip: &str, #[case] expected: bool) {
+        let addr: IpAddr = ip.parse().unwrap();
+        assert_eq!(
+            is_private_ip(addr),
+            expected,
+            "is_private_ip({ip}) should be {expected}"
+        );
     }
 
-    #[test]
-    fn private_ip_ipv6_link_local() {
-        // fe80::/10 — link-local addresses
-        assert!(is_private_ip("fe80::1".parse().unwrap()));
-        assert!(is_private_ip(
-            "fe80::1%eth0"
-                .parse::<IpAddr>()
-                .unwrap_or_else(|_| "fe80::1".parse().unwrap())
-        ));
-        assert!(is_private_ip("febf::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn private_ip_ipv6_allows_public() {
-        assert!(!is_private_ip("2001:db8::1".parse().unwrap()));
-        assert!(!is_private_ip("2607:f8b0:4004:800::200e".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv6_unique_local() {
-        assert!(check_ssrf_url("http://[fc00::1]/hook", &["http", "https"]).is_err());
-        assert!(check_ssrf_url("http://[fd12::1]/hook", &["http", "https"]).is_err());
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv6_link_local() {
-        assert!(check_ssrf_url("http://[fe80::1]/hook", &["http", "https"]).is_err());
-    }
-
-    // -- Container image validation --
+    // -----------------------------------------------------------------------
+    // Container image validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_container_images() {
@@ -480,25 +713,51 @@ mod tests {
 
     #[test]
     fn rejected_container_images() {
-        assert!(check_container_image("").is_err(), "empty");
-        assert!(check_container_image(&"a".repeat(501)).is_err(), "too long");
         assert!(
-            check_container_image("image;rm -rf /").is_err(),
+            matches!(check_container_image(""), Err(ApiError::BadRequest(ref msg)) if msg.contains("image")),
+            "empty image"
+        );
+        assert!(
+            matches!(check_container_image(&"a".repeat(501)), Err(ApiError::BadRequest(ref msg)) if msg.contains("image")),
+            "too long"
+        );
+        assert!(
+            matches!(check_container_image("image;rm -rf /"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
             "semicolon"
         );
-        assert!(check_container_image("img & echo").is_err(), "ampersand");
-        assert!(check_container_image("img | cat").is_err(), "pipe");
-        assert!(check_container_image("$(evil)").is_err(), "dollar");
-        assert!(check_container_image("`evil`").is_err(), "backtick");
-        assert!(check_container_image("img\nevil").is_err(), "newline");
-        assert!(check_container_image("has space").is_err(), "space");
         assert!(
-            check_container_image("---/.../:").is_err(),
+            matches!(check_container_image("img & echo"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "ampersand"
+        );
+        assert!(
+            matches!(check_container_image("img | cat"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "pipe"
+        );
+        assert!(
+            matches!(check_container_image("$(evil)"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "dollar"
+        );
+        assert!(
+            matches!(check_container_image("`evil`"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "backtick"
+        );
+        assert!(
+            matches!(check_container_image("img\nevil"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "newline"
+        );
+        assert!(
+            matches!(check_container_image("has space"), Err(ApiError::BadRequest(ref msg)) if msg.contains("forbidden")),
+            "space"
+        );
+        assert!(
+            matches!(check_container_image("---/.../:"), Err(ApiError::BadRequest(ref msg)) if msg.contains("alphanumeric")),
             "no alphanumeric"
         );
     }
 
-    // -- Setup commands validation --
+    // -----------------------------------------------------------------------
+    // Setup commands validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_setup_commands() {
@@ -509,10 +768,50 @@ mod tests {
     #[test]
     fn rejected_setup_commands() {
         // Too many commands
-        assert!(check_setup_commands(&vec!["cmd".into(); 21]).is_err());
+        let err = check_setup_commands(&vec!["cmd".into(); 21]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("setup_commands")),
+            "too many commands should produce BadRequest, got: {err:?}"
+        );
         // Empty command
-        assert!(check_setup_commands(&["".into()]).is_err());
+        let err = check_setup_commands(&["".into()]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("setup_commands")),
+            "empty command should produce BadRequest, got: {err:?}"
+        );
         // Command too long
-        assert!(check_setup_commands(&["a".repeat(2001)]).is_err());
+        let err = check_setup_commands(&["a".repeat(2001)]).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("setup_commands")),
+            "too-long command should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // proptest — LFS OID roundtrip
+    // -----------------------------------------------------------------------
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn valid_hex_oid_accepted(s in "[0-9a-f]{64}") {
+                prop_assert!(check_lfs_oid(&s).is_ok());
+            }
+
+            #[test]
+            fn wrong_length_hex_rejected(len in 1_usize..64) {
+                let s: String = "a".repeat(len);
+                prop_assert!(check_lfs_oid(&s).is_err());
+            }
+
+            #[test]
+            fn too_long_hex_rejected(len in 65_usize..200) {
+                let s: String = "a".repeat(len);
+                prop_assert!(check_lfs_oid(&s).is_err());
+            }
+        }
     }
 }

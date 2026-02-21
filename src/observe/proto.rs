@@ -459,6 +459,7 @@ pub fn nanos_to_datetime(nanos: u64) -> chrono::DateTime<chrono::Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn trace_id_hex_roundtrip() {
@@ -472,32 +473,59 @@ mod tests {
         assert_eq!(span_id_to_hex(&bytes), "abcdef0123456789");
     }
 
-    #[test]
-    fn severity_mapping() {
-        assert_eq!(severity_to_level(0), "info"); // unspecified -> default info
-        assert_eq!(severity_to_level(1), "trace");
-        assert_eq!(severity_to_level(5), "debug");
-        assert_eq!(severity_to_level(9), "info");
-        assert_eq!(severity_to_level(13), "warn");
-        assert_eq!(severity_to_level(17), "error");
-        assert_eq!(severity_to_level(21), "fatal");
+    #[rstest]
+    #[case(0, "info")]       // unspecified -> default info
+    #[case(1, "trace")]
+    #[case(2, "trace")]
+    #[case(3, "trace")]
+    #[case(4, "trace")]
+    #[case(5, "debug")]
+    #[case(6, "debug")]
+    #[case(7, "debug")]
+    #[case(8, "debug")]
+    #[case(9, "info")]
+    #[case(10, "info")]
+    #[case(11, "info")]
+    #[case(12, "info")]
+    #[case(13, "warn")]
+    #[case(14, "warn")]
+    #[case(15, "warn")]
+    #[case(16, "warn")]
+    #[case(17, "error")]
+    #[case(18, "error")]
+    #[case(19, "error")]
+    #[case(20, "error")]
+    #[case(21, "fatal")]
+    #[case(22, "fatal")]
+    #[case(23, "fatal")]
+    #[case(24, "fatal")]
+    #[case(25, "info")]      // out of range -> default info
+    #[case(99, "info")]      // out of range -> default info
+    fn severity_mapping(#[case] number: i32, #[case] expected: &str) {
+        assert_eq!(severity_to_level(number), expected);
     }
 
-    #[test]
-    fn span_kind_mapping() {
-        assert_eq!(span_kind_to_str(0), "internal");
-        assert_eq!(span_kind_to_str(1), "internal");
-        assert_eq!(span_kind_to_str(2), "server");
-        assert_eq!(span_kind_to_str(3), "client");
-        assert_eq!(span_kind_to_str(4), "producer");
-        assert_eq!(span_kind_to_str(5), "consumer");
+    #[rstest]
+    #[case(0, "internal")]   // unspecified
+    #[case(1, "internal")]
+    #[case(2, "server")]
+    #[case(3, "client")]
+    #[case(4, "producer")]
+    #[case(5, "consumer")]
+    #[case(6, "internal")]   // out of range
+    #[case(99, "internal")]  // out of range
+    fn span_kind_mapping(#[case] kind: i32, #[case] expected: &str) {
+        assert_eq!(span_kind_to_str(kind), expected);
     }
 
-    #[test]
-    fn status_code_mapping() {
-        assert_eq!(status_code_to_str(0), "unset");
-        assert_eq!(status_code_to_str(1), "ok");
-        assert_eq!(status_code_to_str(2), "error");
+    #[rstest]
+    #[case(0, "unset")]
+    #[case(1, "ok")]
+    #[case(2, "error")]
+    #[case(3, "unset")]     // out of range -> unset
+    #[case(99, "unset")]    // out of range -> unset
+    fn status_code_mapping(#[case] code: i32, #[case] expected: &str) {
+        assert_eq!(status_code_to_str(code), expected);
     }
 
     #[test]

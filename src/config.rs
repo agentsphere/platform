@@ -171,4 +171,43 @@ mod tests {
         let result = parse_cors_origins("");
         assert_eq!(result, vec![""]);
     }
+
+    #[test]
+    fn parse_cors_origins_whitespace_trimmed() {
+        let result = parse_cors_origins(" a.com , b.com ");
+        assert_eq!(result, vec!["a.com", "b.com"]);
+    }
+
+    #[test]
+    fn test_default_cors_origins_empty() {
+        let config = Config::test_default();
+        assert!(config.cors_origins.is_empty(), "test_default should have no CORS origins");
+    }
+
+    #[test]
+    fn test_default_agent_namespace() {
+        let config = Config::test_default();
+        assert_eq!(config.agent_namespace, "test-agents");
+    }
+
+    #[test]
+    fn test_default_webauthn_defaults() {
+        let config = Config::test_default();
+        assert_eq!(config.webauthn_rp_id, "localhost");
+        assert_eq!(config.webauthn_rp_origin, "http://localhost:8080");
+        assert_eq!(config.webauthn_rp_name, "Test Platform");
+    }
+
+    #[test]
+    fn test_default_no_master_key() {
+        let config = Config::test_default();
+        assert!(config.master_key.is_none(), "test_default should have no master key");
+    }
+
+    #[test]
+    fn parse_cors_origins_trailing_comma() {
+        let result = parse_cors_origins("a.com,b.com,");
+        // Trailing comma produces an empty string at end
+        assert_eq!(result, vec!["a.com", "b.com", ""]);
+    }
 }

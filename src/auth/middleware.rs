@@ -227,6 +227,42 @@ async fn lookup_session(
 }
 
 #[cfg(test)]
+impl AuthUser {
+    /// Create a test `AuthUser` representing a human user with default name and IP.
+    pub fn test_human(user_id: Uuid) -> Self {
+        Self {
+            user_id,
+            user_name: "test_user".into(),
+            user_type: UserType::Human,
+            ip_addr: Some("127.0.0.1".into()),
+            token_scopes: None,
+        }
+    }
+
+    /// Create a test `AuthUser` with a custom name.
+    pub fn test_with_name(user_id: Uuid, name: &str) -> Self {
+        Self {
+            user_id,
+            user_name: name.into(),
+            user_type: UserType::Human,
+            ip_addr: Some("127.0.0.1".into()),
+            token_scopes: None,
+        }
+    }
+
+    /// Create a test `AuthUser` with specified token scopes.
+    pub fn test_with_scopes(user_id: Uuid, scopes: Vec<String>) -> Self {
+        Self {
+            user_id,
+            user_name: "test_user".into(),
+            user_type: UserType::Human,
+            ip_addr: Some("127.0.0.1".into()),
+            token_scopes: Some(scopes),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::Request;
@@ -365,5 +401,62 @@ mod tests {
     fn ip_from_forwarded_for_trims_whitespace() {
         let parts = make_parts(&[("x-forwarded-for", "  1.2.3.4 , 5.6.7.8 ")]);
         assert_eq!(extract_ip(&parts, true), Some("1.2.3.4".into()));
+    }
+
+    // -- Additional edge case tests --
+
+    #[test]
+    fn bearer_token_no_space_returns_none() {
+        // "Bearerabc" — strip_prefix("Bearer ") won't match
+        let parts = make_parts(&[("authorization", "Bearerabc")]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    #[test]
+    fn empty_authorization_header_returns_none() {
+        let parts = make_parts(&[("authorization", "")]);
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    #[test]
+    fn ip_no_headers_no_connect_info_returns_none() {
+        let parts = make_parts(&[]);
+        assert_eq!(extract_ip(&parts, true), None);
+    }
+
+    #[test]
+    fn ip_from_forwarded_for_single_ipv6() {
+        let parts = make_parts(&[("x-forwarded-for", "2001:db8::1")]);
+        assert_eq!(extract_ip(&parts, true), Some("2001:db8::1".into()));
+    }
+
+    // -- AuthUser test constructor tests --
+
+    #[test]
+    fn test_human_constructor() {
+        let id = Uuid::new_v4();
+        let auth = AuthUser::test_human(id);
+        assert_eq!(auth.user_id, id);
+        assert_eq!(auth.user_name, "test_user");
+        assert_eq!(auth.user_type, UserType::Human);
+        assert_eq!(auth.ip_addr, Some("127.0.0.1".into()));
+        assert!(auth.token_scopes.is_none());
+    }
+
+    #[test]
+    fn test_with_name_constructor() {
+        let id = Uuid::new_v4();
+        let auth = AuthUser::test_with_name(id, "alice");
+        assert_eq!(auth.user_name, "alice");
+    }
+
+    #[test]
+    fn test_with_scopes_constructor() {
+        let id = Uuid::new_v4();
+        let auth = AuthUser::test_with_scopes(id, vec!["project:read".into()]);
+        assert_eq!(
+            auth.token_scopes,
+            Some(vec!["project:read".to_string()])
+        );
     }
 }

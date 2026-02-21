@@ -86,13 +86,30 @@ pub struct OpsRepoResponse {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PreviewResponse {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub branch: String,
+    pub branch_slug: String,
+    pub image_ref: String,
+    pub pipeline_id: Option<Uuid>,
+    pub desired_status: String,
+    pub current_status: String,
+    pub ttl_hours: i32,
+    pub expires_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
-use super::helpers::ListResponse;
+use super::helpers::{ListResponse, require_project_read, require_project_write};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -113,6 +130,16 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{id}/deployments/{env}/history",
             get(list_history),
         )
+        // Preview deployment routes
+        .route(
+            "/api/projects/{id}/previews",
+            get(list_previews),
+        )
+        .route(
+            "/api/projects/{id}/previews/{slug}",
+            get(get_preview).delete(delete_preview),
+        )
+        // Ops repo admin routes
         .route(
             "/api/admin/ops-repos",
             get(list_ops_repos).post(create_ops_repo),
@@ -502,6 +529,147 @@ async fn list_history(
         .collect();
 
     Ok(Json(ListResponse { items, total }))
+}
+
+// ---------------------------------------------------------------------------
+// Preview deployment handlers
+// ---------------------------------------------------------------------------
+
+async fn list_previews(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListResponse<PreviewResponse>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let total = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count!: i64" FROM preview_deployments
+           WHERE project_id = $1 AND desired_status = 'active'"#,
+        id,
+    )
+    .fetch_one(&state.pool)
+    .await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, project_id, branch, branch_slug, image_ref, pipeline_id,
+               desired_status, current_status, ttl_hours, expires_at,
+               created_by, created_at, updated_at
+        FROM preview_deployments
+        WHERE project_id = $1 AND desired_status = 'active'
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+        id,
+        limit,
+        offset,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| PreviewResponse {
+            id: r.id,
+            project_id: r.project_id,
+            branch: r.branch,
+            branch_slug: r.branch_slug,
+            image_ref: r.image_ref,
+            pipeline_id: r.pipeline_id,
+            desired_status: r.desired_status,
+            current_status: r.current_status,
+            ttl_hours: r.ttl_hours,
+            expires_at: r.expires_at,
+            created_by: r.created_by,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect();
+
+    Ok(Json(ListResponse { items, total }))
+}
+
+async fn get_preview(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, slug)): Path<(Uuid, String)>,
+) -> Result<Json<PreviewResponse>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    let r = sqlx::query!(
+        r#"
+        SELECT id, project_id, branch, branch_slug, image_ref, pipeline_id,
+               desired_status, current_status, ttl_hours, expires_at,
+               created_by, created_at, updated_at
+        FROM preview_deployments
+        WHERE project_id = $1 AND branch_slug = $2 AND desired_status = 'active'
+        "#,
+        id,
+        slug,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("preview".into()))?;
+
+    Ok(Json(PreviewResponse {
+        id: r.id,
+        project_id: r.project_id,
+        branch: r.branch,
+        branch_slug: r.branch_slug,
+        image_ref: r.image_ref,
+        pipeline_id: r.pipeline_id,
+        desired_status: r.desired_status,
+        current_status: r.current_status,
+        ttl_hours: r.ttl_hours,
+        expires_at: r.expires_at,
+        created_by: r.created_by,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }))
+}
+
+#[tracing::instrument(skip(state), fields(%id, %slug), err)]
+async fn delete_preview(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, slug)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_project_write(&state, &auth, id).await?;
+
+    let result = sqlx::query!(
+        r#"UPDATE preview_deployments
+           SET desired_status = 'stopped', updated_at = now()
+           WHERE project_id = $1 AND branch_slug = $2 AND desired_status = 'active'"#,
+        id,
+        slug,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("preview".into()));
+    }
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "preview.delete",
+            resource: "preview_deployment",
+            resource_id: None,
+            project_id: Some(id),
+            detail: Some(serde_json::json!({"branch_slug": slug})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 // ---------------------------------------------------------------------------
