@@ -454,9 +454,6 @@ mod tests {
     fn test_with_scopes_constructor() {
         let id = Uuid::new_v4();
         let auth = AuthUser::test_with_scopes(id, vec!["project:read".into()]);
-        assert_eq!(
-            auth.token_scopes,
-            Some(vec!["project:read".to_string()])
-        );
+        assert_eq!(auth.token_scopes, Some(vec!["project:read".to_string()]));
     }
 }

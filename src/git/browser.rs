@@ -321,9 +321,7 @@ async fn branches(
             .output()
     })
     .await
-    .map_err(|_| {
-        ApiError::Internal(anyhow::anyhow!("git for-each-ref timed out after 30s"))
-    })?
+    .map_err(|_| ApiError::Internal(anyhow::anyhow!("git for-each-ref timed out after 30s")))?
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to run git for-each-ref: {e}")))?;
 
     if !output.status.success() {

@@ -14,11 +14,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Helper: create a project for agent tests.
-async fn setup_agent_project(
-    app: &axum::Router,
-    token: &str,
-    name: &str,
-) -> Uuid {
+async fn setup_agent_project(app: &axum::Router, token: &str, name: &str) -> Uuid {
     e2e_helpers::create_project(app, token, name, "private").await
 }
 
@@ -53,10 +49,7 @@ async fn agent_session_creation(pool: PgPool) {
 
     // If pod_name is set, verify it's a valid K8s pod name
     if let Some(pod_name) = body["pod_name"].as_str() {
-        assert!(
-            !pod_name.is_empty(),
-            "pod_name should be non-empty if set"
-        );
+        assert!(!pod_name.is_empty(), "pod_name should be non-empty if set");
     }
 }
 
@@ -130,7 +123,10 @@ async fn agent_pod_spec_correct(pool: PgPool) {
         if let Ok(pod) = pods.get(pod_name).await {
             if let Some(spec) = &pod.spec {
                 let containers = &spec.containers;
-                assert!(!containers.is_empty(), "pod should have at least one container");
+                assert!(
+                    !containers.is_empty(),
+                    "pod should have at least one container"
+                );
 
                 let container = &containers[0];
                 if let Some(envs) = &container.env {
@@ -248,10 +244,7 @@ async fn agent_reaper_captures_logs(pool: PgPool) {
     // We just verify the path format is correct and the check doesn't error.
     if exists {
         let data = state.minio.read(&log_path).await.unwrap();
-        assert!(
-            !data.is_empty(),
-            "log file in MinIO should be non-empty"
-        );
+        assert!(!data.is_empty(), "log file in MinIO should be non-empty");
     }
 }
 

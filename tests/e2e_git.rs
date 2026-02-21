@@ -19,16 +19,11 @@ async fn bare_repo_init_on_project_create(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "git-init-test", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "git-init-test", "private").await;
 
     // Fetch the project to get repo_path
-    let (status, body) = e2e_helpers::get_json(
-        &app,
-        &token,
-        &format!("/api/projects/{project_id}"),
-    )
-    .await;
+    let (status, body) =
+        e2e_helpers::get_json(&app, &token, &format!("/api/projects/{project_id}")).await;
     assert_eq!(status, StatusCode::OK);
 
     // Derive the expected repo path from the config
@@ -68,8 +63,7 @@ async fn smart_http_push(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "push-test", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "push-test", "private").await;
 
     // Create a local bare repo and working copy
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
@@ -107,8 +101,7 @@ async fn smart_http_clone(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let _project_id =
-        e2e_helpers::create_project(&app, &token, "clone-test", "public").await;
+    let _project_id = e2e_helpers::create_project(&app, &token, "clone-test", "public").await;
 
     // Create a bare repo with content
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
@@ -138,8 +131,7 @@ async fn branch_listing(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "branch-list", "public").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "branch-list", "public").await;
 
     // Set up a bare repo at the expected path
     let owner = "admin";
@@ -177,11 +169,11 @@ async fn branch_listing(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
 
     let branches = body.as_array().expect("branches should be an array");
-    let names: Vec<&str> = branches
-        .iter()
-        .filter_map(|b| b["name"].as_str())
-        .collect();
-    assert!(names.contains(&"main"), "should have main branch: {names:?}");
+    let names: Vec<&str> = branches.iter().filter_map(|b| b["name"].as_str()).collect();
+    assert!(
+        names.contains(&"main"),
+        "should have main branch: {names:?}"
+    );
     assert!(
         names.contains(&"feature-a"),
         "should have feature-a branch: {names:?}"
@@ -196,8 +188,7 @@ async fn tree_browsing(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "tree-browse", "public").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "tree-browse", "public").await;
 
     // Create a repo with multiple files
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
@@ -226,10 +217,7 @@ async fn tree_browsing(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
 
     let entries = body.as_array().expect("tree should be an array");
-    let names: Vec<&str> = entries
-        .iter()
-        .filter_map(|e| e["name"].as_str())
-        .collect();
+    let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(
         names.contains(&"README.md"),
         "tree should contain README.md: {names:?}"
@@ -248,8 +236,7 @@ async fn blob_content(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "blob-test", "public").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "blob-test", "public").await;
 
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
     let (_work_dir, work_path) = e2e_helpers::create_working_copy(&bare_path);
@@ -271,13 +258,13 @@ async fn blob_content(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["encoding"], "utf-8");
     assert!(
-        body["content"]
-            .as_str()
-            .unwrap()
-            .contains("Test Project"),
+        body["content"].as_str().unwrap().contains("Test Project"),
         "blob content should contain 'Test Project'"
     );
-    assert!(body["size"].as_i64().unwrap() > 0, "blob size should be positive");
+    assert!(
+        body["size"].as_i64().unwrap() > 0,
+        "blob size should be positive"
+    );
 }
 
 /// Test 7: Fetch commit log via API.
@@ -288,8 +275,7 @@ async fn commit_history(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "commit-log", "public").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "commit-log", "public").await;
 
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
     let (_work_dir, work_path) = e2e_helpers::create_working_copy(&bare_path);
@@ -341,8 +327,7 @@ async fn merge_request_merge(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "mr-merge", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "mr-merge", "private").await;
 
     // Create a bare repo with main and a feature branch
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();

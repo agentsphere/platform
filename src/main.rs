@@ -115,10 +115,7 @@ async fn main() -> anyhow::Result<()> {
         deployer_shutdown_rx,
     ));
     let preview_shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(deployer::preview::run(
-        state.clone(),
-        preview_shutdown_rx,
-    ));
+    tokio::spawn(deployer::preview::run(state.clone(), preview_shutdown_rx));
 
     // Start agent session reaper background task
     let agent_shutdown_rx = shutdown_tx.subscribe();

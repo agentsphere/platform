@@ -50,16 +50,13 @@ async fn deployment_creates_k8s_resources(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-k8s", "staging", "nginx:1.25",
-    )
-    .await;
+    let project_id =
+        setup_deploy_project(&state, &app, &token, "deploy-k8s", "staging", "nginx:1.25").await;
 
     // Poll until the deployment reaches a healthy or failed state
-    let status = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let status =
+        e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+            .await;
     assert_eq!(status, "healthy");
 
     // Verify K8s Deployment exists
@@ -86,7 +83,12 @@ async fn deployment_health_check(pool: PgPool) {
     let token = e2e_helpers::admin_login(&app).await;
 
     let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-health", "staging", "nginx:1.25",
+        &state,
+        &app,
+        &token,
+        "deploy-health",
+        "staging",
+        "nginx:1.25",
     )
     .await;
 
@@ -105,10 +107,9 @@ async fn deployment_health_check(pool: PgPool) {
     );
 
     // Wait for healthy
-    let final_status = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let final_status =
+        e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+            .await;
     assert_eq!(final_status, "healthy");
 }
 
@@ -121,15 +122,18 @@ async fn deployment_rollback(pool: PgPool) {
     let token = e2e_helpers::admin_login(&app).await;
 
     let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-rollback", "staging", "nginx:1.25",
+        &state,
+        &app,
+        &token,
+        "deploy-rollback",
+        "staging",
+        "nginx:1.25",
     )
     .await;
 
     // Wait for initial deployment to be healthy
-    let _ = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let _ = e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+        .await;
 
     // Trigger rollback
     let (status, body) = e2e_helpers::post_json(
@@ -163,16 +167,12 @@ async fn deployment_stop(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-stop", "staging", "nginx:1.25",
-    )
-    .await;
+    let project_id =
+        setup_deploy_project(&state, &app, &token, "deploy-stop", "staging", "nginx:1.25").await;
 
     // Wait for healthy
-    let _ = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let _ = e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+        .await;
 
     // Set desired_status to stopped
     let (status, body) = e2e_helpers::patch_json(
@@ -205,15 +205,18 @@ async fn deployment_update_image(pool: PgPool) {
     let token = e2e_helpers::admin_login(&app).await;
 
     let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-update", "staging", "nginx:1.25",
+        &state,
+        &app,
+        &token,
+        "deploy-update",
+        "staging",
+        "nginx:1.25",
     )
     .await;
 
     // Wait for healthy
-    let _ = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let _ = e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+        .await;
 
     // Update the image
     let (status, body) = e2e_helpers::patch_json(
@@ -241,15 +244,18 @@ async fn deployment_history_recorded(pool: PgPool) {
     let token = e2e_helpers::admin_login(&app).await;
 
     let project_id = setup_deploy_project(
-        &state, &app, &token, "deploy-history", "staging", "nginx:1.25",
+        &state,
+        &app,
+        &token,
+        "deploy-history",
+        "staging",
+        "nginx:1.25",
     )
     .await;
 
     // Wait for healthy
-    let _ = e2e_helpers::poll_deployment_status(
-        &app, &token, project_id, "staging", "healthy", 60,
-    )
-    .await;
+    let _ = e2e_helpers::poll_deployment_status(&app, &token, project_id, "staging", "healthy", 60)
+        .await;
 
     // Fetch deployment history
     let (status, body) = e2e_helpers::get_json(
@@ -290,8 +296,7 @@ async fn preview_deployment_lifecycle(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "deploy-preview", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "deploy-preview", "private").await;
 
     // Insert a preview deployment directly
     sqlx::query(

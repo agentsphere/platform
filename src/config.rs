@@ -192,7 +192,10 @@ mod tests {
     #[test]
     fn test_default_cors_origins_empty() {
         let config = Config::test_default();
-        assert!(config.cors_origins.is_empty(), "test_default should have no CORS origins");
+        assert!(
+            config.cors_origins.is_empty(),
+            "test_default should have no CORS origins"
+        );
     }
 
     #[test]
@@ -212,7 +215,10 @@ mod tests {
     #[test]
     fn test_default_no_master_key() {
         let config = Config::test_default();
-        assert!(config.master_key.is_none(), "test_default should have no master key");
+        assert!(
+            config.master_key.is_none(),
+            "test_default should have no master key"
+        );
     }
 
     #[test]

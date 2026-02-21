@@ -131,10 +131,7 @@ pub fn router() -> Router<AppState> {
             get(list_history),
         )
         // Preview deployment routes
-        .route(
-            "/api/projects/{id}/previews",
-            get(list_previews),
-        )
+        .route("/api/projects/{id}/previews", get(list_previews))
         .route(
             "/api/projects/{id}/previews/{slug}",
             get(get_preview).delete(delete_preview),

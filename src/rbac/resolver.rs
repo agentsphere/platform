@@ -14,10 +14,9 @@ pub fn set_cache_ttl(ttl: u64) {
     CACHE_TTL.set(ttl).ok();
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn cache_ttl() -> i64 {
-    #[allow(clippy::cast_possible_wrap)]
-    let ttl = *CACHE_TTL.get().unwrap_or(&300) as i64;
-    ttl
+    *CACHE_TTL.get().unwrap_or(&300) as i64
 }
 
 fn cache_key(user_id: Uuid, project_id: Option<Uuid>) -> String {
@@ -264,5 +263,15 @@ mod tests {
         let scopes = vec!["project:read".to_string(), "nonexistent:perm".to_string()];
         assert!(scope_allows(Some(&scopes), Permission::ProjectRead));
         assert!(!scope_allows(Some(&scopes), Permission::ProjectWrite));
+    }
+
+    // -- cache_ttl --
+
+    #[test]
+    fn cache_ttl_defaults_to_300() {
+        // OnceLock may already be set from another test or not set at all.
+        // We just verify the function returns a positive value.
+        let ttl = cache_ttl();
+        assert!(ttl > 0, "cache_ttl should be positive, got {ttl}");
     }
 }

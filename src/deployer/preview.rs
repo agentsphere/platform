@@ -7,8 +7,8 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Patch, PatchParams};
 use kube::Api;
+use kube::api::{Patch, PatchParams};
 use uuid::Uuid;
 
 use crate::store::AppState;
@@ -267,9 +267,9 @@ fn build_preview_service(preview: &PendingPreview, namespace: &str) -> Service {
             selector: Some(BTreeMap::from([("app".into(), "preview".into())])),
             ports: Some(vec![ServicePort {
                 port: 80,
-                target_port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    8080,
-                )),
+                target_port: Some(
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8080),
+                ),
                 protocol: Some("TCP".into()),
                 ..Default::default()
             }]),
@@ -341,13 +341,11 @@ async fn cleanup_expired(state: &AppState) -> Result<(), anyhow::Error> {
         .await;
 
         // Delete K8s namespace (cascading delete cleans up all resources)
-        let project_name = sqlx::query_scalar!(
-            "SELECT name FROM projects WHERE id = $1",
-            row.project_id,
-        )
-        .fetch_optional(&state.pool)
-        .await?
-        .unwrap_or_default();
+        let project_name =
+            sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", row.project_id,)
+                .fetch_optional(&state.pool)
+                .await?
+                .unwrap_or_default();
 
         let project_slug = crate::pipeline::slug(&project_name);
         let ns_name = build_namespace_name(&project_slug, &row.branch_slug);
@@ -381,11 +379,7 @@ async fn delete_namespace(kube: &kube::Client, ns_name: &str) -> Result<(), anyh
 
 /// Stop a preview deployment for a given project and branch slug.
 /// Called when an MR is merged to clean up the preview for the source branch.
-pub async fn stop_preview_for_branch(
-    pool: &sqlx::PgPool,
-    project_id: Uuid,
-    branch: &str,
-) {
+pub async fn stop_preview_for_branch(pool: &sqlx::PgPool, project_id: Uuid, branch: &str) {
     let slug = crate::pipeline::slugify_branch(branch);
 
     let _ = sqlx::query!(

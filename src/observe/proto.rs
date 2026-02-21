@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(0, "info")]       // unspecified -> default info
+    #[case(0, "info")] // unspecified -> default info
     #[case(1, "trace")]
     #[case(2, "trace")]
     #[case(3, "trace")]
@@ -499,21 +499,21 @@ mod tests {
     #[case(22, "fatal")]
     #[case(23, "fatal")]
     #[case(24, "fatal")]
-    #[case(25, "info")]      // out of range -> default info
-    #[case(99, "info")]      // out of range -> default info
+    #[case(25, "info")] // out of range -> default info
+    #[case(99, "info")] // out of range -> default info
     fn severity_mapping(#[case] number: i32, #[case] expected: &str) {
         assert_eq!(severity_to_level(number), expected);
     }
 
     #[rstest]
-    #[case(0, "internal")]   // unspecified
+    #[case(0, "internal")] // unspecified
     #[case(1, "internal")]
     #[case(2, "server")]
     #[case(3, "client")]
     #[case(4, "producer")]
     #[case(5, "consumer")]
-    #[case(6, "internal")]   // out of range
-    #[case(99, "internal")]  // out of range
+    #[case(6, "internal")] // out of range
+    #[case(99, "internal")] // out of range
     fn span_kind_mapping(#[case] kind: i32, #[case] expected: &str) {
         assert_eq!(span_kind_to_str(kind), expected);
     }
@@ -522,8 +522,8 @@ mod tests {
     #[case(0, "unset")]
     #[case(1, "ok")]
     #[case(2, "error")]
-    #[case(3, "unset")]     // out of range -> unset
-    #[case(99, "unset")]    // out of range -> unset
+    #[case(3, "unset")] // out of range -> unset
+    #[case(99, "unset")] // out of range -> unset
     fn status_code_mapping(#[case] code: i32, #[case] expected: &str) {
         assert_eq!(status_code_to_str(code), expected);
     }

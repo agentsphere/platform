@@ -19,7 +19,13 @@ async fn setup_pipeline_project(
     app: &axum::Router,
     token: &str,
     name: &str,
-) -> (Uuid, std::path::PathBuf, std::path::PathBuf, tempfile::TempDir, tempfile::TempDir) {
+) -> (
+    Uuid,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let project_id = e2e_helpers::create_project(app, token, name, "private").await;
 
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
@@ -61,10 +67,8 @@ async fn pipeline_trigger_and_execute(pool: PgPool) {
     assert_eq!(body["status"], "pending");
 
     // Poll for completion (max 120s)
-    let final_status = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let final_status =
+        e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
     assert_eq!(final_status, "success");
 
     // Verify pipeline detail
@@ -102,10 +106,8 @@ async fn pipeline_with_multiple_steps(pool: PgPool) {
     let pipeline_id = body["id"].as_str().unwrap();
 
     // Poll for completion
-    let final_status = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let final_status =
+        e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // Verify pipeline completed (may be success or failure depending on
     // whether executor is running; the key assertion is that it ran)
@@ -151,10 +153,8 @@ async fn pipeline_step_failure(pool: PgPool) {
     let pipeline_id = body["id"].as_str().unwrap();
 
     // Poll for completion
-    let final_status = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let final_status =
+        e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // The pipeline should reach a terminal state
     assert!(
@@ -202,10 +202,8 @@ async fn pipeline_cancel(pool: PgPool) {
     );
 
     // Verify pipeline reaches cancelled or another terminal state
-    let final_status = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 60,
-    )
-    .await;
+    let final_status =
+        e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 60).await;
     assert!(
         matches!(final_status.as_str(), "cancelled" | "success" | "failure"),
         "pipeline should be terminal after cancel, got: {final_status}"
@@ -236,10 +234,7 @@ async fn step_logs_captured(pool: PgPool) {
     let pipeline_id = body["id"].as_str().unwrap();
 
     // Wait for completion
-    let _ = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // Get pipeline detail to find step IDs
     let (_, detail) = e2e_helpers::get_json(
@@ -257,13 +252,15 @@ async fn step_logs_captured(pool: PgPool) {
             let (log_status, log_bytes) = e2e_helpers::get_bytes(
                 &app,
                 &token,
-                &format!(
-                    "/api/projects/{project_id}/pipelines/{pipeline_id}/steps/{step_id}/logs"
-                ),
+                &format!("/api/projects/{project_id}/pipelines/{pipeline_id}/steps/{step_id}/logs"),
             )
             .await;
             // Logs endpoint should return 200 (even if empty)
-            assert_eq!(log_status, StatusCode::OK, "logs endpoint should return 200");
+            assert_eq!(
+                log_status,
+                StatusCode::OK,
+                "logs endpoint should return 200"
+            );
         }
     }
 }
@@ -291,10 +288,7 @@ async fn step_logs_in_minio(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED);
     let pipeline_id = body["id"].as_str().unwrap();
 
-    let _ = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // Check that step has a log_ref pointing to MinIO
     let (_, detail) = e2e_helpers::get_json(
@@ -315,10 +309,7 @@ async fn step_logs_in_minio(pool: PgPool) {
                     );
                     // Verify the log file exists in MinIO
                     let exists = state.minio.is_exist(log_ref).await.unwrap_or(false);
-                    assert!(
-                        exists,
-                        "log file should exist in MinIO at path: {log_ref}"
-                    );
+                    assert!(exists, "log file should exist in MinIO at path: {log_ref}");
                 }
             }
         }
@@ -348,10 +339,7 @@ async fn artifact_upload_and_download(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED);
     let pipeline_id = body["id"].as_str().unwrap();
 
-    let _ = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // List artifacts
     let (status, artifacts) = e2e_helpers::get_json(
@@ -429,10 +417,7 @@ steps:
     let pipeline_id = body["id"].as_str().unwrap();
 
     // Wait for completion
-    let _ = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // Verify pipeline has steps
     let (_, detail) = e2e_helpers::get_json(
@@ -463,10 +448,7 @@ async fn pipeline_branch_trigger_filter(pool: PgPool) {
     std::fs::write(work_path.join("feature.txt"), "no pipeline\n").unwrap();
     e2e_helpers::git_cmd(&work_path, &["add", "."]);
     e2e_helpers::git_cmd(&work_path, &["commit", "-m", "feature commit"]);
-    e2e_helpers::git_cmd(
-        &work_path,
-        &["push", "origin", "feature-no-pipeline"],
-    );
+    e2e_helpers::git_cmd(&work_path, &["push", "origin", "feature-no-pipeline"]);
 
     // Trigger on the feature branch
     let (status, body) = e2e_helpers::post_json(
@@ -483,7 +465,9 @@ async fn pipeline_branch_trigger_filter(pool: PgPool) {
     // or fail if the ref doesn't match any pipeline definition.
     // Both outcomes are valid — we just verify the API responds correctly.
     assert!(
-        status == StatusCode::CREATED || status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+        status == StatusCode::CREATED
+            || status == StatusCode::NOT_FOUND
+            || status == StatusCode::BAD_REQUEST,
         "unexpected status for feature branch trigger: {status}"
     );
 }
@@ -540,9 +524,6 @@ async fn concurrent_pipeline_limit(pool: PgPool) {
 
     // Wait for all to complete
     for pid in &pipeline_ids {
-        let _ = e2e_helpers::poll_pipeline_status(
-            &app, &token, project_id, pid, 120,
-        )
-        .await;
+        let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pid, 120).await;
     }
 }

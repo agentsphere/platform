@@ -52,10 +52,8 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
     // Real MinIO via S3 operator
     let minio_endpoint =
         std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into());
-    let minio_access =
-        std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "platform".into());
-    let minio_secret =
-        std::env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "devdevdev".into());
+    let minio_access = std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "platform".into());
+    let minio_secret = std::env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "devdevdev".into());
 
     let minio = {
         let builder = opendal::services::S3::default()
@@ -74,15 +72,14 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
     };
 
     // Real Kube client (from KUBECONFIG or in-cluster)
-    let kube = kube::Client::try_default()
-        .await
-        .unwrap_or_else(|_| {
-            // No kubeconfig available — build a stub that panics on use
-            let cfg = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
-            kube::Client::try_from(cfg).expect("dummy kube client")
-        });
+    let kube = kube::Client::try_default().await.unwrap_or_else(|_| {
+        // No kubeconfig available — build a stub that panics on use
+        let cfg = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+        kube::Client::try_from(cfg).expect("dummy kube client")
+    });
 
-    let git_repos_path = std::env::temp_dir().join(format!("platform-e2e-repos-{}", Uuid::new_v4()));
+    let git_repos_path =
+        std::env::temp_dir().join(format!("platform-e2e-repos-{}", Uuid::new_v4()));
     let ops_repos_path = std::env::temp_dir().join(format!("platform-e2e-ops-{}", Uuid::new_v4()));
 
     let config = Config {
@@ -113,8 +110,7 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
         webauthn_rp_name: "Test Platform".into(),
     };
 
-    let webauthn =
-        platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");
+    let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");
 
     AppState {
         pool,
@@ -264,10 +260,7 @@ pub fn create_bare_repo() -> (TempDir, PathBuf) {
 pub fn create_working_copy(bare_path: &Path) -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let work_path = dir.path().join("work");
-    git_cmd_at(
-        dir.path(),
-        &["clone", bare_path.to_str().unwrap(), "work"],
-    );
+    git_cmd_at(dir.path(), &["clone", bare_path.to_str().unwrap(), "work"]);
 
     // Configure git user for commits
     git_cmd(&work_path, &["config", "user.email", "test@e2e.local"]);
@@ -355,8 +348,8 @@ pub async fn wait_for_pod(
 /// Cleanup K8s resources by label selector.
 pub async fn cleanup_k8s(kube: &kube::Client, namespace: &str, label: &str) {
     use k8s_openapi::api::core::v1::Pod;
-    use kube::api::ListParams;
     use kube::Api;
+    use kube::api::ListParams;
 
     let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
     let lp = ListParams::default().labels(label);
@@ -387,17 +380,12 @@ pub async fn poll_pipeline_status(
             &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
         )
         .await;
-        let status = body["status"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let status = body["status"].as_str().unwrap_or("unknown").to_string();
         if matches!(status.as_str(), "success" | "failure" | "cancelled") {
             return status;
         }
         if start.elapsed().as_secs() > timeout_secs {
-            panic!(
-                "pipeline did not complete within {timeout_secs}s, last status: {status}"
-            );
+            panic!("pipeline did not complete within {timeout_secs}s, last status: {status}");
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -433,9 +421,7 @@ pub async fn poll_deployment_status(
             panic!("deployment reached failed status");
         }
         if start.elapsed().as_secs() > timeout_secs {
-            panic!(
-                "deployment did not reach '{expected}' within {timeout_secs}s, last: {status}"
-            );
+            panic!("deployment did not reach '{expected}' within {timeout_secs}s, last: {status}");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -460,12 +446,7 @@ pub async fn get_json(app: &Router, token: &str, path: &str) -> (StatusCode, Val
 }
 
 /// Send a POST request with Bearer auth and JSON body.
-pub async fn post_json(
-    app: &Router,
-    token: &str,
-    path: &str,
-    body: Value,
-) -> (StatusCode, Value) {
+pub async fn post_json(app: &Router, token: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method("POST")
         .uri(path)
@@ -484,12 +465,7 @@ pub async fn post_json(
 }
 
 /// Send a PATCH request with Bearer auth and JSON body.
-pub async fn patch_json(
-    app: &Router,
-    token: &str,
-    path: &str,
-    body: Value,
-) -> (StatusCode, Value) {
+pub async fn patch_json(app: &Router, token: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method("PATCH")
         .uri(path)

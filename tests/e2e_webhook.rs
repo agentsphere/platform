@@ -35,8 +35,7 @@ async fn webhook_fires_on_issue_create(pool: PgPool) {
         .await;
 
     // Create project + webhook
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-issue-fire", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-issue-fire", "private").await;
 
     let (wh_status, wh_body) = e2e_helpers::post_json(
         &app,
@@ -48,7 +47,11 @@ async fn webhook_fires_on_issue_create(pool: PgPool) {
         }),
     )
     .await;
-    assert_eq!(wh_status, StatusCode::CREATED, "webhook create failed: {wh_body}");
+    assert_eq!(
+        wh_status,
+        StatusCode::CREATED,
+        "webhook create failed: {wh_body}"
+    );
 
     // Create issue (triggers webhook)
     let (issue_status, issue_body) = e2e_helpers::post_json(
@@ -60,7 +63,11 @@ async fn webhook_fires_on_issue_create(pool: PgPool) {
         }),
     )
     .await;
-    assert_eq!(issue_status, StatusCode::CREATED, "issue create failed: {issue_body}");
+    assert_eq!(
+        issue_status,
+        StatusCode::CREATED,
+        "issue create failed: {issue_body}"
+    );
 
     // Wait for async webhook delivery
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -86,8 +93,7 @@ async fn webhook_hmac_signature(pool: PgPool) {
         .mount(&mock_server)
         .await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-hmac", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-hmac", "private").await;
 
     // Create webhook with secret
     let (wh_status, _) = e2e_helpers::post_json(
@@ -119,7 +125,10 @@ async fn webhook_hmac_signature(pool: PgPool) {
 
     // Retrieve the received request and verify HMAC
     let requests = mock_server.received_requests().await.unwrap();
-    assert!(!requests.is_empty(), "should have received at least one request");
+    assert!(
+        !requests.is_empty(),
+        "should have received at least one request"
+    );
     let req = &requests[0];
 
     let signature = req
@@ -137,8 +146,7 @@ async fn webhook_hmac_signature(pool: PgPool) {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(b"test-secret-key").expect("HMAC key");
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret-key").expect("HMAC key");
     mac.update(&req.body);
     let expected = hex::encode(mac.finalize().into_bytes());
     assert_eq!(
@@ -164,8 +172,7 @@ async fn webhook_no_signature_without_secret(pool: PgPool) {
         .mount(&mock_server)
         .await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-nosig", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-nosig", "private").await;
 
     // Create webhook WITHOUT secret
     e2e_helpers::post_json(
@@ -216,8 +223,7 @@ async fn webhook_fires_on_pipeline_complete(pool: PgPool) {
         .mount(&mock_server)
         .await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-pipeline", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-pipeline", "private").await;
 
     // Set up git repo
     let (_bare_dir, bare_path) = e2e_helpers::create_bare_repo();
@@ -255,10 +261,7 @@ async fn webhook_fires_on_pipeline_complete(pool: PgPool) {
     let pipeline_id = body["id"].as_str().unwrap();
 
     // Wait for pipeline to complete
-    let _ = e2e_helpers::poll_pipeline_status(
-        &app, &token, project_id, pipeline_id, 120,
-    )
-    .await;
+    let _ = e2e_helpers::poll_pipeline_status(&app, &token, project_id, pipeline_id, 120).await;
 
     // Give webhook time to fire
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -282,14 +285,11 @@ async fn webhook_timeout_doesnt_block(pool: PgPool) {
 
     // Server takes 15s to respond (longer than the 10s webhook timeout)
     Mock::given(matchers::method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_delay(Duration::from_secs(15)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(15)))
         .mount(&mock_server)
         .await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-timeout", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-timeout", "private").await;
 
     e2e_helpers::post_json(
         &app,
@@ -334,14 +334,11 @@ async fn webhook_concurrent_limit(pool: PgPool) {
 
     // Slow server to keep connections open (simulating concurrency pressure)
     Mock::given(matchers::method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_delay(Duration::from_secs(3)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
         .mount(&mock_server)
         .await;
 
-    let project_id =
-        e2e_helpers::create_project(&app, &token, "wh-concurrent", "private").await;
+    let project_id = e2e_helpers::create_project(&app, &token, "wh-concurrent", "private").await;
 
     e2e_helpers::post_json(
         &app,
@@ -379,8 +376,5 @@ async fn webhook_concurrent_limit(pool: PgPool) {
         "should receive at most 50 concurrent webhooks, got {received}"
     );
     // We should receive at least some (not all dropped)
-    assert!(
-        received > 0,
-        "should receive at least some webhooks, got 0"
-    );
+    assert!(received > 0, "should receive at least some webhooks, got 0");
 }

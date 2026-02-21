@@ -559,12 +559,7 @@ async fn merge_mr(
 
     // After successful merge, stop the preview deployment for the source branch.
     // Don't fail the merge if preview cleanup fails.
-    crate::deployer::preview::stop_preview_for_branch(
-        &state.pool,
-        id,
-        &mr.source_branch,
-    )
-    .await;
+    crate::deployer::preview::stop_preview_for_branch(&state.pool, id, &mr.source_branch).await;
 
     Ok(Json(MrResponse {
         id: merged.id,
