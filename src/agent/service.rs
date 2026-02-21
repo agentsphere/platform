@@ -33,7 +33,8 @@ pub fn get_provider(name: &str) -> Result<Box<dyn AgentProvider>, AgentError> {
 // ---------------------------------------------------------------------------
 
 /// Create a new agent session: insert DB row, create identity, spawn K8s pod.
-#[tracing::instrument(skip(state, prompt, provider_config), fields(%user_id, %project_id), err)]
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(state, prompt, provider_config, extra_permissions), fields(%user_id, %project_id), err)]
 pub async fn create_session(
     state: &AppState,
     user_id: Uuid,
@@ -42,6 +43,7 @@ pub async fn create_session(
     provider_name: &str,
     branch: Option<&str>,
     provider_config: Option<serde_json::Value>,
+    extra_permissions: &[crate::rbac::Permission],
 ) -> Result<AgentSession, AgentError> {
     let provider = get_provider(provider_name)?;
     let config: ProviderConfig = provider_config
@@ -77,6 +79,7 @@ pub async fn create_session(
         session_id,
         user_id,
         project_id,
+        extra_permissions,
     )
     .await?;
 

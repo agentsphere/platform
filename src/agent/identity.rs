@@ -17,13 +17,18 @@ pub struct AgentIdentity {
 
 /// Create an ephemeral agent user, assign the `agent` role, delegate permissions
 /// from the requesting user, and generate an API token for the pod.
-#[tracing::instrument(skip(pool, valkey), fields(%session_id, %delegator_id, %project_id), err)]
+///
+/// `extra_permissions` extends the base set (`ProjectRead` + `ProjectWrite`) with
+/// additional capabilities (e.g. `DeployRead`, `DeployPromote` for ops agents).
+/// Each permission is silently skipped if the delegator doesn't hold it.
+#[tracing::instrument(skip(pool, valkey, extra_permissions), fields(%session_id, %delegator_id, %project_id), err)]
 pub async fn create_agent_identity(
     pool: &PgPool,
     valkey: &fred::clients::Pool,
     session_id: Uuid,
     delegator_id: Uuid,
     project_id: Uuid,
+    extra_permissions: &[Permission],
 ) -> Result<AgentIdentity, AgentError> {
     let agent_user_id = Uuid::new_v4();
     let short_id = &session_id.to_string()[..8];
@@ -62,12 +67,17 @@ pub async fn create_agent_identity(
     .await?;
 
     // 3. Delegate permissions from requesting user to agent user.
-    //    Default: project:read + project:write on the specific project.
+    //    Base set: project:read + project:write on the specific project.
+    //    Extra permissions (e.g. deploy:read, deploy:promote) are appended.
     //    24-hour hard expiry as a safety net.
     let expires_at = Some(Utc::now() + Duration::hours(24));
-    let permissions_to_delegate = [Permission::ProjectRead, Permission::ProjectWrite];
+    let base_permissions = [Permission::ProjectRead, Permission::ProjectWrite];
+    let all_permissions: Vec<&Permission> = base_permissions
+        .iter()
+        .chain(extra_permissions.iter())
+        .collect();
 
-    for perm in &permissions_to_delegate {
+    for perm in &all_permissions {
         // If delegator doesn't hold a permission, create_delegation returns
         // Forbidden — we silently skip (agent gets fewer capabilities).
         let _ = delegation::create_delegation(
@@ -76,7 +86,7 @@ pub async fn create_agent_identity(
             &CreateDelegationParams {
                 delegator_id,
                 delegate_id: agent_user_id,
-                permission: *perm,
+                permission: **perm,
                 project_id: Some(project_id),
                 expires_at,
                 reason: Some(format!("agent session {session_id}")),

@@ -26,6 +26,12 @@ pub struct CreateSessionRequest {
     pub provider: Option<String>,
     pub branch: Option<String>,
     pub config: Option<serde_json::Value>,
+    /// Delegate deploy:read + deploy:promote to the agent.
+    #[serde(default)]
+    pub delegate_deploy: bool,
+    /// Delegate observe:read to the agent.
+    #[serde(default)]
+    pub delegate_observe: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +197,16 @@ async fn create_session(
     .await?
     .ok_or_else(|| ApiError::NotFound("project".into()))?;
 
+    // Build extra permission delegations based on request flags
+    let mut extra_permissions = Vec::new();
+    if body.delegate_deploy {
+        extra_permissions.push(Permission::DeployRead);
+        extra_permissions.push(Permission::DeployPromote);
+    }
+    if body.delegate_observe {
+        extra_permissions.push(Permission::ObserveRead);
+    }
+
     // Create session (identity + pod)
     let session = service::create_session(
         &state,
@@ -200,6 +216,7 @@ async fn create_session(
         provider,
         body.branch.as_deref(),
         body.config,
+        &extra_permissions,
     )
     .await
     .map_err(ApiError::from)?;
