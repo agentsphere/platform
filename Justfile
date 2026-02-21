@@ -42,6 +42,9 @@ test-unit:
 test-doc:
     cargo test --doc
 
+test-integration:
+    cargo nextest run --test '*_integration'
+
 # -- Database -------------------------------------------------------
 db-add name:
     cargo sqlx migrate add -r {{ name }}
