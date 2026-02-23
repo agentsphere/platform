@@ -120,7 +120,7 @@ deploy-local tag="platform:dev":
     kubectl rollout status deployment/platform -n platform --timeout=60s
 
 # -- Full CI locally ------------------------------------------------
-ci: fmt lint deny test-unit build
+ci: fmt lint deny test-unit test-integration build
     @echo "All checks passed"
 
 ci-full: fmt lint deny test-unit test-integration test-e2e build

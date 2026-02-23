@@ -34,8 +34,8 @@ just cov-all        # all tiers combined → coverage-all.lcov
 just cov-total      # ★ combined report: unit + integration + E2E (needs Kind + DB)
 just cov-html       # unit coverage as HTML report
 just cov-summary    # quick terminal summary (unit + integration)
-just ci             # full local CI: fmt lint deny test-unit build
-just ci-full        # ci + test-integration + test-e2e
+just ci             # full local CI: fmt lint deny test-unit test-integration build
+just ci-full        # ci + test-e2e
 just cluster-up     # create kind cluster + Postgres + Valkey + MinIO
 just cluster-down   # destroy kind cluster
 ```
