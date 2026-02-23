@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod dashboard;
 pub mod deployments;
 pub mod helpers;
 pub mod issues;
@@ -9,8 +10,10 @@ pub mod pipelines;
 pub mod projects;
 pub mod secrets;
 pub mod sessions;
+pub mod user_keys;
 pub mod users;
 pub mod webhooks;
+pub mod workspaces;
 
 use axum::Router;
 
@@ -30,5 +33,8 @@ pub fn router() -> Router<AppState> {
         .merge(secrets::router())
         .merge(notifications::router())
         .merge(passkeys::router())
+        .merge(user_keys::router())
+        .merge(workspaces::router())
+        .merge(dashboard::router())
         .merge(crate::git::browser_router())
 }

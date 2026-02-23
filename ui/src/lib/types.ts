@@ -292,8 +292,8 @@ export interface AlertEvent {
   id: string;
   alert_rule_id: string;
   status: string;
-  value: number;
-  message: string;
+  value: number | null;
+  message: string | null;
   created_at: string;
 }
 
@@ -308,10 +308,9 @@ export interface AgentSession {
   branch?: string;
   pod_name?: string;
   provider: string;
-  provider_config?: Record<string, any>;
   cost_tokens?: number;
   created_at: string;
-  updated_at: string;
+  finished_at: string | null;
 }
 
 export interface ProgressEvent {

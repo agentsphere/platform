@@ -28,6 +28,7 @@ pub struct WorkspaceResponse {
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub owner_id: Uuid,
+    pub is_active: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -40,6 +41,7 @@ impl From<workspace::Workspace> for WorkspaceResponse {
             display_name: w.display_name,
             description: w.description,
             owner_id: w.owner_id,
+            is_active: w.is_active,
             created_at: w.created_at.to_rfc3339(),
             updated_at: w.updated_at.to_rfc3339(),
         }
@@ -79,10 +81,15 @@ pub struct ListParams {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/workspaces", get(list_workspaces).post(create_workspace))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
         .route(
             "/api/workspaces/{id}",
-            get(get_workspace).patch(update_workspace).delete(delete_workspace),
+            get(get_workspace)
+                .patch(update_workspace)
+                .delete(delete_workspace),
         )
         .route(
             "/api/workspaces/{id}/members",
@@ -128,7 +135,7 @@ async fn require_workspace_admin(
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// POST /api/workspaces
+/// Create a workspace.
 async fn create_workspace(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -169,7 +176,7 @@ async fn create_workspace(
     Ok((StatusCode::CREATED, Json(ws.into())))
 }
 
-/// GET /api/workspaces
+/// List workspaces.
 async fn list_workspaces(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -187,7 +194,7 @@ async fn list_workspaces(
     }))
 }
 
-/// GET /api/workspaces/{id}
+/// Get workspace by ID.
 async fn get_workspace(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -202,7 +209,7 @@ async fn get_workspace(
     Ok(Json(ws.into()))
 }
 
-/// PATCH /api/workspaces/{id}
+/// Update workspace settings.
 async fn update_workspace(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -244,7 +251,7 @@ async fn update_workspace(
     Ok(Json(ws.into()))
 }
 
-/// DELETE /api/workspaces/{id}
+/// Delete a workspace.
 async fn delete_workspace(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -278,7 +285,7 @@ async fn delete_workspace(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/workspaces/{id}/members
+/// List workspace members.
 async fn list_members(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -290,7 +297,7 @@ async fn list_members(
     Ok(Json(members.into_iter().map(Into::into).collect()))
 }
 
-/// POST /api/workspaces/{id}/members
+/// Add a member to a workspace.
 async fn add_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -301,7 +308,9 @@ async fn add_member(
 
     let role = body.role.as_deref().unwrap_or("member");
     if !matches!(role, "admin" | "member") {
-        return Err(ApiError::BadRequest("role must be 'admin' or 'member'".into()));
+        return Err(ApiError::BadRequest(
+            "role must be 'admin' or 'member'".into(),
+        ));
     }
 
     service::add_member(&state.pool, id, body.user_id, role).await?;
@@ -324,7 +333,7 @@ async fn add_member(
     Ok(StatusCode::CREATED)
 }
 
-/// DELETE /api/workspaces/{id}/members/{user_id}
+/// Delete a workspace member.
 async fn remove_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -376,7 +385,7 @@ struct WorkspaceProjectResponse {
     updated_at: DateTime<Utc>,
 }
 
-/// GET /api/workspaces/{id}/projects
+/// List projects in a workspace.
 async fn list_workspace_projects(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -388,39 +397,43 @@ async fn list_workspace_projects(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let total = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!: i64"
-           FROM projects WHERE workspace_id = $1 AND is_active = true"#,
-        id,
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM projects WHERE workspace_id = $1 AND is_active = true",
     )
+    .bind(id)
     .fetch_one(&state.pool)
-    .await?;
+    .await
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
 
-    let rows = sqlx::query!(
-        r#"SELECT id, name, display_name, description, visibility,
-                  default_branch, created_at, updated_at
-           FROM projects
-           WHERE workspace_id = $1 AND is_active = true
-           ORDER BY updated_at DESC
-           LIMIT $2 OFFSET $3"#,
-        id,
-        limit,
-        offset,
+    let rows = sqlx::query(
+        r"SELECT id, name, display_name, description, visibility,
+                 default_branch, created_at, updated_at
+          FROM projects
+          WHERE workspace_id = $1 AND is_active = true
+          ORDER BY updated_at DESC
+          LIMIT $2 OFFSET $3",
     )
+    .bind(id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
     let items = rows
         .into_iter()
-        .map(|p| WorkspaceProjectResponse {
-            id: p.id,
-            name: p.name,
-            display_name: p.display_name,
-            description: p.description,
-            visibility: p.visibility,
-            default_branch: p.default_branch,
-            created_at: p.created_at,
-            updated_at: p.updated_at,
+        .map(|p| {
+            use sqlx::Row;
+            WorkspaceProjectResponse {
+                id: p.get("id"),
+                name: p.get("name"),
+                display_name: p.get("display_name"),
+                description: p.get("description"),
+                visibility: p.get("visibility"),
+                default_branch: p.get("default_branch"),
+                created_at: p.get("created_at"),
+                updated_at: p.get("updated_at"),
+            }
         })
         .collect();
 

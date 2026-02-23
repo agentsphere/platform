@@ -59,8 +59,8 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
     if (!message.trim() || sending) return;
     setSending(true);
     try {
-      await api.post(`/api/projects/${projectId}/sessions/${sessionId}/messages`, {
-        message: message.trim(),
+      await api.post(`/api/projects/${projectId}/sessions/${sessionId}/message`, {
+        content: message.trim(),
       });
       setMessage('');
     } catch { /* ignore */ }
@@ -80,8 +80,8 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
 
   const elapsed = session.status === 'running'
     ? Date.now() - new Date(session.created_at).getTime()
-    : session.updated_at
-      ? new Date(session.updated_at).getTime() - new Date(session.created_at).getTime()
+    : session.finished_at
+      ? new Date(session.finished_at).getTime() - new Date(session.created_at).getTime()
       : 0;
 
   const isLive = session.status === 'running' || session.status === 'pending';

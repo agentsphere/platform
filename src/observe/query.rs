@@ -115,6 +115,8 @@ pub struct MetricQueryParams {
     pub project_id: Option<Uuid>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+    /// Relative time range like "1h", "6h", "24h", "7d". Converted to `from`.
+    pub range: Option<String>,
     #[serde(rename = "step")]
     _step: Option<i64>,
     #[serde(rename = "agg")]
@@ -128,6 +130,13 @@ pub struct MetricQueryParams {
 pub struct MetricDataPoint {
     pub timestamp: DateTime<Utc>,
     pub value: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MetricSeries {
+    pub name: String,
+    pub labels: std::collections::HashMap<String, String>,
+    pub points: Vec<MetricDataPoint>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +180,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/observe/traces", get(list_traces))
         .route("/api/observe/traces/{trace_id}", get(get_trace))
         .route("/api/observe/metrics", get(query_metrics))
+        .route("/api/observe/metrics/query", get(query_metrics))
         .route("/api/observe/metrics/names", get(list_metric_names))
         .route(
             "/api/observe/sessions/{session_id}/timeline",
@@ -482,7 +492,7 @@ async fn query_metrics(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(params): Query<MetricQueryParams>,
-) -> Result<Json<Vec<MetricDataPoint>>, ApiError> {
+) -> Result<Json<Vec<MetricSeries>>, ApiError> {
     require_observe_read(&state, &auth, params.project_id).await?;
 
     let name = params
@@ -500,9 +510,25 @@ async fn query_metrics(
 
     let limit = params.limit.unwrap_or(1000).min(10_000);
 
+    // Support relative time range (e.g. "1h", "6h", "24h", "7d")
+    let from = params.from.or_else(|| {
+        params.range.as_deref().and_then(|r| {
+            let secs = match r {
+                "1h" => 3600,
+                "6h" => 21600,
+                "12h" => 43200,
+                "24h" | "1d" => 86400,
+                "7d" => 604_800,
+                "30d" => 2_592_000,
+                _ => return None,
+            };
+            Some(Utc::now() - chrono::Duration::seconds(secs))
+        })
+    });
+
     let rows = sqlx::query(
         r"
-        SELECT ms.timestamp, ms.value
+        SELECT ser.id as series_id, ser.labels, ms.timestamp, ms.value
         FROM metric_samples ms
         JOIN metric_series ser ON ser.id = ms.series_id
         WHERE ser.name = $1
@@ -510,24 +536,49 @@ async fn query_metrics(
           AND ($3::uuid IS NULL OR ser.project_id = $3)
           AND ($4::timestamptz IS NULL OR ms.timestamp >= $4)
           AND ($5::timestamptz IS NULL OR ms.timestamp <= $5)
-        ORDER BY ms.timestamp ASC
+        ORDER BY ser.id, ms.timestamp ASC
         LIMIT $6
         ",
     )
     .bind(name)
     .bind(&labels_filter)
     .bind(params.project_id)
-    .bind(params.from)
+    .bind(from)
     .bind(params.to)
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
 
-    let items = rows
-        .into_iter()
-        .map(|r| MetricDataPoint {
+    // Group by series_id
+    let mut series_map: std::collections::HashMap<Uuid, (serde_json::Value, Vec<MetricDataPoint>)> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        let series_id: Uuid = r.get("series_id");
+        let entry = series_map.entry(series_id).or_insert_with(|| {
+            let labels: serde_json::Value = r.get("labels");
+            (labels, Vec::new())
+        });
+        entry.1.push(MetricDataPoint {
             timestamp: r.get("timestamp"),
             value: r.get("value"),
+        });
+    }
+
+    let items: Vec<MetricSeries> = series_map
+        .into_values()
+        .map(|(labels_json, points)| {
+            let labels = match labels_json {
+                serde_json::Value::Object(m) => m
+                    .into_iter()
+                    .map(|(k, v)| (k, v.as_str().unwrap_or_default().to_string()))
+                    .collect(),
+                _ => std::collections::HashMap::new(),
+            };
+            MetricSeries {
+                name: name.to_string(),
+                labels,
+                points,
+            }
         })
         .collect();
 

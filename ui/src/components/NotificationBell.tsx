@@ -43,7 +43,7 @@ export function NotificationBell() {
   };
 
   const markRead = async (id: string) => {
-    await api.patch(`/api/notifications/${id}`, { status: 'read' });
+    await api.patch(`/api/notifications/${id}/read`, {});
     setNotifications(prev => prev.filter(n => n.id !== id));
     setUnreadCount(prev => Math.max(0, prev - 1));
   };

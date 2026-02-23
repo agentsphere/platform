@@ -34,8 +34,10 @@ pub struct CreateAlertRequest {
     pub query: String,
     pub condition: String,
     pub threshold: Option<f64>,
+    #[serde(alias = "window_seconds")]
     pub for_seconds: Option<i32>,
     pub severity: Option<String>,
+    #[serde(alias = "channels")]
     pub notify_channels: Option<Vec<String>>,
     pub project_id: Option<Uuid>,
 }
@@ -47,8 +49,10 @@ pub struct UpdateAlertRequest {
     pub query: Option<String>,
     pub condition: Option<String>,
     pub threshold: Option<f64>,
+    #[serde(alias = "window_seconds")]
     pub for_seconds: Option<i32>,
     pub severity: Option<String>,
+    #[serde(alias = "channels")]
     pub notify_channels: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
@@ -69,8 +73,10 @@ pub struct AlertRuleResponse {
     pub query: String,
     pub condition: String,
     pub threshold: Option<f64>,
+    #[serde(rename = "window_seconds")]
     pub for_seconds: i32,
     pub severity: String,
+    #[serde(rename = "channels")]
     pub notify_channels: Vec<String>,
     pub project_id: Option<Uuid>,
     pub enabled: bool,
@@ -80,6 +86,7 @@ pub struct AlertRuleResponse {
 #[derive(Debug, Serialize)]
 pub struct AlertEventResponse {
     pub id: Uuid,
+    #[serde(rename = "alert_rule_id")]
     pub rule_id: Uuid,
     pub status: String,
     pub value: Option<f64>,
@@ -152,6 +159,7 @@ fn parse_alert_query(query: &str) -> Result<AlertQuery, ApiError> {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/observe/alerts", get(list_alerts).post(create_alert))
+        .route("/api/observe/alerts/events", get(list_all_alert_events))
         .route(
             "/api/observe/alerts/{id}",
             get(get_alert).patch(update_alert).delete(delete_alert),
@@ -577,6 +585,50 @@ async fn list_alert_events(
     Ok(Json(ListResponse { items, total }))
 }
 
+#[tracing::instrument(skip(state), err)]
+async fn list_all_alert_events(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<ListAlertParams>,
+) -> Result<Json<ListResponse<AlertEventResponse>>, ApiError> {
+    require_observe_read(&state, &auth).await?;
+
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alert_events")
+        .fetch_one(&state.pool)
+        .await?;
+
+    let rows = sqlx::query(
+        r"
+        SELECT id, rule_id, status, value, message, created_at, resolved_at
+        FROM alert_events
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        ",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| AlertEventResponse {
+            id: r.get("id"),
+            rule_id: r.get("rule_id"),
+            status: r.get("status"),
+            value: r.get("value"),
+            message: r.get("message"),
+            created_at: r.get("created_at"),
+            resolved_at: r.get("resolved_at"),
+        })
+        .collect();
+
+    Ok(Json(ListResponse { items, total }))
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
@@ -684,6 +736,49 @@ async fn evaluate_all(
     Ok(())
 }
 
+/// Result of evaluating the alert state transition.
+struct AlertTransition {
+    /// Whether the alert should fire (transition to firing).
+    should_fire: bool,
+    /// Whether the alert should resolve (was firing, condition cleared).
+    should_resolve: bool,
+}
+
+/// Pure state machine for alert transitions. Returns what actions to take,
+/// and mutates `state` in place.
+fn next_alert_state(
+    state: &mut AlertState,
+    condition_met: bool,
+    now: DateTime<Utc>,
+    for_seconds: i32,
+) -> AlertTransition {
+    if condition_met {
+        if state.first_triggered.is_none() {
+            state.first_triggered = Some(now);
+        }
+        let held_for = (now - state.first_triggered.unwrap()).num_seconds();
+        if held_for >= i64::from(for_seconds) && !state.firing {
+            state.firing = true;
+            return AlertTransition {
+                should_fire: true,
+                should_resolve: false,
+            };
+        }
+        AlertTransition {
+            should_fire: false,
+            should_resolve: false,
+        }
+    } else {
+        let was_firing = state.firing;
+        state.first_triggered = None;
+        state.firing = false;
+        AlertTransition {
+            should_fire: false,
+            should_resolve: was_firing,
+        }
+    }
+}
+
 async fn handle_alert_state(
     pool: &sqlx::PgPool,
     rule_id: Uuid,
@@ -693,21 +788,12 @@ async fn handle_alert_state(
     now: DateTime<Utc>,
     state: &mut AlertState,
 ) {
-    if condition_met {
-        if state.first_triggered.is_none() {
-            state.first_triggered = Some(now);
-        }
-        let held_for = (now - state.first_triggered.unwrap()).num_seconds();
-        if held_for >= i64::from(for_seconds) && !state.firing {
-            state.firing = true;
-            let _ = fire_alert(pool, rule_id, value).await;
-        }
-    } else {
-        if state.firing {
-            let _ = resolve_alert(pool, rule_id).await;
-        }
-        state.first_triggered = None;
-        state.firing = false;
+    let transition = next_alert_state(state, condition_met, now, for_seconds);
+    if transition.should_fire {
+        let _ = fire_alert(pool, rule_id, value).await;
+    }
+    if transition.should_resolve {
+        let _ = resolve_alert(pool, rule_id).await;
     }
 }
 
@@ -901,5 +987,202 @@ mod tests {
     fn condition_absent() {
         assert!(check_condition("absent", None, None));
         assert!(!check_condition("absent", None, Some(5.0)));
+    }
+
+    // -- check_condition edge cases --
+
+    #[test]
+    fn condition_gt_no_value_returns_false() {
+        assert!(!check_condition("gt", Some(10.0), None));
+    }
+
+    #[test]
+    fn condition_gt_no_threshold_returns_false() {
+        assert!(!check_condition("gt", None, Some(15.0)));
+    }
+
+    #[test]
+    fn condition_lt_no_value_returns_false() {
+        assert!(!check_condition("lt", Some(10.0), None));
+    }
+
+    #[test]
+    fn condition_eq_no_value_returns_false() {
+        assert!(!check_condition("eq", Some(10.0), None));
+    }
+
+    #[test]
+    fn condition_unknown_returns_false() {
+        assert!(!check_condition("unknown", Some(10.0), Some(15.0)));
+        assert!(!check_condition("", Some(10.0), Some(15.0)));
+    }
+
+    #[test]
+    fn condition_eq_near_epsilon() {
+        let v = 10.0;
+        let close = v + f64::EPSILON * 0.5;
+        assert!(check_condition("eq", Some(v), Some(close)));
+    }
+
+    #[test]
+    fn condition_nan_returns_false() {
+        assert!(!check_condition("gt", Some(10.0), Some(f64::NAN)));
+        assert!(!check_condition("lt", Some(10.0), Some(f64::NAN)));
+        assert!(!check_condition("eq", Some(10.0), Some(f64::NAN)));
+    }
+
+    #[test]
+    fn condition_infinity_gt_threshold() {
+        assert!(check_condition("gt", Some(10.0), Some(f64::INFINITY)));
+    }
+
+    // -- validate_condition --
+
+    #[test]
+    fn validate_condition_valid_values() {
+        assert!(validate_condition("gt").is_ok());
+        assert!(validate_condition("lt").is_ok());
+        assert!(validate_condition("eq").is_ok());
+        assert!(validate_condition("absent").is_ok());
+    }
+
+    #[test]
+    fn validate_condition_invalid_values() {
+        assert!(validate_condition("gte").is_err());
+        assert!(validate_condition("").is_err());
+        assert!(validate_condition("GT").is_err());
+    }
+
+    // -- parse_alert_query edge cases --
+
+    #[test]
+    fn parse_query_window_at_min_boundary() {
+        let q = parse_alert_query("metric:cpu window:10").unwrap();
+        assert_eq!(q.window_secs, 10);
+    }
+
+    #[test]
+    fn parse_query_window_at_max_boundary() {
+        let q = parse_alert_query("metric:cpu window:86400").unwrap();
+        assert_eq!(q.window_secs, 86400);
+    }
+
+    #[test]
+    fn parse_query_window_below_min_rejected() {
+        assert!(parse_alert_query("metric:cpu window:9").is_err());
+    }
+
+    #[test]
+    fn parse_query_window_above_max_rejected() {
+        assert!(parse_alert_query("metric:cpu window:86401").is_err());
+    }
+
+    #[test]
+    fn parse_query_window_non_integer_rejected() {
+        assert!(parse_alert_query("metric:cpu window:abc").is_err());
+    }
+
+    #[test]
+    fn parse_query_all_aggregations() {
+        for agg in &["avg", "sum", "max", "min", "count"] {
+            let q = parse_alert_query(&format!("metric:cpu agg:{agg}")).unwrap();
+            assert_eq!(q.aggregation, *agg);
+        }
+    }
+
+    #[test]
+    fn parse_query_empty_rejected() {
+        assert!(parse_alert_query("").is_err());
+    }
+
+    #[test]
+    fn parse_query_invalid_labels_json() {
+        assert!(parse_alert_query("metric:cpu labels:not-json").is_err());
+    }
+
+    // -- alert state machine (next_alert_state) --
+
+    #[test]
+    fn alert_inactive_to_pending_on_condition_met() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: None,
+            firing: false,
+        };
+        let t = next_alert_state(&mut state, true, now, 60);
+        // Should set first_triggered but not fire yet (hold period not met)
+        assert!(state.first_triggered.is_some());
+        assert!(!state.firing);
+        assert!(!t.should_fire);
+        assert!(!t.should_resolve);
+    }
+
+    #[test]
+    fn alert_pending_to_firing_after_hold_period() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: Some(now - chrono::Duration::seconds(120)),
+            firing: false,
+        };
+        let t = next_alert_state(&mut state, true, now, 60);
+        assert!(state.firing);
+        assert!(t.should_fire);
+        assert!(!t.should_resolve);
+    }
+
+    #[test]
+    fn alert_pending_resets_when_condition_clears() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: Some(now - chrono::Duration::seconds(30)),
+            firing: false,
+        };
+        let t = next_alert_state(&mut state, false, now, 60);
+        assert!(state.first_triggered.is_none());
+        assert!(!state.firing);
+        assert!(!t.should_fire);
+        assert!(!t.should_resolve); // was not firing, so no resolve
+    }
+
+    #[test]
+    fn alert_firing_resolves_when_condition_clears() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: Some(now - chrono::Duration::seconds(300)),
+            firing: true,
+        };
+        let t = next_alert_state(&mut state, false, now, 60);
+        assert!(!state.firing);
+        assert!(state.first_triggered.is_none());
+        assert!(!t.should_fire);
+        assert!(t.should_resolve);
+    }
+
+    #[test]
+    fn alert_firing_stays_firing_while_condition_holds() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: Some(now - chrono::Duration::seconds(300)),
+            firing: true,
+        };
+        let t = next_alert_state(&mut state, true, now, 60);
+        // Already firing — no duplicate fire
+        assert!(state.firing);
+        assert!(!t.should_fire);
+        assert!(!t.should_resolve);
+    }
+
+    #[test]
+    fn alert_already_firing_no_duplicate_notification() {
+        let now = Utc::now();
+        let mut state = AlertState {
+            first_triggered: Some(now - chrono::Duration::seconds(600)),
+            firing: true,
+        };
+        // Call multiple times — should never return should_fire again
+        for _ in 0..5 {
+            let t = next_alert_state(&mut state, true, now, 60);
+            assert!(!t.should_fire);
+        }
     }
 }

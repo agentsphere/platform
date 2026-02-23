@@ -64,7 +64,7 @@ export function Alerts() {
 
     try {
       if (editingRule) {
-        await api.put(`/api/observe/alerts/${editingRule.id}`, body);
+        await api.patch(`/api/observe/alerts/${editingRule.id}`, body);
       } else {
         await api.post('/api/observe/alerts', body);
       }
