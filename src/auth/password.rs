@@ -24,12 +24,14 @@ pub fn hash_password(plain: &str) -> anyhow::Result<String> {
     Ok(hash)
 }
 
-pub fn verify_password(plain: &str, hash: &str) -> anyhow::Result<bool> {
-    let parsed =
-        PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("invalid password hash: {e}"))?;
-    Ok(Argon2::default()
+pub fn verify_password(plain: &str, hash: &str) -> bool {
+    // Unparseable hash (e.g. "!disabled") — treat as verification failure
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
         .verify_password(plain.as_bytes(), &parsed)
-        .is_ok())
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -42,13 +44,13 @@ mod tests {
         let hash = hash_password(plain).unwrap();
 
         assert!(hash.starts_with("$argon2"));
-        assert!(verify_password(plain, &hash).unwrap());
+        assert!(verify_password(plain, &hash));
     }
 
     #[test]
     fn wrong_password_fails() {
         let hash = hash_password("secret123").unwrap();
-        assert!(!verify_password("wrong", &hash).unwrap());
+        assert!(!verify_password("wrong", &hash));
     }
 
     #[test]
@@ -66,15 +68,13 @@ mod tests {
             "dummy hash should be a valid argon2 hash"
         );
         // The dummy hash should not verify against a random password
-        assert!(!verify_password("random_password", hash).unwrap());
+        assert!(!verify_password("random_password", hash));
     }
 
     #[test]
-    fn verify_against_invalid_hash_returns_error() {
-        let err = verify_password("anything", "not_a_valid_hash").unwrap_err();
-        assert!(
-            err.to_string().contains("invalid password hash"),
-            "invalid hash should produce descriptive error, got: {err}"
-        );
+    fn verify_against_invalid_hash_returns_false() {
+        // Unparseable hashes (e.g. "!disabled") should return false, not panic
+        assert!(!verify_password("anything", "not_a_valid_hash"));
+        assert!(!verify_password("anything", "!disabled"));
     }
 }

@@ -51,24 +51,44 @@ impl FromRequestParts<AppState> for AuthUser {
         let trust_proxy = state.config.trust_proxy_headers;
         let ip_addr = extract_ip(parts, trust_proxy);
 
-        // Try Bearer token first
-        if let Some(raw_token) = extract_bearer_token(parts)
-            && let Some(user) = lookup_api_token(&state.pool, raw_token).await?
-        {
-            if !user.is_active {
-                return Err(ApiError::Unauthorized);
+        // Try Bearer token — check API tokens first, then session tokens
+        if let Some(raw_token) = extract_bearer_token(parts) {
+            if let Some(user) = lookup_api_token(&state.pool, raw_token).await? {
+                if !user.is_active {
+                    return Err(ApiError::Unauthorized);
+                }
+                let user_type: UserType = user
+                    .user_type
+                    .parse()
+                    .map_err(|e: anyhow::Error| ApiError::Internal(e))?;
+                return Ok(Self {
+                    user_id: user.user_id,
+                    user_name: user.user_name,
+                    user_type,
+                    ip_addr,
+                    token_scopes: Some(user.scopes),
+                });
             }
-            let user_type: UserType = user
-                .user_type
-                .parse()
-                .map_err(|e: anyhow::Error| ApiError::Internal(e))?;
-            return Ok(Self {
-                user_id: user.user_id,
-                user_name: user.user_name,
-                user_type,
-                ip_addr,
-                token_scopes: Some(user.scopes),
-            });
+            // Bearer token not in api_tokens — try as session token
+            if let Some(user) = lookup_session(&state.pool, raw_token).await? {
+                if !user.is_active {
+                    return Err(ApiError::Unauthorized);
+                }
+                let user_type: UserType = user
+                    .user_type
+                    .parse()
+                    .map_err(|e: anyhow::Error| ApiError::Internal(e))?;
+                if !user_type.can_login() {
+                    return Err(ApiError::Unauthorized);
+                }
+                return Ok(Self {
+                    user_id: user.user_id,
+                    user_name: user.user_name,
+                    user_type,
+                    ip_addr,
+                    token_scopes: None,
+                });
+            }
         }
 
         // Try session cookie

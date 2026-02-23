@@ -231,7 +231,7 @@ async fn webhook_fires_on_pipeline_complete(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 

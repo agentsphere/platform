@@ -176,8 +176,7 @@ async fn login(
         None => (password::dummy_hash().to_owned(), None),
     };
 
-    let password_valid =
-        password::verify_password(&body.password, &hash_to_verify).map_err(ApiError::Internal)?;
+    let password_valid = password::verify_password(&body.password, &hash_to_verify);
 
     let user = match user {
         Some(u) if password_valid && u.is_active => u,

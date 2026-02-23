@@ -156,7 +156,7 @@ async fn branch_listing(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -204,7 +204,7 @@ async fn tree_browsing(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -245,7 +245,7 @@ async fn blob_content(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -290,7 +290,7 @@ async fn commit_history(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -344,7 +344,7 @@ async fn merge_request_merge(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 

@@ -34,7 +34,7 @@ async fn setup_pipeline_project(
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -249,7 +249,7 @@ async fn step_logs_captured(pool: PgPool) {
             let step_id = first_step["id"].as_str().unwrap();
 
             // Fetch step logs
-            let (log_status, log_bytes) = e2e_helpers::get_bytes(
+            let (log_status, _log_bytes) = e2e_helpers::get_bytes(
                 &app,
                 &token,
                 &format!("/api/projects/{project_id}/pipelines/{pipeline_id}/steps/{step_id}/logs"),
@@ -308,7 +308,7 @@ async fn step_logs_in_minio(pool: PgPool) {
                         "log_ref should be non-empty for completed step"
                     );
                     // Verify the log file exists in MinIO
-                    let exists = state.minio.is_exist(log_ref).await.unwrap_or(false);
+                    let exists = state.minio.exists(log_ref).await.unwrap_or(false);
                     assert!(exists, "log file should exist in MinIO at path: {log_ref}");
                 }
             }
@@ -383,7 +383,7 @@ async fn pipeline_definition_parsing(pool: PgPool) {
     let app = e2e_helpers::test_router(state.clone());
     let token = e2e_helpers::admin_login(&app).await;
 
-    let (project_id, bare_path, work_path, _bd, _wd) =
+    let (project_id, _bare_path, work_path, _bd, _wd) =
         setup_pipeline_project(&state, &app, &token, "pipe-yaml").await;
 
     // Write a .platformci.yml file
@@ -451,7 +451,7 @@ async fn pipeline_branch_trigger_filter(pool: PgPool) {
     e2e_helpers::git_cmd(&work_path, &["push", "origin", "feature-no-pipeline"]);
 
     // Trigger on the feature branch
-    let (status, body) = e2e_helpers::post_json(
+    let (status, _body) = e2e_helpers::post_json(
         &app,
         &token,
         &format!("/api/projects/{project_id}/pipelines"),
@@ -485,7 +485,7 @@ async fn concurrent_pipeline_limit(pool: PgPool) {
 
     // Trigger multiple pipelines rapidly
     let mut pipeline_ids = Vec::new();
-    for i in 0..7 {
+    for _i in 0..7 {
         let (status, body) = e2e_helpers::post_json(
             &app,
             &token,

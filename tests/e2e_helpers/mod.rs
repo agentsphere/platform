@@ -27,6 +27,9 @@ use platform::store::AppState;
 /// external services rather than using stubs. Falls back gracefully when
 /// services are unavailable (tests should be `#[ignore]`).
 pub async fn e2e_state(pool: PgPool) -> AppState {
+    // Ensure a rustls CryptoProvider is installed (needed by reqwest/fred)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Bootstrap seed data
     platform::store::bootstrap::run(&pool, Some("testpassword"))
         .await
@@ -107,6 +110,7 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
         dev_mode: true,
         webauthn_rp_id: "localhost".into(),
         webauthn_rp_origin: "http://localhost:8080".into(),
+        permission_cache_ttl_secs: 300,
         webauthn_rp_name: "Test Platform".into(),
     };
 
@@ -119,6 +123,7 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
         kube,
         config: Arc::new(config),
         webauthn: Arc::new(webauthn),
+        pipeline_notify: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

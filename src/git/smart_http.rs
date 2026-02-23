@@ -137,8 +137,7 @@ pub async fn authenticate_basic(headers: &HeaderMap, pool: &PgPool) -> Result<Gi
         .as_ref()
         .map_or_else(|| password::dummy_hash(), |u| u.password_hash.as_str());
 
-    let valid =
-        password::verify_password(&password_raw, hash_to_verify).map_err(ApiError::Internal)?;
+    let valid = password::verify_password(&password_raw, hash_to_verify);
 
     let Some(user) = user_row else {
         return Err(ApiError::Unauthorized);

@@ -117,6 +117,7 @@ proptest = "1"
 rstest = "0.25"
 wiremock = "0.6"
 tempfile = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"

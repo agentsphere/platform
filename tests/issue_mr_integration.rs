@@ -3,6 +3,43 @@ mod helpers;
 use axum::http::StatusCode;
 use sqlx::PgPool;
 
+/// Seed a bare repo with an initial commit so branches can be created.
+async fn seed_bare_repo(repo_path: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::process::Command::new("git")
+        .args(["clone", repo_path, "work"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.local"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    std::fs::write(work.join("README.md"), "# test\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["push", "origin", "HEAD:refs/heads/main"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // E6: Issue/MR Integration Tests (15 tests)
 // ---------------------------------------------------------------------------
@@ -280,6 +317,9 @@ async fn create_merge_request(pool: PgPool) {
         .unwrap();
     let repo_path = row.0.unwrap();
 
+    // Seed with an initial commit so branches can be created
+    seed_bare_repo(&repo_path).await;
+
     // Create a dummy branch in the bare repo
     tokio::process::Command::new("git")
         .args(["branch", "feature-branch", "main"])
@@ -320,6 +360,8 @@ async fn list_merge_requests(pool: PgPool) {
         .await
         .unwrap();
     let repo_path = row.0.unwrap();
+
+    seed_bare_repo(&repo_path).await;
 
     // Create two branches
     for branch in ["feat-1", "feat-2"] {
@@ -371,6 +413,8 @@ async fn update_merge_request(pool: PgPool) {
         .unwrap();
     let repo_path = row.0.unwrap();
 
+    seed_bare_repo(&repo_path).await;
+
     tokio::process::Command::new("git")
         .args(["branch", "upd-branch", "main"])
         .current_dir(&repo_path)
@@ -416,6 +460,8 @@ async fn add_mr_comment(pool: PgPool) {
         .await
         .unwrap();
     let repo_path = row.0.unwrap();
+
+    seed_bare_repo(&repo_path).await;
 
     tokio::process::Command::new("git")
         .args(["branch", "comment-branch", "main"])

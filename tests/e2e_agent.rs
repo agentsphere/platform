@@ -239,7 +239,7 @@ async fn agent_reaper_captures_logs(pool: PgPool) {
 
     // Check if logs were stored in MinIO
     let log_path = format!("logs/sessions/{session_id}.log");
-    let exists = state.minio.is_exist(&log_path).await.unwrap_or(false);
+    let exists = state.minio.exists(&log_path).await.unwrap_or(false);
     // Logs may or may not be captured depending on pod lifecycle timing.
     // We just verify the path format is correct and the check doesn't error.
     if exists {

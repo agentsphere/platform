@@ -3226,6 +3226,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rstest",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -35,7 +35,7 @@ async fn setup_deploy_project(
     .bind(project_id)
     .bind(environment)
     .bind(image_ref)
-    .execute(state.pool.as_ref())
+    .execute(&state.pool)
     .await
     .unwrap();
 
@@ -305,7 +305,7 @@ async fn preview_deployment_lifecycle(pool: PgPool) {
            VALUES ($1, 'feature/cool', 'feature-cool', 'nginx:preview', 'active', 'pending', 24, now() + interval '24 hours')"#,
     )
     .bind(project_id)
-    .execute(state.pool.as_ref())
+    .execute(&state.pool)
     .await
     .unwrap();
 
@@ -375,7 +375,7 @@ async fn preview_cleanup_on_mr_merge(pool: PgPool) {
     sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
         .bind(bare_path.to_str().unwrap())
         .bind(project_id)
-        .execute(state.pool.as_ref())
+        .execute(&state.pool)
         .await
         .unwrap();
 
@@ -386,7 +386,7 @@ async fn preview_cleanup_on_mr_merge(pool: PgPool) {
            VALUES ($1, 'feature-preview', 'feature-preview', 'nginx:preview', 'active', 'pending', 24, now() + interval '24 hours')"#,
     )
     .bind(project_id)
-    .execute(state.pool.as_ref())
+    .execute(&state.pool)
     .await
     .unwrap();
 
