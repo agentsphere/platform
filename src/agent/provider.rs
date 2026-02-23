@@ -43,7 +43,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub max_turns: Option<i32>,
     /// Agent role controls which MCP servers are loaded.
-    /// One of: "dev" (default), "ops", "admin", "ui".
+    /// One of: "dev" (default), "ops", "admin", "ui", "test".
     #[serde(default)]
     pub role: Option<String>,
     /// Container image override for this session.
@@ -52,6 +52,20 @@ pub struct ProviderConfig {
     /// Shell commands to run after git clone but before the agent starts.
     #[serde(default)]
     pub setup_commands: Option<Vec<String>>,
+    /// Browser sidecar configuration. When present, a headless Chromium sidecar
+    /// is added to the agent pod and a Playwright MCP server is made available.
+    /// Only allowed for roles: "ui", "test".
+    #[serde(default)]
+    pub browser: Option<BrowserConfig>,
+}
+
+/// Configuration for the headless browser sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserConfig {
+    /// Allowed origin URLs the agent can navigate to via MCP tools.
+    /// e.g. `["http://localhost:3000", "http://preview-myapp.platform-agents.svc:80"]`
+    /// Validated by the MCP server before each navigation — the browser itself is unrestricted.
+    pub allowed_origins: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +136,7 @@ mod tests {
         assert!(config.role.is_none());
         assert!(config.image.is_none());
         assert!(config.setup_commands.is_none());
+        assert!(config.browser.is_none());
     }
 
     #[test]
@@ -158,5 +173,35 @@ mod tests {
     fn progress_kind_serializes_snake_case() {
         let json = serde_json::to_string(&ProgressKind::ToolCall).unwrap();
         assert_eq!(json, r#""tool_call""#);
+    }
+
+    #[test]
+    fn provider_config_with_browser() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"role":"ui","browser":{"allowed_origins":["http://localhost:3000","http://myapp:8080"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.role.as_deref(), Some("ui"));
+        let browser = config.browser.unwrap();
+        assert_eq!(browser.allowed_origins.len(), 2);
+        assert_eq!(browser.allowed_origins[0], "http://localhost:3000");
+        assert_eq!(browser.allowed_origins[1], "http://myapp:8080");
+    }
+
+    #[test]
+    fn provider_config_without_browser() {
+        let config: ProviderConfig =
+            serde_json::from_str(r#"{"role":"dev","model":"opus"}"#).unwrap();
+        assert!(config.browser.is_none());
+    }
+
+    #[test]
+    fn browser_config_roundtrip() {
+        let config = BrowserConfig {
+            allowed_origins: vec!["https://example.com".into()],
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BrowserConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.allowed_origins, config.allowed_origins);
     }
 }

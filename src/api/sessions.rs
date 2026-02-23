@@ -82,6 +82,7 @@ pub struct SessionResponse {
     pub cost_tokens: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub browser_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +200,41 @@ async fn require_session_write(
     Ok(())
 }
 
+/// Validate provider config fields (image, `setup_commands`, browser).
+fn validate_provider_config(
+    config: &serde_json::Value,
+    delegate_admin: bool,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let Ok(parsed) =
+        serde_json::from_value::<crate::agent::provider::ProviderConfig>(config.clone())
+    else {
+        return Ok(());
+    };
+    if let Some(ref image) = parsed.image {
+        validation::check_container_image(image)?;
+    }
+    if let Some(ref commands) = parsed.setup_commands {
+        validation::check_setup_commands(commands)?;
+    }
+    if let Some(ref browser) = parsed.browser {
+        validation::check_browser_config(browser)?;
+        let role = parsed.role.as_deref().unwrap_or("dev");
+        if !matches!(role, "ui" | "test") {
+            return Err(ApiError::BadRequest(
+                "browser access is only available for 'ui' and 'test' roles".into(),
+            ));
+        }
+    }
+    if parsed.role.as_deref() == Some("admin") && !delegate_admin {
+        tracing::warn!(
+            %user_id,
+            "agent session requested admin role without delegate_admin flag — admin MCP tools will get 403"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -230,25 +266,9 @@ async fn create_session(
         validation::check_branch_name(branch)?;
     }
 
-    // Validate container image and setup commands if provided
-    if let Some(ref config) = body.config
-        && let Ok(parsed) =
-            serde_json::from_value::<crate::agent::provider::ProviderConfig>(config.clone())
-    {
-        if let Some(ref image) = parsed.image {
-            validation::check_container_image(image)?;
-        }
-        if let Some(ref commands) = parsed.setup_commands {
-            validation::check_setup_commands(commands)?;
-        }
-
-        // Warn if admin role requested without delegate_admin flag
-        if parsed.role.as_deref() == Some("admin") && !body.delegate_admin {
-            tracing::warn!(
-                user_id = %auth.user_id,
-                "agent session requested admin role without delegate_admin flag — admin MCP tools will get 403"
-            );
-        }
+    // Validate provider config if provided
+    if let Some(ref config) = body.config {
+        validate_provider_config(config, body.delegate_admin, auth.user_id)?;
     }
 
     // Verify project exists
@@ -377,6 +397,7 @@ async fn list_sessions(
             cost_tokens: r.cost_tokens,
             created_at: r.created_at,
             finished_at: r.finished_at,
+            browser_enabled: false, // List view doesn't load provider_config
         })
         .collect();
 
@@ -765,6 +786,7 @@ async fn list_children(
             cost_tokens: r.cost_tokens,
             created_at: r.created_at,
             finished_at: r.finished_at,
+            browser_enabled: false,
         })
         .collect();
 
@@ -783,6 +805,13 @@ fn session_to_response(
     session: &crate::agent::provider::AgentSession,
     truncate: bool,
 ) -> SessionResponse {
+    // Detect browser config from provider_config JSON
+    let browser_enabled = session
+        .provider_config
+        .as_ref()
+        .and_then(|v| v.get("browser"))
+        .is_some();
+
     SessionResponse {
         id: session.id,
         project_id: session.project_id,
@@ -800,6 +829,7 @@ fn session_to_response(
         cost_tokens: session.cost_tokens,
         created_at: session.created_at,
         finished_at: session.finished_at,
+        browser_enabled,
     }
 }
 

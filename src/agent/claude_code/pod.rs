@@ -6,7 +6,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use crate::agent::provider::{AgentSession, ProviderConfig};
+use crate::agent::provider::{AgentSession, BrowserConfig, ProviderConfig};
 
 /// Parameters for building an agent pod. Grouped into a struct to stay under
 /// clippy's 7-argument threshold.
@@ -73,6 +73,30 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
     let pull_policy = image_pull_policy(&resolved_image);
     let main_container = build_main_container(claude_args, env_vars, &resolved_image, &pull_policy);
 
+    let mut containers = vec![main_container];
+    let mut volumes = vec![Volume {
+        name: "workspace".into(),
+        empty_dir: Some(EmptyDirVolumeSource {
+            size_limit: Some(Quantity("1Gi".into())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+
+    // Add browser sidecar when browser config is present
+    if let Some(ref browser) = params.config.browser {
+        containers.push(build_browser_sidecar(browser));
+        // Chromium needs a large /dev/shm — add tmpfs-backed emptyDir
+        volumes.push(Volume {
+            name: "dshm".into(),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".into()),
+                size_limit: Some(Quantity("256Mi".into())),
+            }),
+            ..Default::default()
+        });
+    }
+
     Pod {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(pod_name),
@@ -83,15 +107,8 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
             init_containers: Some(init_containers),
-            containers: vec![main_container],
-            volumes: Some(vec![Volume {
-                name: "workspace".into(),
-                empty_dir: Some(EmptyDirVolumeSource {
-                    size_limit: Some(Quantity("1Gi".into())),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]),
+            containers,
+            volumes: Some(volumes),
             ..Default::default()
         }),
         ..Default::default()
@@ -153,6 +170,14 @@ fn build_env_vars(
     ];
     if let Some(pid) = params.session.project_id {
         vars.push(env_var("PROJECT_ID", &pid.to_string()));
+    }
+    // Browser sidecar env vars
+    if let Some(ref browser) = params.config.browser {
+        vars.push(env_var("BROWSER_ENABLED", "true"));
+        vars.push(env_var("BROWSER_CDP_URL", "http://localhost:9222"));
+        let origins_json =
+            serde_json::to_string(&browser.allowed_origins).unwrap_or_else(|_| "[]".into());
+        vars.push(env_var("BROWSER_ALLOWED_ORIGINS", &origins_json));
     }
     vars
 }
@@ -241,6 +266,47 @@ fn build_main_container(
             limits: Some(BTreeMap::from([
                 ("cpu".into(), Quantity("500m".into())),
                 ("memory".into(), Quantity("512Mi".into())),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Build the headless Chromium browser sidecar container.
+/// Exposes CDP on port 9222 for the Playwright MCP server in the main container.
+fn build_browser_sidecar(_browser_config: &BrowserConfig) -> Container {
+    use k8s_openapi::api::core::v1::ContainerPort;
+
+    Container {
+        name: "browser".into(),
+        image: Some("chromedp/headless-shell:131".into()),
+        image_pull_policy: Some("IfNotPresent".into()),
+        args: Some(vec![
+            "--no-sandbox".into(),
+            "--disable-gpu".into(),
+            "--disable-dev-shm-usage".into(),
+            "--remote-debugging-address=0.0.0.0".into(),
+            "--remote-debugging-port=9222".into(),
+        ]),
+        ports: Some(vec![ContainerPort {
+            container_port: 9222,
+            name: Some("cdp".into()),
+            ..Default::default()
+        }]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "dshm".into(),
+            mount_path: "/dev/shm".into(),
+            ..Default::default()
+        }]),
+        resources: Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".into(), Quantity("200m".into())),
+                ("memory".into(), Quantity("512Mi".into())),
+            ])),
+            limits: Some(BTreeMap::from([
+                ("cpu".into(), Quantity("1".into())),
+                ("memory".into(), Quantity("1Gi".into())),
             ])),
             ..Default::default()
         }),
@@ -707,5 +773,196 @@ mod tests {
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
         assert_eq!(init.len(), 1); // git-clone only
+    }
+
+    // -- Browser sidecar tests --
+
+    fn browser_config() -> ProviderConfig {
+        ProviderConfig {
+            role: Some("ui".into()),
+            browser: Some(crate::agent::provider::BrowserConfig {
+                allowed_origins: vec!["http://localhost:3000".into(), "http://myapp:8080".into()],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn browser_sidecar_added_when_config_present() {
+        let session = test_session();
+        let config = browser_config();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.containers.len(), 2, "should have claude + browser");
+        assert_eq!(spec.containers[0].name, "claude");
+        assert_eq!(spec.containers[1].name, "browser");
+    }
+
+    #[test]
+    fn browser_sidecar_not_added_when_absent() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.containers.len(), 1, "should have only claude");
+    }
+
+    #[test]
+    fn dshm_volume_added_for_browser() {
+        let session = test_session();
+        let config = browser_config();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let volumes = spec.volumes.unwrap();
+        assert_eq!(volumes.len(), 2, "should have workspace + dshm");
+        let dshm = &volumes[1];
+        assert_eq!(dshm.name, "dshm");
+        let empty_dir = dshm.empty_dir.as_ref().unwrap();
+        assert_eq!(empty_dir.medium.as_deref(), Some("Memory"));
+        assert_eq!(
+            empty_dir.size_limit.as_ref().unwrap(),
+            &Quantity("256Mi".into())
+        );
+    }
+
+    #[test]
+    fn no_dshm_volume_without_browser() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let volumes = spec.volumes.unwrap();
+        assert_eq!(volumes.len(), 1, "should have only workspace");
+    }
+
+    #[test]
+    fn browser_env_vars_set_when_enabled() {
+        let session = test_session();
+        let config = browser_config();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref())
+        };
+        assert_eq!(get("BROWSER_ENABLED"), Some("true"));
+        assert_eq!(get("BROWSER_CDP_URL"), Some("http://localhost:9222"));
+        let origins = get("BROWSER_ALLOWED_ORIGINS").unwrap();
+        let parsed: Vec<String> = serde_json::from_str(origins).unwrap();
+        assert_eq!(parsed, vec!["http://localhost:3000", "http://myapp:8080"]);
+    }
+
+    #[test]
+    fn browser_env_vars_absent_when_disabled() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        assert!(
+            env.iter().all(|e| e.name != "BROWSER_ENABLED"),
+            "BROWSER_ENABLED should not be set"
+        );
+        assert!(
+            env.iter().all(|e| e.name != "BROWSER_CDP_URL"),
+            "BROWSER_CDP_URL should not be set"
+        );
+    }
+
+    #[test]
+    fn browser_sidecar_has_cdp_port() {
+        let session = test_session();
+        let config = browser_config();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let browser = &spec.containers[1];
+        let ports = browser.ports.as_ref().unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].container_port, 9222);
+        assert_eq!(ports[0].name.as_deref(), Some("cdp"));
+    }
+
+    #[test]
+    fn browser_sidecar_mounts_dshm() {
+        let session = test_session();
+        let config = browser_config();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &config,
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "file:///data/repos/test",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+        });
+        let spec = pod.spec.unwrap();
+        let browser = &spec.containers[1];
+        let mounts = browser.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "dshm");
+        assert_eq!(mounts[0].mount_path, "/dev/shm");
     }
 }

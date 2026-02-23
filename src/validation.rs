@@ -180,6 +180,34 @@ pub fn check_container_image(image: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validates browser configuration for agent sessions.
+///
+/// Checks that `allowed_origins` is non-empty, at most 20 entries,
+/// and each entry is a valid HTTP/HTTPS URL.
+pub fn check_browser_config(
+    config: &crate::agent::provider::BrowserConfig,
+) -> Result<(), ApiError> {
+    if config.allowed_origins.is_empty() {
+        return Err(ApiError::BadRequest(
+            "browser.allowed_origins must contain at least one origin".into(),
+        ));
+    }
+    if config.allowed_origins.len() > 20 {
+        return Err(ApiError::BadRequest(
+            "browser.allowed_origins: max 20 origins".into(),
+        ));
+    }
+    for (i, origin) in config.allowed_origins.iter().enumerate() {
+        check_length(&format!("browser.allowed_origins[{i}]"), origin, 1, 2048)?;
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            return Err(ApiError::BadRequest(format!(
+                "browser.allowed_origins[{i}]: must use http or https scheme"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validates setup commands for agent sessions.
 ///
 /// Max 20 commands, each 1-2000 characters.
@@ -822,6 +850,65 @@ mod tests {
             matches!(err, ApiError::BadRequest(ref msg) if msg.contains("setup_commands")),
             "too-long command should produce BadRequest, got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Browser config validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn browser_config_valid_origins() {
+        let config = crate::agent::provider::BrowserConfig {
+            allowed_origins: vec![
+                "http://localhost:3000".into(),
+                "https://preview.example.com".into(),
+            ],
+        };
+        assert!(check_browser_config(&config).is_ok());
+    }
+
+    #[test]
+    fn browser_config_empty_origins_rejected() {
+        let config = crate::agent::provider::BrowserConfig {
+            allowed_origins: vec![],
+        };
+        let err = check_browser_config(&config).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("allowed_origins")),
+            "empty origins should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn browser_config_too_many_origins_rejected() {
+        let config = crate::agent::provider::BrowserConfig {
+            allowed_origins: (0..21).map(|i| format!("http://host{i}:3000")).collect(),
+        };
+        let err = check_browser_config(&config).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("max 20")),
+            "too many origins should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn browser_config_non_http_rejected() {
+        let config = crate::agent::provider::BrowserConfig {
+            allowed_origins: vec!["ftp://example.com".into()],
+        };
+        let err = check_browser_config(&config).unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref msg) if msg.contains("http or https")),
+            "non-http origin should produce BadRequest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn browser_config_at_max_origins() {
+        let config = crate::agent::provider::BrowserConfig {
+            allowed_origins: (0..20).map(|i| format!("http://host{i}:3000")).collect(),
+        };
+        assert!(check_browser_config(&config).is_ok());
     }
 
     // -----------------------------------------------------------------------

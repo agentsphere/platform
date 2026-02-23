@@ -36,6 +36,11 @@ case "$ROLE" in
     ;;
 esac
 
+# Add browser MCP server when browser sidecar is enabled
+if [ "${BROWSER_ENABLED:-}" = "true" ]; then
+    MCP_JSON+=',"platform-browser":{"command":"node","args":["'"$MCP_DIR"'/platform-browser.js"]}'
+fi
+
 MCP_JSON+='}}'
 echo "$MCP_JSON" > /tmp/mcp-config.json
 
