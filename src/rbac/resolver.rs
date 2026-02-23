@@ -203,18 +203,25 @@ async fn add_workspace_permissions(
     Ok(())
 }
 
-/// Invalidate all cached permissions for a user.
-/// Called when roles or delegations change.
+/// Invalidate cached permissions for a user.
+///
+/// When `project_id` is `Some`, clears the global cache and that specific project cache.
+/// When `project_id` is `None`, clears ALL cached permissions for this user (global +
+/// every project-scoped entry) using a pattern delete. This is important when workspace
+/// membership changes, since the user may gain/lose access to many projects at once.
 #[tracing::instrument(skip(valkey), fields(%user_id), err)]
 pub async fn invalidate_permissions(
     valkey: &fred::clients::Pool,
     user_id: Uuid,
     project_id: Option<Uuid>,
 ) -> anyhow::Result<()> {
-    // Invalidate both global and project-specific cache
-    valkey::invalidate(valkey, &cache_key(user_id, None)).await?;
     if let Some(pid) = project_id {
+        // Clear global + specific project
+        valkey::invalidate(valkey, &cache_key(user_id, None)).await?;
         valkey::invalidate(valkey, &cache_key(user_id, Some(pid))).await?;
+    } else {
+        // Clear ALL cached permissions for this user (global + all project-scoped)
+        valkey::invalidate_pattern(valkey, &format!("perms:{user_id}:*")).await?;
     }
     Ok(())
 }

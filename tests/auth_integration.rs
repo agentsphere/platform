@@ -93,6 +93,10 @@ async fn login_rate_limited(pool: PgPool) {
     let state = helpers::test_state(pool).await;
     let app = helpers::test_router(state);
 
+    // Use a dedicated user to avoid Valkey key collision with admin_login() in other tests.
+    let admin_token = helpers::admin_login(&app).await;
+    helpers::create_user(&app, &admin_token, "ratelimit-user", "rl@test.com").await;
+
     // Send 11 rapid login attempts — rate limit is 10 per 5min
     let mut got_429 = false;
     for i in 0..12 {
@@ -100,7 +104,7 @@ async fn login_rate_limited(pool: PgPool) {
             &app,
             "",
             "/api/auth/login",
-            serde_json::json!({ "name": "admin", "password": format!("wrong{i}") }),
+            serde_json::json!({ "name": "ratelimit-user", "password": format!("wrong{i}") }),
         )
         .await;
 

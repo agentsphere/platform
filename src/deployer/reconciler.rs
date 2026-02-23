@@ -426,3 +426,48 @@ fn copy_deployment_fields(d: &PendingDeployment) -> PendingDeployment {
         project_name: d.project_name.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_deployment() -> PendingDeployment {
+        PendingDeployment {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            environment: "production".into(),
+            ops_repo_id: None,
+            manifest_path: None,
+            image_ref: "registry.example.com/myapp:v1.2.3".into(),
+            values_override: None,
+            desired_status: "active".into(),
+            deployed_by: Some(Uuid::new_v4()),
+            project_name: "my-app".into(),
+        }
+    }
+
+    #[test]
+    fn basic_manifest_has_correct_name() {
+        let d = sample_deployment();
+        let manifest = generate_basic_manifest(&d);
+        assert!(manifest.contains("name: my-app-production"));
+    }
+
+    #[test]
+    fn basic_manifest_has_correct_image() {
+        let d = sample_deployment();
+        let manifest = generate_basic_manifest(&d);
+        assert!(manifest.contains("image: registry.example.com/myapp:v1.2.3"));
+    }
+
+    #[test]
+    fn basic_manifest_is_valid_yaml() {
+        let d = sample_deployment();
+        let manifest = generate_basic_manifest(&d);
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("manifest should be valid YAML");
+        assert_eq!(parsed["kind"], "Deployment");
+        assert_eq!(parsed["apiVersion"], "apps/v1");
+        assert_eq!(parsed["spec"]["replicas"], 1);
+    }
+}

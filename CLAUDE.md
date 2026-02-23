@@ -31,6 +31,7 @@ just cov-unit       # unit test coverage → coverage-unit.lcov
 just cov-integration # integration coverage → coverage-integration.lcov
 just cov-e2e        # E2E coverage → coverage-e2e.lcov
 just cov-all        # all tiers combined → coverage-all.lcov
+just cov-total      # ★ combined report: unit + integration + E2E (needs Kind + DB)
 just cov-html       # unit coverage as HTML report
 just cov-summary    # quick terminal summary (unit + integration)
 just ci             # full local CI: fmt lint deny test-unit build

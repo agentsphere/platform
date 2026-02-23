@@ -42,6 +42,23 @@ pub async fn invalidate(pool: &fred::clients::Pool, key: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Delete all keys matching a glob pattern (using KEYS + DEL).
+/// Only suitable for small key spaces (e.g. per-user permission caches).
+pub async fn invalidate_pattern(pool: &fred::clients::Pool, pattern: &str) -> anyhow::Result<()> {
+    use fred::interfaces::ClientLike;
+
+    let keys: Vec<String> = pool
+        .custom(
+            fred::types::CustomCommand::new_static("KEYS", None, false),
+            vec![pattern.to_owned()],
+        )
+        .await?;
+    if !keys.is_empty() {
+        pool.del::<(), _>(keys).await?;
+    }
+    Ok(())
+}
+
 #[allow(dead_code)] // used by later modules (not yet wired)
 pub async fn publish(
     pool: &fred::clients::Pool,

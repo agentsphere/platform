@@ -108,10 +108,16 @@ pub async fn test_state(pool: PgPool) -> AppState {
 }
 
 /// Build the full API router with the given state.
+///
+/// Includes the main API router plus observe (query + alerts) and registry routers.
+/// The observe ingest routes (OTLP) are omitted since they require background channels.
 pub fn test_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(platform::api::router())
+        .merge(platform::observe::query::router())
+        .merge(platform::observe::alert::router())
+        .merge(platform::registry::router())
         .with_state(state)
 }
 

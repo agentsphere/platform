@@ -364,10 +364,10 @@ async fn workspace_member_gets_project_read(pool: PgPool) {
     .await;
     let project_id = proj_body["id"].as_str().unwrap();
 
-    // Create user with minimal permissions
+    // Create user with NO global role — only workspace membership should grant access.
+    // (The "viewer" role includes global project:read, which would bypass the workspace check.)
     let (user_id, user_token) =
         helpers::create_user(&app, &admin_token, "ws-projviewer", "pv@test.com").await;
-    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
 
     // Without workspace membership: project should be hidden
     let (status, _) =

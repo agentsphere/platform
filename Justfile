@@ -68,6 +68,14 @@ cov-all:
     cargo llvm-cov nextest --lcov --output-path coverage-all.lcov \
         --ignore-filename-regex '(proto\.rs|ui\.rs)'
 
+cov-total:
+    @echo "=== Combined coverage: unit + integration + E2E ==="
+    cargo llvm-cov clean --workspace
+    cargo llvm-cov nextest --no-report \
+        --lib --test '*_integration' --test 'e2e_*' \
+        --run-ignored all --test-threads 2 --no-fail-fast
+    cargo llvm-cov report --ignore-filename-regex '(proto\.rs|ui\.rs|main\.rs)'
+
 cov-html:
     cargo llvm-cov nextest --lib --html --output-dir coverage-html \
         --ignore-filename-regex '(proto\.rs|ui\.rs)'

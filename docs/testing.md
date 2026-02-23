@@ -261,6 +261,24 @@ Tests: `deployment_status_transitions`, `deployment_get_returns_correct_fields`,
 
 8. **Race conditions** — after triggering a pipeline, the executor may pick it up before your next assertion. Don't assert `status == "pending"` immediately after trigger — use `poll_pipeline_status()` to wait for completion.
 
+9. **Stale kubeconfig** — after Kind cluster restart or Docker Desktop restart, the kubeconfig may become stale (API server port changes). Refresh it:
+   ```bash
+   kind get kubeconfig --name platform > $HOME/.kube/kind-platform
+   ```
+
+10. **`.sqlx/` stale after Rust code changes** — `cargo sqlx prepare` must be re-run whenever `sqlx::query!` macros change in Rust code, not just when migration SQL changes. The `SQLX_OFFLINE=true` build will fail if the cache is stale. The `cargo llvm-cov` target dir is separate from the normal target dir, so even a working regular build may fail under coverage:
+    ```bash
+    just db-prepare   # regenerate .sqlx/ cache
+    ```
+
+11. **Stale E2E pods** — previous test runs leave pods in `e2e-agents` and `e2e-pipelines`. While tests usually tolerate this, cleaning up avoids noise:
+    ```bash
+    kubectl --kubeconfig=$HOME/.kube/kind-platform delete pods --all -n e2e-agents
+    kubectl --kubeconfig=$HOME/.kube/kind-platform delete pods --all -n e2e-pipelines
+    ```
+
+12. **AppState changes require test helper updates** — when fields are added to `AppState`, both `tests/helpers/mod.rs` and `tests/e2e_helpers/mod.rs` must be updated. Missing fields cause all integration and E2E tests to fail to compile.
+
 ### Cluster Management
 
 ```bash
@@ -309,11 +327,43 @@ just cov-unit         # unit coverage → coverage-unit.lcov
 just cov-integration  # integration coverage → coverage-integration.lcov
 just cov-e2e          # E2E coverage → coverage-e2e.lcov (requires Kind cluster)
 just cov-all          # all tiers combined → coverage-all.lcov
+just cov-total        # ★ combined report: unit + integration + E2E (requires Kind cluster + DB)
 just cov-html         # unit coverage as HTML report → coverage-html/
 just cov-summary      # quick terminal summary of unit + integration coverage
 ```
 
 Generated files (`*.lcov`, `coverage-html/`) are gitignored.
+
+### Combined coverage (the meaningful number)
+
+Separate per-tier coverage is diagnostic. The number that matters is combined: "when all tests run, what % of lines are hit?"
+
+The easiest way is `just cov-total`, which requires a live database and Kind cluster:
+
+```bash
+# Prerequisites: Kind cluster running (just cluster-up), DB migrated (just db-migrate)
+export KUBECONFIG=$HOME/.kube/kind-platform
+export DATABASE_URL="postgres://platform:dev@127.0.0.1:5432/platform_dev"
+just cov-total
+```
+
+Under the hood, `just cov-total` runs:
+
+```bash
+# 1. Clean previous profiling data
+cargo llvm-cov clean --workspace
+
+# 2. Run all three test tiers in a single instrumented build
+#    --no-report: accumulate coverage without generating a report yet
+cargo llvm-cov nextest --no-report \
+  --lib --test '*_integration' --test 'e2e_*' \
+  --run-ignored all --test-threads 2 --no-fail-fast
+
+# 3. Generate the combined report (text summary to stdout)
+cargo llvm-cov report --ignore-filename-regex '(proto\.rs|ui\.rs|main\.rs)'
+```
+
+**Note**: `SQLX_OFFLINE=true` does NOT work with `cargo llvm-cov` because it uses a separate target directory (`llvm-cov-target`) and some type annotations fail under the coverage configuration. Always use a live database connection for coverage runs.
 
 ### Excluded from coverage
 

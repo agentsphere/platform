@@ -31,5 +31,8 @@ pub mod ui;
 pub mod notify;
 pub mod secrets;
 
+// OCI Image Registry
+pub mod registry;
+
 // Workspaces
 pub mod workspace;

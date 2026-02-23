@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
+use crate::rbac::resolver;
 use crate::store::AppState;
 use crate::validation;
 use crate::workspace::{self, service};
@@ -315,6 +316,9 @@ async fn add_member(
 
     service::add_member(&state.pool, id, body.user_id, role).await?;
 
+    // Invalidate permission cache — workspace membership grants project access
+    let _ = resolver::invalidate_permissions(&state.valkey, body.user_id, None).await;
+
     write_audit(
         &state.pool,
         &AuditEntry {
@@ -350,6 +354,9 @@ async fn remove_member(
     if !removed {
         return Err(ApiError::NotFound("member".into()));
     }
+
+    // Invalidate permission cache — workspace membership grants project access
+    let _ = resolver::invalidate_permissions(&state.valkey, user_id, None).await;
 
     write_audit(
         &state.pool,

@@ -18,6 +18,35 @@ use platform::config::Config;
 use platform::store::AppState;
 
 // ---------------------------------------------------------------------------
+// Kube config helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve candidate kubeconfig paths for Kind clusters.
+/// Handles the case where KUBECONFIG env var contains a path with unexpanded
+/// `$HOME` (e.g. `/.kube/kind-platform` instead of `/Users/x/.kube/kind-platform`).
+fn resolve_kubeconfig_candidates() -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut paths = Vec::new();
+
+    // 1. Try the KUBECONFIG value as-is
+    if let Ok(raw) = std::env::var("KUBECONFIG") {
+        paths.push(PathBuf::from(&raw));
+        // If it doesn't start with a valid dir, try prepending HOME
+        if !raw.starts_with(&home) && !raw.is_empty() {
+            paths.push(PathBuf::from(format!("{home}{raw}")));
+        }
+    }
+
+    // 2. Kind platform config at well-known location
+    if !home.is_empty() {
+        paths.push(PathBuf::from(format!("{home}/.kube/kind-platform")));
+        paths.push(PathBuf::from(format!("{home}/.kube/config")));
+    }
+
+    paths
+}
+
+// ---------------------------------------------------------------------------
 // AppState builders
 // ---------------------------------------------------------------------------
 
@@ -74,12 +103,34 @@ pub async fn e2e_state(pool: PgPool) -> AppState {
         }
     };
 
-    // Real Kube client (from KUBECONFIG or in-cluster)
-    let kube = kube::Client::try_default().await.unwrap_or_else(|_| {
-        // No kubeconfig available — build a stub that panics on use
-        let cfg = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
-        kube::Client::try_from(cfg).expect("dummy kube client")
-    });
+    // Real Kube client (from KUBECONFIG or in-cluster).
+    // kube::Client::try_default() reads KUBECONFIG env var, but shell variable
+    // expansion ($HOME) may not work correctly in all test harnesses. If it
+    // fails, try resolving known kubeconfig paths explicitly.
+    let kube = match kube::Client::try_default().await {
+        Ok(client) => client,
+        Err(_) => {
+            // try_default failed — attempt to load kubeconfig from known paths
+            let candidates = resolve_kubeconfig_candidates();
+            let mut loaded = None;
+            for path in &candidates {
+                if let Ok(kubeconfig) = kube::config::Kubeconfig::read_from(path) {
+                    let opts = kube::config::KubeConfigOptions::default();
+                    if let Ok(kc) = kube::Config::from_custom_kubeconfig(kubeconfig, &opts).await {
+                        if let Ok(client) = kube::Client::try_from(kc) {
+                            loaded = Some(client);
+                            break;
+                        }
+                    }
+                }
+            }
+            loaded.unwrap_or_else(|| {
+                eprintln!("[E2E] kube client unavailable — tried: {candidates:?}");
+                let cfg = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+                kube::Client::try_from(cfg).expect("dummy kube client")
+            })
+        }
+    };
 
     let git_repos_path =
         std::env::temp_dir().join(format!("platform-e2e-repos-{}", Uuid::new_v4()));

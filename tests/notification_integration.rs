@@ -245,3 +245,143 @@ async fn cannot_mark_other_users_notification(pool: PgPool) {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Dispatch integration tests
+// ---------------------------------------------------------------------------
+
+/// notify() with InApp channel creates a row with status='sent'.
+#[sqlx::test(migrations = "./migrations")]
+async fn notify_in_app_creates_row(pool: PgPool) {
+    let state = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    platform::notify::dispatch::notify(
+        &state,
+        platform::notify::dispatch::NewNotification {
+            user_id: admin_id,
+            notification_type: "test_dispatch".into(),
+            subject: "Dispatch test".into(),
+            body: Some("Test body".into()),
+            channel: platform::notify::dispatch::NotifyChannel::InApp,
+            ref_type: None,
+            ref_id: None,
+        },
+    )
+    .await
+    .expect("notify failed");
+
+    // Verify row in DB
+    let row: (String,) = sqlx::query_as(
+        "SELECT status FROM notifications WHERE user_id = $1 AND notification_type = 'test_dispatch'",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, "sent");
+}
+
+/// on_build_complete with "failure" creates a notification for the project owner.
+#[sqlx::test(migrations = "./migrations")]
+async fn on_build_failed_notifies_owner(pool: PgPool) {
+    let state = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let admin_token = helpers::admin_login(&app).await;
+
+    let proj_id = helpers::create_project(&app, &admin_token, "fail-proj", "private").await;
+
+    platform::notify::dispatch::on_build_complete(&state, proj_id, "failure").await;
+
+    // Admin owns the project, so should get a notification
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND notification_type = 'build_failed'",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count.0, 1, "expected build_failed notification");
+}
+
+/// on_build_complete with "success" does NOT create a notification.
+#[sqlx::test(migrations = "./migrations")]
+async fn on_build_success_skips_notification(pool: PgPool) {
+    let state = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let admin_token = helpers::admin_login(&app).await;
+
+    let proj_id = helpers::create_project(&app, &admin_token, "success-proj", "private").await;
+
+    platform::notify::dispatch::on_build_complete(&state, proj_id, "success").await;
+
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM notifications WHERE notification_type = 'build_failed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count.0, 0,
+        "success should not generate build_failed notification"
+    );
+}
+
+/// on_mr_created creates a notification for the project owner.
+#[sqlx::test(migrations = "./migrations")]
+async fn on_mr_created_notifies_owner(pool: PgPool) {
+    let state = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let admin_token = helpers::admin_login(&app).await;
+
+    let proj_id = helpers::create_project(&app, &admin_token, "mr-proj", "private").await;
+
+    platform::notify::dispatch::on_mr_created(&state, proj_id, 42).await;
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND notification_type = 'mr_created'",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count.0, 1);
+}
+
+/// on_agent_completed creates a notification for the given user.
+#[sqlx::test(migrations = "./migrations")]
+async fn on_agent_completed_notifies_user(pool: PgPool) {
+    let state = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let session_id = Uuid::new_v4();
+    platform::notify::dispatch::on_agent_completed(&state, admin_id, session_id).await;
+
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND notification_type = 'agent_completed'",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count.0, 1);
+}
