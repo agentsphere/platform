@@ -24,6 +24,8 @@ import { ProviderKeys } from './pages/ProviderKeys';
 import { Workspaces } from './pages/Workspaces';
 import { WorkspaceDetail } from './pages/WorkspaceDetail';
 import { CreateApp } from './pages/CreateApp';
+import { OnboardingProvider } from './lib/onboarding';
+import { OnboardingOverlay } from './components/OnboardingOverlay';
 
 function AppRouter() {
   const { user, loading } = useAuth();
@@ -32,30 +34,33 @@ function AppRouter() {
   if (!user) return <Login />;
 
   return (
-    <Layout>
-      <Router>
-        <Dashboard path="/" />
-        <CreateApp path="/create-app" />
-        <Workspaces path="/workspaces" />
-        <WorkspaceDetail path="/workspaces/:id" />
-        <Projects path="/projects" />
-        <ProjectDetail path="/projects/:id/:tab?" />
-        <IssueDetail path="/projects/:id/issues/:number" />
-        <MRDetail path="/projects/:id/merge-requests/:number" />
-        <PipelineDetail path="/projects/:id/pipelines/:pipelineId" />
-        <SessionDetail path="/projects/:id/sessions/:sessionId" />
-        <Logs path="/observe/logs" />
-        <Traces path="/observe/traces" />
-        <TraceDetail path="/observe/traces/:traceId" />
-        <Metrics path="/observe/metrics" />
-        <Alerts path="/observe/alerts" />
-        <Users path="/admin/users" />
-        <Roles path="/admin/roles" />
-        <Delegations path="/admin/delegations" />
-        <Tokens path="/settings/tokens" />
-        <ProviderKeys path="/settings/provider-keys" />
-      </Router>
-    </Layout>
+    <OnboardingProvider>
+      <Layout>
+        <OnboardingOverlay />
+        <Router>
+          <Dashboard path="/" />
+          <CreateApp path="/create-app" />
+          <Workspaces path="/workspaces" />
+          <WorkspaceDetail path="/workspaces/:id" />
+          <Projects path="/projects" />
+          <ProjectDetail path="/projects/:id/:tab?" />
+          <IssueDetail path="/projects/:id/issues/:number" />
+          <MRDetail path="/projects/:id/merge-requests/:number" />
+          <PipelineDetail path="/projects/:id/pipelines/:pipelineId" />
+          <SessionDetail path="/projects/:id/sessions/:sessionId" />
+          <Logs path="/observe/logs" />
+          <Traces path="/observe/traces" />
+          <TraceDetail path="/observe/traces/:traceId" />
+          <Metrics path="/observe/metrics" />
+          <Alerts path="/observe/alerts" />
+          <Users path="/admin/users" />
+          <Roles path="/admin/roles" />
+          <Delegations path="/admin/delegations" />
+          <Tokens path="/settings/tokens" />
+          <ProviderKeys path="/settings/provider-keys" />
+        </Router>
+      </Layout>
+    </OnboardingProvider>
   );
 }
 

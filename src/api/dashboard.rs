@@ -44,6 +44,13 @@ pub struct AuditLogParams {
     pub offset: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct OnboardingStatus {
+    pub has_projects: bool,
+    pub has_provider_key: bool,
+    pub needs_onboarding: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -52,6 +59,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/dashboard/stats", get(dashboard_stats))
         .route("/api/audit-log", get(list_audit_log))
+        .route("/api/onboarding/status", get(onboarding_status))
 }
 
 // ---------------------------------------------------------------------------
@@ -167,4 +175,34 @@ async fn list_audit_log(
         .collect();
 
     Ok(Json(ListResponse { items, total }))
+}
+
+async fn onboarding_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<OnboardingStatus>, ApiError> {
+    let project_count: Option<i64> = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM projects WHERE owner_id = $1 AND is_active = true",
+    )
+    .bind(auth.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Some(0));
+
+    let key_count: Option<i64> = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_provider_keys WHERE user_id = $1 AND provider = 'anthropic'",
+    )
+    .bind(auth.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Some(0));
+
+    let has_projects = project_count.unwrap_or(0) > 0;
+    let has_provider_key = key_count.unwrap_or(0) > 0;
+
+    Ok(Json(OnboardingStatus {
+        has_projects,
+        has_provider_key,
+        needs_onboarding: !has_projects && !has_provider_key,
+    }))
 }
