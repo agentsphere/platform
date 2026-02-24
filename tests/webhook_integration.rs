@@ -217,7 +217,8 @@ async fn list_webhooks(pool: PgPool) {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    let items = body["items"].as_array().expect("items should be array");
+    assert_eq!(items.len(), 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]

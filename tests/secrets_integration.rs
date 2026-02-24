@@ -47,7 +47,7 @@ async fn create_and_list_project_secrets(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "list secrets failed: {body}");
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["name"], "DB_PASSWORD");
 }
@@ -84,7 +84,7 @@ async fn delete_project_secret(pool: PgPool) {
         &format!("/api/projects/{proj_id}/secrets"),
     )
     .await;
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert!(secrets.is_empty());
 }
 
@@ -133,10 +133,10 @@ async fn create_and_list_global_secrets(pool: PgPool) {
 
     let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/secrets").await;
     assert_eq!(status, StatusCode::OK);
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be an array");
     assert!(
         secrets.iter().any(|s| s["name"] == "GLOBAL_KEY"),
-        "global secret not found"
+        "global secret not found in {body}"
     );
 }
 
@@ -297,7 +297,7 @@ async fn create_and_list_workspace_secrets(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["name"], "WS_SECRET");
 }
@@ -345,7 +345,7 @@ async fn delete_workspace_secret(pool: PgPool) {
         &format!("/api/workspaces/{}/secrets", ws.id),
     )
     .await;
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert!(secrets.is_empty());
 }
 
@@ -444,7 +444,7 @@ async fn delete_global_secret(pool: PgPool) {
 
     // Verify not in list
     let (_, body) = helpers::get_json(&app, &admin_token, "/api/admin/secrets").await;
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert!(!secrets.iter().any(|s| s["name"] == "TO_DELETE_GLOBAL"));
 }
 
@@ -483,7 +483,7 @@ async fn create_secret_with_environment(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let secrets: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let secrets = body["items"].as_array().expect("items should be array");
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["name"], "STAGING_DB");
 }

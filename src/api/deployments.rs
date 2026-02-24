@@ -328,6 +328,10 @@ async fn update_deployment(
     require_deploy_promote(&state, &auth, id).await?;
     validate_update_body(&body)?;
 
+    // Reset current_status to 'pending' when image_ref or desired_status
+    // changes so the reconciler picks up the deployment for processing.
+    let needs_reconcile = body.image_ref.is_some() || body.desired_status.is_some();
+
     let r = sqlx::query!(
         r#"
         UPDATE deployments SET
@@ -336,7 +340,8 @@ async fn update_deployment(
             values_override = COALESCE($5, values_override),
             ops_repo_id = COALESCE($6, ops_repo_id),
             manifest_path = COALESCE($7, manifest_path),
-            deployed_by = $8
+            deployed_by = $8,
+            current_status = CASE WHEN $9 THEN 'pending' ELSE current_status END
         WHERE project_id = $1 AND environment = $2
         RETURNING id, project_id, environment, ops_repo_id, manifest_path,
                   image_ref, values_override, desired_status, current_status,
@@ -350,6 +355,7 @@ async fn update_deployment(
         body.ops_repo_id,
         body.manifest_path,
         auth.user_id,
+        needs_reconcile,
     )
     .fetch_optional(&state.pool)
     .await?
@@ -382,6 +388,11 @@ async fn update_deployment(
         if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
             tracing::error!(error = %e, "failed to publish DeployRequested event");
         }
+    }
+
+    // Wake the reconciler immediately so it picks up the change
+    if needs_reconcile {
+        state.deploy_notify.notify_one();
     }
 
     crate::api::webhooks::fire_webhooks(
