@@ -6,7 +6,10 @@ use axum::http::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use helpers::{admin_login, create_project, create_user, test_router, test_state};
+use helpers::{
+    admin_login, assign_role, create_project, create_user, set_user_api_key, test_router,
+    test_state,
+};
 
 // ---------------------------------------------------------------------------
 // Dashboard stats
@@ -132,4 +135,44 @@ async fn onboarding_status_with_project(pool: PgPool) {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["has_projects"], true);
+}
+
+/// User with API key but no projects → needs_onboarding = true (new behavior).
+#[sqlx::test(migrations = "./migrations")]
+async fn onboarding_status_with_key_but_no_projects(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_token = admin_login(&app).await;
+
+    let (user_id, token) = create_user(&app, &admin_token, "haskey", "haskey@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+    set_user_api_key(&pool, user_id).await;
+
+    let (status, body) = helpers::get_json(&app, &token, "/api/onboarding/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["has_provider_key"], true);
+    assert_eq!(body["has_projects"], false);
+    // Key is set but no projects → still needs onboarding
+    assert_eq!(body["needs_onboarding"], true);
+}
+
+/// User with API key AND a project → needs_onboarding = false.
+#[sqlx::test(migrations = "./migrations")]
+async fn onboarding_status_with_key_and_project(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_token = admin_login(&app).await;
+
+    let (user_id, token) = create_user(&app, &admin_token, "fulluser", "full@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+    set_user_api_key(&pool, user_id).await;
+    create_project(&app, &token, "my-first-project", "private").await;
+
+    let (status, body) = helpers::get_json(&app, &token, "/api/onboarding/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["has_provider_key"], true);
+    assert_eq!(body["has_projects"], true);
+    assert_eq!(body["needs_onboarding"], false);
 }

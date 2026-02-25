@@ -125,7 +125,7 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
 // Event dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()> {
+pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()> {
     let event: PlatformEvent = serde_json::from_str(payload)?;
     tracing::debug!(?event, "handling platform event");
 

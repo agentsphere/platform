@@ -94,17 +94,17 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
     Ok(())
 }
 
-struct PendingDeployment {
-    id: Uuid,
-    project_id: Uuid,
-    environment: String,
-    ops_repo_id: Option<Uuid>,
-    manifest_path: Option<String>,
-    image_ref: String,
-    values_override: Option<serde_json::Value>,
-    desired_status: String,
-    deployed_by: Option<Uuid>,
-    project_name: String,
+pub struct PendingDeployment {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub environment: String,
+    pub ops_repo_id: Option<Uuid>,
+    pub manifest_path: Option<String>,
+    pub image_ref: String,
+    pub values_override: Option<serde_json::Value>,
+    pub desired_status: String,
+    pub deployed_by: Option<Uuid>,
+    pub project_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +392,7 @@ fn generate_basic_manifest(deployment: &PendingDeployment) -> String {
 }
 
 /// Update deployment status to healthy and write a success history entry.
-async fn finalize_success(
+pub async fn finalize_success(
     state: &AppState,
     deployment: &PendingDeployment,
     sha: Option<&str>,
@@ -435,7 +435,7 @@ async fn finalize_success(
 }
 
 /// Mark a deployment as failed and record a failure history entry.
-async fn mark_failed(
+pub async fn mark_failed(
     state: &AppState,
     deployment_id: Uuid,
     deployed_by: Option<Uuid>,

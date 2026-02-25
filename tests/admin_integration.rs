@@ -1,6 +1,7 @@
 mod helpers;
 
 use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
 
 // ---------------------------------------------------------------------------
@@ -300,4 +301,456 @@ async fn admin_actions_create_audit_log(pool: PgPool) {
         .unwrap();
 
     assert!(row.0 >= 1, "expected audit_log entry for user.create");
+}
+
+// ---------------------------------------------------------------------------
+// Role CRUD
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_create_role(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/roles",
+        json!({ "name": "custom-role", "description": "A custom role" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["name"], "custom-role");
+    assert_eq!(body["description"], "A custom role");
+    assert_eq!(body["is_system"], false);
+    assert!(body["id"].is_string());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_create_role_duplicate_fails(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/roles",
+        json!({ "name": "dupe-role" }),
+    )
+    .await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/roles",
+        json!({ "name": "dupe-role" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_list_roles(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/roles").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let roles = body.as_array().unwrap();
+    // Should have at least the system roles (admin, developer, viewer)
+    assert!(roles.len() >= 3);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_list_role_permissions(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    // Get the admin role ID
+    let (_, roles) = helpers::get_json(&app, &admin_token, "/api/admin/roles").await;
+    let admin_role = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "admin")
+        .unwrap();
+    let role_id = admin_role["id"].as_str().unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/roles/{role_id}/permissions"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let perms = body.as_array().unwrap();
+    assert!(!perms.is_empty(), "admin role should have permissions");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_set_role_permissions(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    // Create a custom role
+    let (_, role) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/roles",
+        json!({ "name": "perm-role" }),
+    )
+    .await;
+    let role_id = role["id"].as_str().unwrap();
+
+    // Set permissions
+    let (status, body) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/roles/{role_id}/permissions"),
+        json!({ "permissions": ["project:read", "project:write"] }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    // Verify
+    let (_, perms) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/roles/{role_id}/permissions"),
+    )
+    .await;
+    let perm_names: Vec<&str> = perms
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(perm_names.contains(&"project:read"));
+    assert!(perm_names.contains(&"project:write"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_set_system_role_permissions_fails(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    // Get the admin role ID (which is a system role)
+    let (_, roles) = helpers::get_json(&app, &admin_token, "/api/admin/roles").await;
+    let admin_role = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "admin")
+        .unwrap();
+    let role_id = admin_role["id"].as_str().unwrap();
+
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/roles/{role_id}/permissions"),
+        json!({ "permissions": ["project:read"] }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Delegation CRUD
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_create_delegation(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "delegate-target", "del@test.com").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/delegations",
+        json!({
+            "delegate_id": user_id.to_string(),
+            "permission": "project:read",
+            "reason": "testing delegation"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["id"].is_string());
+    assert_eq!(body["permission_name"], "project:read");
+    assert_eq!(body["reason"], "testing delegation");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_revoke_delegation(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "revoke-target", "revoke@test.com").await;
+
+    // Create delegation
+    let (_, deleg) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/delegations",
+        json!({
+            "delegate_id": user_id.to_string(),
+            "permission": "project:read",
+        }),
+    )
+    .await;
+    let deleg_id = deleg["id"].as_str().unwrap();
+
+    // Revoke
+    let (status, body) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/delegations/{deleg_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    // Revoking again should 404
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/delegations/{deleg_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_list_delegations(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "list-deleg", "listdel@test.com").await;
+
+    // Create a delegation
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/delegations",
+        json!({
+            "delegate_id": user_id.to_string(),
+            "permission": "project:read",
+        }),
+    )
+    .await;
+
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/delegations").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let delegations = body.as_array().unwrap();
+    assert!(!delegations.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Service account CRUD
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_create_service_account(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/service-accounts",
+        json!({
+            "name": "my-bot",
+            "email": "bot@test.com",
+            "display_name": "My Bot",
+            "description": "A test bot",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["user"]["name"], "my-bot");
+    assert_eq!(body["user"]["user_type"], "service_account");
+    assert!(body["token"].is_null()); // no scopes = no token
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_create_service_account_with_token(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/service-accounts",
+        json!({
+            "name": "token-bot",
+            "email": "tokenbot@test.com",
+            "scopes": ["project:read"],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["token"].is_object());
+    assert!(
+        body["token"]["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("plat_")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_list_service_accounts(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    // Create a service account first
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/service-accounts",
+        json!({ "name": "list-bot", "email": "listbot@test.com" }),
+    )
+    .await;
+
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/service-accounts").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["total"].as_i64().unwrap() >= 1);
+    let items = body["items"].as_array().unwrap();
+    assert!(items.iter().any(|u| u["name"] == "list-bot"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_deactivate_service_account(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (_, sa) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/service-accounts",
+        json!({ "name": "deac-bot", "email": "deacbot@test.com" }),
+    )
+    .await;
+    let sa_id = sa["user"]["id"].as_str().unwrap();
+
+    let (status, body) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/service-accounts/{sa_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_deactivate_non_service_account_fails(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    // Create a regular user (not a service account)
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "regular-user", "regular@test.com").await;
+
+    // Try to deactivate via service account endpoint
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/service-accounts/{user_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_remove_role(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "role-user", "roleuser@test.com").await;
+
+    // Get developer role ID
+    let (_, roles) = helpers::get_json(&app, &admin_token, "/api/admin/roles").await;
+    let dev_role = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "developer")
+        .unwrap();
+    let role_id = dev_role["id"].as_str().unwrap();
+
+    // Assign role
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{user_id}/roles"),
+        json!({ "role_id": role_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Remove role
+    let (status, body) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{user_id}/roles/{role_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn admin_remove_role_not_found(pool: PgPool) {
+    let state = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+    let admin_token = helpers::admin_login(&app).await;
+
+    let (user_id, _) =
+        helpers::create_user(&app, &admin_token, "norole-user", "norole@test.com").await;
+
+    let fake_role_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{user_id}/roles/{fake_role_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -136,6 +136,25 @@ export function OnboardingOverlay() {
             setTimeout(() => refresh(), 1000);
             break;
           }
+          case 'tool_call': {
+            setMessages(prev => [...prev, { role: 'system', content: `Setting up: ${data.message}...` }]);
+            break;
+          }
+          case 'tool_result': {
+            const isError = data.metadata?.is_error;
+            setMessages(prev => [...prev, { role: 'system', content: isError ? `Error: ${data.message}` : data.message }]);
+            // If a project was created, update session + trigger onboarding refresh
+            if (data.metadata?.tool_name === 'create_project' && !isError && data.metadata?.result) {
+              try {
+                const result = JSON.parse(data.metadata.result as string);
+                if (result.project_id) {
+                  setSession(prev => prev ? { ...prev, project_id: result.project_id } : prev);
+                }
+              } catch { /* ignore parse errors */ }
+              refresh();
+            }
+            break;
+          }
           case 'error': {
             streamBuf.current = '';
             setStreaming(false);
@@ -202,38 +221,42 @@ export function OnboardingOverlay() {
         <div class="onboarding-header">
           <h2 style="margin:0 0 0.25rem">Welcome to Platform</h2>
           <p class="text-muted text-sm" style="margin:0">
-            Set your Claude API key to get started, then describe what you want to build.
+            {hasProviderKey
+              ? 'No projects yet \u2014 describe what you\'d like to build.'
+              : 'Set your Claude API key to get started, then describe what you want to build.'}
           </p>
         </div>
 
-        {/* API Key Section */}
-        <div class="onboarding-key-section">
-          <form onSubmit={handleValidate} style="display:flex;gap:0.5rem;align-items:flex-start">
-            <div style="flex:1">
-              <input
-                type="password"
-                class="input"
-                placeholder="sk-ant-api03-..."
-                value={apiKey}
-                onInput={(e) => setApiKey((e.target as HTMLInputElement).value)}
-                disabled={keyValid || validating || saving}
-              />
-            </div>
-            <button
-              type="submit"
-              class="btn btn-primary"
-              disabled={keyValid || validating || saving || apiKey.length < 10}
-            >
-              {validating ? 'Validating...' : saving ? 'Saving...' : keyValid ? 'Saved' : 'Set Key'}
-            </button>
-          </form>
-          {keyError && (
-            <div class="onboarding-key-status invalid">{keyError}</div>
-          )}
-          {keyValid && (
-            <div class="onboarding-key-status valid">API key verified and saved</div>
-          )}
-        </div>
+        {/* API Key Section (hidden if user already has a key) */}
+        {!hasProviderKey && (
+          <div class="onboarding-key-section">
+            <form onSubmit={handleValidate} style="display:flex;gap:0.5rem;align-items:flex-start">
+              <div style="flex:1">
+                <input
+                  type="password"
+                  class="input"
+                  placeholder="sk-ant-api03-..."
+                  value={apiKey}
+                  onInput={(e) => setApiKey((e.target as HTMLInputElement).value)}
+                  disabled={keyValid || validating || saving}
+                />
+              </div>
+              <button
+                type="submit"
+                class="btn btn-primary"
+                disabled={keyValid || validating || saving || apiKey.length < 10}
+              >
+                {validating ? 'Validating...' : saving ? 'Saving...' : keyValid ? 'Saved' : 'Set Key'}
+              </button>
+            </form>
+            {keyError && (
+              <div class="onboarding-key-status invalid">{keyError}</div>
+            )}
+            {keyValid && (
+              <div class="onboarding-key-status valid">API key verified and saved</div>
+            )}
+          </div>
+        )}
 
         {/* Chat Section */}
         <div class={`onboarding-chat-section ${chatEnabled ? '' : 'disabled'}`}>

@@ -18,7 +18,7 @@ use platform::store::AppState;
 ///
 /// - Bootstraps permissions, roles, admin user (password = "testpassword")
 /// - Connects to real Valkey (flushes DB to prevent cross-test pollution)
-/// - Uses in-memory object storage (no `MinIO` required)
+/// - Connects to real MinIO (S3 backend, bucket: `platform-e2e`)
 /// - Uses a dummy `Kube` client (panics if actually called)
 pub async fn test_state(pool: PgPool) -> AppState {
     // Ensure a rustls CryptoProvider is installed (needed by reqwest/fred)
@@ -47,10 +47,24 @@ pub async fn test_state(pool: PgPool) -> AppState {
             .expect("FLUSHDB failed");
     }
 
-    // In-memory MinIO
-    let minio = opendal::Operator::new(opendal::services::Memory::default())
-        .expect("memory operator")
-        .finish();
+    // Real MinIO (S3 backend) — same instance as Postgres/Valkey from Kind cluster.
+    // Uses a dedicated test bucket to avoid polluting production data.
+    let minio_endpoint =
+        std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into());
+    let minio_access_key = std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "platform".into());
+    let minio_secret_key = std::env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "devdevdev".into());
+    let minio = {
+        let mut builder = opendal::services::S3::default();
+        builder = builder
+            .endpoint(&minio_endpoint)
+            .access_key_id(&minio_access_key)
+            .secret_access_key(&minio_secret_key)
+            .bucket("platform-e2e")
+            .region("us-east-1");
+        opendal::Operator::new(builder)
+            .expect("minio S3 operator")
+            .finish()
+    };
 
     // Dummy Kube client — try real kubeconfig, fall back to a stub
     let kube = if let Ok(c) = kube::Client::try_default().await {
@@ -67,9 +81,9 @@ pub async fn test_state(pool: PgPool) -> AppState {
         listen: "127.0.0.1:0".into(),
         database_url: "postgres://localhost/test".into(),
         valkey_url,
-        minio_endpoint: "http://localhost:9000".into(),
-        minio_access_key: "test".into(),
-        minio_secret_key: "test".into(),
+        minio_endpoint: minio_endpoint.clone(),
+        minio_access_key: minio_access_key.clone(),
+        minio_secret_key: minio_secret_key.clone(),
         master_key: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
         git_repos_path: std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4())),
         ops_repos_path: std::env::temp_dir().join(format!("platform-ops-{}", Uuid::new_v4())),

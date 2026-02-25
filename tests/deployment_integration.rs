@@ -446,3 +446,92 @@ async fn list_and_get_ops_repo(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "list-repo");
 }
+
+// ---------------------------------------------------------------------------
+// Reconciler DB function tests
+// ---------------------------------------------------------------------------
+
+/// finalize_success updates deployment to healthy and writes history.
+#[sqlx::test(migrations = "./migrations")]
+async fn finalize_success_updates_deployment(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let admin_token = admin_login(&app).await;
+
+    let project_id = create_project(&app, &admin_token, "finalize-ok", "private").await;
+    let deploy_id = setup_deployment(&pool, project_id, "staging", "app:v3").await;
+
+    let deployment = platform::deployer::reconciler::PendingDeployment {
+        id: deploy_id,
+        project_id,
+        environment: "staging".into(),
+        ops_repo_id: None,
+        manifest_path: None,
+        image_ref: "app:v3".into(),
+        values_override: None,
+        desired_status: "active".into(),
+        deployed_by: None,
+        project_name: "finalize-ok".into(),
+    };
+
+    platform::deployer::reconciler::finalize_success(&state, &deployment, Some("abc123"), "deploy")
+        .await
+        .expect("finalize_success failed");
+
+    // Verify deployment status is now healthy
+    let (status, sha): (String, Option<String>) =
+        sqlx::query_as("SELECT current_status, current_sha FROM deployments WHERE id = $1")
+            .bind(deploy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(status, "healthy");
+    assert_eq!(sha.as_deref(), Some("abc123"));
+
+    // Verify history entry was created
+    let (h_action, h_status): (String, String) =
+        sqlx::query_as("SELECT action, status FROM deployment_history WHERE deployment_id = $1")
+            .bind(deploy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(h_action, "deploy");
+    assert_eq!(h_status, "success");
+}
+
+/// mark_failed updates deployment to failed and writes failure history.
+#[sqlx::test(migrations = "./migrations")]
+async fn mark_failed_updates_status(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let admin_token = admin_login(&app).await;
+
+    let project_id = create_project(&app, &admin_token, "mark-fail", "private").await;
+    let deploy_id = setup_deployment(&pool, project_id, "production", "app:broken").await;
+
+    platform::deployer::reconciler::mark_failed(&state, deploy_id, None, "manifest apply error")
+        .await;
+
+    // Verify deployment status is now failed
+    let (status,): (String,) =
+        sqlx::query_as("SELECT current_status FROM deployments WHERE id = $1")
+            .bind(deploy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(status, "failed");
+
+    // Verify history entry was created with failure
+    let (h_status, h_message): (String, Option<String>) =
+        sqlx::query_as("SELECT status, message FROM deployment_history WHERE deployment_id = $1")
+            .bind(deploy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(h_status, "failure");
+    assert_eq!(h_message.as_deref(), Some("manifest apply error"));
+}

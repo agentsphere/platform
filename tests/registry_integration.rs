@@ -840,3 +840,85 @@ async fn manifest_invalid_json_rejected(pool: PgPool) {
         "invalid JSON should be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Registry auth paths
+// ---------------------------------------------------------------------------
+
+/// Bearer token auth works for the registry (verifies lookup_api_token path).
+#[sqlx::test(migrations = "./migrations")]
+async fn registry_auth_bearer_token(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_token = admin_login(&app).await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "bearer-user", "bearer@test.com", &pool)
+            .await;
+
+    let (status, _, _) = registry_request(&app, &api_token, "GET", "/v2/").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Basic auth works for the registry (docker login sends user:password as base64).
+#[sqlx::test(migrations = "./migrations")]
+async fn registry_auth_basic_auth(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_token = admin_login(&app).await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "basic-user", "basic@test.com", &pool).await;
+
+    // Encode as Basic auth: username:api_token
+    let creds = format!("basic-user:{api_token}");
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &creds);
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v2/")
+        .header("Authorization", format!("Basic {encoded}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Invalid Bearer token returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn registry_auth_invalid_token_401(pool: PgPool) {
+    let state = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, headers, _) =
+        registry_request(&app, "plat_bogus_token_12345", "GET", "/v2/").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.contains_key("www-authenticate"));
+}
+
+/// Inactive user's token returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn registry_auth_inactive_user_401(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_token = admin_login(&app).await;
+    let (user_id, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "inactive-user",
+        "inactive@test.com",
+        &pool,
+    )
+    .await;
+
+    // Deactivate the user directly in DB
+    sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate user");
+
+    // Token should now be rejected
+    let (status, headers, _) = registry_request(&app, &api_token, "GET", "/v2/").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.contains_key("www-authenticate"));
+}

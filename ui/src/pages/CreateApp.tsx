@@ -81,6 +81,24 @@ export function CreateApp() {
             setStreaming(false);
             break;
           }
+          case 'tool_call': {
+            setMessages(prev => [...prev, { role: 'system', content: `Setting up: ${data.message}...` }]);
+            break;
+          }
+          case 'tool_result': {
+            const isError = data.metadata?.is_error;
+            setMessages(prev => [...prev, { role: 'system', content: isError ? `Error: ${data.message}` : data.message }]);
+            // If a project was created, update session info
+            if (data.metadata?.tool_name === 'create_project' && !isError && data.metadata?.result) {
+              try {
+                const result = JSON.parse(data.metadata.result as string);
+                if (result.project_id) {
+                  setSession(prev => prev ? { ...prev, project_id: result.project_id } : prev);
+                }
+              } catch { /* ignore parse errors */ }
+            }
+            break;
+          }
           case 'error': {
             streamBuf.current = '';
             setStreaming(false);

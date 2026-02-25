@@ -205,3 +205,61 @@ async fn create_app_rate_limited(pool: PgPool) {
 
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
+
+// ---------------------------------------------------------------------------
+// New tests for create-app agent tooling
+// ---------------------------------------------------------------------------
+
+/// Create-app without API key → error mentioning API key.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_app_without_api_key_fails(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let admin_token = admin_login(&app).await;
+    let (user_id, token) = create_user(&app, &admin_token, "nokey", "nokey@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+    // Note: NOT calling set_user_api_key
+
+    let (status, body) = post_json(
+        &app,
+        &token,
+        "/api/create-app",
+        serde_json::json!({ "description": "Build something" }),
+    )
+    .await;
+
+    // Should fail because no API key is configured
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 500 without API key, got {status}: {body}"
+    );
+}
+
+/// After create-app, session has pod_name=null (in-process, not K8s).
+#[sqlx::test(migrations = "./migrations")]
+async fn create_app_session_is_inprocess(pool: PgPool) {
+    let state = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let admin_token = admin_login(&app).await;
+    let (user_id, token) = create_user(&app, &admin_token, "dev7", "dev7@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+    set_user_api_key(&pool, user_id).await;
+
+    let (status, body) = post_json(
+        &app,
+        &token,
+        "/api/create-app",
+        serde_json::json!({ "description": "Build a REST API" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // In-process sessions should have no pod_name
+    assert!(
+        body["pod_name"].is_null(),
+        "in-process session should have null pod_name: {body}"
+    );
+}
