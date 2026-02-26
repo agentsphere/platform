@@ -706,6 +706,7 @@ pub struct ListResponse<T: serde::Serialize> {
 - **Clippy `collapsible_if`**: Use `if let ... && condition { }` instead of nested `if let { if { } }`.
 - **Clippy `trivially_copy_pass_by_ref`**: For `Copy` types, use `self` not `&self` (e.g., `fn as_str(self)`).
 - **`require_permission` route layer**: Requires `from_fn_with_state(state.clone(), ...)` — won't work in sub-routers that return `Router<AppState>` without a concrete state. Use inline permission checks instead.
+- **K8s `kind_to_plural` in applier**: `src/deployer/applier.rs` has a `kind_to_plural()` map for server-side apply. When adding new K8s resource types (e.g., `NetworkPolicy`), add the correct plural to this map — the generic fallback just appends "s" which is wrong for irregular plurals (`"networkpolicies"`, not `"networkpolicys"`).
 
 ## Git Workflow
 
