@@ -58,6 +58,9 @@ test-integration:
 test-e2e:
     bash hack/test-in-cluster.sh --type e2e
 
+test-mcp:
+    cd mcp && npm test
+
 test-ui:
     @echo "Requires running server: just run"
     cd ui && npx playwright test
@@ -126,8 +129,8 @@ deploy-local tag="platform:dev":
     kubectl rollout status deployment/platform -n platform --timeout=60s
 
 # -- Full CI locally ------------------------------------------------
-ci: fmt lint deny test-unit test-integration build
+ci: fmt lint deny test-unit test-mcp test-integration build
     @echo "All checks passed"
 
-ci-full: fmt lint deny test-unit test-integration test-e2e build
+ci-full: fmt lint deny test-unit test-mcp test-integration test-e2e build
     @echo "All checks passed (including E2E tests)"

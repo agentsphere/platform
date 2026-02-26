@@ -29,8 +29,16 @@ case "$ROLE" in
   ui)
     MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
     ;;
-  create-app)
-    for s in platform-pipeline platform-issues platform-deploy platform-admin; do
+  test)
+    MCP_JSON+=',"platform-pipeline":{"command":"node","args":["'"$MCP_DIR"'/platform-pipeline.js"]}'
+    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
+    MCP_JSON+=',"platform-observe":{"command":"node","args":["'"$MCP_DIR"'/platform-observe.js"]}'
+    ;;
+  review)
+    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
+    ;;
+  manager|create-app)
+    for s in platform-pipeline platform-issues platform-deploy platform-observe platform-admin; do
       MCP_JSON+=',"'"$s"'":{"command":"node","args":["'"$MCP_DIR"'/'"$s"'.js"]}'
     done
     ;;
