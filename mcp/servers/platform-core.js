@@ -7,7 +7,8 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { apiGet, apiPost, PROJECT_ID } from "../lib/client.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { apiGet, apiPost, apiPatch, apiDelete, PROJECT_ID } from "../lib/client.js";
 
 const SESSION_ID = process.env.SESSION_ID || "";
 
@@ -72,11 +73,76 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "create_project",
+    description: "Create a new project with a bare git repository.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Slug-style project name (lowercase, hyphens, 1-255 chars)" },
+        display_name: { type: "string", description: "Human-readable display name (optional)" },
+        description: { type: "string", description: "Project description (optional)" },
+        visibility: { type: "string", description: "Visibility: public, internal, or private (default)" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "update_project",
+    description: "Update an existing project (display name, description, visibility, default branch).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "Project UUID" },
+        display_name: { type: "string", description: "New display name" },
+        description: { type: "string", description: "New description" },
+        visibility: { type: "string", description: "New visibility (public/internal/private)" },
+        default_branch: { type: "string", description: "New default branch" },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "delete_project",
+    description: "Soft-delete a project (sets is_active=false). Requires project:write permission.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "Project UUID to delete" },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "get_session",
+    description: "Get details of an agent session including messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session UUID" },
+        project_id: { type: "string", description: "Project UUID (defaults to current)" },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "send_message_to_session",
+    description: "Send a message to an agent session (must be in 'running' status).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session UUID" },
+        content: { type: "string", description: "Message content" },
+        project_id: { type: "string", description: "Project UUID (defaults to current)" },
+      },
+      required: ["session_id", "content"],
+    },
+  },
 ];
 
-server.setRequestHandler({ method: "tools/list" }, async () => ({ tools: TOOLS }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler({ method: "tools/call" }, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
   switch (name) {
@@ -107,6 +173,42 @@ server.setRequestHandler({ method: "tools/call" }, async (request) => {
       if (!PROJECT_ID) throw new Error("PROJECT_ID not set");
       const data = await apiGet(
         `/api/projects/${PROJECT_ID}/sessions/${SESSION_ID}/children`,
+      );
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+    case "create_project": {
+      const body = { name: args.name };
+      if (args.display_name) body.display_name = args.display_name;
+      if (args.description) body.description = args.description;
+      if (args.visibility) body.visibility = args.visibility;
+      const data = await apiPost("/api/projects", { body });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+    case "update_project": {
+      const body = {};
+      if (args.display_name !== undefined) body.display_name = args.display_name;
+      if (args.description !== undefined) body.description = args.description;
+      if (args.visibility !== undefined) body.visibility = args.visibility;
+      if (args.default_branch !== undefined) body.default_branch = args.default_branch;
+      const data = await apiPatch(`/api/projects/${args.project_id}`, { body });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+    case "delete_project": {
+      const data = await apiDelete(`/api/projects/${args.project_id}`);
+      return { content: [{ type: "text", text: data ? JSON.stringify(data, null, 2) : "Project deleted" }] };
+    }
+    case "get_session": {
+      const p = args.project_id || PROJECT_ID;
+      if (!p) throw new Error("PROJECT_ID not set and no project_id provided");
+      const data = await apiGet(`/api/projects/${p}/sessions/${args.session_id}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+    case "send_message_to_session": {
+      const p = args.project_id || PROJECT_ID;
+      if (!p) throw new Error("PROJECT_ID not set and no project_id provided");
+      const data = await apiPost(
+        `/api/projects/${p}/sessions/${args.session_id}/message`,
+        { body: { content: args.content } },
       );
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }

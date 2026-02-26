@@ -8,6 +8,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { apiGet, PROJECT_ID } from "../lib/client.js";
 
 const server = new Server(
@@ -160,9 +161,9 @@ const TOOLS = [
   },
 ];
 
-server.setRequestHandler({ method: "tools/list" }, async () => ({ tools: TOOLS }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler({ method: "tools/call" }, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const p = args.project_id || pid();
 

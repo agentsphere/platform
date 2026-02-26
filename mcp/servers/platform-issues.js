@@ -7,6 +7,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { apiGet, apiPost, apiPatch, PROJECT_ID } from "../lib/client.js";
 
 const server = new Server(
@@ -186,11 +187,23 @@ const TOOLS = [
       required: ["number", "body"],
     },
   },
+  {
+    name: "merge_mr",
+    description: "Merge a merge request (no-ff merge). Requires project:write permission and MR must be open.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        number: { type: "integer", description: "MR number" },
+        project_id: { type: "string", description: "Project UUID (defaults to current)" },
+      },
+      required: ["number"],
+    },
+  },
 ];
 
-server.setRequestHandler({ method: "tools/list" }, async () => ({ tools: TOOLS }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler({ method: "tools/call" }, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const p = args.project_id || pid();
 
@@ -268,6 +281,10 @@ server.setRequestHandler({ method: "tools/call" }, async (request) => {
       const data = await apiPost(`/api/projects/${p}/merge-requests/${args.number}/comments`, {
         body: { body: args.body },
       });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+    case "merge_mr": {
+      const data = await apiPost(`/api/projects/${p}/merge-requests/${args.number}/merge`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
     default:
