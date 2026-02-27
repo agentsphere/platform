@@ -54,7 +54,7 @@ if [[ "$TEST_TYPE" == "e2e" && "$TEST_FILTER" == "*_integration" ]]; then
 fi
 
 # ── Namespace ID ──────────────────────────────────────────────────────────
-RUN_ID="$(date +%s)-$(head -c4 /dev/urandom | xxd -p)"
+RUN_ID="$(date +%s)-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
 NS="test-${RUN_ID}"
 PIPELINE_NS="${NS}-pipelines"
 AGENT_NS="${NS}-agents"
