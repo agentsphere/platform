@@ -1,11 +1,11 @@
 # Dev pod image for in-cluster Claude Code CLI development.
-# Contains: Rust 1.88 toolchain, Node.js 22, Playwright, Claude Code CLI,
+# Contains: Rust toolchain, Node.js 22, Playwright, Claude Code CLI,
 # and all cargo tools needed by the Justfile (nextest, llvm-cov, sqlx, deny).
 #
 # Build:  docker build -f docker/Dockerfile.dev-pod -t platform-dev-pod:latest .
-# Import: ctr -n k8s.io image import dev-pod.tar  (for k3s without registry)
+# Import: sudo ctr -a /run/k3s/containerd/containerd.sock -n k8s.io image import dev-pod.tar
 
-FROM rust:1.88-bookworm
+FROM rust:1.93-bookworm
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
