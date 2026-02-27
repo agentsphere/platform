@@ -318,9 +318,10 @@ spec:
       image: platform-dev-pod:latest
       resources:
         requests:
-          cpu: "3"
-          memory: 12Gi
+          cpu: "1"
+          memory: 4Gi
         limits:
+          cpu: "4"
           memory: 14Gi
       env:
         # Services are in the SAME namespace — short DNS names work
