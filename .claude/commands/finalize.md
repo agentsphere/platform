@@ -238,38 +238,41 @@ git diff --name-only main...HEAD -- 'src/**/*.rs'
 git diff --name-only HEAD -- 'src/**/*.rs'
 ```
 
-### 4.5.2 Run coverage
+### 4.5.2 Run diff-cover
+
+Use `diff-cover` to check coverage on changed lines. This is now on a feature branch with committed changes, so `--compare-branch=main` works directly. Runs all three test tiers (unit + integration + E2E) for combined coverage.
 
 ```bash
-# Minimum: unit coverage (fast, no infra needed)
-just cov-unit
-# Output: coverage-unit.lcov
+# Strict check: fails if any changed line is uncovered
+just cov-diff-check
+# Runs: unit + integration + E2E in Kind cluster → coverage-total.lcov → diff-cover --fail-under=100
 
-# Recommended: combined coverage (needs Kind cluster)
-just cov-total
+# If you need to see the report without failing:
+just cov-diff
 ```
 
-### 4.5.3 Check coverage for touched files
+`diff-cover` outputs a clean summary of exactly which lines are missing coverage:
+```
+------------- Diff Coverage -------------
+Missing lines:
+src/api/handler.rs: 112-114, 121
 
-For each file from git diff:
+Total:   45 lines
+Missing: 3 lines
+Coverage: 93%
+```
 
-1. Parse the lcov file (e.g., `coverage-unit.lcov`)
-2. Find `SF:<absolute-path-to-file>` section
-3. For each line shown in `git diff` as added (`+`) or modified:
-   - Find `DA:<line-number>,<execution-count>`
-   - If execution-count is 0, the line is **UNCOVERED**
+### 4.5.3 Handle uncovered lines
 
-### 4.5.4 Handle uncovered lines
-
-If any touched line is uncovered:
+If `diff-cover` reports uncovered lines:
 
 1. **Can you add a test?** — Add a unit or integration test that exercises the uncovered path
 2. **Is it unreachable in tests?** (e.g., K8s-only code path) — Document why and ensure E2E covers it
-3. **Re-run coverage** after adding tests to confirm the gap is closed
+3. **Re-run `just cov-diff-check`** after adding tests to confirm the gap is closed
 
-### 4.5.5 Coverage target
+### 4.5.4 Coverage target
 
-**100% of touched lines** must be covered by at least one test tier.
+**100% of touched lines** must be covered by at least one test tier (`just cov-diff-check` must pass).
 
 Exceptions (document explicitly in the PR description):
 - `main.rs` bootstrap wiring (covered by E2E only)

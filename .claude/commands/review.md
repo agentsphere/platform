@@ -316,36 +316,38 @@ git diff --name-only main...HEAD -- 'src/**/*.rs'
 git diff --name-only HEAD -- 'src/**/*.rs'
 ```
 
-### 2.5.2 Run coverage
+### 2.5.2 Run coverage and diff-cover
+
+Use `diff-cover` to automatically analyze which changed lines lack test coverage. This replaces manual lcov parsing. Runs all three test tiers (unit + integration + E2E) for combined coverage.
 
 ```bash
-# Fast: unit coverage only (always available)
-just cov-unit
-# Output: coverage-unit.lcov
+# On a feature branch (committed changes vs main):
+just cov-diff
+# Runs: unit + integration + E2E in Kind cluster → coverage-total.lcov → diff-cover vs main
 
-# Full: combined unit + integration + E2E (requires Kind cluster)
-just cov-total
+# On main with uncommitted changes (diff-cover needs committed diffs):
+bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov
+git diff HEAD -- src/ > /tmp/platform-diff.patch
+diff-cover coverage-total.lcov --diff-file /tmp/platform-diff.patch --show-uncovered
 ```
 
-### 2.5.3 Analyze touched-file coverage
+`diff-cover` outputs a clean, structured summary:
+```
+------------- Diff Coverage -------------
+Missing lines:
+src/api/handler.rs: 112-114, 121
+src/validation.rs: 45
 
-For each file in the touched list:
+Total:   45 lines
+Missing: 4 lines
+Coverage: 91%
+```
 
-1. Find the file's section in the lcov output (starts with `SF:<absolute-path>`)
-2. Find `DA:<line>,<hits>` entries for each line
-3. Cross-reference with `git diff` to identify which DA lines are new/modified (added `+` lines)
-4. A touched line with `DA:<line>,0` is **UNCOVERED**
-5. Record uncovered touched lines per file
+### 2.5.3 Produce findings from diff-cover output
 
-### 2.5.4 Output format
+Use the `diff-cover` output directly to build the coverage table — no manual lcov parsing needed.
 
-Produce a coverage table:
-
-| File | Lines changed | Lines covered | Coverage % | Uncovered lines |
-|---|---|---|---|---|
-| `src/api/handler.rs` | 45 | 42 | 93% | 112-114 |
-
-If any touched file has < 100% coverage on changed lines, produce a **[HIGH]** finding with the specific uncovered lines and what test would cover them.
+If any changed lines are uncovered, produce a **[HIGH]** finding per file with the specific uncovered line numbers and what test would cover them.
 
 **Exceptions** (document but don't flag):
 - `main.rs` bootstrap wiring (covered by E2E only)

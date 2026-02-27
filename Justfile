@@ -88,6 +88,16 @@ cov-total:
     @echo "=== Combined coverage: unit + integration + E2E ==="
     bash hack/test-in-cluster.sh --type total
 
+# Diff coverage: only lines changed vs a branch (requires Kind cluster + pipx install diff-cover)
+cov-diff branch="main":
+    bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov
+    diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered
+
+# Diff coverage strict: fail if changed lines < 100% covered
+cov-diff-check branch="main":
+    bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov
+    diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered --fail-under=100
+
 cov-html:
     cargo llvm-cov nextest --lib --html --output-dir coverage-html \
         --ignore-filename-regex '(proto\.rs|ui\.rs)'

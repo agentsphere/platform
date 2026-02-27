@@ -276,6 +276,13 @@ if [[ "$TEST_TYPE" == "total" ]]; then
   echo "────────────────────────────────────────────────────────────────"
   cargo llvm-cov report --ignore-filename-regex "${COV_REPORT_IGNORE_REGEX}"
 
+  if [[ -n "$LCOV_PATH" ]]; then
+    echo ""
+    echo "==> Generating combined LCOV → ${LCOV_PATH}"
+    cargo llvm-cov report --lcov --output-path "${LCOV_PATH}" \
+      --ignore-filename-regex "${COV_REPORT_IGNORE_REGEX}"
+  fi
+
   if [[ $TIER_FAILURES -gt 0 ]]; then
     echo ""
     echo "WARNING: ${TIER_FAILURES} test tier(s) had failures (see above)"

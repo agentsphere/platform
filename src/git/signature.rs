@@ -239,10 +239,89 @@ mod tests {
         assert!(json.get("signer_name").is_none());
     }
 
+    // Real GPG detached signature from an ed25519-signed git commit.
+    // Key fingerprint: E629A9A554026FF6232510CAD19844B71EFDFDDA
+    // Key ID (last 16 hex): D19844B71EFDFDDA
+    const TEST_SIGNATURE_ARMOR: &str = "-----BEGIN PGP SIGNATURE-----\n\niIgEABYKADAWIQTmKamlVAJv9iMlEMrRmES3Hv392gUCaaE6tBIcYWRtaW5AZXhh\nbXBsZS5jb20ACgkQ0ZhEtx79/dpnaQD/Z8aJcamYlCw8M1wYPQ2cs707fMU/0ZlX\nL5yWRQMrxvAA/0C0VEWbRpA0Cy5oknO4BGmq5qp5WWOOIm/66OKLZQMF\n=ZaF0\n-----END PGP SIGNATURE-----";
+
+    // The public key that produced TEST_SIGNATURE_ARMOR.
+    const TEST_SIGNER_PUBLIC_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmDMEaaE6tBYJKwYBBAHaRw8BAQdAfjHN7arMA/6FCc6HMDgDSdP5YSuuPgcUf0MX\nsqOE99a0H1Rlc3QgU2lnbmVyIDxhZG1pbkBleGFtcGxlLmNvbT6IkwQTFgoAOxYh\nBOYpqaVUAm/2IyUQytGYRLce/f3aBQJpoTq0AhsDBQsJCAcCAiICBhUKCQgLAgQW\nAgMBAh4HAheAAAoJENGYRLce/f3aV7UBAJLgQGxEoWY/3ISBHmJxhVgNYJCjSC2Z\ntCQTVVkW5N9mAQCdWcF33bG8ZUu/J1n00XHHY4OgrsuY0mVnMpwHVntiDA==\n=V+C4\n-----END PGP PUBLIC KEY BLOCK-----";
+
+    // The raw signed commit that produced TEST_SIGNATURE_ARMOR.
+    // Signed data = this commit object with the gpgsig header removed.
+    const TEST_SIGNED_RAW_COMMIT: &str = "tree 26f0a7f39487d471fe50def407139827d3ce29b9\nauthor Test Signer <admin@example.com> 1772174004 +0100\ncommitter Test Signer <admin@example.com> 1772174004 +0100\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iIgEABYKADAWIQTmKamlVAJv9iMlEMrRmES3Hv392gUCaaE6tBIcYWRtaW5AZXhh\n bXBsZS5jb20ACgkQ0ZhEtx79/dpnaQD/Z8aJcamYlCw8M1wYPQ2cs707fMU/0ZlX\n L5yWRQMrxvAA/0C0VEWbRpA0Cy5oknO4BGmq5qp5WWOOIm/66OKLZQMF\n =ZaF0\n -----END PGP SIGNATURE-----\n\nSigned commit\n";
+
+    #[test]
+    fn test_extract_signing_key_id_valid_signature() {
+        let key_id = extract_signing_key_id(TEST_SIGNATURE_ARMOR);
+        assert!(
+            key_id.is_some(),
+            "should extract key ID from valid signature"
+        );
+        let key_id = key_id.unwrap();
+        assert_eq!(
+            key_id, "D19844B71EFDFDDA",
+            "key ID should be uppercase hex last-16"
+        );
+    }
+
     #[test]
     fn test_extract_signing_key_id_invalid_signature() {
         let result = extract_signing_key_id("not a valid signature");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_verify_signature_valid() {
+        use pgp::composed::{Deserializable, SignedPublicKey};
+
+        let (key, _) = SignedPublicKey::from_string(TEST_SIGNER_PUBLIC_KEY)
+            .expect("should parse test public key");
+
+        // Extract signed data from the raw commit
+        let parsed = parse_commit_gpgsig(TEST_SIGNED_RAW_COMMIT.as_bytes())
+            .expect("should parse gpgsig from test commit");
+
+        let valid = verify_signature(&parsed.signature_armor, &parsed.signed_data, &key);
+        assert!(
+            valid,
+            "signature should verify against the correct key and data"
+        );
+    }
+
+    #[test]
+    fn test_verify_signature_tampered_data() {
+        use pgp::composed::{Deserializable, SignedPublicKey};
+
+        let (key, _) = SignedPublicKey::from_string(TEST_SIGNER_PUBLIC_KEY)
+            .expect("should parse test public key");
+
+        let parsed = parse_commit_gpgsig(TEST_SIGNED_RAW_COMMIT.as_bytes())
+            .expect("should parse gpgsig from test commit");
+
+        // Tamper with the signed data
+        let mut tampered = parsed.signed_data.clone();
+        tampered[0] = b'X';
+
+        let valid = verify_signature(&parsed.signature_armor, &tampered, &key);
+        assert!(!valid, "signature should NOT verify against tampered data");
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_key() {
+        use pgp::composed::{Deserializable, SignedPublicKey};
+
+        // Use a different key (the ed25519 test key from gpg_keys.rs — different key pair)
+        let wrong_key_armor = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmDMEaaB09RYJKwYBBAHaRw8BAQdA7TymMz+S0gh0Y2hF6sibwc7ny6K6/1TqEWIN\nzCEkavy0HVRlc3QgVXNlciA8YWRtaW5AZXhhbXBsZS5jb20+iJMEExYKADsWIQRh\n2dyD0z6E1lpw/6BZs2OrURhzdQUCaaB09QIbAwULCQgHAgIiAgYVCgkICwIEFgID\nAQIeBwIXgAAKCRBZs2OrURhzdWrvAP4/RbWPq4cqTCYW5AE1PykC3tPONCfZTmgQ\nGbJMcvAAYQD+K9FoComHTJ3ikIjmpLswwdwi0JHTIZhhVqxm2tVsaAc=\n=WQ0b\n-----END PGP PUBLIC KEY BLOCK-----";
+
+        let (wrong_key, _) =
+            SignedPublicKey::from_string(wrong_key_armor).expect("should parse wrong key");
+
+        let parsed = parse_commit_gpgsig(TEST_SIGNED_RAW_COMMIT.as_bytes())
+            .expect("should parse gpgsig from test commit");
+
+        let valid = verify_signature(&parsed.signature_armor, &parsed.signed_data, &wrong_key);
+        assert!(!valid, "signature should NOT verify against wrong key");
     }
 
     #[test]

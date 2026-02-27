@@ -32,6 +32,8 @@ just cov-integration # integration coverage → coverage-integration.lcov
 just cov-e2e        # E2E coverage → coverage-e2e.lcov
 just cov-all        # all tiers combined → coverage-all.lcov
 just cov-total      # ★ combined report: unit + integration + E2E (needs Kind + DB)
+just cov-diff       # diff coverage on changed lines vs main (unit+int+E2E, needs Kind)
+just cov-diff-check # diff coverage strict: fail if changed lines < 100% covered
 just cov-html       # unit coverage as HTML report
 just cov-summary    # quick terminal summary (unit + integration)
 just ci             # full local CI: fmt lint deny test-unit test-integration build
