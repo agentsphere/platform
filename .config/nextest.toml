@@ -1,6 +1,8 @@
 [profile.default]
 failure-output = "immediate-final"
 success-output = "never"
+# Safety net: kill any test that runs longer than 5 minutes
+slow-timeout = { period = "120s", terminate-after = 2 }
 
 [profile.ci]
 retries = 1

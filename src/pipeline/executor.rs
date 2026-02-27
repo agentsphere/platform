@@ -107,6 +107,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
                pl.commit_sha,
                pl.triggered_by,
                p.name as "project_name!: String",
+               p.namespace_slug as "namespace_slug!: String",
                u.name as "owner_name!: String"
         FROM pipelines pl
         JOIN projects p ON p.id = pl.project_id
@@ -134,12 +135,13 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
         project_name: pipeline.project_name,
         repo_clone_url,
         git_auth_token: git_token.0,
+        namespace: format!("{}-dev", pipeline.namespace_slug),
     };
 
     // Create registry auth Secret if registry is configured and we know who triggered it
     let registry_creds = if state.config.registry_url.is_some() {
         if let Some(user_id) = pipeline.triggered_by {
-            match create_registry_secret(state, pipeline_id, user_id).await {
+            match create_registry_secret(state, pipeline_id, user_id, &meta.namespace).await {
                 Ok(creds) => Some(creds),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create registry secret, continuing without");
@@ -159,7 +161,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
 
     // Clean up registry auth Secret + token
     if let Some((_, ref token_hash)) = registry_creds {
-        cleanup_registry_secret(state, pipeline_id, token_hash).await;
+        cleanup_registry_secret(state, pipeline_id, token_hash, &meta.namespace).await;
     }
 
     // Clean up git auth token
@@ -192,6 +194,8 @@ struct PipelineMeta {
     repo_clone_url: String,
     /// Short-lived API token for authenticating git clone via `GIT_ASKPASS`.
     git_auth_token: String,
+    /// K8s namespace for this pipeline's pods (e.g. `{slug}-dev`).
+    namespace: String,
 }
 
 /// A pipeline step row loaded from the database.
@@ -224,8 +228,7 @@ async fn run_all_steps(
     .fetch_all(&state.pool)
     .await?;
 
-    let namespace = &state.config.pipeline_namespace;
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &pipeline.namespace);
 
     for step in &steps {
         if is_cancelled(&state.pool, pipeline_id).await? {
@@ -507,6 +510,7 @@ async fn create_registry_secret(
     state: &AppState,
     pipeline_id: Uuid,
     triggered_by: Uuid,
+    namespace: &str,
 ) -> Result<(String, String), PipelineError> {
     let registry_url = state
         .config
@@ -545,7 +549,6 @@ async fn create_registry_secret(
     });
 
     let secret_name = format!("pl-registry-{}", &pipeline_id.to_string()[..8]);
-    let namespace = &state.config.pipeline_namespace;
 
     let secret = Secret {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
@@ -572,9 +575,13 @@ async fn create_registry_secret(
 }
 
 /// Clean up the registry auth K8s Secret and the short-lived API token.
-async fn cleanup_registry_secret(state: &AppState, pipeline_id: Uuid, token_hash: &str) {
+async fn cleanup_registry_secret(
+    state: &AppState,
+    pipeline_id: Uuid,
+    token_hash: &str,
+    namespace: &str,
+) {
     let secret_name = format!("pl-registry-{}", &pipeline_id.to_string()[..8]);
-    let namespace = &state.config.pipeline_namespace;
 
     // Delete the K8s Secret
     let secrets: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
@@ -1041,9 +1048,24 @@ pub async fn cancel_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), 
 
     skip_remaining_steps(&state.pool, pipeline_id).await?;
 
+    // Look up project namespace for pod deletion
+    let namespace = sqlx::query_scalar!(
+        r#"
+        SELECT p.namespace_slug as "namespace_slug!: String"
+        FROM pipelines pl JOIN projects p ON p.id = pl.project_id
+        WHERE pl.id = $1
+        "#,
+        pipeline_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .map_or_else(
+        || state.config.pipeline_namespace.clone(),
+        |slug| format!("{slug}-dev"),
+    );
+
     // Delete running pods by label selector
-    let namespace = &state.config.pipeline_namespace;
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
     let label = format!("platform.io/pipeline={pipeline_id}");
     let lp = ListParams::default().labels(&label);
 

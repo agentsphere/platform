@@ -5,6 +5,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -12,6 +13,7 @@ use ts_rs::TS;
 
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
+use crate::deployer::namespace::slugify_namespace;
 use crate::error::ApiError;
 use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
@@ -60,6 +62,7 @@ pub struct ProjectResponse {
     pub description: Option<String>,
     pub visibility: String,
     pub default_branch: String,
+    pub namespace_slug: String,
     pub agent_image: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
@@ -67,6 +70,222 @@ pub struct ProjectResponse {
 }
 
 use super::helpers::ListResponse;
+
+/// Insert the project row and return the project ID + `namespace_slug`.
+/// Handles unique constraint violations on `namespace_slug` by appending a hash suffix.
+#[tracing::instrument(skip(pool, auth, body, repo_path), fields(project_name = %body.name), err)]
+async fn insert_project_row(
+    pool: &PgPool,
+    auth: &AuthUser,
+    body: &CreateProjectRequest,
+    visibility: &str,
+    default_branch: &str,
+    repo_path: &str,
+    workspace_id: Uuid,
+) -> Result<ProjectRow, ApiError> {
+    let slug = slugify_namespace(&body.name);
+
+    match try_insert_project(
+        pool,
+        auth,
+        body,
+        visibility,
+        default_branch,
+        repo_path,
+        workspace_id,
+        &slug,
+    )
+    .await
+    {
+        Ok(row) => Ok(row),
+        Err(ApiError::Conflict(msg)) if msg.contains("namespace") => {
+            // Collision on namespace_slug — append short hash suffix
+            let hash = &format!("{:x}", Sha256::digest(body.name.as_bytes()))[..6];
+            let slug_with_hash = format!("{}-{hash}", &slug[..slug.len().min(33)]);
+            try_insert_project(
+                pool,
+                auth,
+                body,
+                visibility,
+                default_branch,
+                repo_path,
+                workspace_id,
+                &slug_with_hash,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// Internal row type to avoid repeating the query_as fields
+struct ProjectRow {
+    id: Uuid,
+    owner_id: Uuid,
+    workspace_id: Uuid,
+    name: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    visibility: String,
+    default_branch: String,
+    namespace_slug: String,
+    agent_image: Option<String>,
+    is_active: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_insert_project(
+    pool: &PgPool,
+    auth: &AuthUser,
+    body: &CreateProjectRequest,
+    visibility: &str,
+    default_branch: &str,
+    repo_path: &str,
+    workspace_id: Uuid,
+    namespace_slug: &str,
+) -> Result<ProjectRow, ApiError> {
+    sqlx::query_as!(
+        ProjectRow,
+        r#"
+        INSERT INTO projects (owner_id, name, display_name, description, visibility, default_branch, repo_path, workspace_id, namespace_slug)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,
+                  namespace_slug, agent_image, is_active, created_at, updated_at
+        "#,
+        auth.user_id,
+        body.name,
+        body.display_name,
+        body.description,
+        visibility,
+        default_branch,
+        repo_path,
+        workspace_id,
+        namespace_slug,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
+            if db_err
+                .constraint()
+                .is_some_and(|c| c.contains("namespace_slug"))
+            {
+                ApiError::Conflict("namespace slug collision".into())
+            } else if db_err
+                .constraint()
+                .is_some_and(|c| c.contains("owner_id") || c.contains("name"))
+            {
+                ApiError::Conflict(format!(
+                    "a project named '{}' already exists",
+                    body.name
+                ))
+            } else {
+                ApiError::from(e)
+            }
+        }
+        _ => ApiError::from(e),
+    })
+}
+
+/// Set up K8s namespaces, network policy, and ops repo for a new project.
+/// Best-effort: failures are logged but do NOT block project creation.
+#[tracing::instrument(skip(state), fields(%project_id, %namespace_slug), err)]
+pub async fn setup_project_infrastructure(
+    state: &AppState,
+    project_id: Uuid,
+    namespace_slug: &str,
+) -> Result<(), ApiError> {
+    let project_id_str = project_id.to_string();
+
+    // 1. Create {slug}-dev namespace
+    if let Err(e) = crate::deployer::namespace::ensure_namespace(
+        &state.kube,
+        namespace_slug,
+        "dev",
+        &project_id_str,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to create dev namespace (will retry)");
+    }
+
+    // 2. Create {slug}-prod namespace
+    if let Err(e) = crate::deployer::namespace::ensure_namespace(
+        &state.kube,
+        namespace_slug,
+        "prod",
+        &project_id_str,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to create prod namespace (will retry)");
+    }
+
+    // 3. Apply NetworkPolicy to -dev namespace (agents only run in -dev; -prod
+    //    NetworkPolicy is intentionally omitted — deployer pods use their own RBAC).
+    if let Err(e) = crate::deployer::namespace::ensure_network_policy(
+        &state.kube,
+        namespace_slug,
+        &state.config.platform_namespace,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to apply network policy (will retry)");
+    }
+
+    // 4. Auto-create ops repo (best-effort — don't block project creation)
+    match crate::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        namespace_slug,
+        "main",
+    )
+    .await
+    {
+        Ok(ops_repo_path) => {
+            let ops_repo_path_str = ops_repo_path.to_string_lossy().to_string();
+            if let Err(e) = sqlx::query!(
+                r#"
+                INSERT INTO ops_repos (name, repo_path, branch, project_id)
+                VALUES ($1, $2, 'main', $3)
+                ON CONFLICT (project_id) WHERE project_id IS NOT NULL DO NOTHING
+                "#,
+                format!("{namespace_slug}-ops"),
+                ops_repo_path_str,
+                project_id,
+            )
+            .execute(&state.pool)
+            .await
+            {
+                tracing::warn!(error = %e, "failed to insert ops repo row");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to init ops repo");
+        }
+    }
+
+    Ok(())
+}
+
+fn project_row_to_response(p: ProjectRow) -> ProjectResponse {
+    ProjectResponse {
+        id: p.id,
+        owner_id: p.owner_id,
+        workspace_id: p.workspace_id,
+        name: p.name,
+        display_name: p.display_name,
+        description: p.description,
+        visibility: p.visibility,
+        default_branch: p.default_branch,
+        namespace_slug: p.namespace_slug,
+        agent_image: p.agent_image,
+        is_active: p.is_active,
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -215,34 +434,22 @@ async fn create_project(
     let (repo_path_str, workspace_id) =
         init_project_repo_and_workspace(&state, &auth, &body).await?;
 
-    let project = sqlx::query!(
-        r#"
-        INSERT INTO projects (owner_id, name, display_name, description, visibility, default_branch, repo_path, workspace_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
-        "#,
-        auth.user_id,
-        body.name,
-        body.display_name,
-        body.description,
+    let project = insert_project_row(
+        &state.pool,
+        &auth,
+        &body,
         visibility,
         default_branch,
-        repo_path_str,
+        &repo_path_str,
         workspace_id,
     )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| match &e {
-        sqlx::Error::Database(db_err)
-            if db_err.code().as_deref() == Some("23505")
-                && db_err
-                    .constraint()
-                    .is_some_and(|c| c.contains("owner_id") || c.contains("name")) =>
-        {
-            ApiError::Conflict(format!("a project named '{}' already exists", body.name))
-        }
-        _ => ApiError::from(e),
-    })?;
+    .await?;
+
+    // Best-effort infra setup (namespaces, network policy, ops repo)
+    if let Err(e) = setup_project_infrastructure(&state, project.id, &project.namespace_slug).await
+    {
+        tracing::warn!(error = %e, project_id = %project.id, "project infra setup incomplete");
+    }
 
     write_audit(
         &state.pool,
@@ -259,23 +466,7 @@ async fn create_project(
     )
     .await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ProjectResponse {
-            id: project.id,
-            owner_id: project.owner_id,
-            workspace_id: project.workspace_id,
-            name: project.name,
-            display_name: project.display_name,
-            description: project.description,
-            visibility: project.visibility,
-            default_branch: project.default_branch,
-            agent_image: project.agent_image,
-            is_active: project.is_active,
-            created_at: project.created_at,
-            updated_at: project.updated_at,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(project_row_to_response(project))))
 }
 
 async fn list_projects(
@@ -310,9 +501,11 @@ async fn list_projects(
     .fetch_one(&state.pool)
     .await?;
 
-    let rows = sqlx::query!(
+    let rows = sqlx::query_as!(
+        ProjectRow,
         r#"
-        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
+        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,
+               namespace_slug, agent_image, is_active, created_at, updated_at
         FROM projects
         WHERE is_active = true
           AND ($1::uuid IS NULL OR owner_id = $1)
@@ -336,23 +529,7 @@ async fn list_projects(
     .fetch_all(&state.pool)
     .await?;
 
-    let items = rows
-        .into_iter()
-        .map(|p| ProjectResponse {
-            id: p.id,
-            owner_id: p.owner_id,
-            workspace_id: p.workspace_id,
-            name: p.name,
-            display_name: p.display_name,
-            description: p.description,
-            visibility: p.visibility,
-            default_branch: p.default_branch,
-            agent_image: p.agent_image,
-            is_active: p.is_active,
-            created_at: p.created_at,
-            updated_at: p.updated_at,
-        })
-        .collect();
+    let items = rows.into_iter().map(project_row_to_response).collect();
 
     Ok(Json(ListResponse { items, total }))
 }
@@ -365,9 +542,11 @@ async fn get_project(
     // Enforce hard project scope from API token
     auth.check_project_scope(id)?;
 
-    let project = sqlx::query!(
+    let project = sqlx::query_as!(
+        ProjectRow,
         r#"
-        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
+        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,
+               namespace_slug, agent_image, is_active, created_at, updated_at
         FROM projects WHERE id = $1 AND is_active = true
         "#,
         id,
@@ -401,20 +580,7 @@ async fn get_project(
         }
     }
 
-    Ok(Json(ProjectResponse {
-        id: project.id,
-        owner_id: project.owner_id,
-        workspace_id: project.workspace_id,
-        name: project.name,
-        display_name: project.display_name,
-        description: project.description,
-        visibility: project.visibility,
-        default_branch: project.default_branch,
-        agent_image: project.agent_image,
-        is_active: project.is_active,
-        created_at: project.created_at,
-        updated_at: project.updated_at,
-    }))
+    Ok(Json(project_row_to_response(project)))
 }
 
 #[tracing::instrument(skip(state, body), fields(%id), err)]
@@ -475,7 +641,8 @@ async fn update_project(
         validation::check_container_image(image)?;
     }
 
-    let project = sqlx::query!(
+    let project = sqlx::query_as!(
+        ProjectRow,
         r#"
         UPDATE projects SET
             display_name = COALESCE($2, display_name),
@@ -485,7 +652,8 @@ async fn update_project(
             agent_image = COALESCE($6, agent_image),
             updated_at = now()
         WHERE id = $1 AND is_active = true
-        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at
+        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,
+                  namespace_slug, agent_image, is_active, created_at, updated_at
         "#,
         id,
         body.display_name,
@@ -513,20 +681,7 @@ async fn update_project(
     )
     .await;
 
-    Ok(Json(ProjectResponse {
-        id: project.id,
-        owner_id: project.owner_id,
-        workspace_id: project.workspace_id,
-        name: project.name,
-        display_name: project.display_name,
-        description: project.description,
-        visibility: project.visibility,
-        default_branch: project.default_branch,
-        agent_image: project.agent_image,
-        is_active: project.is_active,
-        created_at: project.created_at,
-        updated_at: project.updated_at,
-    }))
+    Ok(Json(project_row_to_response(project)))
 }
 
 #[tracing::instrument(skip(state), fields(%id), err)]

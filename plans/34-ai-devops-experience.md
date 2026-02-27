@@ -1,5 +1,10 @@
 # AI DevOps Platform — End-to-End Experience Plan
 
+## Implementation Status
+- **Phase 1:** Merged — PR #7
+- **Phase 2:** Branch `claude/exciting-mccarthy` — PR #10 (https://github.com/agentsphere/platform/pull/10)
+- **Status:** Phase 2 In Review
+
 ## Context
 
 The platform (~23K LOC Rust) replaces 8+ services with a unified AI-powered tool for developing and operating software. Primary interaction: chat with agents. The core building blocks exist (auth, git, pipelines, deployer, observability, secrets, agents) but the end-to-end experience is rough — no per-project isolation, agents clone via `file://` (breaks across namespaces), fixed dev images, no automated ops response, and raw SQL errors surfacing to users.

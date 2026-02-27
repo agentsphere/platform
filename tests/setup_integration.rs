@@ -81,6 +81,7 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         permission_cache_ttl_secs: 300,
         webauthn_rp_name: "Test Platform".into(),
         platform_api_url: "http://platform.test-agents.svc.cluster.local:8080".into(),
+        platform_namespace: "test-platform".into(),
         ssh_listen: None,
         ssh_host_key_path: "/tmp/test_ssh_host_key".into(),
     };

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE projects SET\n            display_name = COALESCE($2, display_name),\n            description = COALESCE($3, description),\n            visibility = COALESCE($4, visibility),\n            default_branch = COALESCE($5, default_branch),\n            agent_image = COALESCE($6, agent_image),\n            updated_at = now()\n        WHERE id = $1 AND is_active = true\n        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO projects (owner_id, name, display_name, description, visibility, default_branch, repo_path, workspace_id, namespace_slug)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,\n                  namespace_slug, agent_image, is_active, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -45,21 +45,26 @@
       },
       {
         "ordinal": 8,
-        "name": "agent_image",
+        "name": "namespace_slug",
         "type_info": "Text"
       },
       {
         "ordinal": 9,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
         "name": "is_active",
         "type_info": "Bool"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -71,6 +76,9 @@
         "Text",
         "Text",
         "Text",
+        "Text",
+        "Text",
+        "Uuid",
         "Text"
       ]
     },
@@ -83,11 +91,12 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false,
       false
     ]
   },
-  "hash": "5b482a266a5293666f6804eb897bfc6b830ccd9da13a675c03a104416bffbcb9"
+  "hash": "fb5ce67cf8c3548984cab24cad3c3053d0e23ecff1d3c4f2508e5bd3f3500064"
 }

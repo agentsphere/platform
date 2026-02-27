@@ -812,29 +812,22 @@ async fn inprocess_tool_input_parsed_from_chunks(pool: PgPool) {
     );
 }
 
-// --- Tool execution: create_ops_repo (exercises that tool handler) ---
+// --- Tool execution: create_project auto-creates ops repo ---
 
 #[sqlx::test(migrations = "./migrations")]
-async fn inprocess_create_ops_repo_tool(pool: PgPool) {
+async fn inprocess_create_project_auto_creates_ops_repo(pool: PgPool) {
     let (state, _admin_token) = helpers::test_state(pool).await;
     let mock = MockAnthropicServer::start().await;
     let admin_id = get_admin_id(&state.pool).await;
     ensure_temp_dirs(&state);
 
-    // Step 1: create project first (need project_id for ops repo)
+    // create_project now automatically sets up infra including ops repo
     mock.enqueue(MockResponse::tool_use(vec![ContentBlock::ToolUse {
         id: "toolu_proj".into(),
         name: "create_project".into(),
         input: serde_json::json!({"name": "ops-repo-test"}),
     }]))
     .await;
-
-    // Step 2: After create_project, model gets result and creates ops repo.
-    // We need to dynamically get the project_id, but the mock is pre-configured.
-    // Instead, we'll run the first tool, extract the project_id, then set up
-    // the second mock response.
-
-    // First, just end the loop with text after create_project
     mock.enqueue(MockResponse::text("Project created.")).await;
 
     let session_id = setup_inprocess_session(&state, admin_id, &mock, "ops repo test").await;
@@ -843,83 +836,77 @@ async fn inprocess_create_ops_repo_tool(pool: PgPool) {
         .await
         .unwrap();
 
-    // Get the created project_id
-    let project_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM projects WHERE name = 'ops-repo-test'")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-
-    // Now queue create_ops_repo with the real project_id
-    mock.enqueue(MockResponse::tool_use(vec![ContentBlock::ToolUse {
-        id: "toolu_ops".into(),
-        name: "create_ops_repo".into(),
-        input: serde_json::json!({"project_id": project_id.0.to_string()}),
-    }]))
-    .await;
-    mock.enqueue(MockResponse::text("Ops repo created.")).await;
-
-    // Add user message to trigger second turn
-    let handle = {
-        let sessions = state.inprocess_sessions.read().unwrap();
-        sessions.get(&session_id).cloned().unwrap()
-    };
-    {
-        let mut msgs = handle.messages.write().await;
-        msgs.push(platform::agent::anthropic::ChatMessage::user(
-            "Now create the ops repo",
-        ));
-    }
-
-    inprocess::run_turn_for_session(&state, session_id)
-        .await
-        .unwrap();
-
-    // Verify ops repo was created (ops_repos has no project_id column, match by name)
+    // Verify ops repo was auto-created by setup_project_infrastructure
     let ops_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM ops_repos WHERE name = 'ops-repo-test-ops'")
             .fetch_one(&state.pool)
             .await
             .unwrap();
-    assert_eq!(ops_count.0, 1, "ops repo should exist in DB");
+    assert_eq!(
+        ops_count.0, 1,
+        "ops repo should be auto-created with project"
+    );
 }
 
-// --- Tool execution: spawn_coding_agent (exercises error path with dummy K8s) ---
+// --- Tool execution: spawn_coding_agent (exercises error path — namespace not created in K8s) ---
 
 #[sqlx::test(migrations = "./migrations")]
 async fn inprocess_spawn_agent_tool_error_handled(pool: PgPool) {
     let (state, _admin_token) = helpers::test_state(pool).await;
     let mock = MockAnthropicServer::start().await;
     let admin_id = get_admin_id(&state.pool).await;
-    ensure_temp_dirs(&state);
 
-    // First: create project
-    mock.enqueue(MockResponse::tool_use(vec![ContentBlock::ToolUse {
-        id: "toolu_proj2".into(),
-        name: "create_project".into(),
-        input: serde_json::json!({"name": "agent-spawn-test"}),
-    }]))
-    .await;
-    mock.enqueue(MockResponse::text("ok")).await;
+    // Insert project directly via SQL — deliberately skip setup_project_infrastructure
+    // so the K8s namespace "spawn-err-test-dev" does NOT exist.
+    let project_id = Uuid::new_v4();
+    let workspace_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1")
+            .bind(admin_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| {
+                // No workspace yet — will be created below
+                Uuid::new_v4()
+            });
 
-    let session_id = setup_inprocess_session(&state, admin_id, &mock, "spawn test").await;
+    // Ensure workspace exists
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(workspace_id)
+    .bind(format!("ws-{workspace_id}"))
+    .bind(admin_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
 
-    inprocess::run_turn_for_session(&state, session_id)
-        .await
-        .unwrap();
-
-    let project_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM projects WHERE name = 'agent-spawn-test'")
+    // Fetch the actual workspace id after potential conflict
+    let workspace_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1")
+            .bind(admin_id)
             .fetch_one(&state.pool)
             .await
             .unwrap();
 
-    // Now try spawn_coding_agent (will fail since no real K8s)
+    sqlx::query(
+        "INSERT INTO projects (id, name, owner_id, visibility, repo_path, workspace_id, namespace_slug) \
+         VALUES ($1, 'spawn-err-test', $2, 'private', '/tmp/fake-repo', $3, 'spawn-err-test')",
+    )
+    .bind(project_id)
+    .bind(admin_id)
+    .bind(workspace_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    // Now try spawn_coding_agent — will fail because namespace "spawn-err-test-dev"
+    // doesn't exist in K8s (we skipped infrastructure setup).
     mock.enqueue(MockResponse::tool_use(vec![ContentBlock::ToolUse {
         id: "toolu_spawn".into(),
         name: "spawn_coding_agent".into(),
         input: serde_json::json!({
-            "project_id": project_id.0.to_string(),
+            "project_id": project_id.to_string(),
             "prompt": "Build a REST API"
         }),
     }]))
@@ -928,17 +915,12 @@ async fn inprocess_spawn_agent_tool_error_handled(pool: PgPool) {
     mock.enqueue(MockResponse::text("Sorry, agent spawn failed."))
         .await;
 
+    let session_id = setup_inprocess_session(&state, admin_id, &mock, "spawn test").await;
     let handle = {
         let sessions = state.inprocess_sessions.read().unwrap();
         sessions.get(&session_id).cloned().unwrap()
     };
     let mut rx = handle.subscribe();
-    {
-        let mut msgs = handle.messages.write().await;
-        msgs.push(platform::agent::anthropic::ChatMessage::user(
-            "Spawn an agent",
-        ));
-    }
 
     inprocess::run_turn_for_session(&state, session_id)
         .await
@@ -957,7 +939,11 @@ async fn inprocess_spawn_agent_tool_error_handled(pool: PgPool) {
         .find(|e| e.kind == ProgressKind::ToolResult && e.message.contains("error"));
     assert!(
         error_result.is_some(),
-        "spawn should produce error result (no K8s)"
+        "spawn should produce error result (namespace not in K8s): got events: {:?}",
+        events
+            .iter()
+            .map(|e| format!("{:?}: {}", e.kind, e.message))
+            .collect::<Vec<_>>(),
     );
 }
 

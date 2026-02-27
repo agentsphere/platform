@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT p.namespace_slug as \"namespace_slug!: String\"\n        FROM pipelines pl JOIN projects p ON p.id = pl.project_id\n        WHERE pl.id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "namespace_slug!: String",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "eee5661288cd98a1d4945b2e5288b29e44e4f6bfa35386f7d47e493affd62619"
+}

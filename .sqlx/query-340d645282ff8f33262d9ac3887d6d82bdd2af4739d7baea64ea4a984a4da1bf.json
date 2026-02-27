@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO ops_repos (name, repo_path, branch, project_id)\n                VALUES ($1, $2, 'main', $3)\n                ON CONFLICT (project_id) WHERE project_id IS NOT NULL DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "340d645282ff8f33262d9ac3887d6d82bdd2af4739d7baea64ea4a984a4da1bf"
+}

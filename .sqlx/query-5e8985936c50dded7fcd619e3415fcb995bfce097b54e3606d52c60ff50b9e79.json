@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT pl.git_ref as \"git_ref!: String\",\n               pl.commit_sha,\n               pl.triggered_by,\n               p.name as \"project_name!: String\",\n               u.name as \"owner_name!: String\"\n        FROM pipelines pl\n        JOIN projects p ON p.id = pl.project_id\n        JOIN users u ON u.id = p.owner_id\n        WHERE pl.id = $1\n        ",
+  "query": "\n        SELECT pl.git_ref as \"git_ref!: String\",\n               pl.commit_sha,\n               pl.triggered_by,\n               p.name as \"project_name!: String\",\n               p.namespace_slug as \"namespace_slug!: String\",\n               u.name as \"owner_name!: String\"\n        FROM pipelines pl\n        JOIN projects p ON p.id = pl.project_id\n        JOIN users u ON u.id = p.owner_id\n        WHERE pl.id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -25,6 +25,11 @@
       },
       {
         "ordinal": 4,
+        "name": "namespace_slug!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "owner_name!: String",
         "type_info": "Text"
       }
@@ -39,8 +44,9 @@
       true,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "10c0b7b8769286b298a876ffe28cc987adb4dfc4dc88506e88376352a60b2900"
+  "hash": "5e8985936c50dded7fcd619e3415fcb995bfce097b54e3606d52c60ff50b9e79"
 }

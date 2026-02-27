@@ -195,6 +195,7 @@ fn kind_to_plural(kind: &str) -> String {
         "StatefulSet" => "statefulsets".into(),
         "DaemonSet" => "daemonsets".into(),
         "PersistentVolumeClaim" => "persistentvolumeclaims".into(),
+        "NetworkPolicy" => "networkpolicies".into(),
         // Fallback: lowercase + "s" (works for most standard resources)
         other => format!("{}s", other.to_lowercase()),
     }

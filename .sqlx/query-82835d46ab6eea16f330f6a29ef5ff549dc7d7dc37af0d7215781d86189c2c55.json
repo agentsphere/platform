@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at\n        FROM projects WHERE id = $1 AND is_active = true\n        ",
+  "query": "\n        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,\n               namespace_slug, agent_image, is_active, created_at, updated_at\n        FROM projects\n        WHERE is_active = true\n          AND ($1::uuid IS NULL OR owner_id = $1)\n          AND ($2::text IS NULL OR visibility = $2)\n          AND ($3::text IS NULL OR name ILIKE $3)\n          AND (\n              visibility = 'public'\n              OR visibility = 'internal'\n              OR owner_id = $4\n          )\n        ORDER BY created_at DESC\n        LIMIT $5 OFFSET $6\n        ",
   "describe": {
     "columns": [
       {
@@ -45,28 +45,38 @@
       },
       {
         "ordinal": 8,
-        "name": "agent_image",
+        "name": "namespace_slug",
         "type_info": "Text"
       },
       {
         "ordinal": 9,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
         "name": "is_active",
         "type_info": "Bool"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -78,11 +88,12 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false,
       false
     ]
   },
-  "hash": "e071706a48917239b667c7fea0ff6bd75d66d72da9048dd86008900411fde768"
+  "hash": "82835d46ab6eea16f330f6a29ef5ff549dc7d7dc37af0d7215781d86189c2c55"
 }

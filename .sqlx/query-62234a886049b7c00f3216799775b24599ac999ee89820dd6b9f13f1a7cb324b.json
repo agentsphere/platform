@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO projects (owner_id, name, display_name, description, visibility, default_branch, repo_path, workspace_id)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch, agent_image, is_active, created_at, updated_at\n        ",
+  "query": "\n        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,\n               namespace_slug, agent_image, is_active, created_at, updated_at\n        FROM projects WHERE id = $1 AND is_active = true\n        ",
   "describe": {
     "columns": [
       {
@@ -45,34 +45,32 @@
       },
       {
         "ordinal": 8,
-        "name": "agent_image",
+        "name": "namespace_slug",
         "type_info": "Text"
       },
       {
         "ordinal": 9,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
         "name": "is_active",
         "type_info": "Bool"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
         "Uuid"
       ]
     },
@@ -85,11 +83,12 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false,
       false
     ]
   },
-  "hash": "c8c20f040e7e731776568cb92a7d56f1becd9198e19a9518223528fe7c4aa3e8"
+  "hash": "62234a886049b7c00f3216799775b24599ac999ee89820dd6b9f13f1a7cb324b"
 }

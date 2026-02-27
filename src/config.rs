@@ -36,6 +36,8 @@ pub struct Config {
     pub webauthn_rp_name: String,
     /// Platform API URL for agent/pipeline pods to reach the platform.
     pub platform_api_url: String,
+    /// K8s namespace where the platform itself runs (for `NetworkPolicy` egress).
+    pub platform_namespace: String,
     /// SSH server listen address (e.g. "0.0.0.0:2222"). `None` disables SSH.
     pub ssh_listen: Option<String>,
     /// Path to ED25519 host key (auto-generated if absent).
@@ -103,6 +105,8 @@ impl Config {
             webauthn_rp_name: env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Platform".into()),
             platform_api_url: env::var("PLATFORM_API_URL")
                 .unwrap_or_else(|_| "http://platform.platform.svc.cluster.local:8080".into()),
+            platform_namespace: env::var("PLATFORM_NAMESPACE")
+                .unwrap_or_else(|_| "platform".into()),
             ssh_listen: env::var("PLATFORM_SSH_LISTEN").ok(),
             ssh_host_key_path: env::var("PLATFORM_SSH_HOST_KEY_PATH")
                 .unwrap_or_else(|_| "/data/ssh_host_ed25519_key".into()),
@@ -143,6 +147,7 @@ impl Config {
             webauthn_rp_origin: "http://localhost:8080".into(),
             webauthn_rp_name: "Test Platform".into(),
             platform_api_url: "http://platform.test-agents.svc.cluster.local:8080".into(),
+            platform_namespace: "test-platform".into(),
             ssh_listen: None,
             ssh_host_key_path: "/tmp/test_ssh_host_key".into(),
         }

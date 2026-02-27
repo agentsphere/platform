@@ -433,6 +433,7 @@ Key: return **404** (not 403) for private resources the user can't access — av
 | `PLATFORM_DEV` | `false` | Dev mode (allows default credentials) |
 | `PLATFORM_PERMISSION_CACHE_TTL` | `300` | Permission cache TTL in seconds |
 | `PLATFORM_MASTER_KEY` | — | AES-256-GCM encryption key for secrets |
+| `PLATFORM_NAMESPACE` | `platform` | K8s namespace where the platform itself runs |
 | `PLATFORM_PIPELINE_NAMESPACE` | `platform-pipelines` | K8s namespace for pipeline pods |
 | `PLATFORM_AGENT_NAMESPACE` | `platform-agents` | K8s namespace for agent pods |
 | `PLATFORM_OPS_REPOS_PATH` | `/data/ops-repos` | Ops repo storage path |

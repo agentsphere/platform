@@ -35,7 +35,7 @@ fn generate_test_ssh_key(dir: &Path) -> std::path::PathBuf {
 /// Build the `GIT_SSH_COMMAND` string for connecting to our test SSH server.
 fn git_ssh_command(key_path: &Path, port: u16) -> String {
     format!(
-        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {} -p {}",
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i {} -p {}",
         key_path.display(),
         port
     )
@@ -153,8 +153,17 @@ async fn setup_ssh_e2e(
         }
     });
 
-    // Small delay to let the server start accepting
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for the SSH server to start accepting connections.
+    // Probe with a TCP connect to ensure the server is ready.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{ssh_port}"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
 
     let dirs = vec![key_dir, host_key_dir];
     (
@@ -170,8 +179,9 @@ async fn setup_ssh_e2e(
 }
 
 /// Helper: run a git command with SSH configured for our test server.
+/// Kills the process after 30 seconds to prevent indefinite hangs.
 fn git_ssh_cmd(dir: &Path, args: &[&str], ssh_cmd: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    let mut child = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_SSH_COMMAND", ssh_cmd)
@@ -179,18 +189,50 @@ fn git_ssh_cmd(dir: &Path, args: &[&str], ssh_cmd: &str) -> Result<String, Strin
         .env("GIT_AUTHOR_EMAIL", "test@e2e.local")
         .env("GIT_COMMITTER_NAME", "E2E Test")
         .env("GIT_COMMITTER_EMAIL", "test@e2e.local")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("git command");
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(format!(
-            "git {} failed (exit {}): {}",
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ))
+    let timeout = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child.stdout.take().map_or_else(Vec::new, |mut s| {
+                    let mut buf = Vec::new();
+                    std::io::Read::read_to_end(&mut s, &mut buf).unwrap_or(0);
+                    buf
+                });
+                let stderr = child.stderr.take().map_or_else(Vec::new, |mut s| {
+                    let mut buf = Vec::new();
+                    std::io::Read::read_to_end(&mut s, &mut buf).unwrap_or(0);
+                    buf
+                });
+                if status.success() {
+                    return Ok(String::from_utf8_lossy(&stdout).into_owned());
+                } else {
+                    return Err(format!(
+                        "git {} failed (exit {}): {}",
+                        args.join(" "),
+                        status,
+                        String::from_utf8_lossy(&stderr)
+                    ));
+                }
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "git {} timed out after {}s",
+                        args.join(" "),
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("git {} wait failed: {e}", args.join(" "))),
+        }
     }
 }
 

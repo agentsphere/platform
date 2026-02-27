@@ -295,6 +295,58 @@ async fn project_owner_has_implicit_access(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
 }
 
+// R11: Assert namespace_slug is present in project API responses
+#[sqlx::test(migrations = "./migrations")]
+async fn create_project_returns_namespace_slug(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({ "name": "slug-check" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        body["namespace_slug"].is_string(),
+        "response should include namespace_slug"
+    );
+    assert_eq!(body["namespace_slug"], "slug-check");
+}
+
+// R10: namespace_slug collision retry — two project names that produce the same slug
+#[sqlx::test(migrations = "./migrations")]
+async fn create_projects_with_same_slug_both_succeed(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state.clone());
+
+    // "my_project" and "my-project" both slugify to "my-project"
+    let id1 = helpers::create_project(&app, &admin_token, "my_project", "private").await;
+    let id2 = helpers::create_project(&app, &admin_token, "my-project", "private").await;
+
+    assert_ne!(id1, id2, "should be two distinct projects");
+
+    // Verify they have different namespace_slugs in DB
+    let slug1: (String,) = sqlx::query_as("SELECT namespace_slug FROM projects WHERE id = $1")
+        .bind(id1)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    let slug2: (String,) = sqlx::query_as("SELECT namespace_slug FROM projects WHERE id = $1")
+        .bind(id2)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+    assert_ne!(
+        slug1.0, slug2.0,
+        "namespace slugs should differ after collision retry"
+    );
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_project_requires_permission(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;

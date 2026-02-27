@@ -74,13 +74,15 @@ pub async fn create_session(
     .execute(&state.pool)
     .await?;
 
-    // 2. Look up project's workspace_id for scope boundaries
-    let workspace_id = sqlx::query_scalar!(
-        "SELECT workspace_id FROM projects WHERE id = $1 AND is_active = true",
+    // 2. Look up project's workspace_id and namespace_slug for scope boundaries
+    let project_info = sqlx::query!(
+        "SELECT workspace_id, namespace_slug FROM projects WHERE id = $1 AND is_active = true",
         project_id,
     )
     .fetch_one(&state.pool)
     .await?;
+    let workspace_id = project_info.workspace_id;
+    let namespace = format!("{}-dev", project_info.namespace_slug);
 
     // 3. Create ephemeral agent identity with role-based permissions
     let agent_identity = identity::create_agent_identity(
@@ -112,8 +114,6 @@ pub async fn create_session(
     let user_api_key = resolve_user_api_key(state, user_id).await;
 
     // 5. Build and create the K8s pod
-    let namespace = &state.config.agent_namespace;
-
     let session_for_pod = AgentSession {
         id: session_id,
         project_id: Some(project_id),
@@ -139,7 +139,7 @@ pub async fn create_session(
         agent_api_token: &agent_identity.api_token,
         platform_api_url,
         repo_clone_url: &repo_clone_url,
-        namespace,
+        namespace: &namespace,
         project_agent_image: project_agent_image.as_deref(),
         anthropic_api_key: user_api_key.as_deref(),
     })?;
@@ -149,7 +149,7 @@ pub async fn create_session(
         .name
         .clone()
         .unwrap_or_else(|| format!("agent-{short_id}"));
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
     pods.create(&PostParams::default(), &pod)
         .await
         .map_err(|e| AgentError::PodCreationFailed(e.to_string()))?;
@@ -186,9 +186,9 @@ pub async fn send_message(
     }
 
     let pod_name = session.pod_name.as_deref().unwrap();
-
-    let namespace = &state.config.agent_namespace;
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+    let namespace =
+        resolve_session_namespace(&state.pool, &session, &state.config.agent_namespace).await?;
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
 
     let mut attached = pods
         .attach(
@@ -232,8 +232,9 @@ pub async fn stop_session(state: &AppState, session_id: Uuid) -> Result<(), Agen
 
     if let Some(ref pod_name) = session.pod_name {
         // K8s pod session — capture logs and delete pod
-        let namespace = &state.config.agent_namespace;
-        let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+        let namespace =
+            resolve_session_namespace(&state.pool, &session, &state.config.agent_namespace).await?;
+        let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
         capture_session_logs(&pods, pod_name, state, session_id).await;
         let _ = pods.delete(pod_name, &DeleteParams::default()).await;
     } else {
@@ -271,8 +272,9 @@ pub async fn get_log_lines(
         .as_deref()
         .ok_or(AgentError::SessionNotRunning)?;
 
-    let namespace = &state.config.agent_namespace;
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+    let namespace =
+        resolve_session_namespace(&state.pool, &session, &state.config.agent_namespace).await?;
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
 
     let log_stream = pods
         .log_stream(
@@ -320,9 +322,11 @@ pub async fn run_reaper(state: AppState, mut shutdown: tokio::sync::watch::Recei
 async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
     let running = sqlx::query!(
         r#"
-        SELECT id, pod_name, agent_user_id, project_id
-        FROM agent_sessions
-        WHERE status = 'running' AND pod_name IS NOT NULL
+        SELECT s.id, s.pod_name, s.agent_user_id, s.project_id,
+               p.namespace_slug as "namespace_slug?"
+        FROM agent_sessions s
+        LEFT JOIN projects p ON p.id = s.project_id
+        WHERE s.status = 'running' AND s.pod_name IS NOT NULL
         "#,
     )
     .fetch_all(&state.pool)
@@ -332,10 +336,12 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
         return Ok(());
     }
 
-    let namespace = &state.config.agent_namespace;
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
-
     for session in running {
+        let namespace = session.namespace_slug.as_deref().map_or_else(
+            || state.config.agent_namespace.clone(),
+            |s| format!("{s}-dev"),
+        );
+        let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
         let Some(ref pod_name) = session.pod_name else {
             continue;
         };
@@ -415,6 +421,27 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the K8s namespace for a session based on its project's `namespace_slug`.
+/// Falls back to `fallback_namespace` for sessions without a project.
+async fn resolve_session_namespace(
+    pool: &PgPool,
+    session: &AgentSession,
+    fallback_namespace: &str,
+) -> Result<String, AgentError> {
+    if let Some(project_id) = session.project_id {
+        let slug = sqlx::query_scalar!(
+            "SELECT namespace_slug FROM projects WHERE id = $1 AND is_active = true",
+            project_id,
+        )
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AgentError::Other(anyhow::anyhow!("project not found")))?;
+        Ok(format!("{slug}-dev"))
+    } else {
+        Ok(fallback_namespace.to_string())
+    }
+}
 
 /// Look up a project's HTTP clone URL and optional custom agent image.
 ///

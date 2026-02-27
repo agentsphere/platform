@@ -104,13 +104,15 @@ async fn create_project_with_repo(pool: &PgPool, repo_path: &str) -> (Uuid, Uuid
     let workspace_id = ws_row.0;
 
     let project_name = format!("test-project-{}", Uuid::new_v4());
+    let namespace_slug = platform::deployer::namespace::slugify_namespace(&project_name);
     let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO projects (owner_id, name, repo_path, visibility, workspace_id) VALUES ($1, $2, $3, 'private', $4) RETURNING id",
+        "INSERT INTO projects (owner_id, name, repo_path, visibility, workspace_id, namespace_slug) VALUES ($1, $2, $3, 'private', $4, $5) RETURNING id",
     )
     .bind(owner_id)
     .bind(&project_name)
     .bind(repo_path)
     .bind(workspace_id)
+    .bind(&namespace_slug)
     .fetch_one(pool)
     .await
     .unwrap();
