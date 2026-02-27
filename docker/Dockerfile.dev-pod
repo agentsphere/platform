@@ -60,7 +60,10 @@ RUN npx playwright install --with-deps chromium
 
 # Non-root user — `claude --dangerously-skip-permissions` refuses to run as root
 RUN useradd -m -s /bin/bash -u 1000 dev \
-    && git config --system init.defaultBranch main
+    && git config --system init.defaultBranch main \
+    && git config --system --add safe.directory /workspace/platform \
+    && chown -R 1000:1000 /usr/local/cargo/registry \
+    && mkdir -p /workspace && chown 1000:1000 /workspace
 USER dev
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
