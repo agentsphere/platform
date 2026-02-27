@@ -370,14 +370,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        # Anthropic API key — optional; not needed when using Claude Max
-        # OAuth login (`claude login`).  Set via setup.sh if using API key.
-        - name: ANTHROPIC_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: claude-credentials
-              key: api-key
-              optional: true
+        # Anthropic API key — uncomment if using API key instead of Max login.
+        # By default, use `claude login` inside the pod for Max subscription.
+        # - name: ANTHROPIC_API_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: claude-credentials
+        #       key: api-key
       volumeMounts:
         - name: home
           mountPath: /home/dev
