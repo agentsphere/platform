@@ -27,11 +27,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 RUN rustup component add rustfmt clippy llvm-tools-preview
 
 # Cargo tools (matching Justfile / CI requirements)
-RUN cargo install cargo-nextest --locked && \
-    cargo install cargo-llvm-cov --locked && \
-    cargo install cargo-sqlx --locked && \
-    cargo install cargo-deny --locked && \
-    cargo install just --locked
+# Install each separately so Docker can cache completed layers on rebuild
+RUN cargo install cargo-nextest --locked
+RUN cargo install cargo-llvm-cov --locked
+RUN cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
+RUN cargo install cargo-deny --locked
+RUN cargo install just --locked
 
 # Python tools (diff-cover for `just cov-diff`)
 ENV PATH="/root/.local/bin:${PATH}"
