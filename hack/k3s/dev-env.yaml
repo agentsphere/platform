@@ -304,7 +304,7 @@ spec:
       storage: 100Gi
 
 ---
-# Persists /root: SSH keys, .claude.json (OAuth session), .gitconfig,
+# Persists /home/dev: SSH keys, .claude.json (OAuth session), .gitconfig,
 # .bash_history, .claude/ cache.  Survives pod restarts so you don't
 # have to re-login to Claude or re-import SSH keys.
 apiVersion: v1
@@ -328,6 +328,10 @@ metadata:
     app: dev-pod
 spec:
   serviceAccountName: dev-pod
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
   containers:
     - name: dev
       image: platform-dev-pod:latest
@@ -378,13 +382,13 @@ spec:
               optional: true
       volumeMounts:
         - name: home
-          mountPath: /root
+          mountPath: /home/dev
         - name: workspace
           mountPath: /workspace
         - name: e2e-shared
           mountPath: /tmp/platform-e2e
   volumes:
-    # Home directory — SSH keys, Claude session, git config, bash history
+    # Home directory (/home/dev) — SSH keys, Claude session, git config, bash history
     - name: home
       persistentVolumeClaim:
         claimName: dev-home

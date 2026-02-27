@@ -28,8 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && make prefix=/usr/local NO_TCLTK=1 install \
     && cd / && rm -rf /tmp/git* \
     && apt-get purge -y --auto-remove make gcc autoconf \
-    && rm -rf /var/lib/apt/lists/* \
-    && git config --global init.defaultBranch main
+    && rm -rf /var/lib/apt/lists/*
 
 # kubectl
 RUN curl -fsSL "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
@@ -50,9 +49,8 @@ RUN cargo install sqlx-cli --locked --no-default-features --features postgres,ru
 RUN cargo install cargo-deny --locked
 RUN cargo install just --locked
 
-# Python tools (diff-cover for `just cov-diff`)
-ENV PATH="/root/.local/bin:${PATH}"
-RUN pipx install diff-cover
+# Python tools (diff-cover for `just cov-diff`) — install system-wide
+RUN pip3 install --break-system-packages diff-cover
 
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
@@ -60,5 +58,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # Playwright headless Chromium (for `just test-ui-headless`)
 RUN npx playwright install --with-deps chromium
 
+# Non-root user — `claude --dangerously-skip-permissions` refuses to run as root
+RUN useradd -m -s /bin/bash -u 1000 dev \
+    && git config --system init.defaultBranch main
+USER dev
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
