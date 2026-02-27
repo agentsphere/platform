@@ -1,0 +1,375 @@
+# Single-namespace dev environment: services + RBAC + dev pod.
+#
+# Default namespace: platform-dev
+# To spin up a second instance:
+#   sed 's/platform-dev/platform-dev-2/g' hack/k3s/dev-env.yaml | kubectl apply -f -
+#
+# Post-deploy (run once per namespace):
+#   NS=platform-dev
+#   kubectl exec -n $NS deploy/postgres -- psql -U postgres -c "ALTER USER platform CREATEDB;"
+#   kubectl exec -n $NS deploy/minio -- sh -c \
+#     'mc alias set local http://localhost:9000 platform devdevdev 2>/dev/null; \
+#      mc mb local/platform --ignore-existing; mc mb local/platform-e2e --ignore-existing'
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-dev
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# RBAC — superset of hack/test-manifests/rbac.yaml (test-runner
+# ClusterRole) + deploy/base/rbac.yaml (pipeline/agent manager).
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dev-pod-admin
+rules:
+  # Pod lifecycle (pipeline steps, agent sessions, test services)
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - services
+      - configmaps
+      - secrets
+      - persistentvolumeclaims
+      - serviceaccounts
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Jobs (pipeline steps)
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Namespace lifecycle (ephemeral test namespaces)
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create, delete]
+  # Events (debugging)
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list, watch]
+  # Deployments (deployer reconciler, test service deployments)
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # RBAC management (E2E tests create per-run ClusterRoleBindings)
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings, roles, rolebindings]
+    verbs: [get, list, create, delete, bind]
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dev-pod
+  namespace: platform-dev
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dev-pod-admin-platform-dev
+subjects:
+  - kind: ServiceAccount
+    name: dev-pod
+    namespace: platform-dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dev-pod-admin
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# Postgres (PVC-backed, persistent across pod restarts)
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: platform-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: platform-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: platform
+            - name: POSTGRES_PASSWORD
+              value: dev
+            - name: POSTGRES_DB
+              value: platform_dev
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, platform]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: platform-dev
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# Valkey (ephemeral cache, no PVC needed)
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey
+  namespace: platform-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: valkey
+  template:
+    metadata:
+      labels:
+        app: valkey
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: platform-dev
+spec:
+  selector:
+    app: valkey
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# MinIO (PVC-backed for artifact persistence)
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: platform-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: platform-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: [server, /data, --console-address, ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: platform
+            - name: MINIO_ROOT_PASSWORD
+              value: devdevdev
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: platform-dev
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# Dev Pod — Rust toolchain + Claude Code CLI + Playwright
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-workspace
+  namespace: platform-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev
+  namespace: platform-dev
+  labels:
+    app: dev-pod
+spec:
+  serviceAccountName: dev-pod
+  containers:
+    - name: dev
+      image: platform-dev-pod:latest
+      resources:
+        requests:
+          cpu: "3"
+          memory: 12Gi
+        limits:
+          memory: 14Gi
+      env:
+        # Services are in the SAME namespace — short DNS names work
+        - name: DATABASE_URL
+          value: "postgres://platform:dev@postgres:5432/platform_dev"
+        - name: VALKEY_URL
+          value: "redis://valkey:6379"
+        - name: MINIO_ENDPOINT
+          value: "http://minio:9000"
+        - name: MINIO_ACCESS_KEY
+          value: platform
+        - name: MINIO_SECRET_KEY
+          value: devdevdev
+        - name: PLATFORM_MASTER_KEY
+          value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        - name: PLATFORM_DEV
+          value: "true"
+        - name: SQLX_OFFLINE
+          value: "true"
+        - name: RUST_LOG
+          value: warn
+        - name: CARGO_BUILD_JOBS
+          value: "4"
+        # Pod IP — Kubernetes downward API.
+        # Used by e2e_helpers::host_addr_for_kind() so pipeline pods
+        # can reach the test server running inside this pod.
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # Anthropic API key — from secret (created by setup.sh)
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: claude-credentials
+              key: api-key
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: e2e-shared
+          mountPath: /tmp/platform-e2e
+  volumes:
+    # Source code, target/, node_modules — survives pod restarts
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: dev-workspace
+    # Shared with pipeline/agent pods on the same node (k3s single-node)
+    - name: e2e-shared
+      hostPath:
+        path: /tmp/platform-e2e
+        type: DirectoryOrCreate
+  restartPolicy: Never

@@ -3,14 +3,21 @@
 export DATABASE_URL := env("DATABASE_URL", "postgres://platform:dev@localhost:5432/platform_dev")
 export VALKEY_URL := env("VALKEY_URL", "redis://localhost:6379")
 
+# Detect in-cluster environment (KUBERNETES_SERVICE_HOST is set automatically in pods)
+# Routes test commands to test-in-pod.sh (DNS) vs test-in-cluster.sh (port-forward)
+in_cluster := env("KUBERNETES_SERVICE_HOST", "")
+test_script := if in_cluster != "" { "hack/test-in-pod.sh" } else { "hack/test-in-cluster.sh" }
+
 default:
     @just --list
 
 # -- Cluster --------------------------------------------------------
 cluster-up:
+    @if [ -n "{{in_cluster}}" ]; then echo "Already in-cluster, skipping"; exit 0; fi
     bash hack/kind-up.sh
 
 cluster-down:
+    @if [ -n "{{in_cluster}}" ]; then echo "Already in-cluster, skipping"; exit 0; fi
     bash hack/kind-down.sh
 
 # -- Dev ------------------------------------------------------------
@@ -51,12 +58,12 @@ test-unit:
 test-doc:
     cargo test --doc
 
-# Ephemeral services in Kind cluster (requires: just cluster-up)
+# Ephemeral services (Kind cluster locally, K8s DNS in-cluster)
 test-integration:
-    bash hack/test-in-cluster.sh --filter '*_integration'
+    bash {{test_script}} --filter '*_integration'
 
 test-e2e:
-    bash hack/test-in-cluster.sh --type e2e
+    bash {{test_script}} --type e2e
 
 test-mcp:
     cd mcp && npm test
@@ -64,6 +71,13 @@ test-mcp:
 test-ui:
     @echo "Requires running server: just run"
     cd ui && npx playwright test
+
+# Start platform server, run Playwright tests, stop server (for in-pod use)
+test-ui-headless:
+    @echo "Starting platform server in background..."
+    cargo run &
+    @sleep 5
+    cd ui && PLATFORM_URL=http://localhost:8080 npx playwright test; STATUS=$$?; kill %1 2>/dev/null || true; exit $$STATUS
 
 # Cleanup stale test namespaces
 test-cleanup:
@@ -75,27 +89,25 @@ cov-unit:
     cargo llvm-cov nextest --lib --lcov --output-path coverage-unit.lcov \
         --ignore-filename-regex '(proto\.rs|ui\.rs)'
 
-# Ephemeral Kind services (requires: just cluster-up)
 cov-integration:
-    bash hack/test-in-cluster.sh --filter '*_integration' --coverage --lcov coverage-integration.lcov
+    bash {{test_script}} --filter '*_integration' --coverage --lcov coverage-integration.lcov
 
 cov-e2e:
-    @echo "Requires Kind cluster: just cluster-up"
-    bash hack/test-in-cluster.sh --type e2e --coverage --lcov coverage-e2e.lcov
+    bash {{test_script}} --type e2e --coverage --lcov coverage-e2e.lcov
 
-# Combined: unit + integration + E2E (requires Kind cluster)
+# Combined: unit + integration + E2E
 cov-total:
     @echo "=== Combined coverage: unit + integration + E2E ==="
-    bash hack/test-in-cluster.sh --type total
+    bash {{test_script}} --type total
 
-# Diff coverage: only lines changed vs a branch (requires Kind cluster + pipx install diff-cover)
+# Diff coverage: only lines changed vs a branch
 cov-diff branch="main":
-    bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov
+    bash {{test_script}} --type total --lcov coverage-total.lcov
     diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered
 
 # Diff coverage strict: fail if changed lines < 100% covered
 cov-diff-check branch="main":
-    bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov
+    bash {{test_script}} --type total --lcov coverage-total.lcov
     diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered --fail-under=100
 
 cov-html:

@@ -600,15 +600,27 @@ pub async fn delete_json(app: &Router, token: &str, path: &str) -> (StatusCode, 
 // Pipeline E2E helpers — real HTTP server for git clone
 // ---------------------------------------------------------------------------
 
-/// Determine the hostname through which Kind pods can reach the test host.
+/// Determine the hostname through which K8s pods can reach the test host.
 ///
-/// On macOS (Docker Desktop), `host.docker.internal` resolves to the host.
-/// On Linux, we use the Docker bridge gateway (typically `172.18.0.1`).
+/// Priority:
+/// 1. `POD_IP` env var — set by Kubernetes downward API when running inside
+///    a dev pod in k3s. The pod IP is routable from any other pod in the cluster.
+/// 2. `E2E_HOST_ADDR` env var — explicit override.
+/// 3. macOS: `host.docker.internal` (Docker Desktop bridge).
+/// 4. Linux: `172.18.0.1` (Docker bridge gateway for Kind).
 fn host_addr_for_kind() -> String {
+    // In-cluster: pod IP set by Kubernetes downward API (hack/k3s/dev-env.yaml)
+    if let Ok(pod_ip) = std::env::var("POD_IP") {
+        return pod_ip;
+    }
+    // Explicit override
+    if let Ok(addr) = std::env::var("E2E_HOST_ADDR") {
+        return addr;
+    }
     if cfg!(target_os = "macos") {
         "host.docker.internal".into()
     } else {
-        std::env::var("E2E_HOST_ADDR").unwrap_or_else(|_| "172.18.0.1".into())
+        "172.18.0.1".into()
     }
 }
 

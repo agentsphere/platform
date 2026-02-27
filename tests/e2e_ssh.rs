@@ -170,28 +170,42 @@ async fn setup_ssh_e2e(
 }
 
 /// Helper: run a git command with SSH configured for our test server.
-fn git_ssh_cmd(dir: &Path, args: &[&str], ssh_cmd: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_SSH_COMMAND", ssh_cmd)
-        .env("GIT_AUTHOR_NAME", "E2E Test")
-        .env("GIT_AUTHOR_EMAIL", "test@e2e.local")
-        .env("GIT_COMMITTER_NAME", "E2E Test")
-        .env("GIT_COMMITTER_EMAIL", "test@e2e.local")
-        .output()
-        .expect("git command");
+///
+/// Uses `spawn_blocking` because `#[sqlx::test]` runs on a single-threaded
+/// (`current_thread`) tokio runtime. The SSH server is spawned via
+/// `tokio::spawn` on the same runtime, so a blocking `std::process::Command`
+/// here would deadlock — git waits for SSH, SSH waits for the runtime, the
+/// runtime is blocked by the git process.
+async fn git_ssh_cmd(dir: &Path, args: &[&str], ssh_cmd: &str) -> Result<String, String> {
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let ssh_cmd = ssh_cmd.to_string();
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(format!(
-            "git {} failed (exit {}): {}",
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&dir)
+            .env("GIT_SSH_COMMAND", &ssh_cmd)
+            .env("GIT_AUTHOR_NAME", "E2E Test")
+            .env("GIT_AUTHOR_EMAIL", "test@e2e.local")
+            .env("GIT_COMMITTER_NAME", "E2E Test")
+            .env("GIT_COMMITTER_EMAIL", "test@e2e.local")
+            .output()
+            .expect("git command");
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(format!(
+                "git {} failed (exit {}): {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    })
+    .await
+    .expect("spawn_blocking join")
 }
 
 /// Test 1: Full SSH clone succeeds.
@@ -228,7 +242,7 @@ async fn test_ssh_clone_with_ed25519_key(pool: PgPool) {
     let clone_dir = tempfile::tempdir().expect("clone tempdir");
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{owner}/{project_name}.git");
 
-    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd);
+    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd).await;
     assert!(result.is_ok(), "SSH clone failed: {:?}", result.err());
 
     // Verify the cloned content
@@ -273,7 +287,7 @@ async fn test_ssh_push_with_ed25519_key(pool: PgPool) {
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{owner}/{project_name}.git");
 
     let clone_dir = tempfile::tempdir().expect("tempdir");
-    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "work"], &ssh_cmd);
+    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "work"], &ssh_cmd).await;
     assert!(result.is_ok(), "SSH clone failed: {:?}", result.err());
 
     let ssh_work = clone_dir.path().join("work");
@@ -285,12 +299,19 @@ async fn test_ssh_push_with_ed25519_key(pool: PgPool) {
         &["config", "user.email", "test@e2e.local"],
         &ssh_cmd,
     )
+    .await
     .unwrap();
-    git_ssh_cmd(&ssh_work, &["config", "user.name", "E2E Test"], &ssh_cmd).unwrap();
-    git_ssh_cmd(&ssh_work, &["add", "."], &ssh_cmd).unwrap();
-    git_ssh_cmd(&ssh_work, &["commit", "-m", "add file via SSH"], &ssh_cmd).unwrap();
+    git_ssh_cmd(&ssh_work, &["config", "user.name", "E2E Test"], &ssh_cmd)
+        .await
+        .unwrap();
+    git_ssh_cmd(&ssh_work, &["add", "."], &ssh_cmd)
+        .await
+        .unwrap();
+    git_ssh_cmd(&ssh_work, &["commit", "-m", "add file via SSH"], &ssh_cmd)
+        .await
+        .unwrap();
 
-    let push_result = git_ssh_cmd(&ssh_work, &["push", "origin", "main"], &ssh_cmd);
+    let push_result = git_ssh_cmd(&ssh_work, &["push", "origin", "main"], &ssh_cmd).await;
     assert!(
         push_result.is_ok(),
         "SSH push failed: {:?}",
@@ -322,7 +343,7 @@ async fn test_ssh_clone_private_repo_denied_no_key(pool: PgPool) {
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{owner}/{project_name}.git");
 
     let clone_dir = tempfile::tempdir().expect("tempdir");
-    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd);
+    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd).await;
     assert!(
         result.is_err(),
         "SSH clone with unregistered key should fail"
@@ -395,7 +416,7 @@ async fn test_ssh_push_no_write_perm_denied(pool: PgPool) {
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{owner}/{project_name}.git");
 
     let clone_dir = tempfile::tempdir().expect("tempdir");
-    let clone_result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "work"], &ssh_cmd);
+    let clone_result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "work"], &ssh_cmd).await;
     assert!(
         clone_result.is_ok(),
         "SSH clone of public repo should succeed: {:?}",
@@ -410,17 +431,23 @@ async fn test_ssh_push_no_write_perm_denied(pool: PgPool) {
         &["config", "user.email", "test@e2e.local"],
         &ssh_cmd,
     )
+    .await
     .unwrap();
-    git_ssh_cmd(&ssh_work, &["config", "user.name", "E2E Test"], &ssh_cmd).unwrap();
-    git_ssh_cmd(&ssh_work, &["add", "."], &ssh_cmd).unwrap();
+    git_ssh_cmd(&ssh_work, &["config", "user.name", "E2E Test"], &ssh_cmd)
+        .await
+        .unwrap();
+    git_ssh_cmd(&ssh_work, &["add", "."], &ssh_cmd)
+        .await
+        .unwrap();
     git_ssh_cmd(
         &ssh_work,
         &["commit", "-m", "unauthorized push attempt"],
         &ssh_cmd,
     )
+    .await
     .unwrap();
 
-    let push_result = git_ssh_cmd(&ssh_work, &["push", "origin", "main"], &ssh_cmd);
+    let push_result = git_ssh_cmd(&ssh_work, &["push", "origin", "main"], &ssh_cmd).await;
     assert!(
         push_result.is_err(),
         "SSH push without write permission should fail"
@@ -467,7 +494,7 @@ async fn test_ssh_last_used_at_updated(pool: PgPool) {
     let ssh_cmd = git_ssh_command(&key_path, ssh_port);
     let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{owner}/{project_name}.git");
     let clone_dir = tempfile::tempdir().expect("tempdir");
-    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd);
+    let result = git_ssh_cmd(clone_dir.path(), &["clone", &ssh_url, "cloned"], &ssh_cmd).await;
     assert!(result.is_ok(), "SSH clone failed: {:?}", result.err());
 
     // Small delay for async update
