@@ -470,6 +470,54 @@ fn extract_secret_patterns(template: &str) -> Vec<(usize, usize, String)> {
     results
 }
 
+/// Query and decrypt all secrets for a project matching the given scopes
+/// and environment. Returns `(name, decrypted_value)` pairs.
+///
+/// When `environment` is `Some("production")`, matches secrets with that
+/// environment plus env-less (NULL) secrets. When `None`, only matches
+/// env-less secrets.
+#[tracing::instrument(skip(pool, master_key), fields(%project_id, ?environment), err)]
+pub async fn query_scoped_secrets(
+    pool: &PgPool,
+    master_key: &[u8; 32],
+    project_id: Uuid,
+    scopes: &[&str],
+    environment: Option<&str>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT name, encrypted_value
+        FROM secrets
+        WHERE project_id = $1
+          AND scope = ANY($2)
+          AND (environment = $3 OR environment IS NULL)
+        ORDER BY name
+        "#,
+        project_id,
+        scopes as &[&str],
+        environment,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decrypt(&row.encrypted_value, master_key) {
+            Ok(plaintext) => {
+                let value = String::from_utf8(plaintext).map_err(|e| {
+                    anyhow::anyhow!("secret '{}' is not valid UTF-8: {e}", row.name)
+                })?;
+                result.push((row.name, value));
+            }
+            Err(e) => {
+                tracing::warn!(secret = %row.name, error = %e, "skipping undecryptable secret");
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// Replace `${{ secrets.NAME }}` patterns in a template string.
 /// Only resolves secrets matching the given scope.
 #[tracing::instrument(skip(pool, master_key, template), fields(%project_id, %scope), err)]

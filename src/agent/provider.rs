@@ -147,6 +147,8 @@ pub struct BuildPodParams<'a> {
     pub project_agent_image: Option<&'a str>,
     /// User-provided Anthropic API key. If set, used instead of the global K8s secret.
     pub anthropic_api_key: Option<&'a str>,
+    /// Extra env vars from project secrets (scope=agent/all), injected into the pod.
+    pub extra_env_vars: &'a [(String, String)],
 }
 
 /// Trait for agent provider implementations.

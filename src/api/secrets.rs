@@ -3,14 +3,17 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use std::time::Instant;
 
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
 use crate::rbac::{Permission, resolver};
 use crate::secrets::engine;
+use crate::secrets::request::{MAX_PENDING_PER_SESSION, SecretRequest, SecretRequestStatus};
 use crate::store::AppState;
 use crate::validation;
 
@@ -29,6 +32,25 @@ pub struct CreateSecretRequest {
 }
 
 const VALID_SCOPES: &[&str] = &["pipeline", "agent", "deploy", "all"];
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSecretRequestBody {
+    pub name: String,
+    pub description: Option<String>,
+    pub environments: Vec<String>,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteSecretRequestBody {
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecretRequestResponse {
+    id: Uuid,
+    status: SecretRequestStatus,
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -142,6 +164,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/projects/{id}/secrets/{name}",
             axum::routing::delete(delete_project_secret),
+        )
+        .route(
+            "/api/projects/{id}/secret-requests",
+            axum::routing::post(create_secret_request),
+        )
+        .route(
+            "/api/projects/{id}/secret-requests/{request_id}",
+            get(get_secret_request).post(complete_secret_request),
         )
         .route(
             "/api/workspaces/{id}/secrets",
@@ -279,6 +309,225 @@ async fn delete_project_secret(
     .await;
 
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// ---------------------------------------------------------------------------
+// Secret request handlers (agent → UI → secret flow)
+// ---------------------------------------------------------------------------
+
+const SECRET_REQUEST_VALID_ENVS: &[&str] = &["preview", "staging", "production"];
+
+#[tracing::instrument(skip(state, body), fields(%id), err)]
+async fn create_secret_request(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateSecretRequestBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_secret_write(&state, &auth, id).await?;
+
+    validation::check_name(&body.name)?;
+    let desc = body.description.as_deref().unwrap_or("");
+    validation::check_length("description", desc, 0, 500)?;
+
+    if body.environments.len() > 5 {
+        return Err(ApiError::BadRequest(
+            "at most 5 environments allowed".into(),
+        ));
+    }
+    for env in &body.environments {
+        if !SECRET_REQUEST_VALID_ENVS.contains(&env.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "environment must be one of {SECRET_REQUEST_VALID_ENVS:?}"
+            )));
+        }
+    }
+
+    // Enforce max 10 pending per session
+    let pending_count = {
+        let map = state
+            .secret_requests
+            .read()
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("secret_requests lock poisoned")))?;
+        map.values()
+            .filter(|r| {
+                r.session_id == body.session_id
+                    && r.effective_status() == SecretRequestStatus::Pending
+            })
+            .count()
+    };
+    if pending_count >= MAX_PENDING_PER_SESSION {
+        return Err(ApiError::TooManyRequests);
+    }
+
+    let req = SecretRequest {
+        id: Uuid::new_v4(),
+        project_id: id,
+        session_id: body.session_id,
+        name: body.name,
+        description: desc.to_owned(),
+        environments: body.environments,
+        status: SecretRequestStatus::Pending,
+        created_at: Instant::now(),
+    };
+
+    let response = SecretRequestResponse {
+        id: req.id,
+        status: req.status,
+    };
+
+    let req_name = req.name.clone();
+    let req_session_id = req.session_id;
+    {
+        let mut map = state
+            .secret_requests
+            .write()
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("secret_requests lock poisoned")))?;
+        map.insert(req.id, req);
+    }
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "secret_request.create",
+            resource: "secret_request",
+            resource_id: Some(response.id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({
+                "name": req_name,
+                "session_id": req_session_id,
+            })),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[tracing::instrument(skip(state), fields(%id, %request_id), err)]
+async fn get_secret_request(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<SecretRequestResponse>, ApiError> {
+    require_secret_read(&state, &auth, id).await?;
+
+    let map = state
+        .secret_requests
+        .read()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("secret_requests lock poisoned")))?;
+
+    let req = map
+        .get(&request_id)
+        .filter(|r| r.project_id == id)
+        .ok_or_else(|| ApiError::NotFound("secret request".into()))?;
+
+    Ok(Json(SecretRequestResponse {
+        id: req.id,
+        status: req.effective_status(),
+    }))
+}
+
+#[tracing::instrument(skip(state, body), fields(%id, %request_id), err)]
+async fn complete_secret_request(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<CompleteSecretRequestBody>,
+) -> Result<Json<SecretRequestResponse>, ApiError> {
+    require_secret_write(&state, &auth, id).await?;
+
+    validation::check_length("value", &body.value, 1, 65_536)?;
+
+    // Extract request metadata from in-memory map, validate state
+    let (req_name, req_environments) = {
+        let mut map = state
+            .secret_requests
+            .write()
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("secret_requests lock poisoned")))?;
+
+        let req = map
+            .get_mut(&request_id)
+            .filter(|r| r.project_id == id)
+            .ok_or_else(|| ApiError::NotFound("secret request".into()))?;
+
+        if req.is_timed_out() {
+            req.status = SecretRequestStatus::TimedOut;
+            return Err(ApiError::BadRequest("secret request has timed out".into()));
+        }
+
+        if req.status != SecretRequestStatus::Pending {
+            return Err(ApiError::BadRequest(format!(
+                "secret request is already {:?}",
+                req.status
+            )));
+        }
+
+        req.status = SecretRequestStatus::Completed;
+        (req.name.clone(), req.environments.clone())
+    };
+
+    // Store the secret in the database for each requested environment
+    let master_key = get_master_key(&state)?;
+    if req_environments.is_empty() {
+        // No specific environment — store with NULL environment, scope=agent
+        engine::create_secret(
+            &state.pool,
+            &master_key,
+            engine::CreateSecretParams {
+                project_id: Some(id),
+                workspace_id: None,
+                environment: None,
+                name: &req_name,
+                value: body.value.as_bytes(),
+                scope: "agent",
+                created_by: auth.user_id,
+            },
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+    } else {
+        for env in &req_environments {
+            engine::create_secret(
+                &state.pool,
+                &master_key,
+                engine::CreateSecretParams {
+                    project_id: Some(id),
+                    workspace_id: None,
+                    environment: Some(env),
+                    name: &req_name,
+                    value: body.value.as_bytes(),
+                    scope: "agent",
+                    created_by: auth.user_id,
+                },
+            )
+            .await
+            .map_err(ApiError::Internal)?;
+        }
+    }
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "secret_request.complete",
+            resource: "secret_request",
+            resource_id: Some(request_id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({ "name": req_name })),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
+    Ok(Json(SecretRequestResponse {
+        id: request_id,
+        status: SecretRequestStatus::Completed,
+    }))
 }
 
 // ---------------------------------------------------------------------------

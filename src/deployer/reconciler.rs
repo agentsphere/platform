@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Secret;
+use kube::Api;
+use kube::api::PostParams;
 use uuid::Uuid;
 
 use crate::store::AppState;
@@ -197,6 +201,9 @@ async fn handle_active(
     )
     .await?;
 
+    // Inject project secrets as a K8s Secret before applying manifests
+    inject_project_secrets(state, deployment, &ns).await;
+
     let (rendered, sha) = render_manifests(state, deployment).await?;
 
     // Build new resource inventory before applying
@@ -338,6 +345,82 @@ async fn handle_stopped(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Query deploy-scoped secrets for a project, decrypt, and create/update a K8s
+/// Secret in the target namespace. Best-effort: logs warnings on failure.
+#[tracing::instrument(skip(state, deployment), fields(project_id = %deployment.project_id, %namespace))]
+async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment, namespace: &str) {
+    let Some(master_key) = state
+        .config
+        .master_key
+        .as_deref()
+        .and_then(|k| crate::secrets::engine::parse_master_key(k).ok())
+    else {
+        return; // secrets engine not configured, skip silently
+    };
+
+    let secrets = match crate::secrets::engine::query_scoped_secrets(
+        &state.pool,
+        &master_key,
+        deployment.project_id,
+        &["deploy", "all"],
+        Some(&deployment.environment),
+    )
+    .await
+    {
+        Ok(s) if s.is_empty() => return,
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, project_id = %deployment.project_id, "failed to query deploy secrets");
+            return;
+        }
+    };
+
+    let secret_name = format!(
+        "{}-{}-secrets",
+        deployment.namespace_slug,
+        env_suffix(&deployment.environment)
+    );
+
+    let data: BTreeMap<String, String> = secrets.into_iter().collect();
+    let k8s_secret = Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(secret_name.clone()),
+            labels: Some(BTreeMap::from([(
+                "platform.io/project".into(),
+                deployment.project_id.to_string(),
+            )])),
+            ..Default::default()
+        },
+        string_data: Some(data),
+        type_: Some("Opaque".into()),
+        ..Default::default()
+    };
+
+    let api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
+    match api.create(&PostParams::default(), &k8s_secret).await {
+        Ok(_) => {
+            tracing::info!(%secret_name, %namespace, "created deploy secrets K8s Secret");
+        }
+        Err(kube::Error::Api(err)) if err.code == 409 => {
+            // Already exists — replace it
+            match api
+                .replace(&secret_name, &PostParams::default(), &k8s_secret)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(%secret_name, %namespace, "updated deploy secrets K8s Secret");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, %secret_name, "failed to update deploy secrets");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %secret_name, "failed to create deploy secrets K8s Secret");
+        }
+    }
+}
 
 /// Render manifests from ops repo template or generate a basic deployment manifest.
 ///

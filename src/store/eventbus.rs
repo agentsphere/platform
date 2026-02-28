@@ -51,6 +51,12 @@ pub enum PlatformEvent {
         environment: String,
         requested_by: Option<Uuid>,
     },
+    /// A pipeline built a custom dev image from `Dockerfile.dev`.
+    DevImageBuilt {
+        project_id: Uuid,
+        image_ref: String,
+        pipeline_id: Uuid,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +175,11 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
             environment,
             requested_by,
         } => handle_rollback_requested(state, project_id, &environment, requested_by).await,
+        PlatformEvent::DevImageBuilt {
+            project_id,
+            image_ref,
+            pipeline_id,
+        } => handle_dev_image_built(state, project_id, &image_ref, pipeline_id).await,
     }
 }
 
@@ -484,6 +495,37 @@ async fn handle_rollback_requested(
     Ok(())
 }
 
+/// A dev image was built from `Dockerfile.dev` → update the project's `agent_image`.
+#[tracing::instrument(skip(state), fields(%project_id, %pipeline_id), err)]
+async fn handle_dev_image_built(
+    state: &AppState,
+    project_id: Uuid,
+    image_ref: &str,
+    pipeline_id: Uuid,
+) -> anyhow::Result<()> {
+    let result = sqlx::query!(
+        "UPDATE projects SET agent_image = $2, updated_at = now() WHERE id = $1 AND is_active = true",
+        project_id,
+        image_ref,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(%project_id, "dev_image_built: project not found or inactive");
+        return Ok(());
+    }
+
+    tracing::info!(
+        %project_id,
+        %image_ref,
+        %pipeline_id,
+        "project agent_image updated from Dockerfile.dev build"
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +583,11 @@ mod tests {
                 project_id: Uuid::nil(),
                 environment: "production".into(),
                 requested_by: Some(Uuid::nil()),
+            },
+            PlatformEvent::DevImageBuilt {
+                project_id: Uuid::nil(),
+                image_ref: "registry/app-dev:latest".into(),
+                pipeline_id: Uuid::nil(),
             },
         ];
 
@@ -603,6 +650,14 @@ mod tests {
                     requested_by: None,
                 },
                 "RollbackRequested",
+            ),
+            (
+                PlatformEvent::DevImageBuilt {
+                    project_id: Uuid::nil(),
+                    image_ref: "registry/app-dev:abc123".into(),
+                    pipeline_id: Uuid::nil(),
+                },
+                "DevImageBuilt",
             ),
         ];
 

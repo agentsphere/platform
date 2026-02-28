@@ -20,6 +20,7 @@ impl AgentProvider for ClaudeCodeProvider {
             namespace: params.namespace,
             project_agent_image: params.project_agent_image,
             anthropic_api_key: params.anthropic_api_key,
+            extra_env_vars: params.extra_env_vars,
         }))
     }
 

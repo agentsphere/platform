@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         pipeline_notify: Arc::new(tokio::sync::Notify::new()),
         deploy_notify: Arc::new(tokio::sync::Notify::new()),
         inprocess_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Set configurable permission cache TTL
@@ -202,11 +203,17 @@ fn spawn_background_tasks(
     if state.config.ssh_listen.is_some() {
         tokio::spawn(git::ssh_server::run(state.clone(), shutdown_tx.subscribe()));
     }
-    tokio::spawn(run_session_cleanup(pool.clone()));
+    tokio::spawn(run_session_cleanup(
+        pool.clone(),
+        state.secret_requests.clone(),
+    ));
     (shutdown_tx, observe_channels)
 }
 
-async fn run_session_cleanup(pool: sqlx::PgPool) {
+async fn run_session_cleanup(
+    pool: sqlx::PgPool,
+    secret_requests: crate::secrets::request::SecretRequests,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
     loop {
         interval.tick().await;
@@ -223,6 +230,16 @@ async fn run_session_cleanup(pool: sqlx::PgPool) {
         .await
         {
             tracing::warn!(error = %e, "expired tokens cleanup failed");
+        }
+        // Evict stale secret requests (completed/timed-out older than 10 minutes)
+        let evict_threshold = std::time::Duration::from_secs(600);
+        if let Ok(mut map) = secret_requests.write() {
+            let before = map.len();
+            map.retain(|_, r| r.created_at.elapsed() < evict_threshold);
+            let evicted = before - map.len();
+            if evicted > 0 {
+                tracing::debug!(evicted, "evicted stale secret requests");
+            }
         }
         tracing::debug!("expired sessions/tokens cleanup complete");
     }

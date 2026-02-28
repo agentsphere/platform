@@ -192,6 +192,7 @@ pub async fn e2e_state_with_api_url(
         pipeline_notify: Arc::new(tokio::sync::Notify::new()),
         deploy_notify: Arc::new(tokio::sync::Notify::new()),
         inprocess_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Create an API token for the bootstrap admin directly in the DB,

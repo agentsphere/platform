@@ -34,6 +34,8 @@ pub struct PodBuildParams<'a> {
     /// User-provided Anthropic API key. If set, used as a plain env var
     /// instead of referencing the global K8s secret.
     pub anthropic_api_key: Option<&'a str>,
+    /// Extra env vars from project secrets (scope=agent/all), injected into the pod.
+    pub extra_env_vars: &'a [(String, String)],
 }
 
 /// Resolves the container image for an agent pod.
@@ -154,6 +156,27 @@ fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> 
     args
 }
 
+/// Env var names that must not be overridden by project secrets.
+/// Overriding these could hijack the agent's identity or redirect API calls.
+const RESERVED_ENV_VARS: &[&str] = &[
+    "PLATFORM_API_TOKEN",
+    "PLATFORM_API_URL",
+    "SESSION_ID",
+    "ANTHROPIC_API_KEY",
+    "BRANCH",
+    "AGENT_ROLE",
+    "PROJECT_ID",
+    "GIT_AUTH_TOKEN",
+    "GIT_BRANCH",
+    "BROWSER_ENABLED",
+    "BROWSER_CDP_URL",
+    "BROWSER_ALLOWED_ORIGINS",
+];
+
+fn is_reserved_env_var(name: &str) -> bool {
+    RESERVED_ENV_VARS.contains(&name)
+}
+
 fn build_env_vars(
     params: &PodBuildParams<'_>,
     session_id: uuid::Uuid,
@@ -196,6 +219,15 @@ fn build_env_vars(
         let origins_json =
             serde_json::to_string(&browser.allowed_origins).unwrap_or_else(|_| "[]".into());
         vars.push(env_var("BROWSER_ALLOWED_ORIGINS", &origins_json));
+    }
+    // Project secrets (scope=agent/all) as extra env vars.
+    // Skip reserved names to prevent privilege escalation (e.g. overriding PLATFORM_API_TOKEN).
+    for (name, value) in params.extra_env_vars {
+        if is_reserved_env_var(name) {
+            tracing::warn!(%name, "skipping reserved env var from project secrets");
+            continue;
+        }
+        vars.push(env_var(name, value));
     }
     vars
 }
@@ -408,6 +440,7 @@ mod tests {
             namespace: "platform-agents",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         assert_eq!(pod.metadata.name.as_deref(), Some("agent-12345678"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("platform-agents"));
@@ -425,6 +458,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["platform.io/component"], "agent-session");
@@ -447,6 +481,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let claude_container = &spec.containers[0];
@@ -467,6 +502,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -497,6 +533,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: Some("sk-ant-user-key-1234"),
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -518,6 +555,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -553,6 +591,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -575,6 +614,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -599,6 +639,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -620,6 +661,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -663,6 +705,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -686,6 +729,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -720,6 +764,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let resources = spec.containers[0].resources.as_ref().unwrap();
@@ -740,6 +785,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -799,6 +845,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -818,6 +865,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: Some("rust:1.80"),
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -841,6 +889,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -867,6 +916,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -885,6 +935,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -916,6 +967,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 2, "should have claude + browser");
@@ -935,6 +987,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 1, "should have only claude");
@@ -953,6 +1006,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -979,6 +1033,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -998,6 +1053,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1025,6 +1081,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1051,6 +1108,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1073,6 +1131,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1097,6 +1156,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let psc = spec.security_context.unwrap();
@@ -1118,6 +1178,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let container = &spec.containers[0];
@@ -1140,6 +1201,7 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            extra_env_vars: &[],
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1147,5 +1209,102 @@ mod tests {
         assert_eq!(sc.allow_privilege_escalation, Some(false));
         let caps = sc.capabilities.as_ref().unwrap();
         assert_eq!(caps.drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
+    }
+
+    // -- Extra env vars (project secrets) tests --
+
+    #[test]
+    fn extra_env_vars_injected_into_pod() {
+        let session = test_session();
+        let secrets = vec![
+            ("DATABASE_URL".into(), "postgres://db:5432/app".into()),
+            ("API_SECRET".into(), "s3cr3t".into()),
+        ];
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            extra_env_vars: &secrets,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref())
+        };
+        assert_eq!(get("DATABASE_URL"), Some("postgres://db:5432/app"));
+        assert_eq!(get("API_SECRET"), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn extra_env_vars_empty_does_not_add_vars() {
+        let session = test_session();
+        let pod_without = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            extra_env_vars: &[],
+        });
+        let spec = pod_without.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        // Should only have the standard env vars (no extra ones)
+        assert!(
+            env.iter().all(|e| e.name != "DATABASE_URL"),
+            "should not have DATABASE_URL without extra_env_vars"
+        );
+    }
+
+    #[test]
+    fn reserved_env_vars_are_filtered_out() {
+        let session = test_session();
+        let secrets = vec![
+            ("PLATFORM_API_TOKEN".into(), "hijacked-token".into()),
+            ("PLATFORM_API_URL".into(), "http://evil.com".into()),
+            ("SESSION_ID".into(), "fake-session".into()),
+            ("SAFE_VAR".into(), "safe-value".into()),
+        ];
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "real-tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            extra_env_vars: &secrets,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref())
+        };
+        // Reserved vars keep their original values
+        assert_eq!(get("PLATFORM_API_TOKEN"), Some("real-tok"));
+        assert_eq!(get("PLATFORM_API_URL"), Some("http://platform:8080"));
+        // Safe custom var is present
+        assert_eq!(get("SAFE_VAR"), Some("safe-value"));
+    }
+
+    #[test]
+    fn is_reserved_env_var_works() {
+        assert!(is_reserved_env_var("PLATFORM_API_TOKEN"));
+        assert!(is_reserved_env_var("ANTHROPIC_API_KEY"));
+        assert!(is_reserved_env_var("SESSION_ID"));
+        assert!(!is_reserved_env_var("MY_CUSTOM_VAR"));
+        assert!(!is_reserved_env_var("DATABASE_URL"));
     }
 }

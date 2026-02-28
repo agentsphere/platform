@@ -179,6 +179,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
 
     if all_succeeded {
         detect_and_write_deployment(state, pipeline_id, project_id).await;
+        detect_and_publish_dev_image(state, pipeline_id, project_id).await;
     }
 
     fire_build_webhook(&state.pool, project_id, pipeline_id, final_status).await;
@@ -872,12 +873,15 @@ async fn mark_pipeline_failed(pool: &PgPool, pipeline_id: Uuid) -> Result<(), Pi
 /// If any step used a kaniko-like image, publish an `ImageBuilt` event (for production)
 /// or directly upsert a preview deployment (for non-main branches).
 async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, project_id: Uuid) {
+    let dev_step_name = super::trigger::DEV_IMAGE_STEP_NAME;
     let image_steps = sqlx::query!(
         r#"
         SELECT name, image FROM pipeline_steps
-        WHERE pipeline_id = $1 AND status = 'success' AND image ILIKE '%kaniko%'
+        WHERE pipeline_id = $1 AND status = 'success'
+          AND image ILIKE '%kaniko%' AND name != $2
         "#,
         pipeline_id,
+        dev_step_name,
     )
     .fetch_all(&state.pool)
     .await;
@@ -957,6 +961,59 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
             tracing::error!(error = %e, %project_id, %branch, "failed to upsert preview deployment");
         }
     }
+}
+
+/// If a `build-dev-image` step succeeded, publish a `DevImageBuilt` event so
+/// the project's `agent_image` is updated.
+#[tracing::instrument(skip(state), fields(%pipeline_id, %project_id))]
+async fn detect_and_publish_dev_image(state: &AppState, pipeline_id: Uuid, project_id: Uuid) {
+    let dev_step_name = super::trigger::DEV_IMAGE_STEP_NAME;
+    let dev_step = sqlx::query_scalar!(
+        r#"SELECT id FROM pipeline_steps
+           WHERE pipeline_id = $1 AND status = 'success' AND name = $2"#,
+        pipeline_id,
+        dev_step_name,
+    )
+    .fetch_optional(&state.pool)
+    .await;
+
+    let Ok(Some(_)) = dev_step else { return };
+
+    let commit_sha = sqlx::query_scalar!(
+        "SELECT commit_sha FROM pipelines WHERE id = $1",
+        pipeline_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
+    let project_name = sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+    let registry = state
+        .config
+        .registry_url
+        .as_deref()
+        .unwrap_or("localhost:5000");
+    let name = project_name.as_deref().unwrap_or("unknown");
+    let tag = commit_sha.as_deref().unwrap_or("latest");
+    let dev_image_ref = format!("{registry}/{name}-dev:{tag}");
+
+    let event = crate::store::eventbus::PlatformEvent::DevImageBuilt {
+        project_id,
+        image_ref: dev_image_ref.clone(),
+        pipeline_id,
+    };
+    if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
+        tracing::error!(error = %e, %project_id, "failed to publish DevImageBuilt event");
+    }
+
+    tracing::info!(%project_id, %dev_image_ref, "DevImageBuilt event published from pipeline");
 }
 
 /// Create or update a preview deployment for a non-main branch.

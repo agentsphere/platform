@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::agent::inprocess::InProcessHandle;
 use crate::config::Config;
+use crate::secrets::request::SecretRequests;
 
 #[derive(Clone)]
 #[allow(dead_code)] // minio, kube, config consumed by modules 03-09
@@ -27,4 +28,6 @@ pub struct AppState {
     pub deploy_notify: Arc<tokio::sync::Notify>,
     /// In-process agent sessions (global/create-app sessions, not K8s pods).
     pub inprocess_sessions: Arc<std::sync::RwLock<HashMap<Uuid, InProcessHandle>>>,
+    /// Ephemeral in-memory state for agent secret requests (5-min TTL).
+    pub secret_requests: SecretRequests,
 }
