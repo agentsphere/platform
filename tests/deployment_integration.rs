@@ -455,6 +455,9 @@ async fn finalize_success_updates_deployment(pool: PgPool) {
         desired_status: "active".into(),
         deployed_by: None,
         project_name: "finalize-ok".into(),
+        namespace_slug: "finalize-ok".into(),
+        tracked_resources: Vec::new(),
+        skip_prune: false,
     };
 
     platform::deployer::reconciler::finalize_success(&state, &deployment, Some("abc123"), "deploy")

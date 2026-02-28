@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployments (project_id, environment, image_ref, ops_repo_id, desired_status, current_status)\n               VALUES ($1, $2, $3, $4, 'active', 'pending')\n               ON CONFLICT (project_id, environment)\n               DO UPDATE SET image_ref = $3, ops_repo_id = COALESCE($4, deployments.ops_repo_id),\n                             desired_status = 'active', current_status = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7719aa17ae71364693ab9814e53d4bd8b90b30ce6f914b89478fd12867a1310b"
+}

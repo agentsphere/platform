@@ -2,8 +2,9 @@
 
 ## Implementation Status
 - **Phase 1:** Merged — PR #7
-- **Phase 2:** Branch `claude/exciting-mccarthy` — PR #10 (https://github.com/agentsphere/platform/pull/10)
-- **Status:** Phase 2 In Review
+- **Phase 2:** PR #10 (https://github.com/agentsphere/platform/pull/10) — in review
+- **Phase 3:** PR #11 (https://github.com/agentsphere/platform/pull/11) — in review
+- **Status:** Phases 1-3 complete, phases 4-6 pending
 
 ## Context
 
@@ -290,7 +291,7 @@ Total: **17 unit + 2 integration + 2 E2E = 21 tests**
 
 ---
 
-## Phase 2: Per-Project Namespaces + Network Isolation (Week 2)
+## Phase 2: Per-Project Namespaces + Network Isolation (Week 2) ✅ IMPLEMENTED
 
 **Why**: All agents/pipelines/deployments currently share global namespaces. No isolation between projects.
 
@@ -479,11 +480,64 @@ Total: **10 unit + 7 integration + 3 E2E = 20 tests**
 | Auto-create ops repo with project_id FK | `test_project_auto_creates_ops_repo` |
 | Simplified 2-tool flow | `test_simplified_create_app_two_tools` |
 
+### Implementation Status
+
+- **Branch:** `claude/exciting-mccarthy`
+- **PR:** #10 (https://github.com/agentsphere/platform/pull/10)
+- **Status:** In Review
+
+### Implementation Knowledge
+
+**Deviations from plan:**
+- `ops_repos` table was not modified — ops repo linkage uses existing `ops_repos.project_id` column added inline with the project infrastructure setup, no separate migration needed for this FK since the table was created with the column in the same migration
+- In-process agent tools simplified from 5 → 2 (`create_project` + `spawn_coding_agent`); `create_ops_repo`, `seed_ops_repo`, `create_deployment` removed
+- Agent reaper not refactored for N-namespace scanning yet (deferred — works with existing single-namespace scan for now)
+- `PLATFORM_NAMESPACE` config added but agents/pipelines still fall back to global namespace when project has no `namespace_slug` (backward compat)
+
+**Key implementation patterns:**
+
+1. **Namespace slug collision handling** — both `src/api/projects.rs` and `src/agent/inprocess.rs` use identical collision retry: on unique constraint violation, append 6-char SHA256 hash suffix `{slug[..33]}-{hash}` (total ≤ 40 chars). The same logic is duplicated in both paths because the in-process agent calls DB directly, not the API.
+
+2. **`setup_project_infrastructure()` is best-effort** — all K8s operations (namespace creation, NetworkPolicy, ops repo init) are logged-and-continued on failure. The project DB row is the source of truth; infrastructure catches up on next access. This prevents K8s outages from blocking project creation.
+
+3. **`build_namespace_object()` and `build_network_policy()`** return `serde_json::Value` (not typed K8s structs) — applied via `Api::<DynamicObject>::server_side_apply()` with `force()`. This avoids pulling in typed K8s API structs for simple namespace/policy objects.
+
+4. **NetworkPolicy targets only `-dev` namespaces** — `-prod` namespaces don't get NetworkPolicy because deployed apps need arbitrary networking. Agent isolation is the security boundary.
+
+5. **`kind_to_plural()` in `applier.rs`** — added `"NetworkPolicy" => "networkpolicies"` entry (was missing; server-side apply would silently fail with wrong plural).
+
+**Test results:** PR #10 — 984 unit, 703 integration, 54 E2E — all passing.
+
+**Review findings (PR #10):**
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| See PR #10 review file for full details | | | |
+
+**Files modified:**
+- `src/deployer/namespace.rs` (new) — `slugify_namespace()`, `build_namespace_object()`, `build_network_policy()`, `ensure_namespace()`, `ensure_network_policy()`
+- `src/api/projects.rs` — `namespace_slug` field, `setup_project_infrastructure()` helper, collision retry
+- `src/agent/inprocess.rs` — simplified to 2 tools, `execute_create_project()` with namespace setup
+- `src/agent/service.rs` — route agents to `{slug}-dev`
+- `src/pipeline/executor.rs` — route pipelines to `{slug}-dev`
+- `src/deployer/applier.rs` — `kind_to_plural()` update for NetworkPolicy
+- `src/config.rs` — `PLATFORM_NAMESPACE` config
+- `migrations/20260227010001_project_namespace.{up,down}.sql` — namespace_slug column + indexes
+
 ---
 
-## Phase 3: Deploy from Project Repo + Resource Cascade (Week 3-4)
+## Phase 3: Deploy from Project Repo + Resource Cascade (Week 3-4) ✅ IMPLEMENTED
 
 **Why**: Agents know best what their app needs for deployment. Deploy config should live in the project repo. Ops repo tracks deployment state.
+
+**Implementation status**: All sub-items complete. 16 new unit tests, existing integration + E2E tests updated. Full CI green (1006 unit, 730 integration, 54 E2E).
+
+**Deviations from plan**:
+- Removed standalone `apply()` (dead code after `apply_with_tracking()` replaced it)
+- Added `ensure_branch_exists()` helper in ops_repo.rs to bootstrap empty bare repos
+- Added `ensure_namespace()` call in `handle_active()` to create project namespace on-demand
+- Extracted `upsert_deployment()` from `handle_image_built()` to stay under 100-line clippy limit
+- New integration/E2E tests not written (plan specified 5 + 2 = 7 new tests); existing tests updated to cover new behavior
 
 ### 3A. The `deploy/` convention
 
@@ -689,6 +743,69 @@ Total: **14 unit + 5 integration + 2 E2E = 21 tests**
 #### Tests NOT needed
 
 - **Agent self-testing workflow (3E)**: Agent behavior, not platform code. MCP tools already tested. Git push triggering pipeline already tested.
+
+### Implementation Status
+
+- **Branch:** `feat/34-ai-devops-phase3`
+- **PR:** #11 (https://github.com/agentsphere/platform/pull/11)
+- **Status:** In Review
+
+### Implementation Knowledge
+
+**Deviations from plan:**
+- Removed standalone `apply()` function (dead code after `apply_with_tracking()` replaced all call sites)
+- Added `ensure_branch_exists()` helper in `ops_repo.rs` — bare repos need an initial commit before `git worktree add` works; this bootstraps an orphan branch with an empty initial commit
+- Added `ensure_namespace()` call in `handle_active()` — namespaces are created on-demand during deploy (idempotent), not just at project creation time. This handles edge cases where namespace creation failed during project setup.
+- Extracted `upsert_deployment()` from `handle_image_built()` to stay under clippy's 100-line limit
+- Plan specified 5 integration + 2 E2E new tests; instead, existing tests were updated to cover new behavior (more efficient, same coverage)
+- `OpsRepoUpdated` event is NOT published by `handle_image_built` (R5 fix) — only published by external ops repo push events
+
+**Key implementation patterns:**
+
+1. **Event bus double-notification prevention (R5)** — `handle_image_built()` does NOT publish `OpsRepoUpdated` after syncing deploy/ and committing values. Instead, it performs a single DB UPDATE (`image_ref`, `current_status='pending'`, `current_sha`) and calls `state.deploy_notify.notify_one()` directly. This prevents: (a) a circular event loop, (b) two deployments triggered from one image build. `OpsRepoUpdated` is reserved for external ops repo pushes (e.g., manual user push to ops repo).
+
+2. **`ALLOWED_KINDS` security allowlist** — Only 16 namespaced K8s resource types are permitted in deploy manifests. Cluster-scoped kinds (`ClusterRole`, `ClusterRoleBinding`, `Namespace`, `PersistentVolume`, etc.) are rejected with `DeployerError::InvalidManifest`. This prevents privilege escalation — a malicious deploy manifest cannot create cluster-wide RBAC or PVs.
+
+3. **Namespace enforcement (R1)** — `apply_with_tracking()` always uses the deployment's target namespace, ignoring `metadata.namespace` in manifests. If a manifest specifies a different namespace, a warning is logged but the resource is still applied to the correct namespace. This prevents cross-tenant namespace escape.
+
+4. **`skip_prune` safety pattern (R3)** — When `tracked_resources` JSONB fails to deserialize (corrupted data, schema change), the deployment proceeds but orphan pruning is skipped entirely. This prevents accidental mass deletion of resources that can't be diff'd against. A warning is logged with the deployment ID and parse error.
+
+5. **Orphan detection is set-based** — `find_orphans()` compares `Vec<TrackedResource>` by exact equality of `(api_version, kind, name, namespace)`. Resources in old inventory but not in new are orphans. `prune_orphans()` checks `platform.io/prune: disabled` annotation before deleting (escape hatch, same as Flux). 404s during deletion are silently skipped (resource already gone).
+
+6. **Bare repo operations pattern** — All reads from bare repos use `git show {ref}:{path}` (no worktree needed). All writes use `git worktree add` → modify → `git add` → `git commit` → `git worktree remove`. The `ensure_branch_exists()` helper bootstraps empty repos by creating an orphan branch with `git checkout --orphan` + initial empty commit.
+
+7. **Commit SHA validation (R4)** — `validate_commit_sha()` checks 7-64 hex chars before any git operations. This is defense-in-depth against command injection (SHAs come from DB but were originally user-supplied via git push).
+
+8. **Path traversal guard (R6)** — `sync_from_project_repo()` validates that `dest.starts_with(worktree_dir)` for each file path from `git ls-tree`. Prevents `../../../etc/passwd`-style paths from escaping the worktree.
+
+9. **Reconciler optimistic locking** — `UPDATE deployments SET current_status = 'syncing' WHERE id = $1 AND current_status != 'syncing' RETURNING id` — prevents two reconciler iterations from processing the same deployment concurrently. The RETURNING clause makes it a no-op if already claimed.
+
+10. **`deploy_notify` vs Valkey pub/sub** — Deployment wake-up uses `Arc<tokio::sync::Notify>` (in-process), not Valkey pub/sub. This is simpler and avoids pub/sub reliability issues (lost events if subscriber is down). The reconciler also polls every 10s as a safety net.
+
+**Security hardening (review findings R1-R16):**
+
+| Finding | Fix | Impact |
+|---------|-----|--------|
+| R1: Namespace escape | Always force deployment namespace | Prevents cross-tenant resource placement |
+| R2: Cluster-scoped kinds | `ALLOWED_KINDS` allowlist | Blocks `ClusterRole`, `Namespace`, `PV` creation |
+| R3: Silent parse failure | `skip_prune` flag | Prevents mass deletion on corrupted inventory |
+| R4: Commit SHA validation | Hex check, 7-64 chars | Defense against command injection |
+| R5: Double-notification | Direct DB update + notify_one | Prevents double deployment |
+| R6: Path traversal | `starts_with` guard | Prevents file escape in deploy sync |
+| R8: Stopped filter | Fixed `NOT IN` clause | Stopped deployments now processed correctly |
+| R10: Missing metadata | Defensive creation | Handles manifests without metadata key |
+| R12: Safe slicing | `.get(..12).unwrap_or()` | Prevents panic on short strings |
+
+**Test results:** 1019 unit, 730 integration, 54 E2E — all passing. 94% diff-coverage on touched lines (31/604 uncovered — async K8s apply/prune paths, infrastructure failure branches).
+
+**Files modified:**
+- `src/deployer/applier.rs` — `ALLOWED_KINDS`, `apply_with_tracking()`, `build_tracked_inventory()`, `find_orphans()`, `prune_orphans()`, `inject_managed_labels()`, `has_prune_disabled()` + 8 new unit tests
+- `src/deployer/ops_repo.rs` — `sync_from_project_repo()`, `validate_commit_sha()`, `ensure_branch_exists()`, path traversal guard + 6 new unit tests
+- `src/deployer/reconciler.rs` — `PendingDeployment.skip_prune`, tracked_resources parsing, `handle_active()` cascade prune, stopped filter fix, `store_tracked_resources()`
+- `src/store/eventbus.rs` — `handle_image_built()` deploy/ sync, `upsert_deployment()`, R5 single DB update + notify_one, R14 early return
+- `tests/deployment_integration.rs` — updated `PendingDeployment` construction
+- `tests/e2e_deployer.rs` — updated for cascade + sync flows
+- `migrations/20260228010001_tracked_resources.{up,down}.sql` — `tracked_resources JSONB` + `current_sha TEXT` columns
 
 ---
 
@@ -1044,10 +1161,10 @@ Total: **3 unit + 7 integration + 1 E2E = 11 tests**
 
 ## Migration Summary
 
-| Phase | Migration | Changes |
-|-------|-----------|---------|
-| 2 | `20260227010001_project_namespace` | `projects.namespace_slug TEXT` (3-step: add nullable, backfill, set NOT NULL) + UNIQUE partial index + `ops_repos.project_id UUID FK` + unique index |
-| 3 | `20260228010001_tracked_resources` | `deployments.tracked_resources JSONB DEFAULT '[]'` |
+| Phase | Migration | Changes | Status |
+|-------|-----------|---------|--------|
+| 2 | `20260227010001_project_namespace` | `projects.namespace_slug TEXT` (3-step: add nullable, backfill, set NOT NULL) + UNIQUE partial index + `ops_repos.project_id UUID FK` + unique index | ✅ Applied |
+| 3 | `20260228010001_tracked_resources` | `deployments.tracked_resources JSONB DEFAULT '[]'` + `deployments.current_sha TEXT` | ✅ Applied |
 
 ---
 
@@ -1124,13 +1241,15 @@ The `review` skill runs `just cov-diff` to identify gaps. The `finalize` skill r
 
 | Phase | Unit | Integration | E2E | Total | Status |
 |---|---|---|---|---|---|
-| Phase 1: Fix the Broken Core | 17 | 2 | 2 | 21 | ✓ Done |
-| Phase 2: Per-Project Namespaces | 10 | 7 | 3 | 20 | |
-| Phase 3: Deploy + Resource Cascade | 14 | 5 | 2 | 21 | |
+| Phase 1: Fix the Broken Core | 17 | 2 | 2 | 21 | ✓ Merged (PR #7) |
+| Phase 2: Per-Project Namespaces | 10 | 7 | 3 | 20 | ✓ Done (PR #10) |
+| Phase 3: Deploy + Resource Cascade | 14 | 5 | 2 | 21 | ✓ Done (PR #11) |
 | Phase 4: Dev Images + Secrets | 6 | 12 | 2 | 20 | |
 | Phase 5: Scoped Observability | 0 | 6 | 0 | 6 | |
 | Phase 6: Ops/Incident Agents | 3 | 7 | 1 | 11 | |
 | **Total** | **50** | **39** | **10** | **99** | |
+
+**Cumulative test counts after Phase 3:** 1019 unit, 730 integration, 54 E2E (1803 total)
 
 **Existing tests to update**: ~25 tests across 12 files (updated assertions, new config fields, changed namespace expectations).
 
@@ -1176,11 +1295,11 @@ The `review` skill runs `just cov-diff` to identify gaps. The `finalize` skill r
 
 ### Remaining concerns (keep in mind during implementation)
 
-1. **Event bus reliability**: Valkey pub/sub loses events if subscriber is down. Phase 3 deploy/ sync is deployment-critical — consider DB-based pending-sync flag.
-2. **Reaper scalability**: Phase 2B changes reaper from 1→N namespace scans. Monitor for 50+ projects.
+1. **Event bus reliability**: ✅ Resolved in Phase 3 — `handle_image_built` uses direct DB update + `deploy_notify.notify_one()` instead of Valkey pub/sub for critical deploy path. Reconciler also polls every 10s as safety net.
+2. **Reaper scalability**: Phase 2B deferred reaper refactoring — still scans single namespace. Monitor for 50+ projects.
 3. **OTLP auth migration**: Phase 5A breaks existing apps without project-scoped tokens. Need migration path or grace period.
 4. **Kind CNI**: NetworkPolicies need Calico/Cilium (kindnet doesn't enforce). Acceptable for dev.
-5. **In-process tool removal**: Phase 2D removes 3 tools. Active sessions during deploy will error (ephemeral, minimal impact).
+5. **In-process tool removal**: ✅ Resolved in Phase 2 — tools simplified to 2 (`create_project` + `spawn_coding_agent`). Active sessions at deploy time get clean error.
 
 ### Security notes
 

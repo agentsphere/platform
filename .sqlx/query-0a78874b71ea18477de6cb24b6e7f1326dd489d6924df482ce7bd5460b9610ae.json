@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT d.id, d.project_id, d.environment, d.ops_repo_id,\n               d.manifest_path, d.image_ref, d.values_override,\n               d.desired_status, d.current_status, d.deployed_by,\n               p.name as \"project_name!: String\"\n        FROM deployments d\n        JOIN projects p ON p.id = d.project_id AND p.is_active = true\n        WHERE (d.desired_status = 'active' AND d.current_status IN ('pending', 'failed'))\n           OR (d.desired_status = 'rollback' AND d.current_status != 'syncing')\n           OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('healthy', 'syncing'))\n        LIMIT 5\n        ",
+  "query": "\n        SELECT d.id, d.project_id, d.environment, d.ops_repo_id,\n               d.manifest_path, d.image_ref, d.values_override,\n               d.desired_status, d.current_status, d.deployed_by,\n               d.tracked_resources,\n               p.name as \"project_name!: String\",\n               p.namespace_slug as \"namespace_slug!: String\"\n        FROM deployments d\n        JOIN projects p ON p.id = d.project_id AND p.is_active = true\n        WHERE (d.desired_status = 'active' AND d.current_status IN ('pending', 'failed'))\n           OR (d.desired_status = 'rollback' AND d.current_status != 'syncing')\n           OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('stopped', 'syncing'))\n        LIMIT 5\n        ",
   "describe": {
     "columns": [
       {
@@ -55,7 +55,17 @@
       },
       {
         "ordinal": 10,
+        "name": "tracked_resources",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
         "name": "project_name!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "namespace_slug!: String",
         "type_info": "Text"
       }
     ],
@@ -73,8 +83,10 @@
       false,
       false,
       true,
+      false,
+      false,
       false
     ]
   },
-  "hash": "b1fd6554a4c9167934f7f0fa671d9c6e4a2f1954676c8b059cbb244bc9dbbb8c"
+  "hash": "0a78874b71ea18477de6cb24b6e7f1326dd489d6924df482ce7bd5460b9610ae"
 }

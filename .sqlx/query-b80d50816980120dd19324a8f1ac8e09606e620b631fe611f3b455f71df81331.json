@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT name FROM projects WHERE id = $1 AND is_active = true",
+  "query": "SELECT commit_sha FROM pipelines WHERE id = $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "name",
+        "name": "commit_sha",
         "type_info": "Text"
       }
     ],
@@ -15,8 +15,8 @@
       ]
     },
     "nullable": [
-      false
+      true
     ]
   },
-  "hash": "42cce7e601b4cdbae67a16614f476cadcc38fcc0f2aaa4e5970d138e3142e0ad"
+  "hash": "b80d50816980120dd19324a8f1ac8e09606e620b631fe611f3b455f71df81331"
 }

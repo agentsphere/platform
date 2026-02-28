@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments SET image_ref = $3, current_status = 'pending',\n               ops_repo_id = COALESCE($4, ops_repo_id)\n               WHERE project_id = $1 AND environment = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7137f25ece0da90615ae223dc15a72a1affb567abcdc64301968d1869d4839de"
+}

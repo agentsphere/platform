@@ -1,139 +1,155 @@
-# Review: Plan 34 Phase 2 — Per-Project Namespaces + Network Isolation
+# Review: 34-ai-devops-experience (Phase 3)
 
-**Date:** 2026-02-27
-**Scope:** 7 source files, 2 migrations, 4 test files, 10 .sqlx cache files, 1 UI type
+**Date:** 2026-02-28
+**Scope:** Phase 3 — Deploy from Project Repo + Resource Cascade
+- `src/deployer/applier.rs` (+351 lines)
+- `src/deployer/ops_repo.rs` (+351 lines)
+- `src/deployer/reconciler.rs` (+93 lines)
+- `src/store/eventbus.rs` (+123 lines)
+- `migrations/20260228010001_tracked_resources.{up,down}.sql`
+- `tests/deployment_integration.rs` (updated)
+- `tests/e2e_deployer.rs` (updated)
+
 **Overall:** PASS WITH FINDINGS
 
 ## Summary
-- Solid implementation of per-project K8s namespace isolation with good test coverage of the pure functions (slugify, network policy builders). The 5→2 tool simplification in the in-process agent is clean.
-- **Findings:** 1 critical, 3 high, 7 medium
-- **Tests:** 14 new unit tests in namespace.rs, existing tests updated. Integration tests all pass (728/728). E2E tests pass (43/43 non-SSH).
-- **Touched-line coverage (unit only):** 48% — expected since most changes are in async handlers requiring integration tests. `config.rs` and `applier.rs` at 100%; `namespace.rs` pure functions at 76.9%.
+- Solid implementation of inventory-based resource tracking, project-namespace routing, and deploy/ sync from project repos. Good use of ArgoCD/Flux patterns with prune-disabled annotation opt-out.
+- 0 critical, 5 high, 6 medium findings
+- 13 new unit tests in applier.rs, 3 new async tests in ops_repo, 3 namespace routing tests in reconciler; E2E tests updated for project-scoped namespaces
+- Touched-line coverage: **94%** (658 lines, 34 uncovered)
 
 ## Critical & High Findings (must fix)
 
-### R1: [CRITICAL] Migration SQL backfill produces wrong slugs for mixed-case project names
-- **File:** `migrations/20260227010001_project_namespace.up.sql:7-10`
-- **Domain:** Database
-- **Description:** The inner `regexp_replace(name, '[^a-z0-9-]', '-', 'g')` runs on the original mixed-case name. Uppercase letters A-Z match `[^a-z0-9-]` and are replaced with hyphens rather than being lowercased. Example: project "MyProject" → SQL: "y-roject", Rust: "myproject".
-- **Risk:** Existing projects get incorrect namespace_slug values that don't match what the Rust `slugify_namespace()` would produce. K8s namespace names won't align with DB values.
-- **Suggested fix:** Apply `lower()` to `name` first:
-  ```sql
-  UPDATE projects SET namespace_slug = regexp_replace(
-      regexp_replace(lower(name), '[^a-z0-9]', '-', 'g'),
-      '-{2,}', '-', 'g'
-  );
-  ```
-
-### R2: [HIGH] Migration backfill does not truncate to 40 chars
-- **File:** `migrations/20260227010001_project_namespace.up.sql:7-12`
-- **Domain:** Database
-- **Description:** The Rust `slugify_namespace()` truncates output to 40 chars (leaving room for `-dev`/`-prod` suffix). The SQL backfill has no truncation. Projects with long names get slugs exceeding 40 chars, which could exceed the 63-char K8s DNS label limit when `-dev` is appended.
-- **Risk:** K8s namespace creation could fail for long-named existing projects.
-- **Suggested fix:** Add after the trim step:
-  ```sql
-  UPDATE projects SET namespace_slug = left(namespace_slug, 40);
-  UPDATE projects SET namespace_slug = rtrim(namespace_slug, '-');
-  ```
-
-### R3: [HIGH] In-process agent bypasses namespace_slug collision retry
-- **File:** `src/agent/inprocess.rs:433-452`
-- **Domain:** Rust Quality / Security
-- **Description:** `execute_create_project` does a raw INSERT with namespace_slug but lacks the collision-retry logic in `insert_project_row()` (API handler). If two project names produce the same slug (e.g., "my_project" and "my-project"), the INSERT fails with a generic error instead of retrying with a hash suffix.
-- **Risk:** In-process agent project creation fails silently on namespace slug collision.
-- **Suggested fix:** Call `crate::api::projects::insert_project_row()` from the in-process path, or refactor project creation into a shared function.
-
-### R4: [HIGH] In-process agent missing display_name/description validation
-- **File:** `src/agent/inprocess.rs:400-407`
+### R1: [HIGH] Manifest can override target namespace — cross-tenant escape
+- **File:** `src/deployer/applier.rs:59`
 - **Domain:** Security
-- **Description:** `execute_create_project` calls `check_name()` on the name but passes display_name and description from the LLM tool call directly to the DB without length validation. The API handler validates these at `src/api/projects.rs:329-346`.
-- **Risk:** A confused LLM could pass oversized strings (up to DB limit).
-- **Suggested fix:** Add:
+- **Description:** `apply_with_tracking()` uses per-resource namespace if specified in the YAML (`obj.metadata.namespace`), falling back to the deployment namespace. A user who controls `deploy/` YAML could set `metadata.namespace: other-project-prod` and deploy into another project's namespace.
+- **Risk:** Cross-tenant resource injection. An agent or developer could write manifests that deploy to namespaces they don't own.
+- **Suggested fix:** Validate or override the namespace: either strip per-resource namespaces and always use the target namespace, or verify the resource namespace matches the allowed set (`{slug}-{env}`). Simplest: `let ns = namespace;` (always use deployment namespace).
+
+### R2: [HIGH] No restriction on cluster-scoped resource types
+- **File:** `src/deployer/applier.rs:50-64`, `kind_to_plural()` at line 352
+- **Domain:** Security
+- **Description:** `kind_to_plural()` includes `ClusterRole`, `ClusterRoleBinding`, and `Namespace` in the mapping. Users could define cluster-scoped resources in their deploy/ YAML, which would apply cluster-wide, not just to their namespace.
+- **Risk:** Privilege escalation via ClusterRoleBinding granting admin access, or Namespace creation allowing tenants to break isolation.
+- **Suggested fix:** Add an allowlist of permitted resource kinds (Deployment, Service, ConfigMap, Secret, Ingress, HPA, PDB, Job, CronJob, StatefulSet, DaemonSet, PVC, NetworkPolicy) and reject cluster-scoped types during `build_tracked_inventory()` or `apply_with_tracking()`.
+
+### R3: [HIGH] Silent tracked_resources parse failure in reconciler
+- **File:** `src/deployer/reconciler.rs:66`
+- **Domain:** Rust Quality
+- **Description:** `serde_json::from_value(row.tracked_resources.clone()).unwrap_or_default()` silently swallows parse errors. If the JSONB column contains malformed data, the deployment will proceed with an empty inventory, pruning ALL previously tracked resources.
+- **Risk:** Data corruption in `tracked_resources` JSONB could trigger accidental mass deletion of K8s resources via orphan pruning.
+- **Suggested fix:** Log a warning when deserialization fails, and either skip pruning entirely or use an empty vec without pruning:
   ```rust
-  if let Some(ref dn) = display_name { validation::check_length("display_name", dn, 1, 255)?; }
-  if let Some(ref d) = description { validation::check_length("description", d, 0, 10_000)?; }
+  let tracked: Vec<applier::TrackedResource> = match serde_json::from_value(row.tracked_resources.clone()) {
+      Ok(t) => t,
+      Err(e) => {
+          tracing::warn!(deployment_id = %row.id, error = %e, "failed to parse tracked_resources, skipping prune");
+          Vec::new() // reconciler should skip pruning when this flag is set
+      }
+  };
   ```
+
+### R4: [HIGH] Unsanitized commit_sha in git commands
+- **File:** `src/deployer/ops_repo.rs:406` (`list_deploy_files`), line 441 (`read_file_at_ref`), line 470 (`write_deploy_files_and_commit`)
+- **Domain:** Security
+- **Description:** `commit_sha` is passed directly to `git ls-tree` and `git show` without validation. A malicious pipeline event could inject arbitrary git arguments if `commit_sha` starts with `--` or contains shell metacharacters.
+- **Risk:** Command injection via crafted commit SHA. While the value originates from `pipelines.commit_sha` (controlled by platform), defense-in-depth requires validation.
+- **Suggested fix:** Validate `commit_sha` is a hex string (7-64 chars): `if !commit_sha.chars().all(|c| c.is_ascii_hexdigit()) || commit_sha.len() < 7 { return Err(...); }`
+
+### R5: [HIGH] Double-notification to reconciler in eventbus
+- **File:** `src/store/eventbus.rs:180-269`
+- **Domain:** Rust Quality
+- **Description:** `handle_image_built()` calls `upsert_deployment()` which calls `deploy_notify.notify_one()` on the non-ops-repo path, then on the ops-repo path it updates the deployment to `pending` (line 222-228) and publishes `OpsRepoUpdated`. The `OpsRepoUpdated` handler also updates deployment to `pending` and calls `deploy_notify.notify_one()` — resulting in double DB write + double notify.
+- **Risk:** Redundant DB writes and reconciler wake-ups. Not data-corruption, but the redundant `pending` write could race with the reconciler claiming the deployment.
+- **Suggested fix:** On the ops-repo path in `handle_image_built()`, call `deploy_notify.notify_one()` directly instead of publishing `OpsRepoUpdated`. The `OpsRepoUpdated` event should only be published when an external ops repo push is received.
 
 ## Medium Findings (should fix)
 
-### R5: [MEDIUM] NetworkPolicy only covers agent pods, not pipeline pods in shared namespace
-- **File:** `src/deployer/namespace.rs:68-130`
+### R6: [MEDIUM] File path traversal in write_deploy_files_and_commit
+- **File:** `src/deployer/ops_repo.rs:440-452`
 - **Domain:** Security
-- **Description:** The NetworkPolicy `podSelector` matches `"platform.io/component": "agent-session"`. Pipeline pods use different labels (`"platform.io/pipeline"`, `"platform.io/step"`) and are now co-located in the same `{slug}-dev` namespace. Pipeline pods have unrestricted cluster-internal network access.
-- **Suggested fix:** Add a second NetworkPolicy for pipeline pods, or use an empty `podSelector {}` to apply to all pods in the namespace. Can defer to a follow-up if pipeline network policy design needs more thought.
+- **Description:** `file_list` entries come from `git ls-tree` output. While git normally won't produce path-traversal filenames, `worktree_dir.join(file_path)` doesn't validate that the result stays within `worktree_dir`. A specially crafted filename like `deploy/../../../etc/creds` could write outside the worktree.
+- **Risk:** Path traversal write if git repo is adversarially crafted.
+- **Suggested fix:** Add a `starts_with` check after resolving: `let dest = worktree_dir.join(file_path); if !dest.starts_with(worktree_dir) { return Err(DeployerError::SyncFailed("path traversal detected".into())); }`
 
-### R6: [MEDIUM] resolve_session_namespace uses hardcoded fallback instead of config
-- **File:** `src/agent/service.rs:439`
+### R7: [MEDIUM] TOCTOU race in upsert_deployment
+- **File:** `src/store/eventbus.rs:281-322`
 - **Domain:** Rust Quality
-- **Description:** The fallback `Ok("platform-agents".into())` is hardcoded rather than using `state.config.agent_namespace`. The reaper at line 337-339 correctly uses `state.config.agent_namespace.clone()`, creating an inconsistency.
-- **Suggested fix:** Either pass `&AppState` to the function and use `state.config.agent_namespace`, or pass the fallback namespace as a parameter.
+- **Description:** `upsert_deployment()` does a SELECT then conditionally an INSERT or UPDATE. Between the SELECT and UPDATE, another event handler could create or delete the deployment row. The INSERT path handles this with `ON CONFLICT`, but the UPDATE path could be a no-op.
+- **Risk:** Low practical risk since the event bus is effectively single-threaded per event, and no-op UPDATE is benign. The `ON CONFLICT` on INSERT covers the concurrent-creation case.
+- **Suggested fix:** Acceptable as-is. Could combine into a single `INSERT ... ON CONFLICT DO UPDATE` for both paths in a future cleanup.
 
-### R7: [MEDIUM] ops_repos INSERT uses ON CONFLICT DO NOTHING without target
-- **File:** `src/api/projects.rs:253`
+### R8: [MEDIUM] Stopped filter may skip healthy deployments
+- **File:** `src/deployer/reconciler.rs:56`
+- **Domain:** Rust Quality
+- **Description:** The reconciler query `WHERE ... OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('healthy', 'syncing'))` means if a deployment is `desired=stopped, current=healthy`, it won't be picked up for scaling to zero.
+- **Risk:** A healthy deployment that the user wants stopped won't be stopped until it transitions to another status. Dead letter scenario.
+- **Suggested fix:** Change the stopped filter to: `d.current_status NOT IN ('stopped', 'syncing')` — i.e., pick up all non-stopped/non-syncing deployments when desired is stopped.
+
+### R9: [MEDIUM] Missing edge case tests for build_tracked_inventory
+- **File:** `src/deployer/applier.rs:77-109`
+- **Domain:** Tests
+- **Description:** `build_tracked_inventory` has tests for basic multi-doc and custom namespace, but missing tests for: empty YAML string, invalid YAML document in multi-doc stream, document with missing `kind` (should be skipped), document with missing `name` (should be skipped).
+- **Suggested test:** Add: `build_tracked_inventory_empty_yaml` → asserts empty vec, `build_tracked_inventory_invalid_doc_skipped` → parses remaining docs, `build_tracked_inventory_missing_kind_skipped`.
+
+### R10: [MEDIUM] inject_managed_labels silently no-ops if metadata key missing
+- **File:** `src/deployer/applier.rs:195-221`
+- **Domain:** Rust Quality
+- **Description:** If a YAML document has no `metadata` key at all, `inject_managed_labels` does nothing — no labels injected, resource won't be trackable by label selector. In practice `metadata.name` is validated elsewhere, but the function should be defensive.
+- **Suggested fix:** Add a test for the no-metadata case. Consider creating the `metadata` object if missing:
+  ```rust
+  if doc.get("metadata").is_none() {
+      doc["metadata"] = serde_json::json!({"labels": {...}});
+  }
+  ```
+
+### R11: [MEDIUM] Missing index on ops_repos.project_id
+- **File:** `migrations/` (existing schema)
 - **Domain:** Database
-- **Description:** `ON CONFLICT DO NOTHING` without specifying a conflict target silently swallows violations on ANY unique constraint (name OR project_id). A name collision with a different project would be hidden.
-- **Suggested fix:** Change to `ON CONFLICT (project_id) DO NOTHING`.
-
-### R8: [MEDIUM] setup_project_infrastructure mixed error semantics
-- **File:** `src/api/projects.rs:191-267`
-- **Domain:** Rust Quality
-- **Description:** K8s namespace/policy steps are best-effort (log and continue), but ops repo init returns `Err` on failure. The caller catches this at line 446-449, but the function's return type `Result<(), ApiError>` doesn't communicate which steps are best-effort. The function also doesn't create a NetworkPolicy for `-prod` namespace.
-- **Suggested fix:** Make ops repo init also best-effort (just log), or split into separate functions. Document that `-prod` NetworkPolicy is intentionally omitted (agents only run in `-dev`).
-
-### R9: [MEDIUM] Stale test exercising removed tool
-- **File:** `tests/inprocess_integration.rs:818`
-- **Domain:** Tests
-- **Description:** `inprocess_create_ops_repo_tool` references the removed `create_ops_repo` tool. It accidentally passes because `create_project` now auto-creates the ops repo via `setup_project_infrastructure`, and the unknown tool error is gracefully handled. The test name, comments, and structure are misleading.
-- **Suggested fix:** Rename to `inprocess_create_project_auto_creates_ops_repo` and remove the second turn that calls the nonexistent tool.
-
-### R10: [MEDIUM] No integration test for namespace_slug collision retry
-- **File:** `src/api/projects.rs:76-118`
-- **Domain:** Tests
-- **Description:** The `insert_project_row` collision-retry logic (SHA256 hash suffix fallback) has zero test coverage at any tier. This is a critical code path.
-- **Suggested fix:** Add integration test: create two projects with names that produce the same slug (e.g., "my_project" and "my-project"), verify both succeed with different namespace_slug values.
-
-### R11: [MEDIUM] No integration test for namespace_slug in API responses
-- **File:** `tests/project_integration.rs`
-- **Domain:** Tests
-- **Description:** No integration test asserts that `ProjectResponse` includes the `namespace_slug` field. Existing `create_project` tests only check `id`, `name`, `visibility`.
-- **Suggested fix:** Add assertion `assert!(body["namespace_slug"].is_string())` to an existing create_project test.
+- **Description:** `eventbus.rs:198` queries `ops_repos WHERE project_id = $1`. If `ops_repos` grows, this needs an index. Currently relies on sequential scan.
+- **Risk:** Low urgency since ops_repos table is small (1:1 with projects), but good hygiene.
+- **Suggested fix:** Add `CREATE INDEX IF NOT EXISTS idx_ops_repos_project_id ON ops_repos(project_id);` in a follow-up migration.
 
 ## Low Findings (optional)
 
-- [LOW] R12: `src/deployer/namespace.rs:133,163` — `ensure_namespace` and `ensure_network_policy` lack `#[tracing::instrument]` attributes → Add instrument with `skip(kube_client)`.
-- [LOW] R13: `src/api/projects.rs:76` — `insert_project_row` lacks `#[tracing::instrument]` → Add instrument with `skip(pool, body)`.
-- [LOW] R14: `src/config.rs` — `PLATFORM_NAMESPACE` env var not documented in CLAUDE.md security env vars table → Add row to table.
-- [LOW] R15: `src/agent/service.rs:430` — `resolve_session_namespace` filters `AND is_active = true`, preventing operations on sessions whose projects were soft-deleted → Remove the filter (reaper correctly uses LEFT JOIN without it).
-- [LOW] R16: `src/deployer/namespace.rs:10` — `slugify_namespace` is `pub` but only used within the crate → Consider `pub(crate)`.
+- [LOW] R12: `src/deployer/ops_repo.rs:470` — `short_sha` uses index slicing `&commit_sha[..12]` which panics on strings shorter than 12 bytes → Use `commit_sha.get(..12).unwrap_or(commit_sha)`.
+- [LOW] R13: `src/deployer/reconciler.rs:312` — `handle_stopped` constructs deployment name as `{project_name}-{environment}` but `handle_active` uses whatever Deployment name is in the manifest. Mismatch if user names their Deployment differently.
+- [LOW] R14: `src/store/eventbus.rs:196` — `project_name` uses `unwrap_or_default()` which could produce empty string if project not found. Consider returning early if project is None.
+- [LOW] R15: `src/deployer/ops_repo.rs:322-328` — `ensure_branch_exists` ignores `git worktree add --orphan` failure silently. Should log error output for debugging.
+- [LOW] R16: `src/deployer/applier.rs:84` — `build_tracked_inventory` silently skips invalid YAML docs with `Err(_) => continue`. Should log a warning for debuggability.
 
-## Coverage — Touched Lines (unit tests only)
+## Coverage — Touched Lines
 
 | File | Lines changed | Lines covered | Coverage % | Uncovered lines |
 |---|---|---|---|---|
-| `src/agent/inprocess.rs` | 15 | 6 | 40% | 422,434-435,444,462-466,487 |
-| `src/agent/service.rs` | 22 | 0 | 0% | 322-326,337-341,424-441 |
-| `src/api/projects.rs` | 95 | 0 | 0% | 76-118,138-189,194-198,243-285,501,529,542,580 |
-| `src/config.rs` | 3 | 3 | 100% | — |
-| `src/deployer/applier.rs` | 1 | 1 | 100% | — |
-| `src/deployer/namespace.rs` | 234 | 180 | 76.9% | 133-194 (async K8s fns) |
-| `src/pipeline/executor.rs` | 11 | 0 | 0% | 231,513,578-583,1063-1064 |
-| **Total** | **381** | **186** | **48%** | — |
+| `src/deployer/applier.rs` | 351 | 342 | 97.4% | 84, 119-122, 192 |
+| `src/deployer/ops_repo.rs` | 351 | 332 | 94.6% | 378, 413, 448, 464-467, 486-492, 923 |
+| `src/deployer/reconciler.rs` | 93 | 90 | 97.1% | 194-195 |
+| `src/store/eventbus.rs` | 123 | 105 | 85.3% | 210, 338-339, 341-345, 347, 349-350 |
+| **Total** | **658** | **624** | **94%** | — |
 
-### Notes on uncovered paths
-- `src/agent/service.rs`, `src/api/projects.rs`, `src/pipeline/executor.rs` — all async handler/service code covered by integration tests (728/728 pass) but not captured in unit coverage
-- `src/deployer/namespace.rs:133-194` — async K8s functions require real cluster; covered by E2E tests
-- Unit coverage 48% is expected for a change dominated by async DB/K8s handlers
+### Uncovered Paths
+- `src/deployer/applier.rs:84` — `build_tracked_inventory` error branch (`Err(_) => continue`); needs test with invalid YAML doc (see R9)
+- `src/deployer/applier.rs:119-122` — `prune_orphans()` function entry; async K8s call not hit in non-E2E tests (prune E2E scenario doesn't exist yet)
+- `src/deployer/applier.rs:192` — `Ok(deleted)` return of prune_orphans; same as above
+- `src/deployer/ops_repo.rs:378,413` — error branches in `sync_from_project_repo` (git worktree add failure, ls-tree failure)
+- `src/deployer/ops_repo.rs:448,464-467,486-492` — error branches in `write_deploy_files_and_commit` (git add failure, git commit failure)
+- `src/deployer/ops_repo.rs:923` — test helper code
+- `src/deployer/reconciler.rs:194-195` — prune branch inside `handle_active` (orphans present case); needs E2E with resource removal
+- `src/store/eventbus.rs:210` — `sync_deploy_to_ops()` call site; integration test doesn't have project repo_path set
+- `src/store/eventbus.rs:338-350` — `sync_deploy_to_ops()` body + `get_pipeline_commit_sha()`; best-effort path not exercised in integration tests
 
 ## Checklist Results
 
 | Category | Status | Notes |
 |---|---|---|
-| Error handling | PASS | Proper `?` propagation, thiserror for module boundaries |
-| Auth & permissions | PASS | create_project checks ProjectWrite, setup_project_infrastructure gated |
-| Input validation | WARN | API handler validates; in-process path missing display_name/description checks (R4) |
-| Audit logging | PASS | Both API and in-process paths audit project creation |
-| Tracing instrumentation | WARN | New async fns missing instrument attributes (R12, R13) |
-| Clippy compliance | PASS | All warnings resolved, allow attribute on too_many_arguments |
-| Test patterns | WARN | Stale test for removed tool (R9), missing collision test (R10) |
-| Migration safety | FAIL | SQL backfill mismatch (R1), missing truncation (R2) |
-| Touched-line coverage | WARN | 48% unit-only; integration tests cover the async paths |
+| Error handling | PASS | Proper `?` propagation, DeployerError variants, best-effort sync with warn logs |
+| Auth & permissions | N/A | No API handler changes in Phase 3 |
+| Input validation | FAIL | R1 (namespace escape), R2 (cluster-scoped kinds), R4 (commit SHA validation) |
+| Audit logging | N/A | Deployer uses deployment_history table, not audit_log |
+| Tracing instrumentation | PASS | All async fns instrumented with skip/fields/err attributes |
+| Clippy compliance | PASS | All lints resolved (too_many_lines, collapsible_if, doc_markdown, dead_code) |
+| Test patterns | PASS | 13 unit + 3 async + 3 namespace routing tests; E2E updated for project namespaces |
+| Migration safety | PASS | Simple `ALTER TABLE ADD COLUMN` with `NOT NULL DEFAULT '[]'`, reversible |
+| Touched-line coverage | PASS | 94% on changed lines (658 total, 34 uncovered — mostly error branches + async K8s paths) |

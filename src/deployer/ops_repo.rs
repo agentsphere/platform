@@ -125,6 +125,9 @@ pub async fn commit_values(
     environment: &str,
     values: &serde_json::Value,
 ) -> Result<String, DeployerError> {
+    // Ensure the branch exists (bare repo may be empty after init)
+    ensure_branch_exists(repo_path, branch).await?;
+
     let worktree_dir = repo_path.join(format!("_values_worktree_{}", Uuid::new_v4()));
 
     let output = tokio::process::Command::new("git")
@@ -297,6 +300,233 @@ async fn cleanup_worktree(repo_path: &Path, worktree_dir: &Path) {
         .await;
 
     let _ = tokio::fs::remove_dir_all(worktree_dir).await;
+}
+
+/// Ensure a bare repo has at least one commit on the given branch.
+/// If the branch ref doesn't exist, creates an empty initial commit.
+async fn ensure_branch_exists(repo_path: &Path, branch: &str) -> Result<(), DeployerError> {
+    let check = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if check.status.success() {
+        return Ok(());
+    }
+
+    // Create a temp worktree with --orphan to bootstrap the branch
+    let tmp_wt = repo_path.join(format!("_init_worktree_{}", Uuid::new_v4()));
+    let wt_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "add", "--orphan", "-b", branch])
+        .arg(&tmp_wt)
+        .output()
+        .await;
+    if let Ok(ref out) = wt_output
+        && !out.status.success()
+    {
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "ensure_branch_exists: worktree add --orphan failed"
+        );
+    }
+
+    // Create an initial empty commit
+    let commit_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&tmp_wt)
+        .args(["commit", "--allow-empty", "-m", "initial commit"])
+        .output()
+        .await;
+    if let Ok(ref out) = commit_output
+        && !out.status.success()
+    {
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "ensure_branch_exists: initial commit failed"
+        );
+    }
+
+    cleanup_worktree(repo_path, &tmp_wt).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sync deploy/ from project repo to ops repo
+// ---------------------------------------------------------------------------
+
+/// Validate that a string looks like a git commit SHA (hex, 7-64 chars).
+fn validate_commit_sha(sha: &str) -> Result<(), DeployerError> {
+    if sha.len() < 7 || sha.len() > 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DeployerError::SyncFailed(format!(
+            "invalid commit SHA: {sha}"
+        )));
+    }
+    Ok(())
+}
+
+/// Sync the `deploy/` directory from a project git repo at a given SHA
+/// into the ops repo, then commit. Deletes files in the ops repo that
+/// are not present in `deploy/` (orphan cleanup).
+/// Returns the new commit SHA.
+#[tracing::instrument(skip(project_repo_path, ops_repo_path), fields(sha = %commit_sha), err)]
+pub async fn sync_from_project_repo(
+    project_repo_path: &Path,
+    ops_repo_path: &Path,
+    branch: &str,
+    commit_sha: &str,
+) -> Result<String, DeployerError> {
+    validate_commit_sha(commit_sha)?;
+
+    // List files in deploy/ at the given SHA
+    let file_list = list_deploy_files(project_repo_path, commit_sha).await?;
+    if file_list.is_empty() {
+        tracing::debug!(%commit_sha, "no deploy/ directory found at commit");
+        return get_head_sha(ops_repo_path).await;
+    }
+
+    // Ensure the branch exists (bare repo may be empty after init)
+    ensure_branch_exists(ops_repo_path, branch).await?;
+
+    let worktree_dir = ops_repo_path.join(format!("_sync_worktree_{}", Uuid::new_v4()));
+
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(ops_repo_path)
+        .arg("worktree")
+        .arg("add")
+        .arg(&worktree_dir)
+        .arg(branch)
+        .output()
+        .await
+        .map_err(|e| DeployerError::SyncFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployerError::SyncFailed(format!(
+            "git worktree add failed: {stderr}"
+        )));
+    }
+
+    let result =
+        write_deploy_files_and_commit(project_repo_path, &worktree_dir, commit_sha, &file_list)
+            .await;
+
+    cleanup_worktree(ops_repo_path, &worktree_dir).await;
+
+    result?;
+
+    get_head_sha(ops_repo_path).await
+}
+
+/// List files under `deploy/` at a given commit SHA using `git ls-tree`.
+async fn list_deploy_files(
+    repo_path: &Path,
+    commit_sha: &str,
+) -> Result<Vec<String>, DeployerError> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["ls-tree", "-r", "--name-only", commit_sha, "--", "deploy/"])
+        .output()
+        .await
+        .map_err(|e| DeployerError::SyncFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        // Empty output or error just means no deploy/ dir — not fatal
+        return Ok(Vec::new());
+    }
+
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Write deploy files from project repo into the ops repo worktree and commit.
+async fn write_deploy_files_and_commit(
+    project_repo_path: &Path,
+    worktree_dir: &Path,
+    commit_sha: &str,
+    file_list: &[String],
+) -> Result<(), DeployerError> {
+    // Remove existing files in worktree that aren't values/ (preserve values dir)
+    let deploy_dir = worktree_dir.join("deploy");
+    if deploy_dir.exists() {
+        tokio::fs::remove_dir_all(&deploy_dir)
+            .await
+            .map_err(|e| DeployerError::SyncFailed(format!("failed to clean deploy/: {e}")))?;
+    }
+
+    // Write each file from project repo
+    for file_path in file_list {
+        let content = read_file_at_ref(project_repo_path, commit_sha, file_path).await?;
+
+        let dest = worktree_dir.join(file_path);
+        // R6: Guard against path traversal in file names
+        if !dest.starts_with(worktree_dir) {
+            return Err(DeployerError::SyncFailed(format!(
+                "path traversal detected in deploy file: {file_path}"
+            )));
+        }
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| DeployerError::SyncFailed(format!("mkdir: {e}")))?;
+        }
+        tokio::fs::write(&dest, &content)
+            .await
+            .map_err(|e| DeployerError::SyncFailed(format!("write {file_path}: {e}")))?;
+    }
+
+    // Stage all changes (including deletions)
+    let add_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_dir)
+        .args(["add", "-A"])
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if !add_output.status.success() {
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        return Err(DeployerError::CommitFailed(format!(
+            "git add failed: {stderr}"
+        )));
+    }
+
+    let short_sha = commit_sha.get(..12).unwrap_or(commit_sha);
+    let commit_msg = format!("sync deploy/ from {short_sha}");
+
+    let commit_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_dir)
+        .env("GIT_AUTHOR_NAME", "Platform")
+        .env("GIT_AUTHOR_EMAIL", "platform@localhost")
+        .env("GIT_COMMITTER_NAME", "Platform")
+        .env("GIT_COMMITTER_EMAIL", "platform@localhost")
+        .args(["commit", "-m", &commit_msg])
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        if stderr.contains("nothing to commit") {
+            return Ok(());
+        }
+        return Err(DeployerError::CommitFailed(format!(
+            "git commit failed: {stderr}"
+        )));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -691,5 +921,248 @@ mod tests {
             "../etc/passwd",
         );
         assert!(result.is_err());
+    }
+
+    // --- sync_from_project_repo tests ---
+
+    /// Create a project repo with a deploy/ directory containing given files.
+    async fn create_project_repo_with_deploy(
+        tmp: &Path,
+        files: &[(&str, &str)],
+    ) -> (PathBuf, String) {
+        let repo_path = tmp.join("project.git");
+        let _ = tokio::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repo_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Create worktree for initial commit
+        let wt = repo_path.join("_init");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["worktree", "add", "--orphan", "-b", "main"])
+            .arg(&wt)
+            .output()
+            .await
+            .unwrap();
+
+        // Write deploy files
+        for (path, content) in files {
+            let dest = wt.join(path);
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await.unwrap();
+            }
+            tokio::fs::write(&dest, content).await.unwrap();
+        }
+
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["add", "."])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .args(["commit", "-m", "add deploy"])
+            .output()
+            .await;
+
+        let sha = get_head_sha(&repo_path).await.unwrap();
+        cleanup_worktree(&repo_path, &wt).await;
+
+        (repo_path, sha)
+    }
+
+    #[tokio::test]
+    async fn sync_from_project_repo_copies_deploy_dir() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+
+        let (project_repo, sha) = create_project_repo_with_deploy(
+            &tmp,
+            &[
+                (
+                    "deploy/production.yaml",
+                    "kind: Deployment\nmetadata:\n  name: test",
+                ),
+                (
+                    "deploy/staging.yaml",
+                    "kind: Service\nmetadata:\n  name: svc",
+                ),
+            ],
+        )
+        .await;
+
+        let ops_repo = bootstrap_repo(&tmp.join("ops")).await;
+
+        sync_from_project_repo(&project_repo, &ops_repo, "main", &sha)
+            .await
+            .unwrap();
+
+        // Verify files exist in ops repo
+        let prod = read_file_at_ref(&ops_repo, "main", "deploy/production.yaml")
+            .await
+            .unwrap();
+        assert!(prod.contains("Deployment"));
+        let staging = read_file_at_ref(&ops_repo, "main", "deploy/staging.yaml")
+            .await
+            .unwrap();
+        assert!(staging.contains("Service"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn sync_from_project_repo_deletes_orphans() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+
+        // First sync: production + staging
+        let (project_repo, sha1) = create_project_repo_with_deploy(
+            &tmp,
+            &[
+                (
+                    "deploy/production.yaml",
+                    "kind: Deployment\nmetadata:\n  name: v1",
+                ),
+                (
+                    "deploy/staging.yaml",
+                    "kind: Service\nmetadata:\n  name: old",
+                ),
+            ],
+        )
+        .await;
+
+        let ops_repo = bootstrap_repo(&tmp.join("ops")).await;
+        sync_from_project_repo(&project_repo, &ops_repo, "main", &sha1)
+            .await
+            .unwrap();
+
+        // Second push: only production (staging removed)
+        // Create new commit in project repo with only production.yaml
+        let wt = project_repo.join("_update");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_repo)
+            .args(["worktree", "add"])
+            .arg(&wt)
+            .arg("main")
+            .output()
+            .await;
+
+        tokio::fs::remove_file(wt.join("deploy/staging.yaml"))
+            .await
+            .unwrap();
+        // Update production.yaml
+        tokio::fs::write(
+            wt.join("deploy/production.yaml"),
+            "kind: Deployment\nmetadata:\n  name: v2",
+        )
+        .await
+        .unwrap();
+
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["add", "-A"])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .args(["commit", "-m", "remove staging"])
+            .output()
+            .await;
+        let sha2 = get_head_sha(&project_repo).await.unwrap();
+        cleanup_worktree(&project_repo, &wt).await;
+
+        // Sync again
+        sync_from_project_repo(&project_repo, &ops_repo, "main", &sha2)
+            .await
+            .unwrap();
+
+        // staging.yaml should be gone
+        let result = read_file_at_ref(&ops_repo, "main", "deploy/staging.yaml").await;
+        assert!(result.is_err(), "staging.yaml should have been deleted");
+
+        // production.yaml should be updated
+        let prod = read_file_at_ref(&ops_repo, "main", "deploy/production.yaml")
+            .await
+            .unwrap();
+        assert!(prod.contains("v2"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn sync_from_project_repo_commit_message() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+
+        let (project_repo, sha) =
+            create_project_repo_with_deploy(&tmp, &[("deploy/app.yaml", "kind: Deployment")]).await;
+
+        let ops_repo = bootstrap_repo(&tmp.join("ops")).await;
+        sync_from_project_repo(&project_repo, &ops_repo, "main", &sha)
+            .await
+            .unwrap();
+
+        // Check the commit message
+        let log_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&ops_repo)
+            .args(["log", "-1", "--pretty=%s"])
+            .output()
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&log_output.stdout);
+        let short_sha = &sha[..sha.len().min(12)];
+        assert!(
+            message.contains(&format!("sync deploy/ from {short_sha}")),
+            "expected commit message with SHA prefix, got: {message}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // --- R4: commit SHA validation tests ---
+
+    #[test]
+    fn validate_commit_sha_valid_full() {
+        assert!(validate_commit_sha("abc1234567890def1234567890abcdef12345678").is_ok());
+    }
+
+    #[test]
+    fn validate_commit_sha_valid_short() {
+        assert!(validate_commit_sha("abc1234").is_ok());
+    }
+
+    #[test]
+    fn validate_commit_sha_too_short() {
+        assert!(validate_commit_sha("abc12").is_err());
+    }
+
+    #[test]
+    fn validate_commit_sha_non_hex() {
+        assert!(validate_commit_sha("ghijklmnop1234567890").is_err());
+    }
+
+    #[test]
+    fn validate_commit_sha_injection_attempt() {
+        assert!(validate_commit_sha("--exec=evil").is_err());
+    }
+
+    #[test]
+    fn validate_commit_sha_empty() {
+        assert!(validate_commit_sha("").is_err());
     }
 }

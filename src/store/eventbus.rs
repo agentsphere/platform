@@ -176,93 +176,83 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// Pipeline built an image → commit values to ops repo → publish `OpsRepoUpdated`.
+/// Pipeline built an image → sync deploy/ → commit values to ops repo → publish `OpsRepoUpdated`.
 async fn handle_image_built(
     state: &AppState,
     project_id: Uuid,
     environment: &str,
     image_ref: &str,
-    _pipeline_id: Uuid,
+    pipeline_id: Uuid,
     _triggered_by: Option<Uuid>,
 ) -> anyhow::Result<()> {
-    // Find the ops repo linked to this project's deployment
-    let deployment = sqlx::query!(
-        "SELECT ops_repo_id FROM deployments WHERE project_id = $1 AND environment = $2",
+    // Look up project info and auto-created ops repo (Phase 2: 1:1 project → ops repo)
+    let project = sqlx::query!(
+        "SELECT name, repo_path FROM projects WHERE id = $1 AND is_active = true",
         project_id,
-        environment,
     )
     .fetch_optional(&state.pool)
     .await?;
 
-    let Some(deployment) = deployment else {
-        // No deployment configured for this environment — create one without ops repo
-        tracing::info!(
-            %project_id,
-            %environment,
-            %image_ref,
-            "no deployment found, creating default"
-        );
-        sqlx::query!(
-            r#"INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status)
-               VALUES ($1, $2, $3, 'active', 'pending')
-               ON CONFLICT (project_id, environment)
-               DO UPDATE SET image_ref = $3, desired_status = 'active', current_status = 'pending'"#,
-            project_id,
-            environment,
-            image_ref,
-        )
-        .execute(&state.pool)
-        .await?;
-        state.deploy_notify.notify_one();
+    let Some(project) = project else {
+        tracing::warn!(%project_id, "image_built: project not found or inactive, skipping");
         return Ok(());
     };
+    let project_name = project.name.clone();
 
-    let Some(ops_repo_id) = deployment.ops_repo_id else {
-        // Deployment exists but no ops repo — just update image_ref directly
-        sqlx::query!(
-            "UPDATE deployments SET image_ref = $3, current_status = 'pending' WHERE project_id = $1 AND environment = $2",
-            project_id,
-            environment,
-            image_ref,
-        )
-        .execute(&state.pool)
-        .await?;
-        state.deploy_notify.notify_one();
-        return Ok(());
-    };
-
-    // Look up the ops repo
     let ops_repo = sqlx::query!(
+        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    // Sync deploy/ from project repo to ops repo (best-effort)
+    if let Some(ops) = &ops_repo
+        && let Some(repo_path) = &project.repo_path
+    {
+        sync_deploy_to_ops(state, repo_path, &ops.repo_path, &ops.branch, pipeline_id).await;
+    }
+
+    // Find or create deployment row; get linked ops_repo_id (if any)
+    let fallback_ops_id = ops_repo.as_ref().map(|o| o.id);
+    let Some(ops_repo_id) =
+        upsert_deployment(state, project_id, environment, image_ref, fallback_ops_id).await?
+    else {
+        return Ok(());
+    };
+
+    // Ops repo linked — commit values and update deployment directly.
+    // R5: Don't publish OpsRepoUpdated (avoids double-write + double-notify).
+    // OpsRepoUpdated is only for external ops repo pushes.
+    let ops = sqlx::query!(
         "SELECT repo_path, branch FROM ops_repos WHERE id = $1",
         ops_repo_id,
     )
     .fetch_one(&state.pool)
     .await?;
 
-    let repo_path = PathBuf::from(&ops_repo.repo_path);
+    let repo_path = PathBuf::from(&ops.repo_path);
 
-    // Get project name for values
-    let project_name = sqlx::query_scalar!(
-        "SELECT name FROM projects WHERE id = $1 AND is_active = true",
-        project_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or_default();
-
-    // Commit values to the ops repo
     let values = serde_json::json!({
         "image_ref": image_ref,
         "project_name": project_name,
         "environment": environment,
     });
 
-    let commit_sha = crate::deployer::ops_repo::commit_values(
-        &repo_path,
-        &ops_repo.branch,
+    let commit_sha =
+        crate::deployer::ops_repo::commit_values(&repo_path, &ops.branch, environment, &values)
+            .await?;
+
+    // Single DB update: set image_ref + pending + commit_sha
+    sqlx::query!(
+        r#"UPDATE deployments SET image_ref = $3, current_status = 'pending', current_sha = $4
+           WHERE project_id = $1 AND environment = $2"#,
+        project_id,
         environment,
-        &values,
+        image_ref,
+        commit_sha,
     )
+    .execute(&state.pool)
     .await?;
 
     tracing::info!(
@@ -273,20 +263,103 @@ async fn handle_image_built(
         "ops repo updated with new image"
     );
 
-    // Publish OpsRepoUpdated event
-    publish(
-        &state.valkey,
-        &PlatformEvent::OpsRepoUpdated {
-            project_id,
-            ops_repo_id,
-            environment: environment.to_owned(),
-            commit_sha,
-            image_ref: image_ref.to_owned(),
-        },
-    )
-    .await?;
+    state.deploy_notify.notify_one();
 
     Ok(())
+}
+
+/// Find or create deployment row. Returns `Some(ops_repo_id)` if an ops repo
+/// is linked (caller should commit values), or `None` if handled inline.
+async fn upsert_deployment(
+    state: &AppState,
+    project_id: Uuid,
+    environment: &str,
+    image_ref: &str,
+    fallback_ops_id: Option<Uuid>,
+) -> anyhow::Result<Option<Uuid>> {
+    let deployment = sqlx::query!(
+        "SELECT ops_repo_id FROM deployments WHERE project_id = $1 AND environment = $2",
+        project_id,
+        environment,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some(deployment) = deployment else {
+        tracing::info!(%project_id, %environment, %image_ref, "no deployment found, creating default");
+        sqlx::query!(
+            r#"INSERT INTO deployments (project_id, environment, image_ref, ops_repo_id, desired_status, current_status)
+               VALUES ($1, $2, $3, $4, 'active', 'pending')
+               ON CONFLICT (project_id, environment)
+               DO UPDATE SET image_ref = $3, ops_repo_id = COALESCE($4, deployments.ops_repo_id),
+                             desired_status = 'active', current_status = 'pending'"#,
+            project_id, environment, image_ref, fallback_ops_id,
+        )
+        .execute(&state.pool)
+        .await?;
+        state.deploy_notify.notify_one();
+        return Ok(None);
+    };
+
+    let Some(ops_repo_id) = deployment.ops_repo_id else {
+        sqlx::query!(
+            r#"UPDATE deployments SET image_ref = $3, current_status = 'pending',
+               ops_repo_id = COALESCE($4, ops_repo_id)
+               WHERE project_id = $1 AND environment = $2"#,
+            project_id,
+            environment,
+            image_ref,
+            fallback_ops_id,
+        )
+        .execute(&state.pool)
+        .await?;
+        state.deploy_notify.notify_one();
+        return Ok(None);
+    };
+
+    Ok(Some(ops_repo_id))
+}
+
+/// Sync the `deploy/` directory from the project repo to the ops repo.
+/// Best-effort: logs warnings on failure but doesn't block the deployment.
+async fn sync_deploy_to_ops(
+    state: &AppState,
+    project_repo_path: &str,
+    ops_repo_path: &str,
+    ops_branch: &str,
+    pipeline_id: Uuid,
+) {
+    let Some(commit_sha) = get_pipeline_commit_sha(state, pipeline_id).await else {
+        tracing::debug!(%pipeline_id, "no commit SHA for pipeline, skipping deploy/ sync");
+        return;
+    };
+
+    let project_path = PathBuf::from(project_repo_path);
+    let ops_path = PathBuf::from(ops_repo_path);
+
+    if let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
+        &project_path,
+        &ops_path,
+        ops_branch,
+        &commit_sha,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to sync deploy/ to ops repo");
+    }
+}
+
+/// Get the commit SHA from a pipeline run for deploy/ sync.
+async fn get_pipeline_commit_sha(state: &AppState, pipeline_id: Uuid) -> Option<String> {
+    sqlx::query_scalar!(
+        "SELECT commit_sha FROM pipelines WHERE id = $1",
+        pipeline_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// Ops repo was updated → update deployment DB row → wake deployer.

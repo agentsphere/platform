@@ -500,10 +500,11 @@ async fn reconciler_deploys_basic_manifest(pool: PgPool) {
         "should have at least 1 history entry after reconciliation"
     );
 
-    // Clean up K8s deployment
+    // Clean up K8s deployment (now in project namespace)
     let deploy_name = "recon-basic-staging";
+    let target_ns = platform::deployer::reconciler::target_namespace("recon-basic", "staging");
     let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-        kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+        kube::Api::namespaced(state.kube.clone(), &target_ns);
     let _ = deployments
         .delete(deploy_name, &kube::api::DeleteParams::default())
         .await;
@@ -640,8 +641,9 @@ async fn reconciler_rollback_restores_previous(pool: PgPool) {
 
     // Clean up
     let deploy_name = "recon-rb-staging";
+    let target_ns = platform::deployer::reconciler::target_namespace("recon-rb", "staging");
     let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-        kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+        kube::Api::namespaced(state.kube.clone(), &target_ns);
     let _ = deployments
         .delete(deploy_name, &kube::api::DeleteParams::default())
         .await;
@@ -685,8 +687,9 @@ async fn reconciler_stop_scales_to_zero(pool: PgPool) {
 
     // Verify K8s deployment has 0 replicas
     let deploy_name = "recon-stop-staging";
+    let target_ns = platform::deployer::reconciler::target_namespace("recon-stop", "staging");
     let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-        kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+        kube::Api::namespaced(state.kube.clone(), &target_ns);
     let k8s_deploy = deployments.get(deploy_name).await.unwrap();
     let replicas = k8s_deploy
         .spec
@@ -745,8 +748,9 @@ async fn reconciler_optimistic_lock(pool: PgPool) {
 
     // Clean up
     let deploy_name = "recon-lock-staging";
+    let target_ns = platform::deployer::reconciler::target_namespace("recon-lock", "staging");
     let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-        kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+        kube::Api::namespaced(state.kube.clone(), &target_ns);
     let _ = deployments
         .delete(deploy_name, &kube::api::DeleteParams::default())
         .await;
@@ -894,9 +898,13 @@ async fn reconciler_multi_env(pool: PgPool) {
     assert_eq!(prod["image_ref"], "nginx:1.26-alpine");
 
     // Clean up
-    for name in ["recon-multi-staging", "recon-multi-production"] {
+    for (name, env) in [
+        ("recon-multi-staging", "staging"),
+        ("recon-multi-production", "production"),
+    ] {
+        let target_ns = platform::deployer::reconciler::target_namespace("recon-multi", env);
         let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-            kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+            kube::Api::namespaced(state.kube.clone(), &target_ns);
         let _ = deployments
             .delete(name, &kube::api::DeleteParams::default())
             .await;
@@ -947,8 +955,9 @@ async fn reconciler_history_actions(pool: PgPool) {
 
     // Clean up
     let deploy_name = "recon-hist-staging";
+    let target_ns = platform::deployer::reconciler::target_namespace("recon-hist", "staging");
     let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-        kube::Api::namespaced(state.kube.clone(), &state.config.pipeline_namespace);
+        kube::Api::namespaced(state.kube.clone(), &target_ns);
     let _ = deployments
         .delete(deploy_name, &kube::api::DeleteParams::default())
         .await;

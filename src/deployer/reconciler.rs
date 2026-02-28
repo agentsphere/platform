@@ -46,12 +46,14 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
         SELECT d.id, d.project_id, d.environment, d.ops_repo_id,
                d.manifest_path, d.image_ref, d.values_override,
                d.desired_status, d.current_status, d.deployed_by,
-               p.name as "project_name!: String"
+               d.tracked_resources,
+               p.name as "project_name!: String",
+               p.namespace_slug as "namespace_slug!: String"
         FROM deployments d
         JOIN projects p ON p.id = d.project_id AND p.is_active = true
         WHERE (d.desired_status = 'active' AND d.current_status IN ('pending', 'failed'))
            OR (d.desired_status = 'rollback' AND d.current_status != 'syncing')
-           OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('healthy', 'syncing'))
+           OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('stopped', 'syncing'))
         LIMIT 5
         "#,
     )
@@ -60,6 +62,19 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
 
     for row in pending {
         let state = state.clone();
+        let (tracked, skip_prune) = match serde_json::from_value::<Vec<applier::TrackedResource>>(
+            row.tracked_resources.clone(),
+        ) {
+            Ok(t) => (t, false),
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = %row.id,
+                    error = %e,
+                    "failed to parse tracked_resources, skipping prune"
+                );
+                (Vec::new(), true)
+            }
+        };
         let deployment = PendingDeployment {
             id: row.id,
             project_id: row.project_id,
@@ -71,6 +86,9 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
             desired_status: row.desired_status,
             deployed_by: row.deployed_by,
             project_name: row.project_name,
+            namespace_slug: row.namespace_slug,
+            tracked_resources: tracked,
+            skip_prune,
         };
 
         tokio::spawn(async move {
@@ -105,6 +123,24 @@ pub struct PendingDeployment {
     pub desired_status: String,
     pub deployed_by: Option<Uuid>,
     pub project_name: String,
+    pub namespace_slug: String,
+    pub tracked_resources: Vec<applier::TrackedResource>,
+    /// When true, skip orphan pruning (`tracked_resources` failed to parse).
+    pub skip_prune: bool,
+}
+
+/// Map environment name to K8s-safe suffix.
+fn env_suffix(environment: &str) -> &str {
+    match environment {
+        "production" => "prod",
+        other => other,
+    }
+}
+
+/// Resolve the target K8s namespace for a deployment.
+/// Maps `production` → `{slug}-prod`, `staging` → `{slug}-staging`, etc.
+pub fn target_namespace(namespace_slug: &str, environment: &str) -> String {
+    format!("{namespace_slug}-{}", env_suffix(environment))
 }
 
 // ---------------------------------------------------------------------------
@@ -150,18 +186,42 @@ async fn handle_active(
     state: &AppState,
     deployment: &PendingDeployment,
 ) -> Result<(), DeployerError> {
+    let ns = target_namespace(&deployment.namespace_slug, &deployment.environment);
+
+    // Ensure the target namespace exists before applying
+    crate::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &deployment.namespace_slug,
+        env_suffix(&deployment.environment),
+        &deployment.project_id.to_string(),
+    )
+    .await?;
+
     let (rendered, sha) = render_manifests(state, deployment).await?;
-    let applied = applier::apply(&state.kube, &rendered, &state.config.pipeline_namespace).await?;
+
+    // Build new resource inventory before applying
+    let new_tracked = applier::build_tracked_inventory(&rendered, &ns);
+
+    // Prune orphaned resources (removed from manifests since last apply).
+    // Skip if tracked_resources failed to deserialize (R3: avoid accidental mass deletion).
+    if !deployment.skip_prune {
+        let orphans = applier::find_orphans(&deployment.tracked_resources, &new_tracked);
+        if !orphans.is_empty() {
+            let pruned = applier::prune_orphans(&state.kube, &orphans).await?;
+            tracing::info!(pruned_count = pruned, "orphaned resources pruned");
+        }
+    }
+
+    // Apply with tracking labels
+    let applied =
+        applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(deployment.id)).await?;
+
+    // Store the new resource inventory
+    store_tracked_resources(state, deployment.id, &new_tracked).await?;
 
     // Wait for health if a Deployment resource was applied
     if let Some(deploy_name) = applier::find_deployment_name(&applied) {
-        applier::wait_healthy(
-            &state.kube,
-            &state.config.pipeline_namespace,
-            deploy_name,
-            Duration::from_secs(300),
-        )
-        .await?;
+        applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
     }
 
     finalize_success(state, deployment, sha.as_deref(), "deploy").await?;
@@ -234,17 +294,17 @@ async fn handle_rollback(
         ..copy_deployment_fields(deployment)
     };
 
+    let ns = target_namespace(&deployment.namespace_slug, &deployment.environment);
     let (rendered, sha) = render_manifests(state, &rollback_deployment).await?;
-    let applied = applier::apply(&state.kube, &rendered, &state.config.pipeline_namespace).await?;
+    let applied =
+        applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(deployment.id)).await?;
+
+    // Update tracked resources for rollback
+    let new_tracked = applier::build_tracked_inventory(&rendered, &ns);
+    store_tracked_resources(state, deployment.id, &new_tracked).await?;
 
     if let Some(deploy_name) = applier::find_deployment_name(&applied) {
-        applier::wait_healthy(
-            &state.kube,
-            &state.config.pipeline_namespace,
-            deploy_name,
-            Duration::from_secs(300),
-        )
-        .await?;
+        applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
     }
 
     // Reset desired_status to active after successful rollback
@@ -265,16 +325,10 @@ async fn handle_stopped(
     state: &AppState,
     deployment: &PendingDeployment,
 ) -> Result<(), DeployerError> {
-    // Derive deployment name from project_name + environment
+    let ns = target_namespace(&deployment.namespace_slug, &deployment.environment);
     let deploy_name = format!("{}-{}", deployment.project_name, deployment.environment);
 
-    applier::scale(
-        &state.kube,
-        &state.config.pipeline_namespace,
-        &deploy_name,
-        0,
-    )
-    .await?;
+    applier::scale(&state.kube, &ns, &deploy_name, 0).await?;
 
     finalize_success(state, deployment, None, "stop").await?;
     fire_webhook(state, deployment, "stopped").await;
@@ -473,6 +527,26 @@ async fn fire_webhook(state: &AppState, deployment: &PendingDeployment, action: 
         .await;
 }
 
+/// Store the tracked resource inventory in the database.
+async fn store_tracked_resources(
+    state: &AppState,
+    deployment_id: Uuid,
+    tracked: &[applier::TrackedResource],
+) -> Result<(), DeployerError> {
+    let json = serde_json::to_value(tracked)
+        .map_err(|e| DeployerError::Other(anyhow::anyhow!("serialize tracked: {e}")))?;
+
+    sqlx::query!(
+        "UPDATE deployments SET tracked_resources = $2 WHERE id = $1",
+        deployment_id,
+        json,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    Ok(())
+}
+
 fn copy_deployment_fields(d: &PendingDeployment) -> PendingDeployment {
     PendingDeployment {
         id: d.id,
@@ -485,6 +559,9 @@ fn copy_deployment_fields(d: &PendingDeployment) -> PendingDeployment {
         desired_status: d.desired_status.clone(),
         deployed_by: d.deployed_by,
         project_name: d.project_name.clone(),
+        namespace_slug: d.namespace_slug.clone(),
+        tracked_resources: d.tracked_resources.clone(),
+        skip_prune: d.skip_prune,
     }
 }
 
@@ -504,6 +581,9 @@ mod tests {
             desired_status: "active".into(),
             deployed_by: Some(Uuid::new_v4()),
             project_name: "my-app".into(),
+            namespace_slug: "my-app".into(),
+            tracked_resources: Vec::new(),
+            skip_prune: false,
         }
     }
 
@@ -630,6 +710,9 @@ mod tests {
             desired_status: "active".into(),
             deployed_by: Some(Uuid::new_v4()),
             project_name: "my-project".into(),
+            namespace_slug: "my-project".into(),
+            tracked_resources: Vec::new(),
+            skip_prune: false,
         };
 
         assert!(d.ops_repo_id.is_some());
@@ -651,6 +734,9 @@ mod tests {
             desired_status: "active".into(),
             deployed_by: None,
             project_name: "app".into(),
+            namespace_slug: "app".into(),
+            tracked_resources: Vec::new(),
+            skip_prune: false,
         };
 
         assert!(d.ops_repo_id.is_none());
@@ -692,5 +778,23 @@ mod tests {
         let metadata_name = &parsed["metadata"]["name"];
         assert_eq!(selector, template);
         assert_eq!(selector.as_str(), metadata_name.as_str());
+    }
+
+    #[test]
+    fn target_namespace_production() {
+        assert_eq!(target_namespace("my-app", "production"), "my-app-prod");
+    }
+
+    #[test]
+    fn target_namespace_staging() {
+        assert_eq!(target_namespace("my-app", "staging"), "my-app-staging");
+    }
+
+    #[test]
+    fn target_namespace_preview() {
+        assert_eq!(
+            target_namespace("my-app", "preview-feat-123"),
+            "my-app-preview-feat-123"
+        );
     }
 }
