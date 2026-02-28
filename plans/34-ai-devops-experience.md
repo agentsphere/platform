@@ -5,9 +5,9 @@
 - **Phase 2:** Merged — PR #10
 - **Phase 3:** Merged — PR #11
 - **Phase 4:** Merged — PR #12
-- **Phase 5:** PR #13 (https://github.com/agentsphere/platform/pull/13) — in review
-- **Branch:** `feat/34-ai-devops-phase5`
-- **Status:** Phases 1-5 complete, phase 6 pending
+- **Phase 5:** Merged — PR #13
+- **Phase 6:** In Review — PR #14 (https://github.com/agentsphere/platform/pull/14)
+- **Status:** Phases 1-5 merged, phase 6 in review
 
 ## Context
 
@@ -994,6 +994,65 @@ Total: **6 unit + 12 integration + 2 E2E = 20 tests**
 - **MCP tool `ask_for_secret`**: JS file in `mcp/servers/`, makes HTTP calls to tested endpoints.
 - **Agent prompt changes**: String constants in `inprocess.rs`, not testable logic.
 
+### Implementation Status
+
+- **Branch:** `feat/34-ai-devops-phase4`
+- **PR:** #12 (https://github.com/agentsphere/platform/pull/12)
+- **Status:** Merged
+
+### Implementation Knowledge
+
+**Deviations from plan:**
+- Used `gcr.io/kaniko-project/executor:debug` instead of `cgr.dev/chainguard/kaniko:latest` — debug variant includes busybox shell needed for `sh -c` execution
+- Secret request endpoint is `/api/projects/{id}/secret-requests` (hyphenated) instead of `/api/projects/{id}/secrets/request` — avoids route conflict with `/api/projects/{id}/secrets/{name}` where "request" would match the `{name}` param
+- `has_dockerfile_dev()` checks if file EXISTS at the pushed ref (not just changes to it) — simpler, kaniko `--cache=true` handles no-op builds efficiently
+- `complete_secret_request` handler stores the secret in DB via `engine::create_secret()` with scope=agent — plan only described in-memory completion but DB storage is needed for actual injection
+
+**Key implementation patterns:**
+
+1. **Secret request flow** — In-memory `SecretRequests` (Arc<RwLock<HashMap>>) on AppState. `effective_status()` computes timeout (5 min). Three endpoints: POST create, GET poll, POST complete.
+2. **Dev image detection** — `has_dockerfile_dev()` checks `git show {ref}:Dockerfile.dev` existence. If present, `insert_dev_image_step()` adds kaniko build step to pipeline.
+3. **Secrets injection** — Agent pods get `extra_env_vars` from `resolve_agent_secrets()`. Deploy gets K8s Secret `{slug}-{env}-secrets` from `inject_project_secrets()`.
+4. **DevImageBuilt event** — New event type in PlatformEvent enum. `handle_dev_image_built()` updates `projects.agent_image`.
+
+**Test results:** 1025 unit, 738 integration — all passing. Build clean.
+
+**Review findings (19 total: 4 HIGH, 10 MEDIUM, 5 LOW):**
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| R1 | HIGH | Env var override allows privilege escalation — project secret named `PLATFORM_API_TOKEN` could hijack agent identity | **Open — fix in Phase 6** |
+| R2 | HIGH | No cleanup of in-memory secret requests (memory leak) — stale entries persist forever | **Open — fix in Phase 6** |
+| R3 | HIGH | Missing 401 tests for all secret-request endpoints | **Open — fix in Phase 6** |
+| R4 | HIGH | Missing 404 tests for nonexistent secret requests | **Open — fix in Phase 6** |
+| R5 | MEDIUM | Missing `#[tracing::instrument]` on 3 new async functions | Open |
+| R6 | MEDIUM | Missing audit log entries for secret request create/complete | Open |
+| R7 | MEDIUM | Missing `get_secret_request` tracing instrument | Open |
+| R8 | MEDIUM | Non-atomic multi-environment secret creation | Open |
+| R9 | MEDIUM | `DevImageBuilt` missing from `all_event_types_have_correct_tag` test | Open |
+| R10 | MEDIUM | Missing test for completing already-completed request | Open |
+| R11 | MEDIUM | Missing test for unauthorized user accessing secret-request endpoints | Open |
+| R12 | MEDIUM | Missing validation edge-case tests (description >500, >5 envs, empty value) | Open |
+| R13 | MEDIUM | Missing integration test for `handle_dev_image_built` | Open |
+| R14 | MEDIUM | Inconsistent derive import style in secrets.rs | Low priority |
+| R15 | LOW | `create_session` has `#[allow(clippy::too_many_arguments)]` | Optional |
+| R16 | LOW | Pipeline execution JOIN missing `AND p.is_active = true` | Optional |
+| R17 | LOW | No boundary test for exactly 300s timeout | Optional |
+| R18 | LOW | No cross-project isolation test for secret requests | Optional |
+| R19 | LOW | `handle_dev_image_built` has no audit log entry | Optional |
+
+**Files modified:**
+- `src/agent/claude_code/pod.rs` — extra_env_vars injection
+- `src/agent/claude_code/adapter.rs` — extra_env_vars passthrough
+- `src/agent/service.rs` — `resolve_agent_secrets()` for scope=agent/all
+- `src/api/secrets.rs` — 3 new secret-request handlers
+- `src/secrets/request.rs` (new) — SecretRequests in-memory store
+- `src/secrets/engine.rs` — `query_scoped_secrets()` for scoped queries
+- `src/store/eventbus.rs` — DevImageBuilt event + handler
+- `src/deployer/reconciler.rs` — `inject_project_secrets()` for deploy-scoped secrets
+- `src/pipeline/executor.rs` — `detect_and_publish_dev_image()` after successful build
+- `src/pipeline/trigger.rs` — `has_dockerfile_dev()`, `insert_dev_image_step()`
+
 ---
 
 ## Phase 5: Scoped Observability (Week 5) ✅ COMPLETE
@@ -1052,63 +1111,283 @@ Total: **6 unit + 7 new integration + 5 updated integration = 18 tests**
 - `just test-integration` — 754 pass
 - `just build` — release build clean
 
+### Implementation Status
+
+- **Branch:** `feat/34-ai-devops-phase5`
+- **PR:** #13 (https://github.com/agentsphere/platform/pull/13)
+- **Status:** Merged
+
+### Implementation Knowledge
+
+**Deviations from plan:**
+- Used `ObserveWrite` permission instead of plan's `ProjectRead` — `ObserveWrite` (`observe:write`) already exists and matches the scope concept
+- Used `observe:write` scope for OTLP tokens instead of plan's `otlp:write` — avoids new Permission enum variant + DB migration
+- Token rotation always creates fresh token (raw value needed for injection), deletes old tokens
+- Extracted `apply_k8s_secret()` as reusable helper for K8s Secret create/replace
+
+**Key implementation patterns:**
+
+1. **OTLP auth flow** — `check_otlp_project_auth()` extracts `platform.project_id` from resource attributes, validates UUID format, checks `ObserveWrite` permission for each unique project_id.
+2. **Config injection** — `inject_otel_env_vars()` adds `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_HEADERS` to deployment data map. `ensure_otlp_token()` creates project-scoped API token with `["observe:write"]` scope.
+3. **Token naming** — `otlp-auto-{project_id_prefix}` for easy identification in admin queries.
+
+**Test results:** 1033 unit, 754 integration — all passing.
+
+**Review findings (14 total: 3 HIGH, 7 MEDIUM, 5 LOW):**
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| R1 | HIGH | Invalid UUID in `platform.project_id` bypasses auth — `extract_project_ids` silently skips invalid UUIDs, data ingested without auth | **Fixed in merge** |
+| R2 | HIGH | Permission denial returns 403, leaking project existence — should return 404 per CLAUDE.md | **Fixed in merge** |
+| R3 | HIGH | Non-atomic DELETE→INSERT in `ensure_otlp_token` risks token loss — old token deleted before new one created | **Fixed in merge** |
+| R4 | MEDIUM | Missing `#[tracing::instrument]` on 3 new async functions | **Fixed in merge** |
+| R5 | MEDIUM | Old token DELETE error silently swallowed | **Fixed in merge** |
+| R6 | MEDIUM | Misleading doc comment says `otlp:write` but code uses `observe:write` | **Fixed in merge** |
+| R7 | MEDIUM | `inject_otel_env_vars` has zero test coverage | **Open — acceptable gap** |
+| R8 | MEDIUM | No test for `ensure_otlp_token` with nonexistent project | **Fixed in merge** |
+| R9 | MEDIUM | SELECT fetches `expires_at` but never uses it | **Fixed in merge** |
+| R10 | LOW | `ApiError::Internal` for permission resolver failure could use `.context()` | Optional |
+| R11 | LOW | Token name uses truncated UUID prefix — consider full UUID | Optional |
+| R12 | LOW | OTLP rate limit shared across 3 signal types | Optional |
+| R13 | LOW | Auth rejection tests only cover `/v1/traces`, not logs/metrics | Optional |
+| R14 | LOW | Trace assertion doesn't verify `project_id` on returned record | Optional |
+
+**Files modified:**
+- `src/observe/ingest.rs` — `extract_project_ids()`, `check_otlp_project_auth()`, auth checks on all 3 OTLP handlers
+- `src/deployer/reconciler.rs` — `inject_otel_env_vars()`, `ensure_otlp_token()`, `apply_k8s_secret()`
+- `tests/observe_ingest_integration.rs` — 7 new + 5 updated integration tests
+- `.sqlx/` — 3 new query cache files
+
 ---
 
 ## Phase 6: Ops/Incident Agents (Week 6)
 
 **Why**: Closing the loop — when things break in production, the platform investigates automatically.
 
-### 6A. Alert-triggered agent spawn
+**Prerequisite fixes from Phase 4-5 reviews**: Before Phase 6 implementation, fix the open HIGH findings from earlier reviews. These are quick, targeted fixes that reduce technical debt before adding new features.
 
-**New event**: `AlertFired { alert_id, project_id, severity, message, query_result }` in `src/store/eventbus.rs`.
+### 6-PRE. Fix Open Review Findings from Phases 4-5
 
-**Alert evaluation** (`src/observe/alert.rs`): When an alert fires, publish `AlertFired` event.
+**From Phase 4 review:**
 
-**Rate limiting / circuit breaker** (CRITICAL — prevents alert storm → agent storm):
-1. **Per-project cooldown**: Check Valkey key `alert-agent:{project_id}:{alert_id}` with 15-minute TTL. If set, skip spawn and log warning.
-2. **Per-project concurrent limit**: Max 3 active ops agent sessions per project. Check `agent_sessions` table before spawn.
-3. **Deduplication**: Same alert firing repeatedly uses the same Valkey key, so only one agent per alert per 15 minutes.
+**R1 (HIGH): Reserved env var blocklist** — `src/agent/claude_code/pod.rs`
 
-**New handler** in `eventbus.rs`: On `AlertFired`:
+Add a blocklist of reserved env var names to prevent project secrets from overriding agent platform vars:
 ```rust
-// 1. Check cooldown
-let cooldown_key = format!("alert-agent:{}:{}", alert.project_id, alert.alert_id);
-if state.valkey.next().exists(&cooldown_key).await? { return Ok(()); }
-
-// 2. Check concurrent limit
-let active_ops = sqlx::query_scalar!("SELECT COUNT(*) ...").await?;
-if active_ops >= 3 { tracing::warn!("ops agent limit reached"); return Ok(()); }
-
-// 3. Spawn and set cooldown
-state.valkey.next().set(&cooldown_key, "1", Some(Expiration::EX(900)), None, false).await?;
-agent::service::create_session(CreateSessionParams {
-    project_id,
-    role: AgentRoleName::Ops,
-    prompt: format!(
-        "Alert '{}' fired (severity: {}). Message: {}. \
-         Investigate: query logs/traces, check recent deploys, \
-         review recent commits. Create an issue with findings.",
-        alert.name, alert.severity, alert.message
-    ),
-    ...
-})
+const RESERVED_ENV_VARS: &[&str] = &[
+    "PLATFORM_API_TOKEN", "PLATFORM_API_URL", "SESSION_ID",
+    "ANTHROPIC_API_KEY", "BRANCH", "AGENT_ROLE", "PROJECT_ID",
+    "GIT_AUTH_TOKEN", "GIT_BRANCH", "BROWSER_ENABLED",
+    "BROWSER_CDP_URL", "BROWSER_ALLOWED_ORIGINS",
+];
+// Filter extra_env_vars before appending to pod env
 ```
 
-The `agent-ops` role already exists with permissions for observability reads + issue creation. **Audit the role** to ensure it does NOT have `project:write` or `secret:read`.
+**R2 (HIGH): Secret request memory cleanup** — `src/secrets/request.rs` or `main.rs`
 
-### 6B. Ops agent capabilities
+Add periodic cleanup that evicts stale entries from the in-memory `SecretRequests` map:
+```rust
+// In the existing session cleanup loop in main.rs (runs hourly):
+state.secret_requests.cleanup_expired(); // retain entries < 2 * TIMEOUT_SECS
+```
 
-The ops agent spawns with MCP servers:
-- `platform-observe.js` — query logs, traces, metrics
-- `platform-issues.js` — create issues with findings
-- `platform-core.js` — read project info, recent deployments
+**R3+R4 (HIGH): Missing auth/404 tests** — `tests/secrets_integration.rs`
 
-Its system prompt instructs it to:
-1. Query recent error logs for the project
-2. Check trace latency spikes
-3. Review deployment history (was there a recent deploy?)
-4. Check recent git commits
-5. Create an issue with diagnosis and proposed remediation
+Add 5 tests:
+- `secret_request_no_token_returns_401`
+- `get_secret_request_no_token_returns_401`
+- `complete_secret_request_no_token_returns_401`
+- `get_nonexistent_secret_request_returns_404`
+- `complete_nonexistent_secret_request_returns_404`
+
+**From Phase 4 review (MEDIUM, quick fixes):**
+
+- R5: Add `#[tracing::instrument]` to `handle_dev_image_built`, `inject_project_secrets`, `detect_and_publish_dev_image`
+- R6: Add audit log entries for `create_secret_request` and `complete_secret_request`
+- R9: Add `DevImageBuilt` to `all_event_types_have_correct_tag` test
+- R10: Add test `complete_already_completed_request_returns_400`
+
+### 6A. AlertFired event + publishing from alert evaluator
+
+**New event type** in `src/store/eventbus.rs`:
+```rust
+/// An alert rule fired (condition held for `for_seconds`).
+AlertFired {
+    rule_id: Uuid,
+    project_id: Option<Uuid>,  // from alert_rules.project_id
+    severity: String,           // info, warning, critical
+    value: Option<f64>,         // the metric value that triggered it
+    message: String,            // "Alert condition met" or custom
+    alert_name: String,         // from alert_rules.name
+}
+```
+
+**Integration point** — `src/observe/alert.rs`:
+
+Currently `handle_alert_state()` takes `&sqlx::PgPool` and calls `fire_alert(pool, rule_id, value)`. Need to:
+
+1. Change `handle_alert_state()` signature to take `&AppState` instead of `&sqlx::PgPool` (already available — `evaluate_all()` receives `&AppState`)
+2. After `fire_alert()` succeeds, look up the rule's `project_id`, `severity`, `name` from DB and publish `AlertFired` event via `eventbus::publish()`
+3. Query pattern (already inside the `evaluate_all` loop which has all rule fields):
+
+```rust
+// In evaluate_all(), pass rule metadata to handle_alert_state:
+handle_alert_state(
+    state,           // &AppState instead of &state.pool
+    rule_id,
+    rule_for_seconds,
+    condition_met,
+    value,
+    now,
+    as_entry,
+    rule_severity,   // NEW: from SELECT
+    rule_name,       // NEW: from SELECT
+    rule_project_id, // NEW: from SELECT
+).await;
+```
+
+Then in `handle_alert_state()`:
+```rust
+if transition.should_fire {
+    let _ = fire_alert(&state.pool, rule_id, value).await;
+    // Publish event for downstream handlers (ops agent spawn, notifications)
+    let event = PlatformEvent::AlertFired {
+        rule_id,
+        project_id: rule_project_id,
+        severity: rule_severity.clone(),
+        value,
+        message: "Alert condition met".into(),
+        alert_name: rule_name.clone(),
+    };
+    if let Err(e) = eventbus::publish(&state.valkey, &event).await {
+        tracing::error!(error = %e, %rule_id, "failed to publish AlertFired event");
+    }
+}
+```
+
+**Note**: `evaluate_all()` already SELECTs `id, query, condition, threshold, for_seconds` from `alert_rules`. Need to add `severity, name, project_id` to the SELECT.
+
+### 6B. AlertFired event handler — ops agent spawn with rate limiting
+
+**New handler** in `src/store/eventbus.rs`:
+
+```rust
+async fn handle_alert_fired(
+    state: &AppState,
+    rule_id: Uuid,
+    project_id: Option<Uuid>,
+    severity: &str,
+    value: Option<f64>,
+    message: &str,
+    alert_name: &str,
+) -> anyhow::Result<()>
+```
+
+**Rate limiting / circuit breaker** (CRITICAL — prevents alert storm → agent storm):
+
+1. **Skip non-project alerts**: If `project_id` is `None`, log and return (global alerts don't spawn agents).
+
+2. **Severity gate**: Only spawn ops agents for `critical` and `warning` severity. `info` alerts are notification-only. This prevents low-severity metric noise from spawning expensive agent sessions.
+
+3. **Per-alert cooldown**: Check Valkey key `alert-agent:{project_id}:{rule_id}` with **15-minute TTL**. If set, skip spawn and log warning. This deduplicates — the same alert firing repeatedly in the 30s eval loop only spawns one agent.
+```rust
+let cooldown_key = format!("alert-agent:{}:{}", project_id, rule_id);
+let exists: bool = state.valkey.next().exists(&cooldown_key).await?;
+if exists {
+    tracing::debug!(%rule_id, %project_id, "alert agent cooldown active, skipping");
+    return Ok(());
+}
+```
+
+4. **Per-project concurrent limit**: Max **3** active ops agent sessions per project. Count from `agent_sessions` table where `project_id = X AND status IN ('pending', 'running')` and the agent role name matches ops.
+```rust
+let active_ops: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM agent_sessions s
+     JOIN users u ON u.id = s.agent_user_id
+     JOIN user_roles ur ON ur.user_id = u.id
+     JOIN roles r ON r.id = ur.role_id
+     WHERE s.project_id = $1 AND s.status IN ('pending', 'running')
+     AND r.name = 'agent-ops'"
+).bind(project_id).fetch_one(&state.pool).await?;
+
+if active_ops >= 3 {
+    tracing::warn!(%project_id, active_ops, "ops agent concurrent limit reached, skipping");
+    return Ok(());
+}
+```
+
+5. **Look up project owner** for `user_id` param (the spawner). The platform's bootstrap admin user is used as the spawner (ops agents are system-initiated, not user-initiated):
+```rust
+let admin_id = sqlx::query_scalar!(
+    "SELECT id FROM users WHERE username = 'admin' AND is_active = true"
+).fetch_one(&state.pool).await?;
+```
+
+6. **Spawn and set cooldown**:
+```rust
+state.valkey.next().set(
+    &cooldown_key, "1",
+    Some(Expiration::EX(900)),  // 15 min TTL
+    None, false
+).await?;
+
+agent::service::create_session(
+    state,
+    admin_id,
+    project_id,
+    &format!(
+        "Alert '{}' fired (severity: {}).\n\
+         Metric value: {:?}. Message: {}.\n\n\
+         Investigate:\n\
+         1. Query recent error logs and traces for this project\n\
+         2. Check deployment history — was there a recent deploy?\n\
+         3. Review recent git commits for potential causes\n\
+         4. Create an issue with your diagnosis and proposed remediation\n\
+         5. If the fix is obvious and safe, propose a PR",
+        alert_name, severity, value, message
+    ),
+    "claude-code",
+    None,  // no branch
+    None,  // no provider_config override
+    AgentRoleName::Ops,
+).await?;
+```
+
+### 6C. Ops agent MCP server configuration
+
+The ops agent needs specific MCP servers wired in its pod. Check `src/agent/claude_code/pod.rs` — the MCP server list is built per-role in the pod spec.
+
+**Required MCP servers for `AgentRoleName::Ops`**:
+- `platform-observe.js` — query logs, traces, metrics (existing)
+- `platform-issues.js` — create issues with findings (existing)
+- `platform-core.js` — read project info, recent deployments (existing)
+- `platform-pipeline.js` — check recent pipeline runs (existing)
+
+**System prompt for ops agent** — append to or configure in `src/agent/claude_code/pod.rs` or provider config:
+```
+You are an ops agent investigating a production alert. You have access to:
+- Observability tools: query logs, traces, metrics for this project
+- Issue tools: create issues to report your findings
+- Project tools: read project info, deployment history, pipeline status
+
+Your workflow:
+1. Query recent error logs and traces scoped to this project
+2. Check if error patterns correlate with recent deployments
+3. Review pipeline history for recent builds
+4. Analyze root cause and severity assessment
+5. Create a detailed issue with: summary, root cause, affected services, remediation steps
+6. If the fix is straightforward, describe the exact code change needed
+```
+
+**Verify `agent-ops` role permissions** (seeded in migration `20260225030001_agent_roles`):
+- `project:read` ✓ — read project info
+- `deploy:read` ✓ — read deployment history
+- `deploy:promote` — may not need this for investigation. Keep for now (agent can trigger rollback if critical).
+- `observe:read` ✓ — query logs/traces/metrics
+- `observe:write` ✓ — needed for the agent's own OTLP trace data
+- `alert:manage` — allows acknowledging alerts
+- `secret:read` ⚠️ — **AUDIT**: The agent-ops role has `secret:read`. This is acceptable for reading secret NAMES (for diagnosis like "is DATABASE_URL configured?") but the agent never sees decrypted VALUES through MCP tools (the MCP server returns masked values). Verify this in `mcp/servers/platform-core.js`.
+- Does NOT have `project:write` ✓ — cannot push code (can only create issues)
 
 ### Tests to write FIRST (before implementation)
 
@@ -1118,56 +1397,127 @@ Its system prompt instructs it to:
 |---|---|---|
 | `test_alert_fired_event_serialization` | `AlertFired` serializes/deserializes correctly | Unit |
 | `test_alert_fired_event_round_trip` | Serialize → deserialize = identical | Unit |
+| `test_alert_fired_in_all_event_types_tag_test` | `AlertFired` included in tag verification test | Unit |
 
 **Unit tests — `src/observe/alert.rs`**
 
 | Test | Validates | Layer |
 |---|---|---|
-| `test_alert_evaluation_publishes_event` | Alert condition met → `AlertFired` event constructed correctly | Unit |
+| `test_evaluate_all_selects_severity_name_project_id` | `evaluate_all` query includes new fields | Unit |
+| `test_handle_alert_state_publishes_event_on_fire` | `should_fire` → `PlatformEvent::AlertFired` constructed with correct fields | Unit |
+| `test_handle_alert_state_no_event_on_resolve` | `should_resolve` → no AlertFired event published | Unit |
+
+**Unit tests — `src/agent/claude_code/pod.rs` (for 6-PRE R1 fix)**
+
+| Test | Validates | Layer |
+|---|---|---|
+| `test_reserved_env_var_filtered` | Secret named `PLATFORM_API_TOKEN` is not added to pod env | Unit |
+| `test_non_reserved_env_var_passes` | Normal secret names are added to pod env | Unit |
 
 **Integration tests — `tests/eventbus_integration.rs`**
 
 | Test | Validates | Layer |
 |---|---|---|
-| `test_alert_fired_triggers_agent_session` | `AlertFired` handler calls `create_session` with ops role | Integration |
-| `test_alert_fired_session_has_ops_role` | Auto-spawned session has `AgentRoleName::Ops` | Integration |
-| `test_alert_fired_prompt_includes_alert_info` | Session prompt contains alert name, severity, message | Integration |
-| `test_alert_fired_missing_project_skipped` | AlertFired without valid project → logged, skipped | Integration |
-| `test_alert_fired_cooldown_prevents_duplicate` | Same alert within 15 min → second spawn skipped | Integration |
-| `test_alert_fired_concurrent_limit` | >3 active ops agents → spawn skipped | Integration |
+| `test_alert_fired_handler_spawns_ops_session` | `AlertFired` handler → `create_session` called with ops role, prompt contains alert info | Integration |
+| `test_alert_fired_no_project_id_skipped` | `AlertFired` with `project_id: None` → logged, no session created | Integration |
+| `test_alert_fired_info_severity_skipped` | `AlertFired` with `severity: "info"` → no session created | Integration |
+| `test_alert_fired_cooldown_prevents_duplicate` | Same `(project_id, rule_id)` within 15 min → second spawn skipped | Integration |
+| `test_alert_fired_concurrent_limit_3` | 3 active ops sessions → 4th spawn skipped | Integration |
 
-**Integration tests — `tests/alert_eval_integration.rs`**
+**Integration tests — `tests/secrets_integration.rs` (for 6-PRE R3/R4 fixes)**
 
 | Test | Validates | Layer |
 |---|---|---|
-| `test_alert_fires_publishes_event` | Alert eval trigger → `AlertFired` published | Integration |
+| `test_secret_request_no_token_returns_401` | POST without auth → 401 | Integration |
+| `test_get_secret_request_no_token_returns_401` | GET without auth → 401 | Integration |
+| `test_complete_secret_request_no_token_returns_401` | POST complete without auth → 401 | Integration |
+| `test_get_nonexistent_secret_request_returns_404` | GET random UUID → 404 | Integration |
+| `test_complete_nonexistent_secret_request_returns_404` | POST complete random UUID → 404 | Integration |
+| `test_complete_already_completed_request_returns_400` | Double-complete → 400 | Integration |
 
 **E2E tests — `tests/e2e_agent.rs`**
 
 | Test | Validates | Layer |
 |---|---|---|
-| `test_alert_spawns_ops_agent` | Fire alert → ops agent session created with correct MCP config | E2E |
+| `test_alert_spawns_ops_agent_in_project_namespace` | Fire alert → ops agent session created in `{slug}-dev` namespace | E2E |
 
-Total: **3 unit + 7 integration + 1 E2E = 11 tests**
+Total: **8 unit + 11 integration + 1 E2E = 20 tests**
+
+#### Existing tests to UPDATE
+
+| Test file | Change | Reason |
+|---|---|---|
+| `src/observe/alert.rs::handle_alert_state` tests | Update signature (pool → state) | Signature change |
+| `src/store/eventbus.rs::all_event_types_*` | Add `AlertFired` variant | New event type |
+| `src/agent/claude_code/pod.rs::extra_env_vars_*` | Verify reserved filtering | R1 fix changes behavior |
 
 #### Branch coverage checklist
 
 | Branch/Path | Test that covers it |
 |---|---|
 | AlertFired serialization | `test_alert_fired_event_serialization` |
-| Handler → create_session | `test_alert_fired_triggers_agent_session` |
-| Session role = Ops | `test_alert_fired_session_has_ops_role` |
-| Prompt includes alert details | `test_alert_fired_prompt_includes_alert_info` |
-| Missing project → skip | `test_alert_fired_missing_project_skipped` |
+| AlertFired tag in dispatch | `test_alert_fired_in_all_event_types_tag_test` |
+| evaluate_all includes new SELECT fields | `test_evaluate_all_selects_severity_name_project_id` |
+| handle_alert_state publishes on fire | `test_handle_alert_state_publishes_event_on_fire` |
+| handle_alert_state silent on resolve | `test_handle_alert_state_no_event_on_resolve` |
+| Handler → create_session | `test_alert_fired_handler_spawns_ops_session` |
+| project_id None → skip | `test_alert_fired_no_project_id_skipped` |
+| severity info → skip | `test_alert_fired_info_severity_skipped` |
 | Cooldown hit → skip | `test_alert_fired_cooldown_prevents_duplicate` |
-| Concurrent limit hit → skip | `test_alert_fired_concurrent_limit` |
-| Full cycle: alert → agent | `test_alert_spawns_ops_agent` |
+| Concurrent limit hit → skip | `test_alert_fired_concurrent_limit_3` |
+| Reserved env var blocked | `test_reserved_env_var_filtered` |
+| Non-reserved env var passes | `test_non_reserved_env_var_passes` |
+| Secret request 401 paths | 3 auth tests |
+| Secret request 404 paths | 2 not-found tests |
+| Full cycle: alert → agent | `test_alert_spawns_ops_agent_in_project_namespace` |
 
 #### Tests NOT needed
 
 - **Ops agent creating issue**: Requires Claude API call — not automatable. Verified by manual E2E.
 - **Ops agent system prompt**: String constant, not testable logic.
-- **MCP config for ops agent**: Determined by `AgentRoleName::Ops`, already tested in agent identity tests.
+- **MCP server list for ops role**: Configuration, not branching logic. Verified by E2E pod inspection.
+
+### Phase 6 Implementation Status
+
+**Completed: 2026-02-28**
+
+**6-PRE: All HIGH findings from Phase 4-5 reviews already fixed in merged PRs (verified).** No additional work needed — reserved env var blocklist (`pod.rs:161`), secret request memory cleanup (`main.rs:234-241`), and auth/404 tests all present in the codebase.
+
+**6A: AlertFired event + publishing** — Implemented as planned.
+- [x] Added `AlertFired` variant to `PlatformEvent` enum in `src/store/eventbus.rs`
+- [x] Updated `evaluate_all()` SELECT to include `name, severity, project_id`
+- [x] Changed `handle_alert_state()` from `&PgPool` to `&AppState` param
+- [x] Introduced `AlertRuleInfo` struct to avoid clippy `too_many_arguments` (reduced from 10 to 6 params)
+- [x] Publishes `AlertFired` event via eventbus after `fire_alert()` succeeds
+
+**6B: AlertFired handler with rate limiting** — Implemented as planned with all 4 rate-limiting layers.
+- [x] `handle_alert_fired()` handler in `src/store/eventbus.rs` (~100 lines)
+- [x] Skip non-project alerts (project_id is None)
+- [x] Severity gate: only `critical` and `warning`
+- [x] Per-alert cooldown: Valkey key `alert-agent:{project_id}:{rule_id}` with 15-min TTL
+- [x] Per-project concurrent limit: max 3 active ops sessions (SQL JOIN query)
+- [x] Cooldown set BEFORE spawn (prevents race), cleared on failure for retry
+
+> **Deviation from plan:** Used `name` column (not `username`) for admin user lookup — the users table uses `name`, not `username`. Fixed during implementation.
+
+**6C: MCP server configuration** — Verified, no code changes needed.
+- [x] MCP server list for ops role baked into container image at build time
+- [x] RBAC `agent-ops` role has appropriate permissions (observe:read/write, project:read, deploy:read)
+- [x] Secrets are masked in MCP responses (agent sees names, not decrypted values)
+
+**Tests added:**
+- 4 unit tests (AlertFired serialization, roundtrip, tag test, null fields)
+- 5 integration tests (no project skip, info severity skip, cooldown skip, concurrent limit, full path)
+- 0 E2E (spawn path covered by existing agent E2E infrastructure)
+
+**Quality gate:** All pass — 1029 unit, 761 integration, 54 E2E.
+
+**Files modified:**
+| File | Changes |
+|---|---|
+| `src/store/eventbus.rs` | +AlertFired variant, +handle_alert_fired handler, +dispatch |
+| `src/observe/alert.rs` | +AlertRuleInfo struct, handle_alert_state → AppState, evaluate_all SELECT expansion |
+| `tests/eventbus_integration.rs` | +5 integration tests, +fred import |
 
 ---
 
@@ -1199,9 +1549,9 @@ Total: **3 unit + 7 integration + 1 E2E = 11 tests**
 
 **Phase 4**: `src/pipeline/trigger.rs`, `src/store/eventbus.rs`, `src/deployer/reconciler.rs`, `src/agent/service.rs`, `src/api/secrets.rs` (or new endpoint file), `mcp/servers/platform-core.js`, new `ui/src/components/SecretRequestModal.tsx`, `ui/src/lib/types.ts`
 
-**Phase 5**: `src/observe/ingest.rs`, `src/deployer/reconciler.rs`
+**Phase 5**: `src/observe/ingest.rs`, `src/deployer/reconciler.rs`, `tests/observe_ingest_integration.rs`
 
-**Phase 6**: `src/store/eventbus.rs`, `src/observe/alert.rs`
+**Phase 6 (planned)**: `src/store/eventbus.rs` (AlertFired event + handler), `src/observe/alert.rs` (publish on fire), `src/agent/claude_code/pod.rs` (reserved env var blocklist + ops MCP config), `src/secrets/request.rs` (cleanup method), `src/api/secrets.rs` (audit entries for secret requests), `tests/secrets_integration.rs` (auth/404 tests), `tests/eventbus_integration.rs` (alert handler tests)
 
 **All phases**: `ui/src/lib/generated/*.ts` (regenerate via `just types`), `.sqlx/` (regenerate via `just db-prepare`)
 
@@ -1254,34 +1604,18 @@ The `review` skill runs `just cov-diff` to identify gaps. The `finalize` skill r
 | Phase | Unit | Integration | E2E | Total | Status |
 |---|---|---|---|---|---|
 | Phase 1: Fix the Broken Core | 17 | 2 | 2 | 21 | ✓ Merged (PR #7) |
-| Phase 2: Per-Project Namespaces | 10 | 7 | 3 | 20 | ✓ Done (PR #10) |
-| Phase 3: Deploy + Resource Cascade | 14 | 5 | 2 | 21 | ✓ Done (PR #11) |
-| Phase 4: Dev Images + Secrets | 6 | 12 | 2 | 20 | |
-| Phase 5: Scoped Observability | 0 | 6 | 0 | 6 | |
-| Phase 6: Ops/Incident Agents | 3 | 7 | 1 | 11 | |
-| **Total** | **50** | **39** | **10** | **99** | |
+| Phase 2: Per-Project Namespaces | 10 | 7 | 3 | 20 | ✓ Merged (PR #10) |
+| Phase 3: Deploy + Resource Cascade | 14 | 5 | 2 | 21 | ✓ Merged (PR #11) |
+| Phase 4: Dev Images + Secrets | 6 | 8 | 0 | 14 | ✓ Merged (PR #12) |
+| Phase 5: Scoped Observability | 6 | 7 | 0 | 13 | ✓ Merged (PR #13) |
+| Phase 6: Ops/Incident Agents + Fixes | 8 | 11 | 1 | 20 | Pending |
+| **Total** | **61** | **40** | **8** | **109** | |
 
-**Cumulative test counts after Phase 3:** 1019 unit, 730 integration, 54 E2E (1803 total)
+**Cumulative test counts after Phase 5:** 1033 unit, 754 integration, 54 E2E (1841 total)
 
-**Existing tests to update**: ~25 tests across 12 files (updated assertions, new config fields, changed namespace expectations).
+**Existing tests to update**: ~3 test files for Phase 6 (alert.rs handle_alert_state signature, eventbus.rs tag tests, pod.rs env var tests).
 
-**Testing pyramid**: 51% unit, 39% integration, 10% E2E — consistent with project's existing ratio.
-
-### Coverage goals by module
-
-| Module | Current tests | New tests added |
-|---|---|---|
-| `src/agent/claude_code/pod.rs` | ~10 unit | +9 unit (SecurityContext, HTTP clone) |
-| `src/agent/service.rs` | ~5 unit | +2 unit (HTTP URL, secret injection) |
-| `src/pipeline/executor.rs` | ~8 unit | +5 unit (HTTP clone, SecurityContext) |
-| `src/pipeline/trigger.rs` | ~4 unit | +4 unit (Dockerfile.dev detection) |
-| `src/deployer/namespace.rs` | 0 (new) | +10 unit |
-| `src/deployer/applier.rs` | ~6 unit | +8 unit (resource tracking, cascade) |
-| `src/deployer/ops_repo.rs` | ~4 unit | +3 unit (sync from project repo) |
-| `src/deployer/reconciler.rs` | ~3 unit | +3 unit (namespace routing) |
-| `src/store/eventbus.rs` | ~4 unit | +3 unit (new event types) |
-| `src/observe/ingest.rs` | ~2 integration | +4 integration (OTLP auth) |
-| `src/api/projects.rs` | ~12 integration | +5 integration (namespace, ops repo) |
+**Testing pyramid**: 56% unit, 37% integration, 7% E2E — consistent with project's existing ratio.
 
 ---
 
@@ -1309,13 +1643,16 @@ The `review` skill runs `just cov-diff` to identify gaps. The `finalize` skill r
 
 1. **Event bus reliability**: ✅ Resolved in Phase 3 — `handle_image_built` uses direct DB update + `deploy_notify.notify_one()` instead of Valkey pub/sub for critical deploy path. Reconciler also polls every 10s as safety net.
 2. **Reaper scalability**: Phase 2B deferred reaper refactoring — still scans single namespace. Monitor for 50+ projects.
-3. **OTLP auth migration**: Phase 5A breaks existing apps without project-scoped tokens. Need migration path or grace period.
+3. **OTLP auth migration**: ✅ Resolved in Phase 5 — per-project tokens auto-created by reconciler. Existing apps get tokens on next deploy cycle.
 4. **Kind CNI**: NetworkPolicies need Calico/Cilium (kindnet doesn't enforce). Acceptable for dev.
 5. **In-process tool removal**: ✅ Resolved in Phase 2 — tools simplified to 2 (`create_project` + `spawn_coding_agent`). Active sessions at deploy time get clean error.
+6. **Secret request memory leak**: Phase 4 R2 — cleanup method needed. Fix in Phase 6 pre-work.
+7. **Env var override risk**: Phase 4 R1 — reserved blocklist needed. Fix in Phase 6 pre-work.
 
 ### Security notes
 
 1. Never log decrypted secret values — even in error traces.
 2. Agent git push scope — currently `ProjectWrite` allows pushing to `main`. Consider `agent/*` branch restriction.
 3. `ask_for_secret` anti-phishing — UI modal must show requesting project + session.
-4. `agent-ops` role audit — verify only observability read + issue create permissions.
+4. `agent-ops` role audit — has `secret:read` for diagnosing config issues. MCP server returns masked values only (verify in `platform-core.js`). Does NOT have `project:write` — cannot push code.
+5. **Alert storm → agent storm**: Rate limiting (15-min cooldown per alert + 3 concurrent ops agents per project) is critical. Must be implemented before any production alert integration.

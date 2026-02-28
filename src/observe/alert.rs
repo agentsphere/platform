@@ -676,17 +676,21 @@ pub async fn evaluate_all(
     alert_states: &mut HashMap<Uuid, AlertState>,
 ) -> Result<(), anyhow::Error> {
     let rules = sqlx::query(
-        "SELECT id, query, condition, threshold, for_seconds FROM alert_rules WHERE enabled = true",
+        "SELECT id, name, query, condition, threshold, for_seconds, severity, project_id \
+         FROM alert_rules WHERE enabled = true",
     )
     .fetch_all(&state.pool)
     .await?;
 
     for rule in &rules {
         let rule_id: Uuid = rule.get("id");
+        let rule_name: String = rule.get("name");
         let rule_query: String = rule.get("query");
         let rule_condition: String = rule.get("condition");
         let rule_threshold: Option<f64> = rule.get("threshold");
         let rule_for_seconds: i32 = rule.get("for_seconds");
+        let rule_severity: String = rule.get("severity");
+        let rule_project_id: Option<Uuid> = rule.get("project_id");
 
         let aq = match parse_alert_query(&rule_query) {
             Ok(q) => q,
@@ -721,19 +725,26 @@ pub async fn evaluate_all(
             firing: false,
         });
 
-        handle_alert_state(
-            &state.pool,
-            rule_id,
-            rule_for_seconds,
-            condition_met,
-            value,
-            now,
-            as_entry,
-        )
-        .await;
+        let rule_info = AlertRuleInfo {
+            id: rule_id,
+            name: &rule_name,
+            severity: &rule_severity,
+            project_id: rule_project_id,
+            for_seconds: rule_for_seconds,
+        };
+        handle_alert_state(state, condition_met, value, now, as_entry, &rule_info).await;
     }
 
     Ok(())
+}
+
+/// Metadata about an alert rule, passed to `handle_alert_state`.
+struct AlertRuleInfo<'a> {
+    id: Uuid,
+    name: &'a str,
+    severity: &'a str,
+    project_id: Option<Uuid>,
+    for_seconds: i32,
 }
 
 /// Result of evaluating the alert state transition.
@@ -780,20 +791,35 @@ fn next_alert_state(
 }
 
 async fn handle_alert_state(
-    pool: &sqlx::PgPool,
-    rule_id: Uuid,
-    for_seconds: i32,
+    app_state: &AppState,
     condition_met: bool,
     value: Option<f64>,
     now: DateTime<Utc>,
-    state: &mut AlertState,
+    alert_state: &mut AlertState,
+    rule_info: &AlertRuleInfo<'_>,
 ) {
-    let transition = next_alert_state(state, condition_met, now, for_seconds);
+    let transition = next_alert_state(alert_state, condition_met, now, rule_info.for_seconds);
     if transition.should_fire {
-        let _ = fire_alert(pool, rule_id, value).await;
+        if let Err(e) = fire_alert(&app_state.pool, rule_info.id, value).await {
+            tracing::error!(error = %e, rule_id = %rule_info.id, "failed to persist alert firing");
+        }
+        // Publish event for downstream handlers (ops agent spawn, notifications)
+        let event = crate::store::eventbus::PlatformEvent::AlertFired {
+            rule_id: rule_info.id,
+            project_id: rule_info.project_id,
+            severity: rule_info.severity.to_string(),
+            value,
+            message: "Alert condition met".into(),
+            alert_name: rule_info.name.to_string(),
+        };
+        if let Err(e) = crate::store::eventbus::publish(&app_state.valkey, &event).await {
+            tracing::error!(error = %e, rule_id = %rule_info.id, "failed to publish AlertFired event");
+        }
     }
-    if transition.should_resolve {
-        let _ = resolve_alert(pool, rule_id).await;
+    if transition.should_resolve
+        && let Err(e) = resolve_alert(&app_state.pool, rule_info.id).await
+    {
+        tracing::error!(error = %e, rule_id = %rule_info.id, "failed to resolve alert");
     }
 }
 

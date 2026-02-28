@@ -57,6 +57,15 @@ pub enum PlatformEvent {
         image_ref: String,
         pipeline_id: Uuid,
     },
+    /// An alert rule fired (condition held for `for_seconds`).
+    AlertFired {
+        rule_id: Uuid,
+        project_id: Option<Uuid>,
+        severity: String,
+        value: Option<f64>,
+        message: String,
+        alert_name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +189,25 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
             image_ref,
             pipeline_id,
         } => handle_dev_image_built(state, project_id, &image_ref, pipeline_id).await,
+        PlatformEvent::AlertFired {
+            rule_id,
+            project_id,
+            severity,
+            value,
+            message,
+            alert_name,
+        } => {
+            handle_alert_fired(
+                state,
+                rule_id,
+                project_id,
+                &severity,
+                value,
+                &message,
+                &alert_name,
+            )
+            .await
+        }
     }
 }
 
@@ -526,6 +554,169 @@ async fn handle_dev_image_built(
     Ok(())
 }
 
+/// An alert fired → optionally spawn an ops agent to investigate.
+///
+/// Rate limiting:
+/// 1. Skip non-project alerts (global alerts don't spawn agents)
+/// 2. Severity gate: only `critical` and `warning` spawn agents
+/// 3. Per-alert cooldown: 15-minute TTL in Valkey prevents duplicate spawns
+/// 4. Per-project concurrent limit: max 3 active ops sessions
+#[tracing::instrument(skip(state), fields(%rule_id, ?project_id, %severity), err)]
+async fn handle_alert_fired(
+    state: &AppState,
+    rule_id: Uuid,
+    project_id: Option<Uuid>,
+    severity: &str,
+    value: Option<f64>,
+    message: &str,
+    alert_name: &str,
+) -> anyhow::Result<()> {
+    // 1. Skip non-project alerts
+    let Some(project_id) = project_id else {
+        tracing::debug!(%rule_id, "alert has no project_id, skipping ops agent spawn");
+        return Ok(());
+    };
+
+    // 2. Severity gate — only warning/critical spawn agents
+    if severity != "critical" && severity != "warning" {
+        tracing::debug!(%rule_id, %severity, "alert severity below threshold, skipping ops agent");
+        return Ok(());
+    }
+
+    // 3. Per-alert cooldown (15 min)
+    let cooldown_key = format!("alert-agent:{project_id}:{rule_id}");
+    let exists: bool = state.valkey.next().exists(&cooldown_key).await?;
+    if exists {
+        tracing::debug!(%rule_id, %project_id, "alert agent cooldown active, skipping");
+        return Ok(());
+    }
+
+    // 4. Per-project concurrent limit (max 3 ops agents)
+    // Count sessions that are either still provisioning (agent_user_id IS NULL)
+    // or have an active agent user with the ops role.
+    let active_ops: Option<i64> = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions s
+         WHERE s.project_id = $1 AND s.status IN ('pending', 'running')
+         AND (
+             s.agent_user_id IS NULL
+             OR EXISTS (
+                 SELECT 1 FROM user_roles ur
+                 JOIN roles r ON r.id = ur.role_id
+                 WHERE ur.user_id = s.agent_user_id AND r.name = 'agent-ops'
+             )
+         )",
+    )
+    .bind(project_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if active_ops.unwrap_or(0) >= 3 {
+        tracing::warn!(%project_id, active_ops, "ops agent concurrent limit reached, skipping");
+        return Ok(());
+    }
+
+    // 5. Attempt spawn (admin lookup, cooldown set, agent creation)
+    spawn_ops_agent(
+        state, project_id, rule_id, alert_name, severity, value, message,
+    )
+    .await
+}
+
+/// Look up admin user, set cooldown, and spawn the ops agent pod.
+/// Separated from `handle_alert_fired` to keep both under clippy's line limit.
+#[tracing::instrument(skip(state, message), fields(%project_id, %rule_id), err)]
+async fn spawn_ops_agent(
+    state: &AppState,
+    project_id: Uuid,
+    rule_id: Uuid,
+    alert_name: &str,
+    severity: &str,
+    value: Option<f64>,
+    message: &str,
+) -> anyhow::Result<()> {
+    let cooldown_key = format!("alert-agent:{project_id}:{rule_id}");
+    // Look up admin user as spawner (ops agents are system-initiated)
+    let admin_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM users WHERE name = 'admin' AND is_active = true")
+            .fetch_optional(&state.pool)
+            .await?;
+
+    let Some(admin_id) = admin_id else {
+        tracing::error!("no active admin user found, cannot spawn ops agent");
+        return Ok(());
+    };
+
+    // Set cooldown atomically via NX — if key already exists, another handler won
+    let was_set: Option<String> = state
+        .valkey
+        .next()
+        .set(
+            &cooldown_key,
+            "1",
+            Some(fred::types::Expiration::EX(900)),
+            Some(fred::types::SetOptions::NX),
+            false,
+        )
+        .await?;
+
+    if was_set.is_none() {
+        tracing::debug!(%rule_id, %project_id, "cooldown race lost, another handler is spawning");
+        return Ok(());
+    }
+
+    // Build agent prompt
+    let value_str = value.map_or("absent".to_string(), |v| format!("{v}"));
+    let prompt = format!(
+        "Alert '{alert_name}' fired (severity: {severity}).\n\
+         Metric value: {value_str}. Message: {message}.\n\n\
+         Investigate:\n\
+         1. Query recent error logs and traces for this project\n\
+         2. Check deployment history — was there a recent deploy?\n\
+         3. Review recent git commits for potential causes\n\
+         4. Create an issue with your diagnosis and proposed remediation\n\
+         5. If the fix is obvious and safe, describe the exact code change needed",
+    );
+
+    match crate::agent::service::create_session(
+        state,
+        admin_id,
+        project_id,
+        &prompt,
+        "claude-code",
+        None,
+        None,
+        crate::agent::AgentRoleName::Ops,
+    )
+    .await
+    {
+        Ok(session) => {
+            tracing::info!(
+                %rule_id,
+                %project_id,
+                session_id = %session.id,
+                "ops agent spawned for alert"
+            );
+        }
+        Err(e) => {
+            // Set a shorter cooldown on failure (3 min backoff instead of full 15 min)
+            let _: Result<(), _> = state
+                .valkey
+                .next()
+                .set::<(), _, _>(
+                    &cooldown_key,
+                    "1",
+                    Some(fred::types::Expiration::EX(180)),
+                    None,
+                    false,
+                )
+                .await;
+            tracing::error!(error = %e, %rule_id, %project_id, "failed to spawn ops agent");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +779,14 @@ mod tests {
                 project_id: Uuid::nil(),
                 image_ref: "registry/app-dev:latest".into(),
                 pipeline_id: Uuid::nil(),
+            },
+            PlatformEvent::AlertFired {
+                rule_id: Uuid::nil(),
+                project_id: Some(Uuid::nil()),
+                severity: "critical".into(),
+                value: Some(95.5),
+                message: "Alert condition met".into(),
+                alert_name: "High CPU".into(),
             },
         ];
 
@@ -658,6 +857,17 @@ mod tests {
                     pipeline_id: Uuid::nil(),
                 },
                 "DevImageBuilt",
+            ),
+            (
+                PlatformEvent::AlertFired {
+                    rule_id: Uuid::nil(),
+                    project_id: Some(Uuid::nil()),
+                    severity: "warning".into(),
+                    value: Some(42.0),
+                    message: "Alert condition met".into(),
+                    alert_name: "Error Rate".into(),
+                },
+                "AlertFired",
             ),
         ];
 
@@ -748,6 +958,71 @@ mod tests {
         match event {
             PlatformEvent::RollbackRequested { requested_by, .. } => {
                 assert!(requested_by.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn alert_fired_serialization_roundtrip() {
+        let event = PlatformEvent::AlertFired {
+            rule_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            severity: "critical".into(),
+            value: Some(99.8),
+            message: "Alert condition met".into(),
+            alert_name: "CPU Usage High".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match (event, parsed) {
+            (
+                PlatformEvent::AlertFired {
+                    rule_id: a_rid,
+                    project_id: a_pid,
+                    severity: a_sev,
+                    value: a_val,
+                    message: a_msg,
+                    alert_name: a_name,
+                },
+                PlatformEvent::AlertFired {
+                    rule_id: b_rid,
+                    project_id: b_pid,
+                    severity: b_sev,
+                    value: b_val,
+                    message: b_msg,
+                    alert_name: b_name,
+                },
+            ) => {
+                assert_eq!(a_rid, b_rid);
+                assert_eq!(a_pid, b_pid);
+                assert_eq!(a_sev, b_sev);
+                assert_eq!(a_val, b_val);
+                assert_eq!(a_msg, b_msg);
+                assert_eq!(a_name, b_name);
+            }
+            _ => panic!("wrong variants"),
+        }
+    }
+
+    #[test]
+    fn alert_fired_with_null_project_and_value() {
+        let json = r#"{
+            "type": "AlertFired",
+            "rule_id": "00000000-0000-0000-0000-000000000001",
+            "project_id": null,
+            "severity": "info",
+            "value": null,
+            "message": "Metric absent",
+            "alert_name": "Heartbeat"
+        }"#;
+        let event: PlatformEvent = serde_json::from_str(json).unwrap();
+        match event {
+            PlatformEvent::AlertFired {
+                project_id, value, ..
+            } => {
+                assert!(project_id.is_none());
+                assert!(value.is_none());
             }
             _ => panic!("wrong variant"),
         }
