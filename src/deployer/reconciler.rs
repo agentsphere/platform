@@ -116,6 +116,7 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct PendingDeployment {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -346,35 +347,45 @@ async fn handle_stopped(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Query deploy-scoped secrets for a project, decrypt, and create/update a K8s
-/// Secret in the target namespace. Best-effort: logs warnings on failure.
+/// Query deploy-scoped secrets for a project, decrypt, inject OTEL config,
+/// and create/update a K8s Secret in the target namespace. Best-effort.
 #[tracing::instrument(skip(state, deployment), fields(project_id = %deployment.project_id, %namespace))]
 async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment, namespace: &str) {
-    let Some(master_key) = state
+    let mut data: BTreeMap<String, String> = BTreeMap::new();
+
+    // Collect deploy-scoped secrets (requires master key)
+    if let Some(master_key) = state
         .config
         .master_key
         .as_deref()
         .and_then(|k| crate::secrets::engine::parse_master_key(k).ok())
-    else {
-        return; // secrets engine not configured, skip silently
-    };
-
-    let secrets = match crate::secrets::engine::query_scoped_secrets(
-        &state.pool,
-        &master_key,
-        deployment.project_id,
-        &["deploy", "all"],
-        Some(&deployment.environment),
-    )
-    .await
     {
-        Ok(s) if s.is_empty() => return,
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, project_id = %deployment.project_id, "failed to query deploy secrets");
-            return;
+        match crate::secrets::engine::query_scoped_secrets(
+            &state.pool,
+            &master_key,
+            deployment.project_id,
+            &["deploy", "all"],
+            Some(&deployment.environment),
+        )
+        .await
+        {
+            Ok(secrets) => {
+                for (name, value) in secrets {
+                    data.insert(name, value);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, project_id = %deployment.project_id, "failed to query deploy secrets");
+            }
         }
-    };
+    }
+
+    // Inject OTEL configuration for automatic observability
+    inject_otel_env_vars(state, deployment, &mut data).await;
+
+    if data.is_empty() {
+        return;
+    }
 
     let secret_name = format!(
         "{}-{}-secrets",
@@ -382,13 +393,130 @@ async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment
         env_suffix(&deployment.environment)
     );
 
-    let data: BTreeMap<String, String> = secrets.into_iter().collect();
+    apply_k8s_secret(state, namespace, &secret_name, deployment.project_id, data).await;
+}
+
+/// Inject OTEL env vars into the secrets data map for automatic observability.
+#[tracing::instrument(skip(state, data), fields(project_id = %deployment.project_id))]
+async fn inject_otel_env_vars(
+    state: &AppState,
+    deployment: &PendingDeployment,
+    data: &mut BTreeMap<String, String>,
+) {
+    data.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+        state.config.platform_api_url.clone(),
+    );
+    data.insert("OTEL_SERVICE_NAME".into(), deployment.project_name.clone());
+
+    // Auto-create or rotate a scoped OTLP token
+    match ensure_otlp_token(state, deployment.project_id).await {
+        Ok(raw_token) => {
+            data.insert(
+                "OTEL_EXPORTER_OTLP_HEADERS".into(),
+                format!("Authorization=Bearer {raw_token}"),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                project_id = %deployment.project_id,
+                "failed to create OTLP token, skipping OTEL auth header"
+            );
+        }
+    }
+}
+
+/// Create or rotate a project-scoped OTLP API token.
+///
+/// - Scope: `["observe:write"]` (minimal — only allows OTLP ingest)
+/// - Project-scoped hard boundary via `project_id`
+/// - 365-day expiry; rotated on each deploy
+///
+/// Uses a transaction with insert-before-delete to avoid any window where
+/// no valid token exists (R3 fix).
+///
+/// Returns the raw token string (never stored in plaintext after this).
+#[tracing::instrument(skip(state), fields(%project_id), err)]
+pub async fn ensure_otlp_token(state: &AppState, project_id: Uuid) -> anyhow::Result<String> {
+    let mut tx = state.pool.begin().await?;
+
+    // Find the project owner to assign the token to
+    let owner_id = sqlx::query_scalar!(
+        "SELECT owner_id FROM projects WHERE id = $1 AND is_active = true",
+        project_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+
+    // Check for existing token (we need to delete it after inserting the new one)
+    let existing = sqlx::query_scalar!(
+        r#"
+        SELECT id
+        FROM api_tokens
+        WHERE project_id = $1
+          AND scopes @> ARRAY['observe:write']
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        project_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // INSERT new token first — ensures a valid token always exists
+    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+
+    sqlx::query!(
+        r#"
+        INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
+        VALUES ($1, $2, $3, $4, $5, now() + interval '365 days')
+        "#,
+        owner_id,
+        format!("otlp-auto-{project_id}"),
+        token_hash,
+        &["observe:write"] as &[&str],
+        project_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // THEN delete the old token to prevent accumulation
+    if let Some(old_id) = existing
+        && let Err(e) = sqlx::query!("DELETE FROM api_tokens WHERE id = $1", old_id)
+            .execute(&mut *tx)
+            .await
+    {
+        tracing::warn!(error = %e, token_id = %old_id, "failed to delete old OTLP token");
+    }
+
+    tx.commit().await?;
+
+    tracing::info!(
+        %project_id,
+        "created OTLP auto-token for project"
+    );
+
+    Ok(raw_token)
+}
+
+/// Create or replace a K8s Secret in the given namespace.
+#[tracing::instrument(skip(state, data), fields(%namespace, %secret_name, %project_id))]
+async fn apply_k8s_secret(
+    state: &AppState,
+    namespace: &str,
+    secret_name: &str,
+    project_id: Uuid,
+    data: BTreeMap<String, String>,
+) {
     let k8s_secret = Secret {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(secret_name.clone()),
+            name: Some(secret_name.to_owned()),
             labels: Some(BTreeMap::from([(
                 "platform.io/project".into(),
-                deployment.project_id.to_string(),
+                project_id.to_string(),
             )])),
             ..Default::default()
         },
@@ -403,9 +531,8 @@ async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment
             tracing::info!(%secret_name, %namespace, "created deploy secrets K8s Secret");
         }
         Err(kube::Error::Api(err)) if err.code == 409 => {
-            // Already exists — replace it
             match api
-                .replace(&secret_name, &PostParams::default(), &k8s_secret)
+                .replace(secret_name, &PostParams::default(), &k8s_secret)
                 .await
             {
                 Ok(_) => {

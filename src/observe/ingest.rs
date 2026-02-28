@@ -1,12 +1,16 @@
+use std::collections::HashSet;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use prost::Message;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
+use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
 
 use super::correlation::{self, CorrelationEnvelope};
@@ -52,6 +56,60 @@ pub fn create_channels() -> (
 }
 
 // ---------------------------------------------------------------------------
+// Per-project OTLP auth
+// ---------------------------------------------------------------------------
+
+/// Check that the authenticated user has `ObserveWrite` permission for every
+/// `project_id` present in the OTLP payload. Returns an error if:
+/// - Any resource has no `platform.project_id` attribute → 400
+/// - Any `platform.project_id` is not a valid UUID → 400
+/// - The user lacks `ObserveWrite` for any project → 404 (avoids leaking existence)
+///
+/// Deduplicates permission lookups within the request (many spans share the same project).
+async fn check_otlp_project_auth(
+    state: &AppState,
+    auth: &AuthUser,
+    resource_attrs_list: &[&[proto::KeyValue]],
+) -> Result<(), ApiError> {
+    // Extract and validate all project IDs in a single pass
+    let mut project_ids = HashSet::new();
+    for attrs in resource_attrs_list {
+        let pid_str = proto::get_string_attr(attrs, "platform.project_id").ok_or_else(|| {
+            ApiError::BadRequest(
+                "resource attribute 'platform.project_id' is required for OTLP ingest".into(),
+            )
+        })?;
+        let pid = Uuid::parse_str(&pid_str).map_err(|_| {
+            ApiError::BadRequest(format!(
+                "invalid platform.project_id: '{pid_str}' is not a valid UUID"
+            ))
+        })?;
+        project_ids.insert(pid);
+    }
+
+    for pid in &project_ids {
+        // Check project scope boundary (scoped tokens)
+        auth.check_project_scope(*pid)?;
+
+        let allowed = resolver::has_permission(
+            &state.pool,
+            &state.valkey,
+            auth.user_id,
+            Some(*pid),
+            Permission::ObserveWrite,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.context("OTLP project auth check")))?;
+
+        if !allowed {
+            return Err(ApiError::NotFound("project".into()));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // OTLP ingest handlers
 // ---------------------------------------------------------------------------
 
@@ -68,6 +126,14 @@ pub async fn ingest_traces(
 
     let request = proto::ExportTraceServiceRequest::decode(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid protobuf: {e}")))?;
+
+    // Collect resource attrs for project auth check
+    let resource_attrs_refs: Vec<&[proto::KeyValue]> = request
+        .resource_spans
+        .iter()
+        .map(|rs| rs.resource.as_ref().map_or(&[][..], |r| &r.attributes[..]))
+        .collect();
+    check_otlp_project_auth(&state, &auth, &resource_attrs_refs).await?;
 
     for rs in &request.resource_spans {
         let resource_attrs = rs.resource.as_ref().map_or(&[][..], |r| &r.attributes);
@@ -103,6 +169,13 @@ pub async fn ingest_logs(
     let request = proto::ExportLogsServiceRequest::decode(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid protobuf: {e}")))?;
 
+    let resource_attrs_refs: Vec<&[proto::KeyValue]> = request
+        .resource_logs
+        .iter()
+        .map(|rl| rl.resource.as_ref().map_or(&[][..], |r| &r.attributes[..]))
+        .collect();
+    check_otlp_project_auth(&state, &auth, &resource_attrs_refs).await?;
+
     for rl in &request.resource_logs {
         let resource_attrs = rl.resource.as_ref().map_or(&[][..], |r| &r.attributes);
         for sl in &rl.scope_logs {
@@ -136,6 +209,13 @@ pub async fn ingest_metrics(
 
     let request = proto::ExportMetricsServiceRequest::decode(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid protobuf: {e}")))?;
+
+    let resource_attrs_refs: Vec<&[proto::KeyValue]> = request
+        .resource_metrics
+        .iter()
+        .map(|rm| rm.resource.as_ref().map_or(&[][..], |r| &r.attributes[..]))
+        .collect();
+    check_otlp_project_auth(&state, &auth, &resource_attrs_refs).await?;
 
     for rm in &request.resource_metrics {
         let resource_attrs = rm.resource.as_ref().map_or(&[][..], |r| &r.attributes);
@@ -812,4 +892,11 @@ mod tests {
         assert_eq!(event["name"], "exception");
         assert!(event["attributes"].is_object());
     }
+
+    // ── extract_project_ids (removed — validation merged into check_otlp_project_auth) ──
+    // UUID presence/format validation is now tested via integration tests:
+    // - otlp_ingest_missing_project_id_returns_400
+    // - otlp_ingest_invalid_project_id_uuid_returns_400
+    // - otlp_ingest_accepts_authorized_project
+    // - otlp_ingest_deduplicates_project_auth
 }

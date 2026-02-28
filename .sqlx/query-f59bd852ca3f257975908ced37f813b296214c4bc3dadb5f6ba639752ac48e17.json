@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id\n        FROM api_tokens\n        WHERE project_id = $1\n          AND scopes @> ARRAY['observe:write']\n          AND (expires_at IS NULL OR expires_at > now())\n        ORDER BY created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f59bd852ca3f257975908ced37f813b296214c4bc3dadb5f6ba639752ac48e17"
+}
