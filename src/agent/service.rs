@@ -35,7 +35,7 @@ pub fn get_provider(name: &str) -> Result<Box<dyn AgentProvider>, AgentError> {
 // ---------------------------------------------------------------------------
 
 /// Create a new agent session: insert DB row, create identity, spawn K8s pod.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tracing::instrument(skip(state, prompt, provider_config), fields(%user_id, %project_id, %agent_role), err)]
 pub async fn create_session(
     state: &AppState,
@@ -113,6 +113,9 @@ pub async fn create_session(
     // 4. Look up user's provider key (if set)
     let user_api_key = resolve_user_api_key(state, user_id).await;
 
+    // 4b. Query project secrets scoped to agent/all
+    let extra_env_vars = resolve_agent_secrets(state, project_id).await;
+
     // 5. Build and create the K8s pod
     let session_for_pod = AgentSession {
         id: session_id,
@@ -142,6 +145,7 @@ pub async fn create_session(
         namespace: &namespace,
         project_agent_image: project_agent_image.as_deref(),
         anthropic_api_key: user_api_key.as_deref(),
+        extra_env_vars: &extra_env_vars,
     })?;
 
     let pod_name = pod
@@ -553,6 +557,32 @@ async fn fire_agent_webhook(pool: &PgPool, project_id: Uuid, session_id: Uuid, s
         "project_id": project_id,
     });
     crate::api::webhooks::fire_webhooks(pool, project_id, "agent", &payload).await;
+}
+
+/// Resolve project secrets scoped to agent/all for injection into agent pods.
+/// Returns an empty vec on error or if no secrets engine is configured.
+async fn resolve_agent_secrets(state: &AppState, project_id: Uuid) -> Vec<(String, String)> {
+    let Some(master_key_hex) = state.config.master_key.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(master_key) = crate::secrets::engine::parse_master_key(master_key_hex) else {
+        return Vec::new();
+    };
+    match crate::secrets::engine::query_scoped_secrets(
+        &state.pool,
+        &master_key,
+        project_id,
+        &["agent", "all"],
+        None,
+    )
+    .await
+    {
+        Ok(secrets) => secrets,
+        Err(e) => {
+            tracing::warn!(error = %e, %project_id, "failed to resolve agent secrets");
+            Vec::new()
+        }
+    }
 }
 
 /// Try to resolve the user's Anthropic API key from `user_provider_keys`.

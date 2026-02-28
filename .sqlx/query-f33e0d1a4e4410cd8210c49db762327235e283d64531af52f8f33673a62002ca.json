@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE projects SET agent_image = $2, updated_at = now() WHERE id = $1 AND is_active = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f33e0d1a4e4410cd8210c49db762327235e283d64531af52f8f33673a62002ca"
+}

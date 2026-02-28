@@ -100,6 +100,9 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         inprocess_sessions: std::sync::Arc::new(std::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
+        secret_requests: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
     };
 
     (state, setup_token)

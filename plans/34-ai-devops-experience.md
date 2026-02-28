@@ -2,9 +2,11 @@
 
 ## Implementation Status
 - **Phase 1:** Merged — PR #7
-- **Phase 2:** PR #10 (https://github.com/agentsphere/platform/pull/10) — in review
-- **Phase 3:** PR #11 (https://github.com/agentsphere/platform/pull/11) — in review
-- **Status:** Phases 1-3 complete, phases 4-6 pending
+- **Phase 2:** Merged — PR #10
+- **Phase 3:** Merged — PR #11
+- **Phase 4:** PR #12 (https://github.com/agentsphere/platform/pull/12) — in review
+- **Branch:** `feat/34-ai-devops-phase4`
+- **Status:** Phases 1-4 complete, phases 5-6 pending
 
 ## Context
 
@@ -811,7 +813,24 @@ Total: **14 unit + 5 integration + 2 E2E = 21 tests**
 
 ## Phase 4: Dev Images + Secrets (Week 4-5)
 
+**Status: COMPLETE** (2026-02-28)
+
 **Why**: Agents need project-specific tooling, and deployed apps need secrets. Secret UX should feel safe — never paste secrets into chat.
+
+### Implementation Progress
+
+- [x] 4A: Customizable dev images (Dockerfile.dev detection, kaniko build step, DevImageBuilt event, handler)
+- [x] 4B: ask_for_secret API (in-memory state, secret request endpoints with 5-min timeout, max 10 per session)
+- [x] 4C: Secrets injection into deployed apps (K8s Secret creation in reconciler, scope=deploy/all)
+- [x] 4D: Secrets injection into agent pods (extra_env_vars in BuildPodParams, scope=agent/all)
+- [x] Unit tests: 2 new (extra_env_vars_injected, extra_env_vars_empty) + existing eventbus serialization test
+- [x] Integration tests: 8 new (secret requests create/complete/validate/max + scoped queries deploy/agent/env filter)
+- [x] Quality gate: fmt + clippy + deny + 1025 unit + 738 integration + build all pass
+
+> **Deviation:** Used `gcr.io/kaniko-project/executor:debug` instead of `cgr.dev/chainguard/kaniko:latest` — debug variant includes busybox shell needed for `sh -c` execution.
+> **Deviation:** Secret request endpoint is `/api/projects/{id}/secret-requests` (hyphenated) instead of `/api/projects/{id}/secrets/request` — avoids route conflict with `/api/projects/{id}/secrets/{name}` where "request" would match the `{name}` param.
+> **Deviation:** `has_dockerfile_dev()` checks if file EXISTS at the pushed ref (not just changes to it) — simpler, kaniko `--cache=true` handles no-op builds efficiently.
+> **Deviation:** `complete_secret_request` handler stores the secret in DB via `engine::create_secret()` with scope=agent — plan only described in-memory completion but DB storage is needed for actual injection.
 
 ### 4A. Customizable dev images
 

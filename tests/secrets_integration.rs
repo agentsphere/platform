@@ -4,6 +4,7 @@ mod helpers;
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
+use sqlx::Row;
 
 use helpers::{assign_role, create_project, create_user, test_router, test_state};
 
@@ -499,6 +500,642 @@ async fn create_secret_invalid_environment(pool: PgPool) {
 
 // ---------------------------------------------------------------------------
 // User provider keys
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Secret requests (ask_for_secret)
+// ---------------------------------------------------------------------------
+
+/// Create a secret request → pending, then retrieve it.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_and_get_secret_request(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-proj1", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "API_KEY",
+            "description": "An API key for the service",
+            "environments": ["production"],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create request failed: {body}");
+    let request_id = body["id"].as_str().expect("should return id");
+    assert_eq!(body["status"], "pending");
+
+    // GET the request
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get request failed: {body}");
+    assert_eq!(body["status"], "pending");
+}
+
+/// Complete a secret request → stores the secret.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_secret_request(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-comp", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create request
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "COMP_SECRET",
+            "environments": ["staging"],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap();
+
+    // Complete it with a value
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "the-actual-secret-value" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "complete request failed: {body}");
+    assert_eq!(body["status"], "completed");
+
+    // Verify the secret was stored
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secrets = body["items"].as_array().expect("items should be array");
+    assert!(
+        secrets.iter().any(|s| s["name"] == "COMP_SECRET"),
+        "completed secret should appear in list"
+    );
+}
+
+/// Secret request name validation → 400 for invalid names.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_validates_name(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-val", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Empty name should fail
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Max 10 pending requests per session.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_max_per_session(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-max", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create 10 requests
+    for i in 0..10 {
+        let (status, _) = helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{proj_id}/secret-requests"),
+            serde_json::json!({
+                "name": format!("SECRET_{i}"),
+                "environments": [],
+                "session_id": session_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "request {i} should succeed");
+    }
+
+    // 11th should fail
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "SECRET_OVERFLOW",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "11th request should be rejected"
+    );
+}
+
+/// Invalid environment in secret request → 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_invalid_environment(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-badenv", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "SOME_SECRET",
+            "environments": ["invalid_env"],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Scoped secret queries (deploy vs agent)
+// ---------------------------------------------------------------------------
+
+/// Secrets with scope='deploy' are returned by query_scoped_secrets with deploy scope.
+#[sqlx::test(migrations = "./migrations")]
+async fn query_scoped_secrets_deploy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "scope-deploy", "private").await;
+
+    // Create secrets with different scopes
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "DEPLOY_SECRET", "value": "deploy-val", "scope": "deploy" }),
+    )
+    .await;
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "AGENT_SECRET", "value": "agent-val", "scope": "agent" }),
+    )
+    .await;
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "ALL_SECRET", "value": "all-val", "scope": "all" }),
+    )
+    .await;
+
+    // Query deploy scope
+    let master_key = platform::secrets::engine::parse_master_key(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let secrets = platform::secrets::engine::query_scoped_secrets(
+        &pool,
+        &master_key,
+        proj_id,
+        &["deploy", "all"],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"DEPLOY_SECRET"),
+        "should have deploy secret"
+    );
+    assert!(
+        names.contains(&"ALL_SECRET"),
+        "should have all-scope secret"
+    );
+    assert!(
+        !names.contains(&"AGENT_SECRET"),
+        "should NOT have agent secret"
+    );
+}
+
+/// Secrets with scope='agent' are returned by query_scoped_secrets with agent scope.
+#[sqlx::test(migrations = "./migrations")]
+async fn query_scoped_secrets_agent(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "scope-agent", "private").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "DEPLOY_ONLY", "value": "dv", "scope": "deploy" }),
+    )
+    .await;
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "AGENT_ONLY", "value": "av", "scope": "agent" }),
+    )
+    .await;
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "ALL_SCOPE", "value": "allv", "scope": "all" }),
+    )
+    .await;
+
+    let master_key = platform::secrets::engine::parse_master_key(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let secrets = platform::secrets::engine::query_scoped_secrets(
+        &pool,
+        &master_key,
+        proj_id,
+        &["agent", "all"],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"AGENT_ONLY"), "should have agent secret");
+    assert!(names.contains(&"ALL_SCOPE"), "should have all-scope secret");
+    assert!(
+        !names.contains(&"DEPLOY_ONLY"),
+        "should NOT have deploy secret"
+    );
+}
+
+/// query_scoped_secrets filters by environment correctly.
+#[sqlx::test(migrations = "./migrations")]
+async fn query_scoped_secrets_environment_filter(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "scope-env", "private").await;
+
+    // Secret with environment=staging
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "STAGING_SECRET", "value": "sv", "scope": "deploy", "environment": "staging" }),
+    )
+    .await;
+    // Secret with no environment (applies to all)
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "GLOBAL_SECRET", "value": "gv", "scope": "deploy" }),
+    )
+    .await;
+    // Secret with environment=production
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "PROD_SECRET", "value": "pv", "scope": "deploy", "environment": "production" }),
+    )
+    .await;
+
+    let master_key = platform::secrets::engine::parse_master_key(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+
+    // Query for staging → STAGING_SECRET + GLOBAL_SECRET (null env matches)
+    let secrets = platform::secrets::engine::query_scoped_secrets(
+        &pool,
+        &master_key,
+        proj_id,
+        &["deploy", "all"],
+        Some("staging"),
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"STAGING_SECRET"),
+        "should have staging secret"
+    );
+    assert!(
+        names.contains(&"GLOBAL_SECRET"),
+        "should have global (null-env) secret"
+    );
+    assert!(
+        !names.contains(&"PROD_SECRET"),
+        "should NOT have production secret"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Secret request — auth & edge-case tests (R3, R4, R10, R11, R12)
+// ---------------------------------------------------------------------------
+
+/// POST secret-request without token → 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_no_token_returns_401(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-noauth", "private").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "",
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "MY_KEY",
+            "environments": [],
+            "session_id": uuid::Uuid::new_v4(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// GET secret-request without token → 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_secret_request_no_token_returns_401(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let fake_id = uuid::Uuid::new_v4();
+
+    let (status, _) = helpers::get_json(
+        &app,
+        "",
+        &format!("/api/projects/{fake_id}/secret-requests/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// POST complete secret-request without token → 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_secret_request_no_token_returns_401(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let fake_id = uuid::Uuid::new_v4();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "",
+        &format!("/api/projects/{fake_id}/secret-requests/{fake_id}"),
+        serde_json::json!({ "value": "s3cr3t" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// GET nonexistent secret-request → 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_nonexistent_secret_request_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-miss", "private").await;
+    let fake_request_id = uuid::Uuid::new_v4();
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{fake_request_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// POST complete nonexistent secret-request → 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_nonexistent_secret_request_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-miss2", "private").await;
+    let fake_request_id = uuid::Uuid::new_v4();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{fake_request_id}"),
+        serde_json::json!({ "value": "val" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Complete an already-completed request → 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_already_completed_request_returns_400(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-dup", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create request
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "DUP_KEY",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap();
+
+    // Complete it once
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "first-value" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Try completing again → 400
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "second-value" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Non-authorized user cannot create secret request.
+#[sqlx::test(migrations = "./migrations")]
+async fn non_authorized_user_cannot_create_secret_request(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-rbac", "private").await;
+    // Create a user with no roles on this project
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "norole-user", "norole@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "NO_ACCESS",
+            "environments": [],
+            "session_id": uuid::Uuid::new_v4(),
+        }),
+    )
+    .await;
+    // No SecretWrite permission → 403
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Validation: >5 environments → 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_too_many_environments(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-envlim", "private").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "BIG_ENV",
+            "environments": ["preview", "staging", "production", "preview", "staging", "production"],
+            "session_id": uuid::Uuid::new_v4(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Validation: empty value on complete → 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_secret_request_empty_value(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-emptyval", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "EMPTY_VAL",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap();
+
+    // Empty value → 400 (check_length min=1)
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// DevImageBuilt event handler (R13)
+// ---------------------------------------------------------------------------
+
+/// handle_dev_image_built updates project's agent_image.
+#[sqlx::test(migrations = "./migrations")]
+async fn dev_image_built_updates_project_agent_image(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let proj_id = create_project(&app, &admin_token, "devimg-proj", "private").await;
+
+    // Verify agent_image is initially NULL
+    let row = sqlx::query("SELECT agent_image FROM projects WHERE id = $1")
+        .bind(proj_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let agent_image: Option<String> = row.get("agent_image");
+    assert!(
+        agent_image.is_none(),
+        "agent_image should be NULL initially"
+    );
+
+    // Simulate a DevImageBuilt event via direct handler call
+    let event = platform::store::eventbus::PlatformEvent::DevImageBuilt {
+        project_id: proj_id,
+        image_ref: "registry.local/devimg-proj-dev:abc123".into(),
+        pipeline_id: uuid::Uuid::new_v4(),
+    };
+    let payload = serde_json::to_string(&event).unwrap();
+    platform::store::eventbus::handle_event(&state, &payload)
+        .await
+        .unwrap();
+
+    // Verify agent_image was updated
+    let row = sqlx::query("SELECT agent_image FROM projects WHERE id = $1")
+        .bind(proj_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let agent_image: Option<String> = row.get("agent_image");
+    assert_eq!(
+        agent_image.as_deref(),
+        Some("registry.local/devimg-proj-dev:abc123"),
+        "agent_image should be updated"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// User provider keys (continued)
 // ---------------------------------------------------------------------------
 
 /// Delete nonexistent key → 404.
