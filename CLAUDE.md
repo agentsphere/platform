@@ -218,8 +218,9 @@ state.pipeline_notify.notify_one();
 
 ### K8s namespaces
 
-- `PLATFORM_PIPELINE_NAMESPACE` (default: `platform-pipelines`) — pipeline pods
-- `PLATFORM_AGENT_NAMESPACE` (default: `platform-agents`) — agent pods
+- Pipeline and agent pods spawn in per-project namespaces: `{namespace_slug}-dev`
+- `PLATFORM_PIPELINE_NAMESPACE` (default: `platform-pipelines`) — legacy fallback for pipelines without a project (kept for future use)
+- `PLATFORM_AGENT_NAMESPACE` (default: `platform-agents`) — legacy fallback for agents without a project (kept for future use)
 
 ## Deployer Patterns (Phase 06)
 
@@ -434,8 +435,8 @@ Key: return **404** (not 403) for private resources the user can't access — av
 | `PLATFORM_PERMISSION_CACHE_TTL` | `300` | Permission cache TTL in seconds |
 | `PLATFORM_MASTER_KEY` | — | AES-256-GCM encryption key for secrets |
 | `PLATFORM_NAMESPACE` | `platform` | K8s namespace where the platform itself runs |
-| `PLATFORM_PIPELINE_NAMESPACE` | `platform-pipelines` | K8s namespace for pipeline pods |
-| `PLATFORM_AGENT_NAMESPACE` | `platform-agents` | K8s namespace for agent pods |
+| `PLATFORM_PIPELINE_NAMESPACE` | `platform-pipelines` | Legacy fallback namespace for pipeline pods (pods now use per-project `{slug}-dev`) |
+| `PLATFORM_AGENT_NAMESPACE` | `platform-agents` | Legacy fallback namespace for agent pods (pods now use per-project `{slug}-dev`) |
 | `PLATFORM_OPS_REPOS_PATH` | `/data/ops-repos` | Ops repo storage path |
 | `WEBAUTHN_RP_ID` | — | WebAuthn relying party ID |
 | `WEBAUTHN_RP_ORIGIN` | — | WebAuthn relying party origin |
