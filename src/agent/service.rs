@@ -110,8 +110,11 @@ pub async fn create_session(
     let (repo_clone_url, project_agent_image) =
         get_project_repo_info(&state.pool, project_id, platform_api_url).await?;
 
-    // 4. Look up user's provider key (if set)
-    let user_api_key = resolve_user_api_key(state, user_id).await;
+    // 4. Look up user's provider key, falling back to global platform secret
+    let user_api_key = match resolve_user_api_key(state, user_id).await {
+        Some(key) => Some(key),
+        None => resolve_global_api_key(state).await,
+    };
 
     // 4b. Query project secrets scoped to agent/all
     let extra_env_vars = resolve_agent_secrets(state, project_id).await;
@@ -595,6 +598,28 @@ pub(crate) async fn resolve_user_api_key(state: &AppState, user_id: Uuid) -> Opt
         Ok(key) => key,
         Err(e) => {
             tracing::warn!(error = %e, %user_id, "failed to resolve user API key, falling back to global");
+            None
+        }
+    }
+}
+
+/// Try to resolve a global `ANTHROPIC_API_KEY` from the platform secrets engine.
+/// Falls back to `None` if no global secret is configured or the secrets engine
+/// is unavailable.
+pub(crate) async fn resolve_global_api_key(state: &AppState) -> Option<String> {
+    let master_key_hex = state.config.master_key.as_deref()?;
+    let master_key = crate::secrets::engine::parse_master_key(master_key_hex).ok()?;
+    match crate::secrets::engine::resolve_global_secret(
+        &state.pool,
+        &master_key,
+        "ANTHROPIC_API_KEY",
+        "agent",
+    )
+    .await
+    {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::debug!(error = %e, "no global ANTHROPIC_API_KEY secret found");
             None
         }
     }

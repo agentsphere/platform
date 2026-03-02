@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, Pod, PodSecurityContext,
-    PodSpec, ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSecurityContext, PodSpec,
+    ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -197,31 +197,22 @@ fn build_env_vars(
 ) -> Vec<EnvVar> {
     let role = params.config.role.as_deref().unwrap_or("dev");
 
-    // Use user-provided key if available, otherwise fall back to global K8s secret
-    let api_key_env = match params.anthropic_api_key {
-        Some(key) => env_var("ANTHROPIC_API_KEY", key),
-        None => EnvVar {
-            name: "ANTHROPIC_API_KEY".into(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: "platform-agent-secrets".into(),
-                    key: "anthropic-api-key".into(),
-                    optional: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    };
+    // ANTHROPIC_API_KEY is resolved upstream: user key → global platform secret.
+    // If neither is set, the env var is simply omitted (Claude Code will error clearly).
+    let api_key_env = params
+        .anthropic_api_key
+        .map(|key| env_var("ANTHROPIC_API_KEY", key));
 
     let mut vars = vec![
-        api_key_env,
         env_var("SESSION_ID", &session_id.to_string()),
         env_var("PLATFORM_API_TOKEN", params.agent_api_token),
         env_var("PLATFORM_API_URL", params.platform_api_url),
         env_var("BRANCH", branch),
         env_var("AGENT_ROLE", role),
     ];
+    if let Some(key_env) = api_key_env {
+        vars.push(key_env);
+    }
     if let Some(pid) = params.session.project_id {
         vars.push(env_var("PROJECT_ID", &pid.to_string()));
     }
@@ -517,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_key_from_secret_ref() {
+    fn no_api_key_omits_env_var() {
         let session = test_session();
         let pod = build_agent_pod(&PodBuildParams {
             session: &session,
@@ -533,19 +524,11 @@ mod tests {
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
-        let api_key_env = env.iter().find(|e| e.name == "ANTHROPIC_API_KEY").unwrap();
-        // Must come from a K8s Secret, not a hardcoded value
-        assert!(api_key_env.value.is_none());
-        let secret_ref = api_key_env
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "platform-agent-secrets");
-        assert_eq!(secret_ref.key, "anthropic-api-key");
-        assert_eq!(secret_ref.optional, Some(true));
+        // When no API key is provided, ANTHROPIC_API_KEY should be absent entirely
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY should not be present when no key is provided"
+        );
     }
 
     #[test]

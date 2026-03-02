@@ -33,11 +33,11 @@
       "Left": []
     },
     "nullable": [
+      false,
       true,
       true,
       true,
-      true,
-      false
+      true
     ]
   },
   "hash": "f5d11a105d64ea30e786ce974fd7cd54c6813078b34abce9eff6a346b338f109"

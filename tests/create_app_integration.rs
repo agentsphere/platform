@@ -222,11 +222,16 @@ async fn create_app_without_api_key_fails(pool: PgPool) {
     )
     .await;
 
-    // Should fail because no API key is configured
+    // Should fail with 400 because no API key is configured (user or global)
     assert_eq!(
         status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "expected 500 without API key, got {status}: {body}"
+        StatusCode::BAD_REQUEST,
+        "expected 400 without API key, got {status}: {body}"
+    );
+    let error_msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("API key"),
+        "expected error about API key, got: {error_msg}"
     );
 }
 

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::anthropic::{self, ChatMessage, TurnResult};
 use super::error::AgentError;
 use super::provider::{ProgressEvent, ProgressKind};
+use super::service::resolve_global_api_key;
 use crate::audit::{AuditEntry, write_audit};
 use crate::store::AppState;
 
@@ -167,12 +168,15 @@ pub async fn create_inprocess_session(
 ) -> Result<Uuid, AgentError> {
     let _ = super::service::get_provider(provider_name)?;
 
-    // Resolve user API key
-    let api_key = resolve_user_api_key(state, user_id).await.ok_or_else(|| {
-        AgentError::ConfigurationRequired(
-            "No Anthropic API key configured. Set your key in Settings > Provider Keys.".into(),
-        )
-    })?;
+    // Resolve API key: user provider key → global platform secret
+    let api_key = match resolve_user_api_key(state, user_id).await {
+        Some(key) => key,
+        None => resolve_global_api_key(state).await.ok_or_else(|| {
+            AgentError::ConfigurationRequired(
+                "No Anthropic API key configured. Set your key in Settings > Provider Keys, or ask an admin to set a global ANTHROPIC_API_KEY secret.".into(),
+            )
+        })?,
+    };
 
     let session_id = Uuid::new_v4();
 
