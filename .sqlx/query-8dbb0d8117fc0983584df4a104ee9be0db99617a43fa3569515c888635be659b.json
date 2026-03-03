@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status,\n               branch, pod_name, provider, provider_config,\n               cost_tokens, created_at, finished_at,\n               parent_session_id, spawn_depth, allowed_child_roles\n        FROM agent_sessions WHERE id = $1\n        ",
+  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status, branch, pod_name,\n               provider, cost_tokens, created_at, finished_at, execution_mode\n        FROM agent_sessions\n        WHERE project_id = $1 AND ($2::text IS NULL OR status = $2)\n        ORDER BY created_at DESC\n        LIMIT $3 OFFSET $4\n        ",
   "describe": {
     "columns": [
       {
@@ -50,43 +50,31 @@
       },
       {
         "ordinal": 9,
-        "name": "provider_config",
-        "type_info": "Jsonb"
-      },
-      {
-        "ordinal": 10,
         "name": "cost_tokens",
         "type_info": "Int8"
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "finished_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
-        "name": "parent_session_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 14,
-        "name": "spawn_depth",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 15,
-        "name": "allowed_child_roles",
-        "type_info": "TextArray"
+        "ordinal": 12,
+        "name": "execution_mode",
+        "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -100,13 +88,10 @@
       true,
       false,
       true,
-      true,
       false,
       true,
-      true,
-      false,
-      true
+      false
     ]
   },
-  "hash": "3b68cf727783d272f69a828ae4fe5335a898103706b7ada5ee58638341f2c8f0"
+  "hash": "8dbb0d8117fc0983584df4a104ee9be0db99617a43fa3569515c888635be659b"
 }

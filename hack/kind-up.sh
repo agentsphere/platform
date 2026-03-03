@@ -2,46 +2,32 @@
 set -euo pipefail
 
 CLUSTER_NAME="platform"
-REG_NAME="kind-registry"
-REG_PORT="5001"
-
-# --- Local container registry (localhost:5001) ---
-if [ "$(docker inspect -f '{{.State.Running}}' "${REG_NAME}" 2>/dev/null || true)" != 'true' ]; then
-  docker run -d --restart=always -p "127.0.0.1:${REG_PORT}:5000" --name "${REG_NAME}" registry:2
-fi
 
 # Create cluster if it doesn't exist
 if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
   kind create cluster --name "$CLUSTER_NAME" --config hack/kind-config.yaml
 fi
 
-# Connect registry to the Kind network (idempotent)
-if [ "$(docker inspect -f='{{json .NetworkSettings.Networks.kind}}' "${REG_NAME}" 2>/dev/null)" = 'null' ]; then
-  docker network connect "kind" "${REG_NAME}"
+# Detect host address for containerd registry mirror
+# macOS (OrbStack / Docker Desktop): host.docker.internal
+# Linux: Docker bridge gateway IP
+if [[ "$(uname)" == "Darwin" ]]; then
+  PLATFORM_HOST="host.docker.internal"
+else
+  PLATFORM_HOST=$(docker network inspect kind \
+    -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "172.17.0.1")
 fi
 
-# Configure containerd to use the local registry (hosts.toml for containerd v2)
-REGISTRY_DIR="/etc/containerd/certs.d/localhost:${REG_PORT}"
+# Configure containerd to use the platform's own registry (hosts.toml for containerd v2)
+# The platform binary serves OCI v2 at /v2/ on port 8080
+REGISTRY_DIR="/etc/containerd/certs.d/${PLATFORM_HOST}:8080"
 for node in $(kind get nodes --name "${CLUSTER_NAME}"); do
   docker exec "${node}" mkdir -p "${REGISTRY_DIR}"
   docker exec -i "${node}" sh -c "cat > ${REGISTRY_DIR}/hosts.toml" <<TOML
-[host."http://kind-registry:5000"]
+[host."http://${PLATFORM_HOST}:8080"]
+  capabilities = ["pull", "resolve"]
 TOML
 done
-
-# Document the local registry for tools that expect it
-# https://github.com/kubernetes-sigs/kind/blob/main/site/content/docs/user/local-registry.md
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: local-registry-hosting
-  namespace: kube-public
-data:
-  localRegistryHosting.v1: |
-    host: "localhost:${REG_PORT}"
-    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
-EOF
 
 # Export kubeconfig
 kind get kubeconfig --name "$CLUSTER_NAME" > "${HOME}/.kube/kind-platform"
@@ -290,7 +276,7 @@ kubectl exec -n platform deployment/minio -- sh -c \
 
 echo ""
 echo "Dev cluster ready."
-echo "  Registry: localhost:${REG_PORT}"
+echo "  Registry: platform's own /v2/ (via ${PLATFORM_HOST}:8080)"
 echo "  Postgres: localhost:5432 (platform/dev)"
 echo "  Valkey:   localhost:6379"
 echo "  MinIO:    localhost:9000 (S3 API), localhost:9001 (console)"

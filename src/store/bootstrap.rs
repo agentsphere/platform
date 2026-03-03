@@ -308,7 +308,8 @@ pub async fn run(
     seed_roles(pool).await?;
 
     if dev_mode {
-        create_admin_user(pool, admin_password.unwrap_or("admin")).await?;
+        let admin_id = create_admin_user(pool, admin_password.unwrap_or("admin")).await?;
+        create_runner_project(pool, admin_id).await?;
         Ok(BootstrapResult::DevAdmin)
     } else {
         let raw_token = create_setup_token(pool).await?;
@@ -417,6 +418,44 @@ pub async fn create_admin_user(pool: &PgPool, password: &str) -> anyhow::Result<
 
     tracing::info!(user_id = %admin_id, "admin user created");
     Ok(admin_id)
+}
+
+/// Create the `platform-runner` project so the built-in registry has a home
+/// for infrastructure images (e.g. the agent runner). Idempotent.
+async fn create_runner_project(pool: &PgPool, admin_id: Uuid) -> anyhow::Result<()> {
+    // Look up admin's default workspace
+    let workspace_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1")
+            .bind(admin_id)
+            .fetch_one(pool)
+            .await?;
+
+    let project_id = Uuid::new_v4();
+    let result = sqlx::query(
+        "INSERT INTO projects (id, name, display_name, owner_id, workspace_id, visibility, namespace_slug)
+         VALUES ($1, 'platform-runner', 'Platform Runner Images', $2, $3, 'internal', 'platform-runner')
+         ON CONFLICT (owner_id, name) DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(admin_id)
+    .bind(workspace_id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        // Pre-create registry repository so image pushes work without lazy-create
+        sqlx::query(
+            "INSERT INTO registry_repositories (id, project_id, name)
+             VALUES ($1, $2, 'platform-runner')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+        tracing::info!("platform-runner project created for registry");
+    }
+    Ok(())
 }
 
 /// Generate and store a setup token (production path). Returns the raw token.

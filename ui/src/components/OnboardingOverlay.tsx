@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { api } from '../lib/api';
-import { createWs, type ReconnectingWebSocket } from '../lib/ws';
+import { createSse, type EventSourceClient } from '../lib/sse';
 import { useOnboarding } from '../lib/onboarding';
 
 interface ValidateResponse {
@@ -42,7 +42,7 @@ export function OnboardingOverlay() {
   const [chatLoading, setChatLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const messagesEnd = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<ReconnectingWebSocket | null>(null);
+  const sseRef = useRef<EventSourceClient | null>(null);
   const streamBuf = useRef('');
 
   const chatEnabled = keyValid || hasProviderKey;
@@ -52,9 +52,9 @@ export function OnboardingOverlay() {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Cleanup WS on unmount
+  // Cleanup SSE on unmount
   useEffect(() => {
-    return () => { wsRef.current?.close(); };
+    return () => { sseRef.current?.close(); };
   }, []);
 
   // Keep overlay visible while an onboarding session is active,
@@ -99,12 +99,11 @@ export function OnboardingOverlay() {
     }
   }
 
-  // --- WebSocket chat ---
-  function connectWs(sessionId: string) {
-    const ws = createWs({
-      url: `/api/sessions/${sessionId}/ws`,
-      onOpen() {},
-      onClose() {
+  // --- SSE chat ---
+  function connectSse(sessionId: string) {
+    const sse = createSse({
+      url: `/api/sessions/${sessionId}/events`,
+      onError() {
         setStreaming(false);
       },
       onMessage(data: ProgressEvent) {
@@ -164,10 +163,8 @@ export function OnboardingOverlay() {
             break;
         }
       },
-      reconnect: true,
-      maxRetries: 5,
     });
-    wsRef.current = ws;
+    sseRef.current = sse;
   }
 
   async function handleChatSubmit(e: Event) {
@@ -188,7 +185,7 @@ export function OnboardingOverlay() {
         setSession(resp);
         setStreaming(true);
         streamBuf.current = '';
-        connectWs(resp.id);
+        connectSse(resp.id);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Failed to create session';
         setMessages(prev => [...prev, { role: 'system', content: `Error: ${msg}` }]);
@@ -199,15 +196,11 @@ export function OnboardingOverlay() {
       setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
       streamBuf.current = '';
       setStreaming(true);
-      if (wsRef.current) {
-        wsRef.current.send(JSON.stringify({ content: userMsg }));
-      } else {
-        try {
-          await api.post(`/api/sessions/${session.id}/message`, { content: userMsg });
-        } catch {
-          setMessages(prev => [...prev, { role: 'system', content: 'Failed to send message' }]);
-          setStreaming(false);
-        }
+      try {
+        await api.post(`/api/sessions/${session.id}/message`, { content: userMsg });
+      } catch {
+        setMessages(prev => [...prev, { role: 'system', content: 'Failed to send message' }]);
+        setStreaming(false);
       }
     }
   }

@@ -5,7 +5,7 @@ import { timeAgo, duration } from '../lib/format';
 import { Badge } from '../components/Badge';
 import { StatusDot } from '../components/StatusDot';
 import { SecretRequestModal } from '../components/SecretRequestModal';
-import { createWs, type ReconnectingWebSocket } from '../lib/ws';
+import { createSse, type EventSourceClient } from '../lib/sse';
 
 interface Props {
   id?: string;
@@ -34,7 +34,7 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
   const [sending, setSending] = useState(false);
   const [secretRequest, setSecretRequest] = useState<SecretRequestMeta | null>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<ReconnectingWebSocket | null>(null);
+  const sseRef = useRef<EventSourceClient | null>(null);
 
   useEffect(() => {
     if (!projectId || !sessionId) return;
@@ -53,13 +53,13 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
     }).catch(() => {});
   }, [projectId, sessionId]);
 
-  // WebSocket for live streaming
+  // SSE for live streaming
   useEffect(() => {
     if (!projectId || !sessionId || !session) return;
     if (session.status !== 'running' && session.status !== 'pending') return;
 
-    const ws = createWs({
-      url: `/api/projects/${projectId}/sessions/${sessionId}/ws`,
+    const sse = createSse({
+      url: `/api/projects/${projectId}/sessions/${sessionId}/events`,
       onMessage: (raw: Record<string, any>) => {
         const event: ProgressEvent = {
           kind: normalizeKind(raw.kind),
@@ -82,8 +82,8 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
         }
       },
     });
-    wsRef.current = ws;
-    return () => ws.close();
+    sseRef.current = sse;
+    return () => sse.close();
   }, [projectId, sessionId, session?.status]);
 
   // Auto-scroll

@@ -222,17 +222,22 @@ async fn create_app_without_api_key_fails(pool: PgPool) {
     )
     .await;
 
-    // Should fail because no API key is configured
+    // Should fail with 400 because no API key is configured (user or global)
     assert_eq!(
         status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "expected 500 without API key, got {status}: {body}"
+        StatusCode::BAD_REQUEST,
+        "expected 400 without API key, got {status}: {body}"
+    );
+    let error_msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("API key"),
+        "expected error about API key, got: {error_msg}"
     );
 }
 
-/// After create-app, session has pod_name=null (in-process, not K8s).
+/// After create-app, session uses cli_subprocess execution mode with no pod.
 #[sqlx::test(migrations = "./migrations")]
-async fn create_app_session_is_inprocess(pool: PgPool) {
+async fn create_app_session_is_cli_subprocess(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
     let app = test_router(state);
 
@@ -249,9 +254,19 @@ async fn create_app_session_is_inprocess(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // In-process sessions should have no pod_name
+    // CLI subprocess sessions should have no pod_name
     assert!(
         body["pod_name"].is_null(),
-        "in-process session should have null pod_name: {body}"
+        "cli_subprocess session should have null pod_name: {body}"
     );
+
+    // Verify execution mode is cli_subprocess
+    let session_id = body["id"].as_str().unwrap();
+    let row: (String,) =
+        sqlx::query_as("SELECT execution_mode FROM agent_sessions WHERE id = $1::uuid")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "cli_subprocess");
 }

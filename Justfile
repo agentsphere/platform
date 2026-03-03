@@ -65,6 +65,9 @@ test-integration:
 test-e2e:
     bash {{test_script}} --type e2e
 
+test-llm:
+    cargo nextest run --test llm_create_app --run-ignored ignored-only
+
 test-mcp:
     cd mcp && npm test
 
@@ -149,12 +152,22 @@ build:
     just ui
     SQLX_OFFLINE=true cargo build --release
 
+cli-build:
+    cargo build --release --manifest-path cli/platform-cli/Cargo.toml
+
+cli-install:
+    cargo install --path cli/platform-cli
+
 docker tag="platform:dev":
     docker build -f docker/Dockerfile -t {{ tag }} .
 
 agent-image:
-    docker build -f docker/Dockerfile.claude-runner -t localhost:5001/platform-claude-runner:latest .
-    docker push localhost:5001/platform-claude-runner:latest
+    docker build -f docker/Dockerfile.claude-runner -t localhost:8080/platform-runner/platform-claude-runner:latest .
+    docker push localhost:8080/platform-runner/platform-claude-runner:latest
+
+registry-login:
+    @echo "Login to the platform's built-in registry (admin/admin in dev mode):"
+    @echo "  docker login localhost:8080"
 
 # -- Deploy to kind -------------------------------------------------
 deploy-local tag="platform:dev":

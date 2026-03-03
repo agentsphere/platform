@@ -42,6 +42,13 @@ pub struct Config {
     pub ssh_listen: Option<String>,
     /// Path to ED25519 host key (auto-generated if absent).
     pub ssh_host_key_path: String,
+    /// Maximum concurrent CLI subprocess sessions per platform pod.
+    pub max_cli_subprocesses: usize,
+    /// Valkey host:port as seen from inside agent pods.
+    /// Defaults to host:port parsed from `VALKEY_URL`.
+    /// Override when platform connects via port-forward but agents use K8s DNS.
+    /// Example: `"valkey.platform.svc.cluster.local:6379"`
+    pub valkey_agent_host: String,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -56,11 +63,14 @@ fn parse_cors_origins(s: &str) -> Vec<String> {
 
 impl Config {
     pub fn load() -> Self {
+        let valkey_url = env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        let valkey_agent_host = env::var("PLATFORM_VALKEY_AGENT_HOST")
+            .unwrap_or_else(|_| derive_valkey_host_port(&valkey_url));
         Self {
             listen: env::var("PLATFORM_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://platform:dev@localhost:5432/platform_dev".into()),
-            valkey_url: env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
+            valkey_url,
             minio_endpoint: env::var("MINIO_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:9000".into()),
             minio_access_key: env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "platform".into()),
@@ -110,8 +120,25 @@ impl Config {
             ssh_listen: env::var("PLATFORM_SSH_LISTEN").ok(),
             ssh_host_key_path: env::var("PLATFORM_SSH_HOST_KEY_PATH")
                 .unwrap_or_else(|_| "/data/ssh_host_ed25519_key".into()),
+            max_cli_subprocesses: env::var("PLATFORM_MAX_CLI_SUBPROCESSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            valkey_agent_host,
         }
     }
+}
+
+/// Extract host:port from a Redis URL, falling back to `"localhost:6379"`.
+fn derive_valkey_host_port(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.to_owned();
+            let port = u.port().unwrap_or(6379);
+            Some(format!("{host}:{port}"))
+        })
+        .unwrap_or_else(|| "localhost:6379".into())
 }
 
 #[cfg(test)]
@@ -150,6 +177,8 @@ impl Config {
             platform_namespace: "test-platform".into(),
             ssh_listen: None,
             ssh_host_key_path: "/tmp/test_ssh_host_key".into(),
+            max_cli_subprocesses: 10,
+            valkey_agent_host: "localhost:6379".into(),
         }
     }
 }
@@ -293,6 +322,38 @@ mod tests {
         assert!(!config.webauthn_rp_id.is_empty());
         assert!(!config.webauthn_rp_origin.is_empty());
         assert!(!config.webauthn_rp_name.is_empty());
+    }
+
+    #[test]
+    fn test_default_valkey_agent_host() {
+        let config = Config::test_default();
+        assert_eq!(config.valkey_agent_host, "localhost:6379");
+    }
+
+    #[test]
+    fn derive_valkey_host_port_from_url() {
+        assert_eq!(
+            derive_valkey_host_port("redis://myhost:7000"),
+            "myhost:7000"
+        );
+    }
+
+    #[test]
+    fn derive_valkey_host_port_default_port() {
+        assert_eq!(derive_valkey_host_port("redis://myhost"), "myhost:6379");
+    }
+
+    #[test]
+    fn derive_valkey_host_port_with_auth() {
+        assert_eq!(
+            derive_valkey_host_port("redis://user:pass@myhost:6380"),
+            "myhost:6380"
+        );
+    }
+
+    #[test]
+    fn derive_valkey_host_port_invalid_url() {
+        assert_eq!(derive_valkey_host_port("not-a-url"), "localhost:6379");
     }
 
     #[test]

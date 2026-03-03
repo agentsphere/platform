@@ -3,13 +3,11 @@ pub mod eventbus;
 pub mod pool;
 pub mod valkey;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use uuid::Uuid;
 
-use crate::agent::inprocess::InProcessHandle;
+use crate::agent::claude_cli::CliSessionManager;
 use crate::config::Config;
 use crate::secrets::request::SecretRequests;
 
@@ -26,8 +24,8 @@ pub struct AppState {
     pub pipeline_notify: Arc<tokio::sync::Notify>,
     /// Notify the deployer reconciler that a deployment is ready.
     pub deploy_notify: Arc<tokio::sync::Notify>,
-    /// In-process agent sessions (global/create-app sessions, not K8s pods).
-    pub inprocess_sessions: Arc<std::sync::RwLock<HashMap<Uuid, InProcessHandle>>>,
     /// Ephemeral in-memory state for agent secret requests (5-min TTL).
     pub secret_requests: SecretRequests,
+    /// CLI subprocess sessions running inside the platform pod.
+    pub cli_sessions: CliSessionManager,
 }

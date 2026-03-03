@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use base64::Engine;
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSecurityContext, PodSpec,
-    Secret, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, LocalObjectReference, Pod,
+    PodSecurityContext, PodSpec, Secret, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::Api;
@@ -686,6 +686,11 @@ fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
             security_context: Some(PodSecurityContext {
                 fs_group: Some(1000),
                 ..Default::default()
+            }),
+            image_pull_secrets: p.registry_secret.map(|name| {
+                vec![LocalObjectReference {
+                    name: name.to_string(),
+                }]
             }),
             init_containers: Some(vec![Container {
                 name: "clone".into(),
@@ -1692,6 +1697,51 @@ mod tests {
     }
 
     // -- registry secret mount --
+
+    #[test]
+    fn pod_spec_image_pull_secrets_set_when_registry_secret() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "build",
+            image: "gcr.io/kaniko-project/executor:latest",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: Some("pl-registry-00000000"),
+            git_auth_token: "test-token",
+        });
+
+        let spec = pod.spec.unwrap();
+        let secrets = spec.image_pull_secrets.unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "pl-registry-00000000");
+    }
+
+    #[test]
+    fn pod_spec_image_pull_secrets_absent_without_registry_secret() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_auth_token: "test-token",
+        });
+
+        let spec = pod.spec.unwrap();
+        assert!(
+            spec.image_pull_secrets.is_none(),
+            "imagePullSecrets should be absent when no registry secret"
+        );
+    }
 
     #[test]
     fn pod_spec_without_registry_secret_has_one_volume() {

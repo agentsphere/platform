@@ -178,6 +178,9 @@ pub async fn e2e_state_with_api_url(
         platform_namespace: "test-platform".into(),
         ssh_listen: None,
         ssh_host_key_path: "/tmp/test_ssh_host_key".into(),
+        max_cli_subprocesses: 10,
+        valkey_agent_host: std::env::var("PLATFORM_VALKEY_AGENT_HOST")
+            .unwrap_or_else(|_| "localhost:6379".into()),
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");
@@ -187,12 +190,14 @@ pub async fn e2e_state_with_api_url(
         valkey,
         minio,
         kube,
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
         webauthn: Arc::new(webauthn),
         pipeline_notify: Arc::new(tokio::sync::Notify::new()),
         deploy_notify: Arc::new(tokio::sync::Notify::new()),
-        inprocess_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cli_sessions: platform::agent::claude_cli::CliSessionManager::new(
+            config.max_cli_subprocesses,
+        ),
     };
 
     // Create an API token for the bootstrap admin directly in the DB,

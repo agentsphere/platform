@@ -1,3 +1,4 @@
+pub mod cli_creds;
 pub mod middleware;
 pub mod passkey;
 pub mod password;

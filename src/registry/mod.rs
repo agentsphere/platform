@@ -4,6 +4,7 @@ pub mod digest;
 pub mod error;
 pub mod gc;
 pub mod manifests;
+pub mod pull_secret;
 pub mod tags;
 pub mod types;
 

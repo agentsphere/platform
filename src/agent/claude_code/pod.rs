@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, Pod, PodSecurityContext,
-    PodSpec, ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, LocalObjectReference, Pod,
+    PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -34,10 +34,17 @@ pub struct PodBuildParams<'a> {
     /// User-provided Anthropic API key. If set, used as a plain env var
     /// instead of referencing the global K8s secret.
     pub anthropic_api_key: Option<&'a str>,
+    /// CLI OAuth token for subscription auth. When set, `CLAUDE_CODE_OAUTH_TOKEN` is
+    /// injected instead of `ANTHROPIC_API_KEY`, letting the CLI use the user's subscription.
+    pub cli_oauth_token: Option<&'a str>,
     /// Extra env vars from project secrets (scope=agent/all), injected into the pod.
     pub extra_env_vars: &'a [(String, String)],
-    /// Container registry URL (e.g. `localhost:5001`). Prefixed to the default agent image.
+    /// Container registry URL (e.g. `host.docker.internal:8080`). Prefixed to the default agent image.
     pub registry_url: Option<&'a str>,
+    /// K8s Secret name for `imagePullSecrets` (registry auth for image pulls).
+    pub registry_secret_name: Option<&'a str>,
+    /// Valkey URL with per-session ACL credentials for pub/sub.
+    pub valkey_url: Option<&'a str>,
 }
 
 /// Resolves the container image for an agent pod.
@@ -90,7 +97,7 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         labels.insert("platform.io/project".into(), pid.to_string());
     }
 
-    let claude_args = build_claude_args(params, &branch);
+    let agent_runner_args = build_agent_runner_args(params);
     let env_vars = build_env_vars(params, session_id, &branch);
     let init_containers = build_init_containers(params, &branch);
     let resolved_image = resolve_image(
@@ -99,7 +106,8 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         params.registry_url,
     );
     let pull_policy = image_pull_policy(&resolved_image);
-    let main_container = build_main_container(claude_args, env_vars, &resolved_image, &pull_policy);
+    let main_container =
+        build_main_container(agent_runner_args, env_vars, &resolved_image, &pull_policy);
 
     let mut containers = vec![main_container];
     let mut volumes = vec![Volume {
@@ -140,6 +148,11 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
                 fs_group: Some(1000),
                 ..Default::default()
             }),
+            image_pull_secrets: params.registry_secret_name.map(|name| {
+                vec![LocalObjectReference {
+                    name: name.to_string(),
+                }]
+            }),
             init_containers: Some(init_containers),
             containers,
             volumes: Some(volumes),
@@ -149,13 +162,14 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
     }
 }
 
-fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> {
+fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
     let mut args = vec![
-        "--print".to_owned(),
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-        "--verbose".to_owned(),
-        "--dangerously-skip-permissions".to_owned(),
+        "--prompt".to_owned(),
+        params.session.prompt.clone(),
+        "--cwd".to_owned(),
+        "/workspace".to_owned(),
+        "--permission-mode".to_owned(),
+        "bypassPermissions".to_owned(),
     ];
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
@@ -165,7 +179,6 @@ fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> 
         args.push("--max-turns".to_owned());
         args.push(max_turns.to_string());
     }
-    args.push(params.session.prompt.clone());
     args
 }
 
@@ -176,6 +189,9 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "PLATFORM_API_URL",
     "SESSION_ID",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+    "VALKEY_URL",
     "BRANCH",
     "AGENT_ROLE",
     "PROJECT_ID",
@@ -197,31 +213,26 @@ fn build_env_vars(
 ) -> Vec<EnvVar> {
     let role = params.config.role.as_deref().unwrap_or("dev");
 
-    // Use user-provided key if available, otherwise fall back to global K8s secret
-    let api_key_env = match params.anthropic_api_key {
-        Some(key) => env_var("ANTHROPIC_API_KEY", key),
-        None => EnvVar {
-            name: "ANTHROPIC_API_KEY".into(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: "platform-agent-secrets".into(),
-                    key: "anthropic-api-key".into(),
-                    optional: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    };
-
     let mut vars = vec![
-        api_key_env,
         env_var("SESSION_ID", &session_id.to_string()),
         env_var("PLATFORM_API_TOKEN", params.agent_api_token),
         env_var("PLATFORM_API_URL", params.platform_api_url),
         env_var("BRANCH", branch),
         env_var("AGENT_ROLE", role),
     ];
+
+    // Auth priority: CLI OAuth token (subscription) > Anthropic API key.
+    // When cli_oauth_token is set, the CLI uses the user's subscription.
+    // When only anthropic_api_key is set, the CLI uses the API directly.
+    // If neither is set, the env vars are omitted (Claude Code will error clearly).
+    if let Some(oauth_token) = params.cli_oauth_token {
+        vars.push(env_var("CLAUDE_CODE_OAUTH_TOKEN", oauth_token));
+    } else if let Some(api_key) = params.anthropic_api_key {
+        vars.push(env_var("ANTHROPIC_API_KEY", api_key));
+    }
+    if let Some(valkey_url) = params.valkey_url {
+        vars.push(env_var("VALKEY_URL", valkey_url));
+    }
     if let Some(pid) = params.session.project_id {
         vars.push(env_var("PROJECT_ID", &pid.to_string()));
     }
@@ -333,7 +344,7 @@ fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str
 }
 
 fn build_main_container(
-    claude_args: Vec<String>,
+    agent_runner_args: Vec<String>,
     env_vars: Vec<EnvVar>,
     image: &str,
     pull_policy: &str,
@@ -342,7 +353,8 @@ fn build_main_container(
         name: "claude".into(),
         image: Some(image.to_owned()),
         image_pull_policy: Some(pull_policy.to_owned()),
-        args: Some(claude_args),
+        command: Some(vec!["agent-runner".to_owned()]),
+        args: Some(agent_runner_args),
         stdin: Some(false),
         tty: Some(false),
         working_dir: Some("/workspace".into()),
@@ -448,6 +460,8 @@ mod tests {
             parent_session_id: None,
             spawn_depth: 0,
             allowed_child_roles: None,
+            execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         }
     }
 
@@ -463,8 +477,11 @@ mod tests {
             namespace: "platform-agents",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         assert_eq!(pod.metadata.name.as_deref(), Some("agent-12345678"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("platform-agents"));
@@ -482,8 +499,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["platform.io/component"], "agent-session");
@@ -506,8 +526,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let claude_container = &spec.containers[0];
@@ -517,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_key_from_secret_ref() {
+    fn no_api_key_omits_env_var() {
         let session = test_session();
         let pod = build_agent_pod(&PodBuildParams {
             session: &session,
@@ -528,24 +551,19 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
-        let api_key_env = env.iter().find(|e| e.name == "ANTHROPIC_API_KEY").unwrap();
-        // Must come from a K8s Secret, not a hardcoded value
-        assert!(api_key_env.value.is_none());
-        let secret_ref = api_key_env
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "platform-agent-secrets");
-        assert_eq!(secret_ref.key, "anthropic-api-key");
-        assert_eq!(secret_ref.optional, Some(true));
+        // When no API key is provided, ANTHROPIC_API_KEY should be absent entirely
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY should not be present when no key is provided"
+        );
     }
 
     #[test]
@@ -560,8 +578,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: Some("sk-ant-user-key-1234"),
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -583,8 +604,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -620,8 +644,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -646,8 +673,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -671,8 +701,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -694,8 +727,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -739,8 +775,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -764,8 +803,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -800,8 +842,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let resources = spec.containers[0].resources.as_ref().unwrap();
@@ -822,8 +867,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -912,8 +960,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -933,8 +984,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: Some("rust:1.80"),
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -958,8 +1012,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -986,8 +1043,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1006,8 +1066,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1039,8 +1102,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 2, "should have claude + browser");
@@ -1060,8 +1126,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 1, "should have only claude");
@@ -1080,8 +1149,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1108,8 +1180,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1129,8 +1204,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1158,8 +1236,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1186,8 +1267,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1210,8 +1294,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1236,8 +1323,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let psc = spec.security_context.unwrap();
@@ -1259,8 +1349,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let container = &spec.containers[0];
@@ -1283,8 +1376,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1312,8 +1408,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &secrets,
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1338,8 +1437,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &[],
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod_without.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1368,8 +1470,11 @@ mod tests {
             namespace: "ns",
             project_agent_image: None,
             anthropic_api_key: None,
+            cli_oauth_token: None,
             extra_env_vars: &secrets,
             registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1392,5 +1497,221 @@ mod tests {
         assert!(is_reserved_env_var("SESSION_ID"));
         assert!(!is_reserved_env_var("MY_CUSTOM_VAR"));
         assert!(!is_reserved_env_var("DATABASE_URL"));
+    }
+
+    // -- imagePullSecrets tests --
+
+    #[test]
+    fn image_pull_secrets_set_when_provided() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: Some("host.docker.internal:8080"),
+            registry_secret_name: Some("regpull-12345678"),
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let secrets = spec.image_pull_secrets.unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regpull-12345678");
+    }
+
+    #[test]
+    fn image_pull_secrets_absent_when_none() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        assert!(
+            spec.image_pull_secrets.is_none(),
+            "imagePullSecrets should be absent when no registry secret is configured"
+        );
+    }
+
+    // -- CLI OAuth token (subscription auth) tests --
+
+    #[test]
+    fn pod_env_includes_oauth_token() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: Some("ccode-oauth-token-12345"),
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let oauth = env
+            .iter()
+            .find(|e| e.name == "CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("CLAUDE_CODE_OAUTH_TOKEN should be set");
+        assert_eq!(oauth.value.as_deref(), Some("ccode-oauth-token-12345"));
+    }
+
+    #[test]
+    fn pod_env_no_api_key_when_oauth_set() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: Some("ccode-oauth-token-12345"),
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY should not be set when OAuth token is present"
+        );
+    }
+
+    #[test]
+    fn pod_env_fallback_to_api_key() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: Some("sk-ant-fallback-key"),
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let api_key = env
+            .iter()
+            .find(|e| e.name == "ANTHROPIC_API_KEY")
+            .expect("ANTHROPIC_API_KEY should be set as fallback");
+        assert_eq!(api_key.value.as_deref(), Some("sk-ant-fallback-key"));
+        assert!(
+            env.iter().all(|e| e.name != "CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN should not be set when using API key fallback"
+        );
+    }
+
+    #[test]
+    fn oauth_token_is_reserved() {
+        assert!(
+            is_reserved_env_var("CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN must be reserved to prevent privilege escalation"
+        );
+    }
+
+    #[test]
+    fn config_dir_is_reserved() {
+        assert!(
+            is_reserved_env_var("CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must be reserved to prevent config hijacking"
+        );
+    }
+
+    #[test]
+    fn both_oauth_and_api_key_prefers_oauth() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: Some("sk-ant-should-be-ignored"),
+            cli_oauth_token: Some("ccode-oauth-winner"),
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        // OAuth token should be present
+        let oauth = env
+            .iter()
+            .find(|e| e.name == "CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("CLAUDE_CODE_OAUTH_TOKEN should be set");
+        assert_eq!(oauth.value.as_deref(), Some("ccode-oauth-winner"));
+        // API key should NOT be present (OAuth takes priority)
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY should not be set when OAuth token is present"
+        );
+    }
+
+    #[test]
+    fn no_auth_omits_both_env_vars() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY should not be set when no auth configured"
+        );
+        assert!(
+            env.iter().all(|e| e.name != "CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN should not be set when no auth configured"
+        );
     }
 }

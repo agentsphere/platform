@@ -443,7 +443,7 @@ Key: return **404** (not 403) for private resources the user can't access — av
 | `WEBAUTHN_RP_NAME` | — | WebAuthn relying party display name |
 | `PLATFORM_SMTP_HOST` | — | SMTP server host |
 | `PLATFORM_API_URL` | `http://platform.platform.svc.cluster.local:8080` | HTTP URL for agent/pipeline pods to reach the platform |
-| `PLATFORM_REGISTRY_URL` | — | Container registry URL |
+| `PLATFORM_REGISTRY_URL` | — | Platform's built-in OCI registry URL (e.g. `host.docker.internal:8080`) |
 
 ## Type System Patterns
 

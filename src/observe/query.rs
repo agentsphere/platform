@@ -1,12 +1,14 @@
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use fred::prelude::*;
+use fred::interfaces::EventInterface;
+use fred::interfaces::PubsubInterface;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use ts_rs::TS;
@@ -184,7 +186,7 @@ pub struct LiveTailParams {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/observe/logs", get(search_logs))
-        .route("/api/observe/logs/tail", get(live_tail_ws))
+        .route("/api/observe/logs/tail", get(live_tail_sse))
         .route("/api/observe/traces", get(list_traces))
         .route("/api/observe/traces/{trace_id}", get(get_trace))
         .route("/api/observe/metrics", get(query_metrics))
@@ -720,15 +722,14 @@ async fn session_timeline(
 }
 
 // ---------------------------------------------------------------------------
-// Live tail WebSocket
+// Live tail SSE
 // ---------------------------------------------------------------------------
 
-#[tracing::instrument(skip(state, ws), err)]
-async fn live_tail_ws(
+#[tracing::instrument(skip(state), err)]
+async fn live_tail_sse(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(params): Query<LiveTailParams>,
-    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
     let project_id = params
         .project_id
@@ -736,50 +737,35 @@ async fn live_tail_ws(
 
     require_observe_read(&state, &auth, Some(project_id)).await?;
 
-    Ok(ws.on_upgrade(move |socket| handle_live_tail(socket, state, project_id, params)))
-}
-
-async fn handle_live_tail(
-    mut socket: WebSocket,
-    state: AppState,
-    project_id: Uuid,
-    params: LiveTailParams,
-) {
-    let subscriber = state.valkey.next().clone();
     let channel = format!("logs:{project_id}");
 
-    if subscriber.subscribe(channel.as_str()).await.is_err() {
-        let _ = socket.send(Message::Close(None)).await;
-        return;
-    }
+    // Dedicated subscriber connection for this SSE stream.
+    let subscriber = state.valkey.next().clone_new();
+    subscriber
+        .subscribe(&channel)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let mut msg_rx = subscriber.message_rx();
 
-    let mut rx = subscriber.message_rx();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
 
-    loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                match msg {
-                    Ok(message) => {
-                        if let Ok(text) = message.value.convert::<String>()
-                            && should_forward(&text, &params)
-                            && socket.send(Message::Text(text.into())).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            ws_msg = socket.recv() => {
-                match ws_msg {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
-                }
+    tokio::spawn(async move {
+        while let Ok(msg) = msg_rx.recv().await {
+            let text: String = match msg.value.convert() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if should_forward(&text, &params) && tx.send(text).await.is_err() {
+                break;
             }
         }
-    }
+        let _ = subscriber.unsubscribe(&channel).await;
+    });
 
-    let _ = subscriber.unsubscribe(channel.as_str()).await;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|text| Ok::<_, std::convert::Infallible>(Event::default().event("log").data(text)));
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// Check if a live tail message matches optional level/service filters.

@@ -374,6 +374,41 @@ pub async fn resolve_secret(
         .map_err(|e| anyhow::anyhow!("secret value is not valid UTF-8: {e}"))
 }
 
+/// Resolve (decrypt) a global secret by name (`project_id IS NULL`).
+/// Enforces scope matching like [`resolve_secret`].
+#[tracing::instrument(skip(pool, master_key), fields(%name, %requested_scope), err)]
+pub async fn resolve_global_secret(
+    pool: &PgPool,
+    master_key: &[u8; 32],
+    name: &str,
+    requested_scope: &str,
+) -> anyhow::Result<String> {
+    let row = sqlx::query!(
+        r#"
+        SELECT encrypted_value, scope
+        FROM secrets
+        WHERE project_id IS NULL AND workspace_id IS NULL AND environment IS NULL
+          AND name = $1
+        LIMIT 1
+        "#,
+        name,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("global secret '{name}' not found"))?;
+
+    if row.scope != "all" && row.scope != requested_scope && requested_scope != "all" {
+        anyhow::bail!(
+            "global secret '{name}' has scope '{}' but '{requested_scope}' was requested",
+            row.scope
+        );
+    }
+
+    let plaintext = decrypt(&row.encrypted_value, master_key)?;
+    String::from_utf8(plaintext)
+        .map_err(|e| anyhow::anyhow!("secret value is not valid UTF-8: {e}"))
+}
+
 /// Resolve (decrypt) a secret using the full hierarchy (most specific wins):
 ///
 /// 1. Project + Environment  (`project_id = X, environment = staging`)

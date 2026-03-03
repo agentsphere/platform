@@ -68,6 +68,8 @@ pub struct AgentSession {
     pub parent_session_id: Option<Uuid>,
     pub spawn_depth: i32,
     pub allowed_child_roles: Option<Vec<String>>,
+    pub execution_mode: String,
+    pub uses_pubsub: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ pub struct BrowserConfig {
 // ---------------------------------------------------------------------------
 
 /// Structured progress event parsed from agent output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressEvent {
     pub kind: ProgressKind,
     pub message: String,
@@ -130,6 +132,9 @@ pub enum ProgressKind {
     Error,
     Completed,
     Text,
+    /// Forward-compatible catch-all for unknown event kinds from agent-runner.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,10 +152,17 @@ pub struct BuildPodParams<'a> {
     pub project_agent_image: Option<&'a str>,
     /// User-provided Anthropic API key. If set, used instead of the global K8s secret.
     pub anthropic_api_key: Option<&'a str>,
+    /// CLI OAuth token for subscription auth. When set, `CLAUDE_CODE_OAUTH_TOKEN` is
+    /// injected instead of `ANTHROPIC_API_KEY`.
+    pub cli_oauth_token: Option<&'a str>,
     /// Extra env vars from project secrets (scope=agent/all), injected into the pod.
     pub extra_env_vars: &'a [(String, String)],
-    /// Container registry URL (e.g. `localhost:5001`). Prefixed to the default agent image.
+    /// Container registry URL (e.g. `host.docker.internal:8080`). Prefixed to the default agent image.
     pub registry_url: Option<&'a str>,
+    /// K8s Secret name for `imagePullSecrets` (registry auth for image pulls).
+    pub registry_secret_name: Option<&'a str>,
+    /// Valkey URL with per-session ACL credentials for pub/sub.
+    pub valkey_url: Option<&'a str>,
 }
 
 /// Trait for agent provider implementations.
@@ -160,6 +172,7 @@ pub trait AgentProvider: Send + Sync {
     fn build_pod(&self, params: BuildPodParams<'_>) -> Result<Pod, AgentError>;
 
     /// Parse a single line of streaming output into a structured progress event.
+    #[allow(dead_code)] // Pending removal in Step 6 (dead code cleanup)
     fn parse_progress(&self, line: &str) -> Option<ProgressEvent>;
 
     /// Provider name identifier (e.g., "claude-code").
@@ -216,6 +229,43 @@ mod tests {
     fn progress_kind_serializes_snake_case() {
         let json = serde_json::to_string(&ProgressKind::ToolCall).unwrap();
         assert_eq!(json, r#""tool_call""#);
+    }
+
+    #[test]
+    fn progress_event_deserialize_text() {
+        let json = r#"{"kind":"text","message":"hello"}"#;
+        let event: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.kind, ProgressKind::Text);
+        assert_eq!(event.message, "hello");
+        assert!(event.metadata.is_none());
+    }
+
+    #[test]
+    fn progress_event_deserialize_with_metadata() {
+        let json = r#"{"kind":"tool_call","message":"Read","metadata":{"file":"test.rs"}}"#;
+        let event: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.kind, ProgressKind::ToolCall);
+        assert!(event.metadata.is_some());
+    }
+
+    #[test]
+    fn progress_event_deserialize_unknown_kind() {
+        let json = r#"{"kind":"new_future_kind","message":"test"}"#;
+        let event: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.kind, ProgressKind::Unknown);
+    }
+
+    #[test]
+    fn progress_event_roundtrip() {
+        let event = ProgressEvent {
+            kind: ProgressKind::Completed,
+            message: "done".into(),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ProgressEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, ProgressKind::Completed);
+        assert_eq!(back.message, "done");
     }
 
     #[test]

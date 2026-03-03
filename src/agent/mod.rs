@@ -1,10 +1,15 @@
-pub mod anthropic;
+pub mod claude_cli;
 pub mod claude_code;
+pub mod cli_invoke;
+pub mod commands;
+pub mod create_app;
+pub mod create_app_prompt;
 pub mod error;
 pub mod identity;
-pub mod inprocess;
 pub mod provider;
+pub mod pubsub_bridge;
 pub mod service;
+pub mod valkey_acl;
 
 use std::fmt;
 use std::str::FromStr;
