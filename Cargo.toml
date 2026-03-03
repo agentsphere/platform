@@ -35,7 +35,7 @@ sqlx = { version = "0.8", features = [
 ] }
 
 # IP address types for INET columns
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 
 # Kubernetes
 kube = { version = "3", features = ["runtime", "client", "ws"] }
@@ -49,8 +49,8 @@ serde_yaml = "0.9"
 # OTEL / observability
 prost = "0.14"
 prost-types = "0.14"
-arrow = { version = "57", features = ["json"] }
-parquet = { version = "57", features = ["async"] }
+arrow = { version = "58", features = ["json"] }
+parquet = { version = "58", features = ["async"] }
 
 # Object storage
 opendal = { version = "0.55", features = ["services-s3"] }
@@ -75,12 +75,12 @@ base64 = "0.22"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa"] }
 
 # SSH server
-russh = "0.49"
+russh = "0.56"
 russh-keys = "0.49"
 async-trait = "0.1"
 
 # GPG key parsing
-pgp = "~0.15"
+pgp = "~0.19"
 
 # WebAuthn (passkeys)
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
@@ -131,7 +131,7 @@ ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-compat"
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", features = ["full"] }
 proptest = "1"
-rstest = "0.25"
+rstest = "0.26"
 wiremock = "0.6"
 tempfile = "3"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
