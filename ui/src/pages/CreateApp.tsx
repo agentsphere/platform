@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { api } from '../lib/api';
-import { createWs, ReconnectingWebSocket } from '../lib/ws';
+import { createSse, type EventSourceClient } from '../lib/sse';
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'thinking';
@@ -27,7 +27,7 @@ export function CreateApp() {
   const [connected, setConnected] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const messagesEnd = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<ReconnectingWebSocket | null>(null);
+  const sseRef = useRef<EventSourceClient | null>(null);
   // Accumulate streaming text into the last assistant message
   const streamBuf = useRef('');
 
@@ -36,18 +36,18 @@ export function CreateApp() {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Cleanup WebSocket on unmount
+  // Cleanup SSE on unmount
   useEffect(() => {
-    return () => { wsRef.current?.close(); };
+    return () => { sseRef.current?.close(); };
   }, []);
 
-  function connectWs(sessionId: string) {
-    const ws = createWs({
-      url: `/api/sessions/${sessionId}/ws`,
+  function connectSse(sessionId: string) {
+    const sse = createSse({
+      url: `/api/sessions/${sessionId}/events`,
       onOpen() {
         setConnected(true);
       },
-      onClose() {
+      onError() {
         setConnected(false);
         setStreaming(false);
       },
@@ -109,10 +109,8 @@ export function CreateApp() {
             break;
         }
       },
-      reconnect: true,
-      maxRetries: 5,
     });
-    wsRef.current = ws;
+    sseRef.current = sse;
   }
 
   async function handleSubmit(e: Event) {
@@ -134,8 +132,8 @@ export function CreateApp() {
         setSession(resp);
         setStreaming(true);
         streamBuf.current = '';
-        // Connect WebSocket to receive streaming response
-        connectWs(resp.id);
+        // Connect SSE to receive streaming response
+        connectSse(resp.id);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Failed to create session';
         setMessages(prev => [...prev, { role: 'system', content: `Error: ${msg}` }]);
@@ -143,20 +141,15 @@ export function CreateApp() {
         setLoading(false);
       }
     } else {
-      // Follow-up message — send via WebSocket
+      // Follow-up message — send via REST
       setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
       streamBuf.current = '';
       setStreaming(true);
-      if (wsRef.current) {
-        wsRef.current.send(JSON.stringify({ content: userMsg }));
-      } else {
-        // Fallback to REST
-        try {
-          await api.post(`/api/sessions/${session.id}/message`, { content: userMsg });
-        } catch {
-          setMessages(prev => [...prev, { role: 'system', content: 'Failed to send message' }]);
-          setStreaming(false);
-        }
+      try {
+        await api.post(`/api/sessions/${session.id}/message`, { content: userMsg });
+      } catch {
+        setMessages(prev => [...prev, { role: 'system', content: 'Failed to send message' }]);
+        setStreaming(false);
       }
     }
   }

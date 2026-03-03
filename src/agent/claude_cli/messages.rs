@@ -83,6 +83,9 @@ pub struct ResultMessage {
     pub num_turns: Option<u32>,
     #[serde(default)]
     pub usage: Option<UsageInfo>,
+    /// Structured output when `--json-schema` was used.
+    #[serde(default)]
+    pub structured_output: Option<serde_json::Value>,
 }
 
 /// Token usage information.
@@ -314,6 +317,34 @@ mod tests {
     #[test]
     fn parse_cli_message_invalid_json() {
         assert!(parse_cli_message("not json").is_err());
+    }
+
+    #[test]
+    fn result_with_structured_output() {
+        let json = r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"text","structured_output":{"text":"Hello","tools":[]}}"#;
+        let msg: CliMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            CliMessage::Result(r) => {
+                assert_eq!(r.subtype, "success");
+                let so = r.structured_output.unwrap();
+                assert_eq!(so["text"], "Hello");
+                assert!(so["tools"].as_array().unwrap().is_empty());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn result_without_structured_output() {
+        let json = r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"plain text"}"#;
+        let msg: CliMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            CliMessage::Result(r) => {
+                assert!(r.structured_output.is_none());
+                assert_eq!(r.result.as_deref(), Some("plain text"));
+            }
+            _ => panic!("expected Result"),
+        }
     }
 
     #[test]

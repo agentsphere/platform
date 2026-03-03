@@ -3,7 +3,7 @@ import { api, qs, type ListResponse } from '../../lib/api';
 import type { LogEntry, Project } from '../../lib/types';
 import { FilterBar, type FilterDef } from '../../components/FilterBar';
 import { Pagination } from '../../components/Pagination';
-import { createWs, type ReconnectingWebSocket } from '../../lib/ws';
+import { createSse, type EventSourceClient } from '../../lib/sse';
 
 const TIME_RANGES = [
   { value: '1h', label: 'Last 1 hour' },
@@ -38,7 +38,7 @@ export function Logs() {
   const [liveTail, setLiveTail] = useState(false);
   const [loading, setLoading] = useState(false);
   const [projects, setProjects] = useState<{ value: string; label: string }[]>([{ value: '', label: 'All projects' }]);
-  const wsRef = useRef<ReconnectingWebSocket | null>(null);
+  const sseRef = useRef<EventSourceClient | null>(null);
 
   // Load projects for filter dropdown
   useEffect(() => {
@@ -78,17 +78,18 @@ export function Logs() {
 
   useEffect(() => {
     if (liveTail) {
-      const ws = createWs({
+      const sse = createSse({
         url: '/api/observe/logs/tail',
+        event: 'log',
         onMessage: (entry: LogEntry) => {
           setLogs(prev => [entry, ...prev].slice(0, 200));
         },
       });
-      wsRef.current = ws;
-      return () => ws.close();
-    } else if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+      sseRef.current = sse;
+      return () => sse.close();
+    } else if (sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
     }
   }, [liveTail]);
 

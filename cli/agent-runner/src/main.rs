@@ -2,6 +2,7 @@
 mod control;
 #[allow(dead_code)] // Copied from platform crate — not all paths used in standalone binary
 mod error;
+mod mcp;
 mod messages;
 mod pubsub;
 mod render;
@@ -94,6 +95,10 @@ struct Cli {
     /// Additional KEY=VALUE env vars to pass to the CLI (repeatable)
     #[arg(long = "extra-env")]
     extra_env: Vec<String>,
+
+    /// Disable MCP server integration even when PLATFORM_API_TOKEN is set.
+    #[arg(long)]
+    no_mcp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +240,26 @@ async fn main() -> anyhow::Result<()> {
         trimmed
     };
 
-    // 7. Build spawn options
+    // 7. Generate MCP config (if platform vars available and not disabled)
+    let mcp_config_path = if !cli.no_mcp {
+        if let Some(mcp_config) = mcp::resolve_mcp_config() {
+            let mcp_dir = config_dir
+                .as_ref()
+                .map(|d| d.path().to_path_buf())
+                .unwrap_or_else(|| std::env::temp_dir());
+            let path = mcp::write_mcp_config(&mcp_dir, &mcp_config)
+                .context("failed to write MCP config")?;
+            eprintln!("[info] MCP config written to {}", path.display());
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        eprintln!("[info] MCP disabled via --no-mcp");
+        None
+    };
+
+    // 8. Build spawn options
     let allowed_tools = cli
         .allowed_tools
         .map(|s| s.split(',').map(|t| t.trim().to_owned()).collect());
@@ -261,13 +285,14 @@ async fn main() -> anyhow::Result<()> {
         anthropic_api_key,
         extra_env,
         isolate_env: is_pod_mode,
+        mcp_config: mcp_config_path,
         ..Default::default()
     };
 
-    // 8. Spawn CLI subprocess
+    // 9. Spawn CLI subprocess
     let transport = SubprocessTransport::spawn(opts).context("failed to spawn Claude CLI")?;
 
-    // 9. Run REPL (initial prompt sent inside so response-reading picks it up)
+    // 10. Run REPL (initial prompt sent inside so response-reading picks it up)
     repl::run(transport, pubsub, initial_prompt).await?;
 
     // config_dir is dropped here (auto-cleanup)
@@ -533,6 +558,18 @@ mod tests {
     fn parse_cwd() {
         let cli = Cli::try_parse_from(["agent-runner", "--cwd", "/tmp"]).unwrap();
         assert_eq!(cli.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn parse_no_mcp_flag() {
+        let cli = Cli::try_parse_from(["agent-runner", "--no-mcp"]).unwrap();
+        assert!(cli.no_mcp);
+    }
+
+    #[test]
+    fn no_mcp_flag_default_false() {
+        let cli = Cli::try_parse_from(["agent-runner"]).unwrap();
+        assert!(!cli.no_mcp);
     }
 
     // -- Extra env tests --

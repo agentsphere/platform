@@ -1058,6 +1058,8 @@ The create-session endpoint accepts commands:
 
 ## PR 6: Client Binary (`platform-cli`)
 
+> **Superseded**: platform-cli deleted in Plan 38. Agent communication uses Valkey pub/sub via agent-runner instead.
+
 Standalone Rust binary that connects to the platform via WebSocket for remote session interaction.
 
 - [ ] Types & errors defined

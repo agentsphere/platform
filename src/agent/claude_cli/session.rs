@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::error::CliError;
 use super::messages::CliMessage;
-use super::transport::SubprocessTransport;
 use crate::agent::provider::{ProgressEvent, ProgressKind};
 
 // ---------------------------------------------------------------------------
@@ -28,12 +28,29 @@ pub enum SessionMode {
 // ---------------------------------------------------------------------------
 
 /// Internal state for an active CLI subprocess session.
+///
+/// Progress events are published via Valkey pub/sub (not broadcast channel).
+/// `pending_messages` queues user messages received while the tool loop is busy.
+#[derive(Debug)]
 pub struct CliSessionHandle {
-    pub transport: Arc<Mutex<SubprocessTransport>>,
-    pub tx: broadcast::Sender<ProgressEvent>,
     pub mode: SessionMode,
     pub session_id: Uuid,
     pub cli_session_id: Mutex<Option<String>>,
+    /// Cancellation flag — checked between tool rounds in the create-app loop.
+    pub cancelled: AtomicBool,
+    /// Queued user messages — drained between tool rounds or after tool loop finishes.
+    pub pending_messages: Mutex<Vec<String>>,
+    /// Whether the tool loop is currently running (prevents concurrent invocations).
+    pub busy: AtomicBool,
+    /// User who owns this session (for tool execution context).
+    pub user_id: Uuid,
+}
+
+impl CliSessionHandle {
+    /// Check whether the tool loop is currently running.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,9 +76,9 @@ impl CliSessionManager {
     pub async fn register(
         &self,
         session_id: Uuid,
-        transport: SubprocessTransport,
+        user_id: Uuid,
         mode: SessionMode,
-    ) -> Result<broadcast::Receiver<ProgressEvent>, CliError> {
+    ) -> Result<Arc<CliSessionHandle>, CliError> {
         let mut sessions = self.sessions.write().await;
         if sessions.len() >= self.max_concurrent {
             return Err(CliError::SessionError(format!(
@@ -70,29 +87,18 @@ impl CliSessionManager {
             )));
         }
 
-        let (tx, rx) = broadcast::channel(256);
         let handle = Arc::new(CliSessionHandle {
-            transport: Arc::new(Mutex::new(transport)),
-            tx,
             mode,
             session_id,
             cli_session_id: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            pending_messages: Mutex::new(Vec::new()),
+            busy: AtomicBool::new(false),
+            user_id,
         });
 
-        sessions.insert(session_id, handle);
-        Ok(rx)
-    }
-
-    /// Subscribe to progress events for an active session.
-    pub async fn subscribe(
-        &self,
-        session_id: Uuid,
-    ) -> Result<broadcast::Receiver<ProgressEvent>, CliError> {
-        let sessions = self.sessions.read().await;
-        let handle = sessions
-            .get(&session_id)
-            .ok_or_else(|| CliError::SessionError("CLI session not found".into()))?;
-        Ok(handle.tx.subscribe())
+        sessions.insert(session_id, handle.clone());
+        Ok(handle)
     }
 
     /// Get a reference to the session handle.
@@ -271,31 +277,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_unknown_session_returns_error() {
+    async fn register_and_get_session() {
         let mgr = CliSessionManager::new(10);
-        let result = mgr.subscribe(Uuid::new_v4()).await;
-        assert!(result.is_err());
+        let sid = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+        let handle = mgr
+            .register(sid, uid, SessionMode::Persistent)
+            .await
+            .unwrap();
+        assert_eq!(handle.session_id, sid);
+        assert_eq!(handle.user_id, uid);
+        assert!(!handle.is_busy());
+
+        let got = mgr.get(sid).await.unwrap();
+        assert_eq!(got.session_id, sid);
     }
 
     #[tokio::test]
     async fn remove_session_decrements_count() {
         let mgr = CliSessionManager::new(10);
         let sid = Uuid::new_v4();
-
-        // We need a real transport, but for testing we can construct one
-        // using the spawn_cat helper. Instead, test the manager's map directly.
-        // Register a mock by inserting directly.
-        {
-            let (tx, _rx) = broadcast::channel(16);
-            let handle = Arc::new(CliSessionHandle {
-                transport: Arc::new(Mutex::new(spawn_dummy_transport().await)),
-                tx,
-                mode: SessionMode::OneShot,
-                session_id: sid,
-                cli_session_id: Mutex::new(None),
-            });
-            mgr.sessions.write().await.insert(sid, handle);
-        }
+        mgr.register(sid, Uuid::new_v4(), SessionMode::OneShot)
+            .await
+            .unwrap();
 
         assert_eq!(mgr.active_count().await, 1);
         mgr.remove(sid).await;
@@ -306,29 +310,64 @@ mod tests {
     async fn concurrent_limit_enforced() {
         let mgr = CliSessionManager::new(2);
 
-        // Register 2 sessions (at limit)
-        for _ in 0..2 {
-            let (tx, _rx) = broadcast::channel(16);
-            let handle = Arc::new(CliSessionHandle {
-                transport: Arc::new(Mutex::new(spawn_dummy_transport().await)),
-                tx,
-                mode: SessionMode::OneShot,
-                session_id: Uuid::new_v4(),
-                cli_session_id: Mutex::new(None),
-            });
-            mgr.sessions.write().await.insert(handle.session_id, handle);
-        }
+        mgr.register(Uuid::new_v4(), Uuid::new_v4(), SessionMode::OneShot)
+            .await
+            .unwrap();
+        mgr.register(Uuid::new_v4(), Uuid::new_v4(), SessionMode::OneShot)
+            .await
+            .unwrap();
 
         // 3rd should fail
         let result = mgr
-            .register(
-                Uuid::new_v4(),
-                spawn_dummy_transport().await,
-                SessionMode::OneShot,
-            )
+            .register(Uuid::new_v4(), Uuid::new_v4(), SessionMode::OneShot)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("limit reached"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_flag_works() {
+        let mgr = CliSessionManager::new(10);
+        let sid = Uuid::new_v4();
+        let handle = mgr
+            .register(sid, Uuid::new_v4(), SessionMode::Persistent)
+            .await
+            .unwrap();
+
+        assert!(!handle.cancelled.load(Ordering::Relaxed));
+        handle.cancelled.store(true, Ordering::Relaxed);
+        assert!(handle.cancelled.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn pending_messages_queue() {
+        let mgr = CliSessionManager::new(10);
+        let sid = Uuid::new_v4();
+        let handle = mgr
+            .register(sid, Uuid::new_v4(), SessionMode::Persistent)
+            .await
+            .unwrap();
+
+        handle.pending_messages.lock().await.push("msg1".into());
+        handle.pending_messages.lock().await.push("msg2".into());
+
+        let drained: Vec<String> = handle.pending_messages.lock().await.drain(..).collect();
+        assert_eq!(drained, vec!["msg1", "msg2"]);
+        assert!(handle.pending_messages.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn busy_flag_works() {
+        let mgr = CliSessionManager::new(10);
+        let sid = Uuid::new_v4();
+        let handle = mgr
+            .register(sid, Uuid::new_v4(), SessionMode::Persistent)
+            .await
+            .unwrap();
+
+        assert!(!handle.is_busy());
+        handle.busy.store(true, Ordering::Relaxed);
+        assert!(handle.is_busy());
     }
 
     // -- cli_message_to_progress tests --
@@ -407,6 +446,7 @@ mod tests {
             duration_ms: Some(1234),
             num_turns: Some(3),
             usage: None,
+            structured_output: None,
         });
         let event = cli_message_to_progress(&msg).unwrap();
         assert_eq!(event.kind, ProgressKind::Completed);
@@ -424,35 +464,10 @@ mod tests {
             duration_ms: None,
             num_turns: None,
             usage: None,
+            structured_output: None,
         });
         let event = cli_message_to_progress(&msg).unwrap();
         assert_eq!(event.kind, ProgressKind::Error);
         assert!(event.message.contains("Rate limit"));
-    }
-
-    /// Helper: create a dummy SubprocessTransport for manager tests.
-    async fn spawn_dummy_transport() -> SubprocessTransport {
-        use std::process::Stdio;
-        use tokio::io::{BufReader, BufWriter};
-
-        let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "exec cat"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cat");
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-
-        SubprocessTransport {
-            child,
-            stdin: tokio::sync::Mutex::new(BufWriter::new(stdin)),
-            stdout: tokio::sync::Mutex::new(BufReader::new(stdout)),
-            stderr_task: None,
-            session_id: tokio::sync::Mutex::new(None),
-            alive: std::sync::atomic::AtomicBool::new(true),
-        }
     }
 }

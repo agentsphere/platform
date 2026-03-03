@@ -65,6 +65,9 @@ test-integration:
 test-e2e:
     bash {{test_script}} --type e2e
 
+test-llm:
+    cargo nextest run --test llm_create_app --run-ignored ignored-only
+
 test-mcp:
     cd mcp && npm test
 

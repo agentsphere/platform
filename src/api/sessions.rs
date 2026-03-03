@@ -1,11 +1,13 @@
-use axum::extract::ws;
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use ts_rs::TS;
@@ -132,8 +134,8 @@ pub fn router() -> Router<AppState> {
             get(list_children),
         )
         .route(
-            "/api/projects/{id}/sessions/{session_id}/ws",
-            get(ws_handler),
+            "/api/projects/{id}/sessions/{session_id}/events",
+            get(sse_session_events),
         )
         // Global (project-less) endpoints
         .route("/api/create-app", axum::routing::post(create_app))
@@ -145,7 +147,10 @@ pub fn router() -> Router<AppState> {
             "/api/sessions/{session_id}/message",
             axum::routing::post(send_message_global),
         )
-        .route("/api/sessions/{session_id}/ws", get(ws_handler_global))
+        .route(
+            "/api/sessions/{session_id}/events",
+            get(sse_session_events_global),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -874,16 +879,15 @@ fn session_to_response(
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket
+// SSE (Server-Sent Events)
 // ---------------------------------------------------------------------------
 
-/// WebSocket handler: streams agent output in real-time.
-/// Auth is validated during the HTTP upgrade via the `AuthUser` extractor.
-async fn ws_handler(
+/// SSE handler: streams agent output in real-time via Valkey pub/sub.
+/// Auth is validated via the `AuthUser` extractor (cookies sent by `EventSource`).
+async fn sse_session_events(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((id, session_id)): Path<(Uuid, Uuid)>,
-    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
     require_project_read(&state, &auth, id).await?;
 
@@ -895,152 +899,23 @@ async fn ws_handler(
         return Err(ApiError::NotFound("session".into()));
     }
 
-    let provider_name = session.provider.clone();
+    let rx = crate::agent::pubsub_bridge::subscribe_session_events(&state.valkey, session_id)
+        .await
+        .map_err(ApiError::Internal)?;
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(state, session_id, provider_name, socket)))
-}
+    let stream = ReceiverStream::new(rx).map(|event| {
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(json))
+    });
 
-async fn handle_ws(
-    state: AppState,
-    session_id: Uuid,
-    provider_name: String,
-    mut socket: ws::WebSocket,
-) {
-    // First, try the in-process broadcast channel (for sessions created via create-app).
-    if let Some(rx) = crate::agent::inprocess::subscribe(&state, session_id) {
-        stream_broadcast_to_ws(&state, session_id, rx, &mut socket, "in-process").await;
-        return;
-    }
-
-    // Try CLI subprocess broadcast channel.
-    if let Ok(rx) = state.cli_sessions.subscribe(session_id).await {
-        stream_broadcast_to_ws(&state, session_id, rx, &mut socket, "cli-subprocess").await;
-        return;
-    }
-
-    // Fall back to pod log streaming for pod-based sessions.
-    stream_pod_logs_to_ws(&state, session_id, &provider_name, &mut socket).await;
-}
-
-/// Stream events from a broadcast channel to a WebSocket client.
-/// Used for both in-process and CLI subprocess sessions.
-async fn stream_broadcast_to_ws(
-    state: &AppState,
-    session_id: Uuid,
-    mut rx: tokio::sync::broadcast::Receiver<crate::agent::provider::ProgressEvent>,
-    socket: &mut ws::WebSocket,
-    label: &str,
-) {
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        let json = serde_json::to_string(&event).unwrap_or_default();
-                        if socket.send(ws::Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(%session_id, lagged = n, %label, "ws subscriber lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(ws::Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<SendMessageRequest>(&text) {
-                            let _ = service::send_message(state, session_id, &cmd.content).await;
-                        }
-                    }
-                    Some(Ok(ws::Message::Close(_))) | None => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-    tracing::info!(%session_id, %label, "websocket connection closed");
-}
-
-/// Stream pod logs to a WebSocket client.
-async fn stream_pod_logs_to_ws(
-    state: &AppState,
-    session_id: Uuid,
-    provider_name: &str,
-    socket: &mut ws::WebSocket,
-) {
-    let Ok(provider) = service::get_provider(provider_name) else {
-        return;
-    };
-
-    let mut lines = match service::get_log_lines(state, session_id).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, %session_id, "failed to get log stream for ws");
-            let _ = socket
-                .send(ws::Message::Text(
-                    serde_json::json!({"kind":"error","message":"failed to connect to agent"})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            return;
-        }
-    };
-
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Some(event) = provider.parse_progress(&line) {
-                            let _ = sqlx::query!(
-                                r#"INSERT INTO agent_messages (session_id, role, content, metadata)
-                                   VALUES ($1, 'assistant', $2, $3)"#,
-                                session_id,
-                                &event.message,
-                                event.metadata,
-                            )
-                            .execute(&state.pool)
-                            .await;
-
-                            let json = serde_json::to_string(&event).unwrap_or_default();
-                            if socket.send(ws::Message::Text(json.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(error = %e, %session_id, "log stream error");
-                        break;
-                    }
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(ws::Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<SendMessageRequest>(&text) {
-                            let _ = service::send_message(state, session_id, &cmd.content).await;
-                        }
-                    }
-                    Some(Ok(ws::Message::Close(_))) | None => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-    tracing::info!(%session_id, "websocket connection closed");
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 // ---------------------------------------------------------------------------
-// Global (project-less) message + WebSocket handlers
+// Global (project-less) message + SSE handlers
 // ---------------------------------------------------------------------------
 
-/// Send a message to a global (project-less) in-process session.
+/// Send a message to a global (project-less) session.
 async fn send_message_global(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -1065,12 +940,11 @@ async fn send_message_global(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-/// WebSocket handler for global (project-less) in-process sessions.
-async fn ws_handler_global(
+/// SSE handler for global (project-less) sessions.
+async fn sse_session_events_global(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(session_id): Path<Uuid>,
-    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
     let session = service::fetch_session(&state.pool, session_id)
         .await
@@ -1081,60 +955,16 @@ async fn ws_handler_global(
         return Err(ApiError::Forbidden);
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_ws_global(state, session_id, socket)))
-}
+    let rx = crate::agent::pubsub_bridge::subscribe_session_events(&state.valkey, session_id)
+        .await
+        .map_err(ApiError::Internal)?;
 
-async fn handle_ws_global(state: AppState, session_id: Uuid, mut socket: ws::WebSocket) {
-    // Subscribe to the in-process session's broadcast channel
-    let Some(mut rx) = crate::agent::inprocess::subscribe(&state, session_id) else {
-        // Session not found in in-process map — may have already completed.
-        let _ = socket
-            .send(ws::Message::Text(
-                serde_json::json!({"kind":"error","message":"session not active"})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
-    };
+    let stream = ReceiverStream::new(rx).map(|event| {
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(json))
+    });
 
-    loop {
-        tokio::select! {
-            // Receive progress events from the in-process agent
-            event = rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        let json = serde_json::to_string(&event).unwrap_or_default();
-                        if socket.send(ws::Message::Text(json.into())).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(%session_id, lagged = n, "ws subscriber lagged");
-                        // Continue receiving — we'll just miss some events
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Session ended — send completion and close
-                        break;
-                    }
-                }
-            }
-            // Receive messages from the WebSocket client
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(ws::Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<SendMessageRequest>(&text) {
-                            let _ = service::send_message(&state, session_id, &cmd.content).await;
-                        }
-                    }
-                    Some(Ok(ws::Message::Close(_))) | None => break,
-                    _ => {} // Ignore pings, binary, etc.
-                }
-            }
-        }
-    }
-
-    tracing::info!(%session_id, "global websocket connection closed");
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[cfg(test)]
@@ -1304,6 +1134,7 @@ mod tests {
             spawn_depth: 0,
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         };
 
         let response = session_to_response(&session, false);
@@ -1333,6 +1164,7 @@ mod tests {
             spawn_depth: 0,
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         };
 
         let response = session_to_response(&session, true);
@@ -1362,6 +1194,7 @@ mod tests {
             spawn_depth: 0,
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         };
 
         let response = session_to_response(&session, false);
@@ -1388,6 +1221,7 @@ mod tests {
             spawn_depth: 0,
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         };
 
         let response = session_to_response(&session, false);

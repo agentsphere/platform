@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status,\n               branch, pod_name, provider, provider_config,\n               cost_tokens, created_at, finished_at,\n               parent_session_id, spawn_depth, allowed_child_roles,\n               execution_mode\n        FROM agent_sessions WHERE id = $1\n        ",
+  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status,\n               branch, pod_name, provider, provider_config,\n               cost_tokens, created_at, finished_at,\n               parent_session_id, spawn_depth, allowed_child_roles,\n               execution_mode, uses_pubsub\n        FROM agent_sessions WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,11 @@
         "ordinal": 16,
         "name": "execution_mode",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "uses_pubsub",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -111,8 +116,9 @@
       true,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "77fd2f82958ba71b78ee0ad6153fe52e72e4dde592e2e13f0124b28c59595a98"
+  "hash": "e40a59888357fa182667326bf09b7ccb9fb6fd0a98464ca715cd0cc480fc3b52"
 }

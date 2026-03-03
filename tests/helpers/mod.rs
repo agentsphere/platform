@@ -106,6 +106,7 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         ssh_listen: None,
         ssh_host_key_path: "/tmp/test_ssh_host_key".into(),
         max_cli_subprocesses: 10,
+        valkey_agent_host: "localhost:6379".into(),
     };
 
     // Build WebAuthn
@@ -120,7 +121,6 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         webauthn: Arc::new(webauthn),
         pipeline_notify: Arc::new(tokio::sync::Notify::new()),
         deploy_notify: Arc::new(tokio::sync::Notify::new()),
-        inprocess_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         cli_sessions: platform::agent::claude_cli::CliSessionManager::new(
             config.max_cli_subprocesses,

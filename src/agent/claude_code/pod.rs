@@ -43,6 +43,8 @@ pub struct PodBuildParams<'a> {
     pub registry_url: Option<&'a str>,
     /// K8s Secret name for `imagePullSecrets` (registry auth for image pulls).
     pub registry_secret_name: Option<&'a str>,
+    /// Valkey URL with per-session ACL credentials for pub/sub.
+    pub valkey_url: Option<&'a str>,
 }
 
 /// Resolves the container image for an agent pod.
@@ -95,7 +97,7 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         labels.insert("platform.io/project".into(), pid.to_string());
     }
 
-    let claude_args = build_claude_args(params, &branch);
+    let agent_runner_args = build_agent_runner_args(params);
     let env_vars = build_env_vars(params, session_id, &branch);
     let init_containers = build_init_containers(params, &branch);
     let resolved_image = resolve_image(
@@ -104,7 +106,8 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
         params.registry_url,
     );
     let pull_policy = image_pull_policy(&resolved_image);
-    let main_container = build_main_container(claude_args, env_vars, &resolved_image, &pull_policy);
+    let main_container =
+        build_main_container(agent_runner_args, env_vars, &resolved_image, &pull_policy);
 
     let mut containers = vec![main_container];
     let mut volumes = vec![Volume {
@@ -159,13 +162,14 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
     }
 }
 
-fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> {
+fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
     let mut args = vec![
-        "--print".to_owned(),
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-        "--verbose".to_owned(),
-        "--dangerously-skip-permissions".to_owned(),
+        "--prompt".to_owned(),
+        params.session.prompt.clone(),
+        "--cwd".to_owned(),
+        "/workspace".to_owned(),
+        "--permission-mode".to_owned(),
+        "bypassPermissions".to_owned(),
     ];
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
@@ -175,7 +179,6 @@ fn build_claude_args(params: &PodBuildParams<'_>, _branch: &str) -> Vec<String> 
         args.push("--max-turns".to_owned());
         args.push(max_turns.to_string());
     }
-    args.push(params.session.prompt.clone());
     args
 }
 
@@ -188,6 +191,7 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CONFIG_DIR",
+    "VALKEY_URL",
     "BRANCH",
     "AGENT_ROLE",
     "PROJECT_ID",
@@ -225,6 +229,9 @@ fn build_env_vars(
         vars.push(env_var("CLAUDE_CODE_OAUTH_TOKEN", oauth_token));
     } else if let Some(api_key) = params.anthropic_api_key {
         vars.push(env_var("ANTHROPIC_API_KEY", api_key));
+    }
+    if let Some(valkey_url) = params.valkey_url {
+        vars.push(env_var("VALKEY_URL", valkey_url));
     }
     if let Some(pid) = params.session.project_id {
         vars.push(env_var("PROJECT_ID", &pid.to_string()));
@@ -337,7 +344,7 @@ fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str
 }
 
 fn build_main_container(
-    claude_args: Vec<String>,
+    agent_runner_args: Vec<String>,
     env_vars: Vec<EnvVar>,
     image: &str,
     pull_policy: &str,
@@ -346,7 +353,8 @@ fn build_main_container(
         name: "claude".into(),
         image: Some(image.to_owned()),
         image_pull_policy: Some(pull_policy.to_owned()),
-        args: Some(claude_args),
+        command: Some(vec!["agent-runner".to_owned()]),
+        args: Some(agent_runner_args),
         stdin: Some(false),
         tty: Some(false),
         working_dir: Some("/workspace".into()),
@@ -453,6 +461,7 @@ mod tests {
             spawn_depth: 0,
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
+            uses_pubsub: false,
         }
     }
 
@@ -472,6 +481,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         assert_eq!(pod.metadata.name.as_deref(), Some("agent-12345678"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("platform-agents"));
@@ -493,6 +503,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["platform.io/component"], "agent-session");
@@ -519,6 +530,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let claude_container = &spec.containers[0];
@@ -543,6 +555,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -569,6 +582,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -594,6 +608,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -633,6 +648,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -661,6 +677,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -688,6 +705,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -713,6 +731,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -760,6 +779,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -787,6 +807,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -825,6 +846,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let resources = spec.containers[0].resources.as_ref().unwrap();
@@ -849,6 +871,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -941,6 +964,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -964,6 +988,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -991,6 +1016,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1021,6 +1047,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1043,6 +1070,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1078,6 +1106,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 2, "should have claude + browser");
@@ -1101,6 +1130,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 1, "should have only claude");
@@ -1123,6 +1153,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1153,6 +1184,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1176,6 +1208,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1207,6 +1240,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1237,6 +1271,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1263,6 +1298,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1291,6 +1327,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let psc = spec.security_context.unwrap();
@@ -1316,6 +1353,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let container = &spec.containers[0];
@@ -1342,6 +1380,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1373,6 +1412,7 @@ mod tests {
             extra_env_vars: &secrets,
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1401,6 +1441,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod_without.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1433,6 +1474,7 @@ mod tests {
             extra_env_vars: &secrets,
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1475,6 +1517,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: Some("host.docker.internal:8080"),
             registry_secret_name: Some("regpull-12345678"),
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let secrets = spec.image_pull_secrets.unwrap();
@@ -1498,6 +1541,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         assert!(
@@ -1524,6 +1568,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1550,6 +1595,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1575,6 +1621,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1621,6 +1668,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1653,6 +1701,7 @@ mod tests {
             extra_env_vars: &[],
             registry_url: None,
             registry_secret_name: None,
+            valkey_url: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();

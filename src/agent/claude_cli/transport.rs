@@ -59,6 +59,15 @@ pub struct CliSpawnOptions {
     pub anthropic_api_key: Option<String>,
     /// Additional environment variables to pass to the subprocess.
     pub extra_env: Vec<(String, String)>,
+    /// `-p <text>` — one-shot prompt mode. When set, `--input-format stream-json`
+    /// is omitted from args (stdin is not used in `-p` mode).
+    pub prompt: Option<String>,
+    /// `--session-id <id>` — set CLI session ID (first invocation).
+    pub initial_session_id: Option<String>,
+    /// `--json-schema <json>` — force structured output.
+    pub json_schema: Option<String>,
+    /// `--tools ""` — disable all built-in tools.
+    pub disable_tools: bool,
 }
 
 impl SubprocessTransport {
@@ -296,13 +305,17 @@ fn find_claude_cli(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
 
 /// Build CLI arguments from spawn options.
 pub(crate) fn build_args(opts: &CliSpawnOptions) -> Vec<String> {
-    let mut args = vec![
-        "--input-format".to_owned(),
-        "stream-json".to_owned(),
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-        "--verbose".to_owned(),
-    ];
+    let mut args = Vec::new();
+
+    // When using -p mode, skip --input-format stream-json (stdin not used)
+    if opts.prompt.is_none() {
+        args.push("--input-format".to_owned());
+        args.push("stream-json".to_owned());
+    }
+
+    args.push("--output-format".to_owned());
+    args.push("stream-json".to_owned());
+    args.push("--verbose".to_owned());
 
     if let Some(ref model) = opts.model {
         args.push("--model".to_owned());
@@ -346,6 +359,26 @@ pub(crate) fn build_args(opts: &CliSpawnOptions) -> Vec<String> {
 
     if opts.include_partial {
         args.push("--include-partial-messages".to_owned());
+    }
+
+    if opts.disable_tools {
+        args.push("--tools".to_owned());
+        args.push(String::new()); // --tools ""
+    }
+
+    if let Some(ref schema) = opts.json_schema {
+        args.push("--json-schema".to_owned());
+        args.push(schema.clone());
+    }
+
+    if let Some(ref prompt) = opts.prompt {
+        args.push("-p".to_owned());
+        args.push(prompt.clone());
+    }
+
+    if let Some(ref sid) = opts.initial_session_id {
+        args.push("--session-id".to_owned());
+        args.push(sid.clone());
     }
 
     args
@@ -486,6 +519,58 @@ mod tests {
         let args = build_args(&opts);
         assert!(args.contains(&"--permission-mode".to_owned()));
         assert!(args.contains(&"bypassPermissions".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_prompt_skips_input_format() {
+        let opts = CliSpawnOptions {
+            prompt: Some("hello world".into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        // -p mode should NOT include --input-format stream-json
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--input-format" && w[1] == "stream-json")
+        );
+        assert!(args.contains(&"-p".to_owned()));
+        assert!(args.contains(&"hello world".to_owned()));
+        // --output-format stream-json is still present
+        assert!(args.contains(&"--output-format".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_initial_session_id() {
+        let opts = CliSpawnOptions {
+            initial_session_id: Some("my-session-123".into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        assert!(args.contains(&"--session-id".to_owned()));
+        assert!(args.contains(&"my-session-123".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_json_schema() {
+        let opts = CliSpawnOptions {
+            json_schema: Some(r#"{"type":"object"}"#.into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        assert!(args.contains(&"--json-schema".to_owned()));
+        assert!(args.contains(&r#"{"type":"object"}"#.to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_disable_tools() {
+        let opts = CliSpawnOptions {
+            disable_tools: true,
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        let idx = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[idx + 1], ""); // --tools ""
     }
 
     #[test]
