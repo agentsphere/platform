@@ -66,6 +66,10 @@ pub struct Config {
     pub registry_node_url: Option<String>,
     /// Directory containing OCI layout tarballs to seed into the registry on startup.
     pub seed_images_path: PathBuf,
+    /// Health check interval in seconds (default 15).
+    pub health_check_interval_secs: u64,
+    /// Minimum tracing level for platform self-observability (default "warn").
+    pub self_observe_level: String,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -152,6 +156,12 @@ impl Config {
             registry_node_url: env::var("PLATFORM_REGISTRY_NODE_URL").ok(),
             seed_images_path: env::var("PLATFORM_SEED_IMAGES_PATH")
                 .map_or_else(|_| PathBuf::from("/data/seed-images"), PathBuf::from),
+            health_check_interval_secs: env::var("PLATFORM_HEALTH_CHECK_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+            self_observe_level: env::var("PLATFORM_SELF_OBSERVE_LEVEL")
+                .unwrap_or_else(|_| "warn".into()),
         }
     }
 
@@ -220,6 +230,8 @@ impl Config {
             cli_spawn_enabled: true,
             registry_node_url: None,
             seed_images_path: "/tmp/seed-images".into(),
+            health_check_interval_secs: 15,
+            self_observe_level: "warn".into(),
         }
     }
 }

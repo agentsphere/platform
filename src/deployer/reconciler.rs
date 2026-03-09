@@ -20,6 +20,7 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
     tracing::info!("deployer reconciler started");
 
     let mut interval = tokio::time::interval(Duration::from_secs(10));
+    state.task_registry.register("deployer_reconciler", 15);
 
     loop {
         tokio::select! {
@@ -28,8 +29,12 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 break;
             }
             _ = interval.tick() => {
-                if let Err(e) = reconcile(&state).await {
-                    tracing::error!(error = %e, "error polling pending deployments");
+                match reconcile(&state).await {
+                    Ok(()) => state.task_registry.heartbeat("deployer_reconciler"),
+                    Err(e) => {
+                        state.task_registry.report_error("deployer_reconciler", &e.to_string());
+                        tracing::error!(error = %e, "error polling pending deployments");
+                    }
                 }
             }
             () = state.deploy_notify.notified() => {

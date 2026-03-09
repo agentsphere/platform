@@ -27,6 +27,8 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
+    state.task_registry.register("pipeline_executor", 10);
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -34,8 +36,12 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 break;
             }
             _ = interval.tick() => {
-                if let Err(e) = poll_pending(&state).await {
-                    tracing::error!(error = %e, "error polling pending pipelines");
+                match poll_pending(&state).await {
+                    Ok(()) => state.task_registry.heartbeat("pipeline_executor"),
+                    Err(e) => {
+                        state.task_registry.report_error("pipeline_executor", &e.to_string());
+                        tracing::error!(error = %e, "error polling pending pipelines");
+                    }
                 }
             }
             () = state.pipeline_notify.notified() => {

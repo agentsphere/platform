@@ -11,6 +11,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 mod audit;
 mod config;
 mod error;
+mod health;
 mod store;
 mod validation;
 
@@ -53,9 +54,18 @@ async fn main() -> anyhow::Result<()> {
     // Install rustls crypto provider before any TLS usage (kube, reqwest, lettre)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Platform self-observe: capture warn+ logs into the observe pipeline
+    let self_observe_level = observe::tracing_layer::parse_level(
+        &std::env::var("PLATFORM_SELF_OBSERVE_LEVEL").unwrap_or_else(|_| "warn".into()),
+    );
+    let (platform_logs_tx, platform_logs_rx) = observe::tracing_layer::create_channel();
+    let platform_log_layer =
+        observe::tracing_layer::PlatformLogLayer::new(platform_logs_tx, self_observe_level);
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_env("PLATFORM_LOG").unwrap_or_else(|_| "info".into()))
         .with(fmt::layer().json())
+        .with(platform_log_layer)
         .init();
 
     let mut cfg = config::Config::load();
@@ -133,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         deploy_notify: Arc::new(tokio::sync::Notify::new()),
         secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         cli_sessions: agent::claude_cli::CliSessionManager::new(cfg.max_cli_subprocesses),
+        health: Arc::new(std::sync::RwLock::new(health::HealthSnapshot::default())),
+        task_registry: Arc::new(health::TaskRegistry::new()),
     };
 
     // Set configurable permission cache TTL
@@ -161,9 +173,26 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, observe_channels) = spawn_background_tasks(&state, &pool);
 
+    // Bridge platform tracing logs into the observe pipeline
+    observe::tracing_layer::spawn_bridge(platform_logs_rx, observe_channels.logs_tx.clone());
+
     // Build router
+    let ready_state = state.clone();
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let s = ready_state.clone();
+                async move {
+                    if health::checks::is_ready(&s).await {
+                        (axum::http::StatusCode::OK, "ok")
+                    } else {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                    }
+                }
+            }),
+        )
         .merge(api::router())
         .merge(observe::router(observe_channels))
         // Git routes get a higher body limit (500 MB for push/LFS)
@@ -235,6 +264,7 @@ fn spawn_background_tasks(
         pool.clone(),
         state.secret_requests.clone(),
     ));
+    tokio::spawn(health::checks::run(state.clone(), shutdown_tx.subscribe()));
     (shutdown_tx, observe_channels)
 }
 

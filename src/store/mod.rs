@@ -9,6 +9,7 @@ use sqlx::PgPool;
 
 use crate::agent::claude_cli::CliSessionManager;
 use crate::config::Config;
+use crate::health::{HealthSnapshot, TaskRegistry};
 use crate::secrets::request::SecretRequests;
 
 #[derive(Clone)]
@@ -28,4 +29,8 @@ pub struct AppState {
     pub secret_requests: SecretRequests,
     /// CLI subprocess sessions running inside the platform pod.
     pub cli_sessions: CliSessionManager,
+    /// Cached health snapshot, updated by the background health loop.
+    pub health: Arc<std::sync::RwLock<HealthSnapshot>>,
+    /// In-memory heartbeat tracker for background tasks.
+    pub task_registry: Arc<TaskRegistry>,
 }

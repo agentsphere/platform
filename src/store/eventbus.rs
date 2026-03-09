@@ -100,6 +100,7 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
     }
 
     let mut message_rx = subscriber.message_rx();
+    state.task_registry.register("event_bus", 30);
 
     loop {
         tokio::select! {
@@ -111,6 +112,7 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
             msg = message_rx.recv() => {
                 match msg {
                     Ok(message) => {
+                        state.task_registry.heartbeat("event_bus");
                         let payload: String = match message.value.convert() {
                             Ok(s) => s,
                             Err(e) => {
@@ -126,6 +128,7 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                         });
                     }
                     Err(e) => {
+                        state.task_registry.report_error("event_bus", &e.to_string());
                         tracing::error!(error = %e, "event bus recv error");
                         // Reconnect pause
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

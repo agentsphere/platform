@@ -88,6 +88,8 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         cli_spawn_enabled: false,
         registry_node_url: None,
         seed_images_path: "/tmp/seed-images".into(),
+        health_check_interval_secs: 15,
+        self_observe_level: "warn".into(),
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");
@@ -105,6 +107,10 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
             std::collections::HashMap::new(),
         )),
         cli_sessions: platform::agent::claude_cli::CliSessionManager::new(10),
+        health: std::sync::Arc::new(std::sync::RwLock::new(
+            platform::health::HealthSnapshot::default(),
+        )),
+        task_registry: std::sync::Arc::new(platform::health::TaskRegistry::new()),
     };
 
     (state, setup_token)

@@ -193,6 +193,8 @@ pub async fn e2e_state_with_api_url(
         registry_node_url: std::env::var("PLATFORM_REGISTRY_NODE_URL").ok(),
         seed_images_path: std::env::var("PLATFORM_SEED_IMAGES_PATH")
             .map_or_else(|_| "/tmp/seed-images".into(), std::path::PathBuf::from),
+        health_check_interval_secs: 15,
+        self_observe_level: "warn".into(),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)
@@ -217,6 +219,10 @@ pub async fn e2e_state_with_api_url(
         cli_sessions: platform::agent::claude_cli::CliSessionManager::new(
             config.max_cli_subprocesses,
         ),
+        health: Arc::new(std::sync::RwLock::new(
+            platform::health::HealthSnapshot::default(),
+        )),
+        task_registry: Arc::new(platform::health::TaskRegistry::new()),
     };
 
     // Create an API token for the bootstrap admin directly in the DB,

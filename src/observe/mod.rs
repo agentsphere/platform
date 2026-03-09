@@ -6,6 +6,7 @@ pub mod parquet;
 pub mod proto;
 pub mod query;
 pub mod store;
+pub mod tracing_layer;
 
 use axum::Router;
 

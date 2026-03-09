@@ -22,14 +22,23 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
     tracing::info!("preview reconciler started");
 
     let mut interval = tokio::time::interval(Duration::from_secs(15));
+    state.task_registry.register("preview_reconciler", 20);
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let mut had_error = false;
                 if let Err(e) = reconcile(&state).await {
+                    state.task_registry.report_error("preview_reconciler", &e.to_string());
                     tracing::error!(error = %e, "preview reconciliation failed");
+                    had_error = true;
                 }
                 if let Err(e) = cleanup_expired(&state).await {
+                    state.task_registry.report_error("preview_reconciler", &e.to_string());
                     tracing::error!(error = %e, "preview cleanup failed");
+                    had_error = true;
+                }
+                if !had_error {
+                    state.task_registry.heartbeat("preview_reconciler");
                 }
             }
             _ = shutdown.changed() => {

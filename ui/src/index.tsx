@@ -21,6 +21,7 @@ import { Alerts } from './pages/observe/Alerts';
 import { Users } from './pages/admin/Users';
 import { Roles } from './pages/admin/Roles';
 import { Delegations } from './pages/admin/Delegations';
+import { Health } from './pages/admin/Health';
 import { Tokens } from './pages/admin/Tokens';
 import { ProviderKeys } from './pages/ProviderKeys';
 import { AccountSettings } from './pages/AccountSettings';
@@ -68,6 +69,7 @@ function AppRouter() {
           <Users path="/admin/users" />
           <Roles path="/admin/roles" />
           <Delegations path="/admin/delegations" />
+          <Health path="/admin/health" />
           <AccountSettings path="/settings/account" />
           <Tokens path="/settings/tokens" />
           <ProviderKeys path="/settings/provider-keys" />

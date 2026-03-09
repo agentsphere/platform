@@ -10,6 +10,7 @@ use crate::store::AppState;
 /// - Expired upload temp files in `MinIO`
 pub async fn run(state: AppState, mut shutdown: watch::Receiver<()>) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    state.task_registry.register("registry_gc", 7200);
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -17,8 +18,12 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<()>) {
                 break;
             }
             _ = interval.tick() => {
-                if let Err(e) = collect_garbage(&state).await {
-                    tracing::error!(error = %e, "registry GC failed");
+                match collect_garbage(&state).await {
+                    Ok(()) => state.task_registry.heartbeat("registry_gc"),
+                    Err(e) => {
+                        state.task_registry.report_error("registry_gc", &e.to_string());
+                        tracing::error!(error = %e, "registry GC failed");
+                    }
                 }
             }
         }

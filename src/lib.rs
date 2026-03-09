@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod store;
 pub mod validation;
 

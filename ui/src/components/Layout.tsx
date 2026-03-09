@@ -19,6 +19,7 @@ const ADMIN_NAV = [
   { href: '/admin/users', label: 'Users' },
   { href: '/admin/roles', label: 'Roles' },
   { href: '/admin/delegations', label: 'Delegations' },
+  { href: '/admin/health', label: 'Health' },
 ];
 
 const SETTINGS_NAV = [

@@ -424,6 +424,7 @@ pub async fn run_reaper_once(state: &AppState) {
 /// finalizes their sessions.
 pub async fn run_reaper(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) {
     tracing::info!("agent session reaper started");
+    state.task_registry.register("agent_reaper", 60);
 
     loop {
         tokio::select! {
@@ -432,8 +433,12 @@ pub async fn run_reaper(state: AppState, mut shutdown: tokio::sync::watch::Recei
                 break;
             }
             () = tokio::time::sleep(Duration::from_secs(30)) => {
-                if let Err(e) = reap_terminated_sessions(&state).await {
-                    tracing::error!(error = %e, "error reaping agent sessions");
+                match reap_terminated_sessions(&state).await {
+                    Ok(()) => state.task_registry.heartbeat("agent_reaper"),
+                    Err(e) => {
+                        state.task_registry.report_error("agent_reaper", &e.to_string());
+                        tracing::error!(error = %e, "error reaping agent sessions");
+                    }
                 }
             }
         }

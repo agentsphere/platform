@@ -18,6 +18,7 @@ use super::error::ObserveError;
 /// Background task: rotate old data to Parquet every 15 minutes.
 pub async fn rotation_loop(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) {
     tracing::info!("parquet rotation started");
+    state.task_registry.register("parquet_rotation", 1800);
 
     loop {
         tokio::select! {
@@ -26,14 +27,24 @@ pub async fn rotation_loop(state: AppState, mut shutdown: tokio::sync::watch::Re
                 break;
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(900)) => {
+                let mut had_error = false;
                 if let Err(e) = rotate_logs(&state).await {
+                    state.task_registry.report_error("parquet_rotation", &e.to_string());
                     tracing::error!(error = %e, "log rotation failed");
+                    had_error = true;
                 }
                 if let Err(e) = rotate_spans(&state).await {
+                    state.task_registry.report_error("parquet_rotation", &e.to_string());
                     tracing::error!(error = %e, "span rotation failed");
+                    had_error = true;
                 }
                 if let Err(e) = rotate_metrics(&state).await {
+                    state.task_registry.report_error("parquet_rotation", &e.to_string());
                     tracing::error!(error = %e, "metric rotation failed");
+                    had_error = true;
+                }
+                if !had_error {
+                    state.task_registry.heartbeat("parquet_rotation");
                 }
             }
         }

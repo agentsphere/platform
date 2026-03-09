@@ -151,6 +151,8 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         registry_node_url: std::env::var("PLATFORM_REGISTRY_NODE_URL").ok(),
         seed_images_path: std::env::var("PLATFORM_SEED_IMAGES_PATH")
             .map_or_else(|_| "/tmp/seed-images".into(), std::path::PathBuf::from),
+        health_check_interval_secs: 15,
+        self_observe_level: "warn".into(),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)
@@ -176,6 +178,10 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         cli_sessions: platform::agent::claude_cli::CliSessionManager::new(
             config.max_cli_subprocesses,
         ),
+        health: Arc::new(std::sync::RwLock::new(
+            platform::health::HealthSnapshot::default(),
+        )),
+        task_registry: Arc::new(platform::health::TaskRegistry::new()),
     };
 
     // Create an API token for the bootstrap admin directly in the DB,
@@ -204,8 +210,22 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
 /// Includes the main API router plus observe (query + alerts) and registry routers.
 /// The observe ingest routes (OTLP) are omitted since they require background channels.
 pub fn test_router(state: AppState) -> Router {
+    let ready_state = state.clone();
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let s = ready_state.clone();
+                async move {
+                    if platform::health::checks::is_ready(&s).await {
+                        (axum::http::StatusCode::OK, "ok")
+                    } else {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                    }
+                }
+            }),
+        )
         .merge(platform::api::router())
         .merge(platform::observe::query::router())
         .merge(platform::observe::alert::router())

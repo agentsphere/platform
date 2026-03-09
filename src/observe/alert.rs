@@ -653,6 +653,7 @@ pub struct AlertState {
 /// Background task that evaluates alert rules every 30 seconds.
 pub async fn evaluate_alerts_loop(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) {
     tracing::info!("alert evaluator started");
+    state.task_registry.register("alert_evaluator", 60);
     let mut alert_states: HashMap<Uuid, AlertState> = HashMap::new();
 
     loop {
@@ -662,8 +663,12 @@ pub async fn evaluate_alerts_loop(state: AppState, mut shutdown: tokio::sync::wa
                 break;
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                if let Err(e) = evaluate_all(&state, &mut alert_states).await {
-                    tracing::error!(error = %e, "alert evaluation cycle failed");
+                match evaluate_all(&state, &mut alert_states).await {
+                    Ok(()) => state.task_registry.heartbeat("alert_evaluator"),
+                    Err(e) => {
+                        state.task_registry.report_error("alert_evaluator", &e.to_string());
+                        tracing::error!(error = %e, "alert evaluation cycle failed");
+                    }
                 }
             }
         }
