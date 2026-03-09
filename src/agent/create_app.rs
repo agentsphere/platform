@@ -16,6 +16,10 @@ use crate::store::AppState;
 /// Maximum number of automatic tool rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 10;
 
+/// Delay before feeding `check_session_progress` results back to the LLM.
+/// Gives the worker pod time to make progress between polls.
+const POLL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Tool loop
 // ---------------------------------------------------------------------------
@@ -65,34 +69,20 @@ pub async fn run_create_app_loop(
             },
             oauth_token: oauth_token.clone(),
             anthropic_api_key: anthropic_api_key.clone(),
-            max_turns: Some(1),
+            max_turns: Some(10),
         };
 
         let (response, result_msg) = match cli_invoke::invoke_cli(params, &state.valkey).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, %session_id, "CLI invocation failed");
-                let _ = pubsub_bridge::publish_event(
-                    &state.valkey,
-                    session_id,
-                    &ProgressEvent {
-                        kind: ProgressKind::Error,
-                        message: format!("CLI invocation failed: {e}"),
-                        metadata: None,
-                    },
-                )
-                .await;
+                publish_cli_error(&state.valkey, session_id, &e).await;
                 break;
             }
         };
 
-        // Update cost tracking
+        // Update cost tracking + store CLI session ID for resume
         if let Some(ref result) = result_msg {
             let _ = cli_invoke::update_session_cost(&state.pool, session_id, result).await;
-        }
-
-        // Store CLI session ID for resume
-        if let Some(ref result) = result_msg {
             let mut cli_sid = handle.cli_session_id.lock().await;
             *cli_sid = Some(result.session_id.clone());
         }
@@ -141,6 +131,17 @@ pub async fn run_create_app_loop(
         if handle.cancelled.load(Ordering::Relaxed) {
             tracing::info!(%session_id, "create-app loop cancelled after tool execution");
             break;
+        }
+
+        // Backoff: if the only tools were check_session_progress, wait before
+        // feeding results back so the worker has time to make progress.
+        let only_polls = response
+            .tools
+            .iter()
+            .all(|t| t.name == "check_session_progress");
+        if only_polls {
+            tracing::debug!(%session_id, "poll-only round, backing off {:?}", POLL_BACKOFF);
+            tokio::time::sleep(POLL_BACKOFF).await;
         }
 
         // Check for pending user messages (priority over tool results)
@@ -377,6 +378,7 @@ async fn execute_create_project(
         "project_id": project_id.to_string(),
         "name": name,
         "namespace_slug": namespace_slug,
+        "_next": "Now call spawn_coding_agent with this project_id"
     }))
 }
 
@@ -409,6 +411,7 @@ async fn execute_spawn_agent(
     Ok(serde_json::json!({
         "session_id": session.id.to_string(),
         "status": session.status,
+        "_next": "Agent is running. Tell the user and return tools: []. Do NOT call check_session_progress."
     }))
 }
 
@@ -537,6 +540,21 @@ async fn execute_check_progress(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Publish a CLI invocation error and log it.
+async fn publish_cli_error(valkey: &fred::clients::Pool, session_id: Uuid, error: &AgentError) {
+    tracing::error!(error = %error, %session_id, "CLI invocation failed");
+    let _ = pubsub_bridge::publish_event(
+        valkey,
+        session_id,
+        &ProgressEvent {
+            kind: ProgressKind::Error,
+            message: format!("CLI invocation failed: {error}"),
+            metadata: None,
+        },
+    )
+    .await;
+}
+
 /// Drain pending messages from the session handle, joining with newlines.
 async fn drain_pending(handle: &CliSessionHandle) -> String {
     let mut msgs = handle.pending_messages.lock().await;
@@ -635,6 +653,11 @@ mod tests {
     #[test]
     fn max_tool_rounds_is_ten() {
         assert_eq!(MAX_TOOL_ROUNDS, 10);
+    }
+
+    #[test]
+    fn poll_backoff_is_ten_seconds() {
+        assert_eq!(POLL_BACKOFF.as_secs(), 10);
     }
 
     #[test]

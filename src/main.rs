@@ -201,8 +201,11 @@ async fn main() -> anyhow::Result<()> {
         .merge(registry::router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
         .with_state(state)
         .fallback(ui::static_handler)
-        // Default body limit: 10 MB for API endpoints
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        // Default body limit: 10 MB for API endpoints.
+        // Uses axum's DefaultBodyLimit (not tower-http's RequestBodyLimitLayer) so that
+        // inner per-route RequestBodyLimitLayer overrides (e.g. 500 MB for git/registry)
+        // take precedence instead of being blocked by the outer global limit.
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         // Security response headers
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("x-frame-options"),

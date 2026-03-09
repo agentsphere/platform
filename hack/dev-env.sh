@@ -125,6 +125,9 @@ PLATFORM_DEV=true
 PLATFORM_MASTER_KEY=0000000000000000000000000000000000000000000000000000000000000000
 
 # --- Container registry ---
+# for image pull (localhost auto-allows plain HTTP; NodePort of DaemonSet registry proxy)
+PLATFORM_REGISTRY_NODE_URL=localhost:${REGISTRY_NODE_PORT}
+# for push (Kaniko --destination prefix; no scheme — Kaniko adds it)
 PLATFORM_REGISTRY_URL=${PLATFORM_HOST}:${BACKEND_PORT}
 
 # --- Agent/Pipeline pod communication ---

@@ -616,6 +616,10 @@ just test-e2e         # after multi-step workflow changes (~2.5 min)
 
 **Never skip E2E tests.** They catch real issues that unit and integration tests miss. If any tier fails, fix the issue before declaring the work done.
 
+### MANDATORY: Read test report after in-cluster tests
+
+`just test-integration`, `just test-e2e`, and `just cov-total` run tests inside the Kind cluster via `hack/test-in-cluster.sh`. Each run has a unique `RUN_ID` (8-char hex) and writes a JUnit-based test report to **`test-report-{RUN_ID}.txt`** in the project root. **Always read the matching `test-report-*.txt` file after any in-cluster test run** to check the pass/fail summary and identify any failures — do not rely solely on the exit code or terminal tail output. The RUN_ID is printed early in the test output (look for `platform-test-{RUN_ID}` namespace lines).
+
 ### Test Tier Boundary: Endpoint Scope vs User Journey
 
 The boundary is **how much of the user's reality are we simulating**, not whether the code is sync or async.

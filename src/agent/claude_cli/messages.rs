@@ -84,7 +84,7 @@ pub struct ResultMessage {
     #[serde(default)]
     pub usage: Option<UsageInfo>,
     /// Structured output when `--json-schema` was used.
-    #[serde(default)]
+    #[serde(default, alias = "structuredOutput")]
     pub structured_output: Option<serde_json::Value>,
 }
 

@@ -292,7 +292,7 @@ export CLAUDE_CLI_PATH="/tmp/platform-e2e/mock-claude-cli.sh"
 export SQLX_OFFLINE=true
 
 # Test report file — written after tests complete
-REPORT_FILE="${PROJECT_DIR}/test-report.txt"
+REPORT_FILE="${PROJECT_DIR}/test-report-${RUN_ID}.txt"
 JUNIT_FILE="${PROJECT_DIR}/target/nextest/ci/junit.xml"
 
 # ── Coverage: clean previous data ────────────────────────────────────────

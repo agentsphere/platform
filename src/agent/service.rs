@@ -285,8 +285,8 @@ pub async fn create_session(
 
 /// Send a message to a running agent session.
 ///
-/// Routes via Valkey pub/sub for `uses_pubsub` sessions, otherwise falls back
-/// to execution-mode-specific routing (`cli_subprocess`, pod stdin).
+/// Routes `cli_subprocess` sessions to the in-memory pending-messages queue,
+/// `uses_pubsub` sessions via Valkey pub/sub, and pod sessions via stdin attach.
 #[tracing::instrument(skip(state, content), fields(%session_id), err)]
 pub async fn send_message(
     state: &AppState,
@@ -299,17 +299,19 @@ pub async fn send_message(
         return Err(AgentError::SessionNotRunning);
     }
 
+    // CLI subprocess routing — check BEFORE uses_pubsub because CLI sessions
+    // set uses_pubsub=true for events but need the in-memory pending_messages
+    // queue for input (there is no pub/sub input subscriber in the platform process).
+    if session.execution_mode == "cli_subprocess" {
+        return send_cli_message(state, session_id, content).await;
+    }
+
     // Pub/sub path (agent-runner pods)
     if session.uses_pubsub {
         super::pubsub_bridge::publish_prompt(&state.valkey, session_id, content)
             .await
             .map_err(AgentError::Other)?;
         return Ok(());
-    }
-
-    // CLI subprocess routing
-    if session.execution_mode == "cli_subprocess" {
-        return send_cli_message(state, session_id, content).await;
     }
 
     // "pod" — fall through to existing pod attach logic

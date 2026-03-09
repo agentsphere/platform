@@ -48,12 +48,14 @@ pub async fn on_push(
 ) -> Result<Option<Uuid>, PipelineError> {
     let Some(yaml) = read_file_at_ref(&params.repo_path, &params.branch, ".platform.yaml").await
     else {
+        tracing::debug!("no .platform.yaml at ref, skipping pipeline trigger");
         return Ok(None);
     };
 
     let def = definition::parse(&yaml)?;
 
     if !definition::matches_push(def.trigger.as_ref(), &params.branch) {
+        tracing::debug!("push trigger does not match branch, skipping");
         return Ok(None);
     }
 
@@ -246,6 +248,7 @@ async fn insert_dev_image_step(
         --dockerfile={dockerfile} \
         --context=/workspace \
         --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}-dev:${{COMMIT_SHA:-latest}} \
+        --insecure \
         --cache=true"
     );
     let commands: Vec<&str> = vec![&cmd];
@@ -278,18 +281,26 @@ async fn has_dockerfile_dev(repo_path: &Path, git_ref: &str) -> bool {
 
 /// Read a file's contents from a git repo at a given ref.
 async fn read_file_at_ref(repo_path: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+    let output = match tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
         .arg("show")
         .arg(format!("{git_ref}:{file_path}"))
         .output()
         .await
-        .ok()?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, ?repo_path, git_ref, file_path, "git show command failed");
+            return None;
+        }
+    };
 
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::debug!(git_ref, file_path, ?repo_path, %stderr, "file not found at ref");
         None
     }
 }

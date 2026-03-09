@@ -416,6 +416,14 @@ pub(crate) fn build_env(opts: &CliSpawnOptions) -> Vec<(String, String)> {
         env.push(("CLAUDE_CONFIG_DIR".to_owned(), dir.display().to_string()));
     }
 
+    // Git auth — PLATFORM_API_TOKEN is used by the GIT_ASKPASS script
+    // to authenticate git push/pull against the platform's smart HTTP endpoint.
+    for var in ["PLATFORM_API_TOKEN", "GIT_ASKPASS", "PLATFORM_API_URL"] {
+        if let Ok(val) = std::env::var(var) {
+            env.push((var.to_owned(), val));
+        }
+    }
+
     // Extra env vars from caller
     for (key, value) in &opts.extra_env {
         env.push((key.clone(), value.clone()));

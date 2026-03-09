@@ -158,7 +158,9 @@ pub async fn post_receive(state: &AppState, params: &PostReceiveParams) -> Resul
         params.pushed_branches.iter().map(String::as_str).collect()
     };
 
+    let mut pipelines_triggered = 0u32;
     for branch in &branches {
+        tracing::info!(branch, "post-receive: processing push");
         let commit_sha = get_branch_sha(&params.repo_path, branch).await;
 
         let trigger_params = crate::pipeline::trigger::PushTriggerParams {
@@ -171,14 +173,23 @@ pub async fn post_receive(state: &AppState, params: &PostReceiveParams) -> Resul
 
         match crate::pipeline::trigger::on_push(&state.pool, &trigger_params).await {
             Ok(Some(pipeline_id)) => {
+                tracing::info!(%pipeline_id, branch, "pipeline created, notifying executor");
                 crate::pipeline::trigger::notify_executor(state, pipeline_id).await;
+                pipelines_triggered += 1;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::info!(branch, "no pipeline triggered for branch");
+            }
             Err(e) => {
                 tracing::error!(error = %e, branch, "pipeline trigger failed");
             }
         }
     }
+    tracing::info!(
+        branches = branches.len(),
+        pipelines_triggered,
+        "post-receive complete"
+    );
 
     // Fire push webhooks for each pushed branch
     for branch in &branches {

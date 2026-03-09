@@ -206,13 +206,31 @@ async fn collect_stderr(transport: &mut SubprocessTransport) -> String {
 /// Parse the structured output from a `ResultMessage`.
 ///
 /// Falls back to using `result` as text with empty tools if `structured_output`
-/// is absent or malformed.
+/// is absent or malformed. Handles both direct JSON objects and string-wrapped
+/// JSON (some CLI versions serialize structured output as a JSON string).
 fn parse_structured_output(result: &ResultMessage) -> StructuredResponse {
     if let Some(ref structured) = result.structured_output {
+        // Try direct deserialization (JSON object)
         if let Ok(response) = serde_json::from_value::<StructuredResponse>(structured.clone()) {
             return response;
         }
-        tracing::warn!("failed to parse structured_output, falling back to result text");
+        // Try string-wrapped JSON (CLI may serialize as string)
+        if let Some(s) = structured.as_str()
+            && let Ok(response) = serde_json::from_str::<StructuredResponse>(s)
+        {
+            return response;
+        }
+        tracing::warn!(
+            structured_output = %structured,
+            "failed to parse structured_output, falling back to result text"
+        );
+    } else {
+        tracing::warn!(
+            subtype = %result.subtype,
+            is_error = result.is_error,
+            has_result = result.result.is_some(),
+            "result message has no structured_output field"
+        );
     }
 
     // Fallback: use result text with no tools
@@ -231,15 +249,45 @@ fn parse_structured_output(result: &ResultMessage) -> StructuredResponse {
 // ---------------------------------------------------------------------------
 
 /// Format tool execution results for feeding back via `--resume`.
+///
+/// Uses a structured, readable format with labeled key-value pairs and
+/// next-step hints to guide the LLM on what to do with return values.
 pub fn format_tool_results(results: &[(String, Result<serde_json::Value, String>)]) -> String {
     let mut parts = Vec::new();
     for (name, result) in results {
         match result {
-            Ok(value) => parts.push(format!("{name}: success — {value}")),
-            Err(err) => parts.push(format!("{name}: error — {err}")),
+            Ok(value) => {
+                let mut lines = vec![format!("[{name}] OK")];
+                // Format return values as labeled key-value pairs
+                if let Some(obj) = value.as_object() {
+                    for (k, v) in obj {
+                        if k.starts_with('_') {
+                            continue; // skip hint fields in the data section
+                        }
+                        match v {
+                            serde_json::Value::String(s) => {
+                                lines.push(format!("  {k}: {s}"));
+                            }
+                            _ => {
+                                lines.push(format!("  {k}: {v}"));
+                            }
+                        }
+                    }
+                    // Show hint fields last, clearly labeled
+                    if let Some(hint) = obj.get("_next") {
+                        lines.push(format!("  → {}", hint.as_str().unwrap_or("")));
+                    }
+                } else {
+                    lines.push(format!("  result: {value}"));
+                }
+                parts.push(lines.join("\n"));
+            }
+            Err(err) => {
+                parts.push(format!("[{name}] ERROR: {err}"));
+            }
         }
     }
-    format!("Tool results:\n{}", parts.join("\n"))
+    format!("TOOL RESULTS:\n{}", parts.join("\n\n"))
 }
 
 /// The JSON schema for create-app structured output.
@@ -361,19 +409,21 @@ mod tests {
     fn format_tool_results_success() {
         let results = vec![(
             "create_project".to_owned(),
-            Ok(serde_json::json!({"project_id": "abc"})),
+            Ok(serde_json::json!({"project_id": "abc", "_next": "Call spawn_coding_agent"})),
         )];
         let formatted = format_tool_results(&results);
-        assert!(formatted.contains("create_project: success"));
-        assert!(formatted.contains("abc"));
+        assert!(formatted.contains("[create_project] OK"));
+        assert!(formatted.contains("project_id: abc"));
+        assert!(formatted.contains("→ Call spawn_coding_agent"));
+        // _next key should not appear as a data field
+        assert!(!formatted.contains("  _next:"));
     }
 
     #[test]
     fn format_tool_results_error() {
         let results = vec![("create_project".to_owned(), Err("name taken".into()))];
         let formatted = format_tool_results(&results);
-        assert!(formatted.contains("create_project: error"));
-        assert!(formatted.contains("name taken"));
+        assert!(formatted.contains("[create_project] ERROR: name taken"));
     }
 
     #[test]
@@ -386,15 +436,26 @@ mod tests {
             ("spawn_coding_agent".to_owned(), Err("failed".into())),
         ];
         let formatted = format_tool_results(&results);
-        assert!(formatted.contains("create_project: success"));
-        assert!(formatted.contains("spawn_coding_agent: error"));
+        assert!(formatted.contains("[create_project] OK"));
+        assert!(formatted.contains("[spawn_coding_agent] ERROR"));
     }
 
     #[test]
     fn format_tool_results_empty() {
         let results: Vec<(String, Result<serde_json::Value, String>)> = Vec::new();
         let formatted = format_tool_results(&results);
-        assert!(formatted.contains("Tool results:"));
+        assert!(formatted.contains("TOOL RESULTS:"));
+    }
+
+    #[test]
+    fn format_tool_results_non_object_value() {
+        let results = vec![(
+            "some_tool".to_owned(),
+            Ok(serde_json::json!("plain string")),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[some_tool] OK"));
+        assert!(formatted.contains("result: \"plain string\""));
     }
 
     #[test]
@@ -434,6 +495,26 @@ mod tests {
         let resp = parse_structured_output(&result);
         assert_eq!(resp.text, "Plain text response");
         assert!(resp.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_structured_output_string_wrapped() {
+        let inner = r#"{"text":"Creating project","tools":[{"name":"create_project","parameters":{"name":"my-app"}}]}"#;
+        let result = ResultMessage {
+            subtype: "success".into(),
+            session_id: "s1".into(),
+            is_error: false,
+            result: None,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            usage: None,
+            structured_output: Some(serde_json::Value::String(inner.into())),
+        };
+        let resp = parse_structured_output(&result);
+        assert_eq!(resp.text, "Creating project");
+        assert_eq!(resp.tools.len(), 1);
+        assert_eq!(resp.tools[0].name, "create_project");
     }
 
     #[test]

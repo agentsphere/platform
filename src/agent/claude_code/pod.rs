@@ -190,6 +190,20 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
     }
 }
 
+/// System prompt injected into every Worker Agent pod.
+///
+/// Ensures the agent works in the git repo and commits/pushes its output,
+/// regardless of what the Manager's spawn prompt says.
+const WORKER_AGENT_SYSTEM_PROMPT: &str = "\
+You are a coding agent running inside a container. Your working directory is /workspace, \
+which is a git repository cloned from the platform.\n\n\
+RULES:\n\
+1. Create ALL files directly in /workspace (the current directory). NEVER use /tmp or other paths.\n\
+2. After you finish creating/modifying files, you MUST stage, commit, and push:\n\
+   git add -A && git commit -m \"your commit message\" && git push origin main\n\
+3. Git credentials are pre-configured — push will work without extra setup.\n\
+4. The platform automatically builds and deploys your code when you push to main.";
+
 fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
     let cli_path = params
         .claude_cli_path
@@ -203,6 +217,8 @@ fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
         "/workspace".to_owned(),
         "--permission-mode".to_owned(),
         "bypassPermissions".to_owned(),
+        "--system-prompt".to_owned(),
+        WORKER_AGENT_SYSTEM_PROMPT.to_owned(),
     ];
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
@@ -231,6 +247,7 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "AGENT_ROLE",
     "PROJECT_ID",
     "GIT_AUTH_TOKEN",
+    "GIT_ASKPASS",
     "GIT_BRANCH",
     "BROWSER_ENABLED",
     "BROWSER_CDP_URL",
@@ -265,6 +282,9 @@ fn build_env_vars(
         env_var("DISABLE_TELEMETRY", "1"),
         env_var("BRANCH", branch),
         env_var("AGENT_ROLE", role),
+        // GIT_ASKPASS env var — more reliable than repo-local core.askPass config
+        // because it works even if the agent runs git commands outside the repo directory.
+        env_var("GIT_ASKPASS", "/workspace/.platform/bin/git-askpass.sh"),
     ];
 
     // Auth priority: CLI OAuth token (subscription) > Anthropic API key.
@@ -305,27 +325,39 @@ fn build_env_vars(
     vars
 }
 
-/// Build the setup-tools init container that downloads agent-runner from the
-/// platform server and installs Claude CLI.
+/// Build the shell script for the setup-tools init container.
 ///
-/// Uses the same image as the main container (no extra image pull).
-/// Tools are installed to `/workspace/.platform/bin/` (shared workspace volume).
-/// Idempotent: skips each tool if already present.
-fn build_setup_tools_container(
-    params: &PodBuildParams<'_>,
-    image: &str,
-    pull_policy: &str,
-) -> Container {
-    let setup_script = format!(
+/// Detects baked-in binaries (PATH + common locations) before attempting downloads.
+fn build_setup_script(claude_cli_version: &str) -> String {
+    format!(
         r#"set -eu
 BIN_DIR=/workspace/.platform/bin
 mkdir -p "$BIN_DIR"
 
+# Helper: find a binary on PATH or in common install locations
+find_binary() {{
+  name="$1"
+  # Check PATH first
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  # Check common install locations (baked-in images)
+  for dir in /usr/local/bin /usr/bin /opt/bin /home/agent/.local/bin; do
+    if [ -x "$dir/$name" ]; then
+      echo "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}}
+
 # 1. Setup agent-runner: prefer baked-in binary, fallback to download
 if [ ! -x "$BIN_DIR/agent-runner" ]; then
-  if command -v agent-runner >/dev/null 2>&1; then
-    ln -sf "$(command -v agent-runner)" "$BIN_DIR/agent-runner"
-    echo "[setup] agent-runner found on PATH, symlinked"
+  FOUND=$(find_binary agent-runner || true)
+  if [ -n "$FOUND" ]; then
+    ln -sf "$FOUND" "$BIN_DIR/agent-runner"
+    echo "[setup] agent-runner found at $FOUND, symlinked"
   else
     ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
     echo "[setup] Downloading agent-runner ($ARCH)..."
@@ -347,17 +379,25 @@ if [ ! -x "$BIN_DIR/agent-runner" ]; then
       exit 1
     fi
     chmod +x "$BIN_DIR/agent-runner"
-    echo "[setup] agent-runner installed"
+    echo "[setup] agent-runner installed via download"
   fi
 fi
 
-# 2. Install Claude CLI (npm preferred, native installer fallback)
-if ! command -v claude >/dev/null 2>&1 && [ ! -x "$BIN_DIR/claude" ]; then
-  if command -v npm >/dev/null 2>&1; then
+# 2. Setup Claude CLI: prefer baked-in binary, fallback to npm/installer
+if [ ! -x "$BIN_DIR/claude" ]; then
+  FOUND=$(find_binary claude || true)
+  if [ -n "$FOUND" ]; then
+    ln -sf "$FOUND" "$BIN_DIR/claude"
+    echo "[setup] Claude CLI found at $FOUND, symlinked"
+  elif command -v npm >/dev/null 2>&1; then
     echo "[setup] Installing Claude CLI v{claude_cli_version} via npm..."
     npm install -g --prefix /workspace/.platform \
       @anthropic-ai/claude-code@{claude_cli_version} 2>&1 | tail -1
-    echo "[setup] Claude CLI installed"
+    # npm global bin may land in /workspace/.platform/bin or lib/node_modules/.bin
+    if [ ! -x "$BIN_DIR/claude" ] && [ -x /workspace/.platform/lib/node_modules/.bin/claude ]; then
+      ln -sf /workspace/.platform/lib/node_modules/.bin/claude "$BIN_DIR/claude"
+    fi
+    echo "[setup] Claude CLI installed via npm"
   elif command -v curl >/dev/null 2>&1; then
     echo "[setup] Installing Claude CLI via native installer..."
     export HOME=/workspace/.platform
@@ -365,7 +405,7 @@ if ! command -v claude >/dev/null 2>&1 && [ ! -x "$BIN_DIR/claude" ]; then
     if [ -x /workspace/.platform/.local/bin/claude ]; then
       ln -sf /workspace/.platform/.local/bin/claude "$BIN_DIR/claude"
     fi
-    echo "[setup] Claude CLI installed"
+    echo "[setup] Claude CLI installed via native installer"
   else
     echo '[setup] WARNING: no npm or curl — Claude CLI not installed' >&2
     echo '[setup] Ensure claude is available on PATH in the main container' >&2
@@ -373,8 +413,21 @@ if ! command -v claude >/dev/null 2>&1 && [ ! -x "$BIN_DIR/claude" ]; then
 fi
 
 echo "[setup] Auto-setup complete""#,
-        claude_cli_version = params.claude_cli_version,
-    );
+    )
+}
+
+/// Build the setup-tools init container that downloads agent-runner from the
+/// platform server and installs Claude CLI.
+///
+/// Uses the same image as the main container (no extra image pull).
+/// Tools are installed to `/workspace/.platform/bin/` (shared workspace volume).
+/// Idempotent: skips each tool if already present.
+fn build_setup_tools_container(
+    params: &PodBuildParams<'_>,
+    image: &str,
+    pull_policy: &str,
+) -> Container {
+    let setup_script = build_setup_script(params.claude_cli_version);
 
     Container {
         name: "setup-tools".into(),
@@ -475,7 +528,26 @@ fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str
              fi; \
              git checkout \"$GIT_BRANCH\" 2>/dev/null || git checkout -b \"$GIT_BRANCH\"; \
              git config user.name 'platform-agent'; \
-             git config user.email 'agent@platform.local'",
+             git config user.email 'agent@platform.local'; \
+             mkdir -p /workspace/.platform/bin; \
+             printf '#!/bin/sh\\necho \"$PLATFORM_API_TOKEN\"\\n' > /workspace/.platform/bin/git-askpass.sh; \
+             chmod +x /workspace/.platform/bin/git-askpass.sh; \
+             git config core.askPass /workspace/.platform/bin/git-askpass.sh; \
+             git config credential.helper ''; \
+             cat > /workspace/CLAUDE.md << 'CLAUDEMD'\n\
+# Agent Instructions\n\
+\n\
+You are working in /workspace, a git repository. ALL files must be created here (the current directory).\n\
+NEVER create files in /tmp, /private, or any other directory.\n\
+\n\
+After you finish creating/modifying ALL files, you MUST commit and push:\n\
+```\n\
+git add -A && git commit -m \"Initial app scaffold\" && git push origin main\n\
+```\n\
+\n\
+Git credentials are pre-configured. Push will work without extra setup.\n\
+Do NOT test or verify the app — just create files, commit, and push.\n\
+CLAUDEMD",
         )]),
         env: Some(vec![
             env_var("GIT_AUTH_TOKEN", api_token),

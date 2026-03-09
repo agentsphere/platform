@@ -26,7 +26,7 @@ ui/test-results/
 coverage-html/
 
 # Test reports
-test-report.txt
+test-report-*.txt
 
 # Kind kubeconfig
 kind-platform.kubeconfig

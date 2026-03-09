@@ -291,7 +291,7 @@ pub async fn resolve_project(
 /// `GET /:owner/:repo/info/refs?service=git-upload-pack|git-receive-pack`
 ///
 /// Returns ref advertisement with pkt-line header.
-#[tracing::instrument(skip(state), fields(%owner, %repo), err)]
+#[tracing::instrument(skip(state), fields(%owner, %repo))]
 async fn info_refs(
     State(state): State<AppState>,
     AxumPath((owner, repo)): AxumPath<(String, String)>,
@@ -309,8 +309,19 @@ async fn info_refs(
 
     let project = resolve_project(&state.pool, &state.config, &owner, &repo).await?;
 
-    // Auth + RBAC
-    check_access(&state, &headers, &project, service == "git-upload-pack").await?;
+    // Auth + RBAC — first git request often has no credentials (WWW-Authenticate flow).
+    // Log at debug for 401 (expected), error for real failures.
+    if let Err(e) = check_access(&state, &headers, &project, service == "git-upload-pack").await {
+        match &e {
+            ApiError::Unauthorized => {
+                tracing::debug!(%owner, %repo, "git info/refs: no credentials (client will retry via WWW-Authenticate)");
+            }
+            _ => {
+                tracing::error!(error = %e, %owner, %repo, "git info/refs auth failed");
+            }
+        }
+        return Err(e);
+    }
 
     // Run git service with --advertise-refs
     // The service query value is "git-upload-pack" or "git-receive-pack" but
@@ -425,6 +436,11 @@ async fn receive_pack(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("git wait: {e}")))?;
 
     if status.success() {
+        tracing::info!(
+            %owner, %repo,
+            branches = ?pushed_branches,
+            "receive-pack succeeded, dispatching post-receive"
+        );
         // Run post-receive hooks in background
         let hook_state = state.clone();
         let params = super::hooks::PostReceiveParams {
