@@ -340,6 +340,26 @@ textarea.input { resize: vertical; min-height: 80px; }
 .onboarding-key-status.valid { color: var(--success); }
 .onboarding-key-status.invalid { color: var(--danger); }
 
+/* Reply banner (WhatsApp-style) */
+.reply-banner { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0.75rem; background: var(--bg-tertiary); border-left: 3px solid var(--accent); border-radius: var(--radius); margin-bottom: 0.5rem; font-size: 13px; color: var(--text-secondary); }
+.reply-banner-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-banner-text strong { color: var(--text-primary); }
+.reply-banner-dismiss { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px; padding: 0 0.25rem; line-height: 1; }
+.reply-banner-dismiss:hover { color: var(--text-primary); }
+
+/* Agent status bar */
+.agent-bar { display: flex; flex-wrap: wrap; gap: 0.25rem; padding: 0.5rem 0; border-top: 1px solid var(--border); }
+.agent-bar-item { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.25rem 0.6rem; border-radius: 99px; border: 1px solid var(--border); background: var(--bg-secondary); cursor: pointer; font-size: 12px; color: var(--text-secondary); transition: border-color 0.15s, background 0.15s; font-family: var(--font); }
+.agent-bar-item:hover { background: var(--bg-hover); border-color: var(--text-muted); }
+.agent-bar-active { border-color: var(--accent); background: var(--bg-tertiary); }
+.agent-bar-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.agent-bar-label { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Chat message agent label */
+.chat-agent-name { font-weight: 600; margin-bottom: 0.25rem; font-size: 0.85rem; }
+.chat-msg-clickable { cursor: pointer; transition: outline 0.1s; border-radius: 0.5rem; }
+.chat-msg-clickable:hover { outline: 1px solid var(--border); }
+
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
   .sidebar { transform: translateX(-100%); }
