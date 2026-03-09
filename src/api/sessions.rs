@@ -13,6 +13,8 @@ use uuid::Uuid;
 use ts_rs::TS;
 
 use crate::agent::AgentRoleName;
+use crate::agent::provider::{ProgressEvent, ProgressKind};
+use crate::agent::pubsub_bridge;
 use crate::agent::service;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
@@ -782,6 +784,22 @@ async fn spawn_child(
     )
     .await;
 
+    // Notify parent's SSE subscribers about the new child
+    let _ = pubsub_bridge::publish_event(
+        &state.valkey,
+        session_id,
+        &ProgressEvent {
+            kind: ProgressKind::Milestone,
+            message: format!("Child agent spawned: {child_id}"),
+            metadata: Some(serde_json::json!({
+                "event_type": "child_spawned",
+                "child_session_id": child_id,
+                "child_prompt": body.prompt.chars().take(200).collect::<String>(),
+            })),
+        },
+    )
+    .await;
+
     // Fetch the created child to return
     let child = service::fetch_session(&state.pool, child_id)
         .await
@@ -952,14 +970,15 @@ struct SseGlobalParams {
 /// SSE handler for global (project-less) sessions.
 ///
 /// With `?include_children=true`, streams events from the parent session AND
-/// all its current child sessions. Each event includes a `session_id` field
-/// so the client can distinguish which session emitted it.
+/// all its child sessions (including dynamically spawned ones). Each event
+/// includes a `session_id` field so the client can distinguish which session
+/// emitted it.
 async fn sse_session_events_global(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(session_id): Path<Uuid>,
     Query(params): Query<SseGlobalParams>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let session = service::fetch_session(&state.pool, session_id)
         .await
         .map_err(ApiError::from)?;
@@ -969,39 +988,41 @@ async fn sse_session_events_global(
         return Err(ApiError::Forbidden);
     }
 
-    // Build list of session IDs to subscribe to
     let include_children = params.include_children.unwrap_or(false);
-    let mut all_ids = vec![session_id];
+
     if include_children {
-        let child_ids: Vec<Uuid> =
-            sqlx::query_scalar("SELECT id FROM agent_sessions WHERE parent_session_id = $1")
-                .bind(session_id)
-                .fetch_all(&state.pool)
+        // Dynamic subscription: polls DB for new children every 3s
+        let rx =
+            pubsub_bridge::subscribe_session_tree_dynamic(&state.valkey, &state.pool, session_id)
                 .await
-                .map_err(|e| ApiError::Internal(e.into()))?;
-        all_ids.extend(child_ids);
-    }
+                .map_err(ApiError::Internal)?;
 
-    let rx = crate::agent::pubsub_bridge::subscribe_session_tree_events(&state.valkey, &all_ids)
-        .await
-        .map_err(ApiError::Internal)?;
-
-    let stream = ReceiverStream::new(rx).map(move |(sid, event)| {
-        if include_children {
-            // Include session_id so client knows which session emitted the event
+        let stream = ReceiverStream::new(rx).map(|(sid, event)| {
             let mut json = serde_json::to_value(&event).unwrap_or_default();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("session_id".into(), serde_json::json!(sid));
             }
             let data = serde_json::to_string(&json).unwrap_or_default();
             Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(data))
-        } else {
+        });
+
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        let rx = pubsub_bridge::subscribe_session_events(&state.valkey, session_id)
+            .await
+            .map_err(ApiError::Internal)?;
+
+        let stream = ReceiverStream::new(rx).map(|event| {
             let data = serde_json::to_string(&event).unwrap_or_default();
             Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(data))
-        }
-    });
+        });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    }
 }
 
 #[cfg(test)]
