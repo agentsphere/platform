@@ -225,19 +225,22 @@ async fn llm_create_app_full_flow(pool: PgPool) {
     // We can't use start_agent_server() directly because it builds the router
     // before we can modify config. Instead, bind the listener first, build state
     // with the correct API URL, enable cli_spawn, then build the router.
-    let port: u16 = std::env::var("PLATFORM_LISTEN_PORT")
-        .expect("PLATFORM_LISTEN_PORT must be set")
-        .parse()
-        .expect("invalid PLATFORM_LISTEN_PORT");
+    let port: u16 = if let Ok(p) = std::env::var("PLATFORM_LISTEN_PORT") {
+        p.parse().expect("invalid PLATFORM_LISTEN_PORT")
+    } else {
+        0 // bind to :0 to let the OS pick a free port
+    };
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .expect("bind listener");
+    let actual_port = listener.local_addr().expect("local_addr").port();
+    eprintln!("[LLM E2E] Listening on port {actual_port}");
     let host = if cfg!(target_os = "macos") {
         "host.docker.internal"
     } else {
         "172.18.0.1"
     };
-    let platform_api_url = format!("http://{host}:{port}");
+    let platform_api_url = format!("http://{host}:{actual_port}");
 
     let (mut state, admin_token) =
         e2e_helpers::e2e_state_with_api_url(pool.clone(), Some(platform_api_url)).await;
@@ -257,7 +260,7 @@ async fn llm_create_app_full_flow(pool: PgPool) {
     });
 
     // Background health monitor — pings the server every 5s to detect if/when it stops
-    let health_port = port;
+    let health_port = actual_port;
     let _health_monitor = tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))

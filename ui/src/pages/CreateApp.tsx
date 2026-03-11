@@ -162,6 +162,14 @@ export function CreateApp() {
             }
             break;
           }
+          case 'waiting_for_input': {
+            setStreamBuf(sid, '');
+            if (sid === sessionId) {
+              // Clarification phase — re-enable input for user reply
+              setStreaming(false);
+            }
+            break;
+          }
           case 'tool_call': {
             setMessages(prev => [...prev, { role: 'system', content: `Setting up: ${data.message}...`, sessionId: sid }]);
             break;

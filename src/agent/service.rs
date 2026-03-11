@@ -796,6 +796,7 @@ pub async fn create_global_session(
 
     // Spawn the create-app tool loop (skip when CLI spawn is disabled, e.g. integration tests)
     if state.config.cli_spawn_enabled {
+        use super::create_app::LoopOutcome;
         let state_clone = state.clone();
         let prompt_owned = prompt.to_owned();
         let oauth = cli_oauth_token.clone();
@@ -810,23 +811,34 @@ pub async fn create_global_session(
             )
             .await;
 
-            let final_status = match &result {
-                Ok(()) => "completed",
+            match result {
+                Ok(LoopOutcome::Completed | LoopOutcome::Cancelled) => {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE agent_sessions SET status = 'completed', finished_at = now() WHERE id = $1 AND status = 'running'",
+                    )
+                    .bind(session_id)
+                    .execute(&state_clone.pool)
+                    .await
+                    {
+                        tracing::error!(error = %e, %session_id, "failed to update session status");
+                    }
+                }
+                Ok(LoopOutcome::WaitingForInput) => {
+                    // Session stays running — user will send a follow-up message
+                    tracing::debug!(%session_id, "create-app loop waiting for user input");
+                }
                 Err(e) => {
                     tracing::error!(error = %e, %session_id, "create-app loop failed");
-                    "failed"
+                    if let Err(db_err) = sqlx::query(
+                        "UPDATE agent_sessions SET status = 'failed', finished_at = now() WHERE id = $1 AND status = 'running'",
+                    )
+                    .bind(session_id)
+                    .execute(&state_clone.pool)
+                    .await
+                    {
+                        tracing::error!(error = %db_err, %session_id, "failed to update session status");
+                    }
                 }
-            };
-
-            if let Err(e) = sqlx::query(
-                "UPDATE agent_sessions SET status = $2, finished_at = now() WHERE id = $1 AND status = 'running'",
-            )
-            .bind(session_id)
-            .bind(final_status)
-            .execute(&state_clone.pool)
-            .await
-            {
-                tracing::error!(error = %e, %session_id, "failed to update session status after create-app loop");
             }
         });
     } else {

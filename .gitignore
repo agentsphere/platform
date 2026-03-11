@@ -4,8 +4,7 @@ cli/*/target/
 **/*.rs.bk
 
 # Environment
-.env
-.env.dev
+.env*
 
 # Node / UI
 ui/node_modules/

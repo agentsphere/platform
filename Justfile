@@ -110,6 +110,9 @@ test-e2e filter="":
 test-llm:
     cargo nextest run --test llm_create_app --test llm_create_app_e2e --run-ignored ignored-only
 
+test-e2e-llm:
+    bash hack/run-llm-e2e.sh
+
 test-mcp:
     cd mcp && npm test
 

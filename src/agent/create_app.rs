@@ -16,6 +16,18 @@ use crate::store::AppState;
 /// Maximum number of automatic tool rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 10;
 
+/// Outcome of a `run_create_app_loop` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopOutcome {
+    /// Tools were executed and the LLM finished — session can be finalized.
+    Completed,
+    /// LLM returned text with no tool calls (e.g. clarification question) — session
+    /// stays running so the user can reply.
+    WaitingForInput,
+    /// The loop was cancelled via `handle.cancelled`.
+    Cancelled,
+}
+
 // ---------------------------------------------------------------------------
 // Tool loop
 // ---------------------------------------------------------------------------
@@ -29,6 +41,7 @@ const MAX_TOOL_ROUNDS: usize = 10;
 /// - LLM returns no tools and no pending user messages → done
 /// - `handle.cancelled` is set → stopped
 /// - `MAX_TOOL_ROUNDS` reached → safety limit
+#[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(state, handle, initial_prompt, oauth_token, anthropic_api_key), fields(session_id = %handle.session_id), err)]
 pub async fn run_create_app_loop(
     state: &AppState,
@@ -36,7 +49,7 @@ pub async fn run_create_app_loop(
     initial_prompt: String,
     oauth_token: Option<String>,
     anthropic_api_key: Option<String>,
-) -> Result<(), AgentError> {
+) -> Result<LoopOutcome, AgentError> {
     handle.busy.store(true, Ordering::Relaxed);
     let session_id = handle.session_id;
 
@@ -44,11 +57,14 @@ pub async fn run_create_app_loop(
     // If we already have a CLI session ID from a prior invocation, resume it
     // (e.g. user sent a follow-up message after the first turn completed)
     let mut is_resume = handle.cli_session_id.lock().await.is_some();
+    let mut any_tools_executed = false;
+    let mut outcome = LoopOutcome::Completed;
 
     for round in 0..MAX_TOOL_ROUNDS {
         // Check cancellation
         if handle.cancelled.load(Ordering::Relaxed) {
             tracing::info!(%session_id, "create-app loop cancelled");
+            outcome = LoopOutcome::Cancelled;
             break;
         }
 
@@ -115,17 +131,33 @@ pub async fn run_create_app_loop(
             // No tools — check for pending user messages
             let pending = drain_pending(&handle).await;
             if pending.is_empty() {
-                // Done — no tools and no pending messages
-                let _ = pubsub_bridge::publish_event(
-                    &state.valkey,
-                    session_id,
-                    &ProgressEvent {
-                        kind: ProgressKind::Completed,
-                        message: "Turn completed".into(),
-                        metadata: None,
-                    },
-                )
-                .await;
+                // Decide outcome: if we never executed tools, the LLM is asking
+                // a clarification question — stay running for user reply.
+                if any_tools_executed {
+                    let _ = pubsub_bridge::publish_event(
+                        &state.valkey,
+                        session_id,
+                        &ProgressEvent {
+                            kind: ProgressKind::Completed,
+                            message: "Turn completed".into(),
+                            metadata: None,
+                        },
+                    )
+                    .await;
+                    outcome = LoopOutcome::Completed;
+                } else {
+                    let _ = pubsub_bridge::publish_event(
+                        &state.valkey,
+                        session_id,
+                        &ProgressEvent {
+                            kind: ProgressKind::WaitingForInput,
+                            message: "Waiting for user input".into(),
+                            metadata: None,
+                        },
+                    )
+                    .await;
+                    outcome = LoopOutcome::WaitingForInput;
+                }
                 break;
             }
             // User sent messages while we were processing — use them as next prompt
@@ -135,11 +167,13 @@ pub async fn run_create_app_loop(
         }
 
         // Execute tools
+        any_tools_executed = true;
         let tool_results = execute_tools(state, session_id, handle.user_id, &response.tools).await;
 
         // Check cancellation after tool execution
         if handle.cancelled.load(Ordering::Relaxed) {
             tracing::info!(%session_id, "create-app loop cancelled after tool execution");
+            outcome = LoopOutcome::Cancelled;
             break;
         }
 
@@ -154,12 +188,13 @@ pub async fn run_create_app_loop(
     }
 
     handle.busy.store(false, Ordering::Relaxed);
-    Ok(())
+    Ok(outcome)
 }
 
 /// Run pending user messages through the CLI via `--resume`.
 ///
 /// Called from `send_message()` when the tool loop is not busy.
+/// Finalizes the session if the resumed loop completes or fails.
 pub async fn run_pending_messages(
     state: &AppState,
     handle: Arc<CliSessionHandle>,
@@ -171,10 +206,30 @@ pub async fn run_pending_messages(
         return;
     }
 
-    if let Err(e) =
-        run_create_app_loop(state, handle, pending, oauth_token, anthropic_api_key).await
-    {
-        tracing::error!(error = %e, "run_pending_messages failed");
+    let session_id = handle.session_id;
+    match run_create_app_loop(state, handle, pending, oauth_token, anthropic_api_key).await {
+        Ok(LoopOutcome::Completed | LoopOutcome::Cancelled) => {
+            let _ = sqlx::query(
+                "UPDATE agent_sessions SET status = 'completed', finished_at = now() \
+                 WHERE id = $1 AND status = 'running'",
+            )
+            .bind(session_id)
+            .execute(&state.pool)
+            .await;
+        }
+        Ok(LoopOutcome::WaitingForInput) => {
+            // Session stays running — user will send another follow-up
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %session_id, "run_pending_messages failed");
+            let _ = sqlx::query(
+                "UPDATE agent_sessions SET status = 'failed', finished_at = now() \
+                 WHERE id = $1 AND status = 'running'",
+            )
+            .bind(session_id)
+            .execute(&state.pool)
+            .await;
+        }
     }
 }
 
@@ -770,5 +825,18 @@ mod tests {
                 "tool {name} not in known tools"
             );
         }
+    }
+
+    #[test]
+    fn loop_outcome_variants() {
+        assert_ne!(LoopOutcome::Completed, LoopOutcome::WaitingForInput);
+        assert_ne!(LoopOutcome::Completed, LoopOutcome::Cancelled);
+        assert_ne!(LoopOutcome::WaitingForInput, LoopOutcome::Cancelled);
+    }
+
+    #[test]
+    fn loop_outcome_debug() {
+        let s = format!("{:?}", LoopOutcome::WaitingForInput);
+        assert!(s.contains("WaitingForInput"));
     }
 }

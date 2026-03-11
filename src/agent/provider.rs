@@ -132,6 +132,7 @@ pub enum ProgressKind {
     Milestone,
     Error,
     Completed,
+    WaitingForInput,
     Text,
     /// Forward-compatible catch-all for unknown event kinds from agent-runner.
     #[serde(other)]
@@ -238,6 +239,14 @@ mod tests {
     fn progress_kind_serializes_snake_case() {
         let json = serde_json::to_string(&ProgressKind::ToolCall).unwrap();
         assert_eq!(json, r#""tool_call""#);
+    }
+
+    #[test]
+    fn progress_kind_waiting_for_input_roundtrip() {
+        let json = serde_json::to_string(&ProgressKind::WaitingForInput).unwrap();
+        assert_eq!(json, r#""waiting_for_input""#);
+        let back: ProgressKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProgressKind::WaitingForInput);
     }
 
     #[test]
