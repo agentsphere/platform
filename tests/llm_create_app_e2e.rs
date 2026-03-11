@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
+use kube::api::ListParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -479,11 +480,10 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         let pod_timeout = Duration::from_secs(120);
         let pod_start = std::time::Instant::now();
         let (pod_name, namespace) = loop {
-            if pod_start.elapsed() > pod_timeout {
-                panic!(
-                    "child session {child_session_id} never got a pod_name within {pod_timeout:?}"
-                );
-            }
+            assert!(
+                pod_start.elapsed() <= pod_timeout,
+                "child session {child_session_id} never got a pod_name within {pod_timeout:?}"
+            );
             let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT pod_name, session_namespace FROM agent_sessions WHERE id = $1",
             )
@@ -686,7 +686,7 @@ async fn llm_create_app_full_flow(pool: PgPool) {
             );
             eprintln!("[LLM E2E] Checking pods in namespace: {prod_ns}");
             let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &prod_ns);
-            match pods.list(&Default::default()).await {
+            match pods.list(&ListParams::default()).await {
                 Ok(pod_list) => {
                     for p in &pod_list.items {
                         let name = p.metadata.name.as_deref().unwrap_or("?");
