@@ -83,12 +83,18 @@ pub async fn resolve_repo_with_access(
             rp.workspace_id,
         )
     } else if need_push {
-        // No repo found — for push, fall back to project-name lookup + lazy-create
+        // No repo found — for push, fall back to project-name lookup + lazy-create.
+        // For namespaced names like "project/dev", use the first segment as project name.
+        let project_lookup_name = if let Some(slash) = name.find('/') {
+            &name[..slash]
+        } else {
+            name
+        };
         let project = sqlx::query!(
             r#"SELECT id, owner_id, workspace_id
                FROM projects
                WHERE name = $1 AND is_active = true"#,
-            name,
+            project_lookup_name,
         )
         .fetch_optional(&state.pool)
         .await?
@@ -200,7 +206,9 @@ pub async fn resolve_repo_with_optional_access(
         .ok_or(RegistryError::NameUnknown)?;
 
     if rp.visibility != "public" {
-        return Err(RegistryError::NameUnknown);
+        // Return 401 (not 404) so containerd/Docker retries with credentials
+        // from imagePullSecrets. Returning 404 would make it give up immediately.
+        return Err(RegistryError::Unauthorized);
     }
 
     Ok(RepoAccess {
@@ -221,6 +229,44 @@ async fn version_check(
         HeaderValue::from_static("registry/2.0"),
     );
     Ok((StatusCode::OK, headers, "{}").into_response())
+}
+
+/// Check if an image reference (e.g. `"myapp-dev:session-abc"`) matches a glob pattern.
+///
+/// The pattern supports `*` as a wildcard matching any sequence of characters.
+/// Returns `true` if pattern is `None` (no restriction).
+pub fn matches_tag_pattern(image_ref: &str, pattern: &str) -> bool {
+    glob_match(pattern, image_ref)
+}
+
+/// Simple glob match: `*` matches any sequence of characters. No other wildcards.
+fn glob_match(pattern: &str, input: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == input;
+    }
+
+    let mut pos = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(found) = input[pos..].find(part) {
+            if i == 0 && found != 0 {
+                return false; // first segment must be a prefix
+            }
+            pos += found + part.len();
+        } else {
+            return false;
+        }
+    }
+
+    // If pattern doesn't end with *, input must be fully consumed
+    if !pattern.ends_with('*') {
+        return pos == input.len();
+    }
+
+    true
 }
 
 pub fn router() -> Router<AppState> {
@@ -247,4 +293,65 @@ pub fn router() -> Router<AppState> {
         )
         // Tag listing
         .route("/v2/{name}/tags/list", get(tags::list_tags))
+        // --- Two-segment namespaced routes (e.g. project/app, project/dev) ---
+        .route(
+            "/v2/{ns}/{repo}/blobs/{digest}",
+            head(blobs::head_blob_ns).get(blobs::get_blob_ns),
+        )
+        .route(
+            "/v2/{ns}/{repo}/blobs/uploads/",
+            post(blobs::start_upload_ns),
+        )
+        .route(
+            "/v2/{ns}/{repo}/blobs/uploads/{uuid}",
+            patch(blobs::upload_chunk_ns).put(blobs::complete_upload_ns),
+        )
+        .route(
+            "/v2/{ns}/{repo}/manifests/{reference}",
+            head(manifests::head_manifest_ns)
+                .get(manifests::get_manifest_ns)
+                .put(manifests::put_manifest_ns)
+                .delete(manifests::delete_manifest_ns),
+        )
+        .route("/v2/{ns}/{repo}/tags/list", get(tags::list_tags_ns))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_tag_pattern_exact() {
+        assert!(matches_tag_pattern(
+            "myapp-dev:session-abc",
+            "myapp-dev:session-*"
+        ));
+    }
+
+    #[test]
+    fn matches_tag_pattern_rejects_other_tag() {
+        assert!(!matches_tag_pattern("myapp:latest", "myapp-dev:session-*"));
+    }
+
+    #[test]
+    fn matches_tag_pattern_rejects_other_repo() {
+        assert!(!matches_tag_pattern(
+            "other-dev:session-abc",
+            "myapp-dev:session-*"
+        ));
+    }
+
+    #[test]
+    fn matches_tag_pattern_wildcard_suffix() {
+        assert!(matches_tag_pattern(
+            "myapp-dev:session-abc12345-build1",
+            "myapp-dev:session-abc12345-*"
+        ));
+    }
+
+    #[test]
+    fn matches_tag_pattern_no_wildcard_exact() {
+        assert!(matches_tag_pattern("myapp:v1", "myapp:v1"));
+        assert!(!matches_tag_pattern("myapp:v2", "myapp:v1"));
+    }
 }

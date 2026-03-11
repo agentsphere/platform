@@ -1,4 +1,5 @@
-export function Badge({ status }: { status: string }) {
-  const cls = status.toLowerCase().replace(/\s+/g, '_');
-  return <span class={`badge badge-${cls}`}>{status}</span>;
+export function Badge({ status, variant, children }: { status?: string; variant?: string; children?: any }) {
+  const label = children ?? status ?? '';
+  const cls = (variant ?? status ?? 'default').toLowerCase().replace(/\s+/g, '_');
+  return <span class={`badge badge-${cls}`}>{label}</span>;
 }

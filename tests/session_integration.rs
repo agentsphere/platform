@@ -17,16 +17,29 @@ async fn insert_session(
     prompt: &str,
     status: &str,
 ) -> Uuid {
+    insert_session_with_ns(pool, project_id, user_id, prompt, status, None).await
+}
+
+/// Insert a session row with optional `session_namespace`.
+async fn insert_session_with_ns(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    prompt: &str,
+    status: &str,
+    session_namespace: Option<&str>,
+) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
-         VALUES ($1, $2, $3, $4, $5, 'claude-code')",
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, session_namespace)
+         VALUES ($1, $2, $3, $4, $5, 'claude-code', $6)",
     )
     .bind(id)
     .bind(project_id)
     .bind(user_id)
     .bind(prompt)
     .bind(status)
+    .bind(session_namespace)
     .execute(pool)
     .await
     .expect("insert session");
@@ -1214,26 +1227,8 @@ async fn create_session_spawns_k8s_pod(pool: PgPool) {
         .await
         .unwrap();
 
-    // Ensure the project namespace exists so pod creation doesn't fail on 404
-    let ns_slug: String = sqlx::query_scalar("SELECT namespace_slug FROM projects WHERE id = $1")
-        .bind(project_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let namespace = state.config.project_namespace(&ns_slug, "dev");
-    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
-        kube::Api::all(state.kube.clone());
-    let ns_obj = serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": { "name": namespace }
-    }))
-    .unwrap();
-    let _ = ns_api
-        .create(&kube::api::PostParams::default(), &ns_obj)
-        .await; // ignore AlreadyExists
-
-    // Call create_session directly to get the real error (API returns opaque 500)
+    // Call create_session directly to get the real error (API returns opaque 500).
+    // create_session now creates its own session namespace with RBAC.
     let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
     let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
 
@@ -1258,19 +1253,78 @@ async fn create_session_spawns_k8s_pod(pool: PgPool) {
         .expect("pod_name should be set after successful creation");
     assert!(!pod_name.is_empty());
 
+    // Pod is now created in the session namespace, not the project dev namespace
+    let session_ns = session
+        .session_namespace
+        .as_deref()
+        .expect("session_namespace should be set");
+
     // Verify the pod actually exists in K8s
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
-        kube::Api::namespaced(state.kube.clone(), &namespace);
+        kube::Api::namespaced(state.kube.clone(), session_ns);
     let pod = pods.get(pod_name).await;
     assert!(pod.is_ok(), "pod {pod_name} should exist in K8s");
 
-    // Cleanup: delete the pod
-    let _ = pods
-        .delete(pod_name, &kube::api::DeleteParams::default())
-        .await;
-
-    // Cleanup: delete the namespace
+    // Cleanup: delete the session namespace (cascades to pod)
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
     let _ = ns_api
-        .delete(&namespace, &kube::api::DeleteParams::default())
+        .delete(session_ns, &kube::api::DeleteParams::default())
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Session namespace
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_namespace_stored_in_db(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "ns-test", "private").await;
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_id,
+        admin_id,
+        "test",
+        "running",
+        Some("myapp-s-abc12345"),
+    )
+    .await;
+
+    // Verify session_namespace is stored in DB
+    let ns: Option<String> =
+        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch session namespace");
+
+    assert_eq!(ns.as_deref(), Some("myapp-s-abc12345"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_namespace_null_for_old_sessions(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "ns-null", "private").await;
+    let session_id = insert_session(&pool, project_id, admin_id, "legacy", "running").await;
+
+    // Verify session_namespace is NULL for sessions without it
+    let ns: Option<String> =
+        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch session namespace");
+
+    assert!(ns.is_none());
 }

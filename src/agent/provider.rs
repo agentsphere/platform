@@ -70,6 +70,7 @@ pub struct AgentSession {
     pub allowed_child_roles: Option<Vec<String>>,
     pub execution_mode: String,
     pub uses_pubsub: bool,
+    pub session_namespace: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +170,8 @@ pub struct BuildPodParams<'a> {
     pub host_mount_path: Option<&'a str>,
     /// Override CLI binary path inside the pod (for mock CLI in tests).
     pub claude_cli_path: Option<&'a str>,
+    /// K8s `ServiceAccount` name for the pod (e.g. `agent-sa` for session RBAC).
+    pub service_account_name: Option<&'a str>,
 }
 
 /// Trait for agent provider implementations.

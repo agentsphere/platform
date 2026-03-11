@@ -28,6 +28,7 @@ impl AgentProvider for ClaudeCodeProvider {
             claude_cli_version: params.claude_cli_version,
             host_mount_path: params.host_mount_path,
             claude_cli_path: params.claude_cli_path,
+            service_account_name: params.service_account_name,
         }))
     }
 

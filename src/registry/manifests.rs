@@ -80,6 +80,14 @@ pub async fn put_manifest(
         project_id: _,
     } = resolve_repo_with_access(&state, &user, &name, true).await?;
 
+    // Enforce tag pattern restriction from scoped tokens
+    if let Some(ref pattern) = user.registry_tag_pattern {
+        let full_ref = format!("{name}:{reference}");
+        if !super::matches_tag_pattern(&full_ref, pattern) {
+            return Err(RegistryError::Denied);
+        }
+    }
+
     let content = body.to_vec();
 
     // Compute digest of the raw manifest bytes
@@ -194,6 +202,51 @@ pub async fn delete_manifest(
     }
 
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Namespaced wrappers (two-segment: {ns}/{repo})
+// ---------------------------------------------------------------------------
+
+pub async fn head_manifest_ns(
+    state: State<AppState>,
+    user: OptionalRegistryUser,
+    Path((ns, repo, reference)): Path<(String, String, String)>,
+) -> Result<Response, RegistryError> {
+    head_manifest(state, user, Path((format!("{ns}/{repo}"), reference))).await
+}
+
+pub async fn get_manifest_ns(
+    state: State<AppState>,
+    user: OptionalRegistryUser,
+    Path((ns, repo, reference)): Path<(String, String, String)>,
+) -> Result<Response, RegistryError> {
+    get_manifest(state, user, Path((format!("{ns}/{repo}"), reference))).await
+}
+
+pub async fn put_manifest_ns(
+    state: State<AppState>,
+    user: RegistryUser,
+    Path((ns, repo, reference)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, RegistryError> {
+    put_manifest(
+        state,
+        user,
+        Path((format!("{ns}/{repo}"), reference)),
+        headers,
+        body,
+    )
+    .await
+}
+
+pub async fn delete_manifest_ns(
+    state: State<AppState>,
+    user: RegistryUser,
+    Path((ns, repo, reference)): Path<(String, String, String)>,
+) -> Result<Response, RegistryError> {
+    delete_manifest(state, user, Path((format!("{ns}/{repo}"), reference))).await
 }
 
 // ---------------------------------------------------------------------------

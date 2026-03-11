@@ -111,7 +111,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
         r#"
         SELECT pl.git_ref as "git_ref!: String",
                pl.commit_sha,
-               pl.triggered_by,
+               p.owner_id as "owner_id!",
                p.name as "project_name!: String",
                p.namespace_slug as "namespace_slug!: String",
                u.name as "owner_name!: String"
@@ -131,9 +131,14 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
         platform_api_url, pipeline.owner_name, pipeline.project_name,
     );
 
+    // Use the project owner for git/registry auth tokens — `triggered_by` may be
+    // an ephemeral agent user whose identity gets cleaned up before the pipeline
+    // finishes (race condition: reaper deletes agent tokens while Kaniko is still pushing).
+    let auth_user_id = pipeline.owner_id;
+
     // Create a short-lived git auth token for HTTP clone (scoped to this project)
     let git_token =
-        create_git_auth_token(state, pipeline_id, project_id, pipeline.triggered_by).await?;
+        create_git_auth_token(state, pipeline_id, project_id, Some(auth_user_id)).await?;
 
     let meta = PipelineMeta {
         git_ref: pipeline.git_ref,
@@ -149,18 +154,14 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     // Ensure project namespace exists (lazy creation for DB-only projects)
     ensure_project_namespace(state, &meta.namespace, project_id).await?;
 
-    // Create registry auth Secret if registry is configured and we know who triggered it
+    // Create registry auth Secret if registry is configured
     let registry_creds = if state.config.registry_url.is_some() {
-        if let Some(user_id) = pipeline.triggered_by {
-            match create_registry_secret(state, pipeline_id, user_id, &meta.namespace).await {
-                Ok(creds) => Some(creds),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to create registry secret, continuing without");
-                    None
-                }
+        match create_registry_secret(state, pipeline_id, auth_user_id, &meta.namespace).await {
+            Ok(creds) => Some(creds),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create registry secret, continuing without");
+                None
             }
-        } else {
-            None
         }
     } else {
         None
@@ -976,7 +977,7 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
     let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
     let name = project_name.as_deref().unwrap_or("unknown");
     let tag = pipeline_meta.commit_sha.as_deref().unwrap_or("latest");
-    let image_ref = format!("{registry}/{name}:{tag}");
+    let image_ref = format!("{registry}/{name}/app:{tag}");
 
     // Extract branch from git_ref
     let branch = pipeline_meta
@@ -1054,7 +1055,7 @@ async fn detect_and_publish_dev_image(state: &AppState, pipeline_id: Uuid, proje
     let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
     let name = project_name.as_deref().unwrap_or("unknown");
     let tag = commit_sha.as_deref().unwrap_or("latest");
-    let dev_image_ref = format!("{registry}/{name}-dev:{tag}");
+    let dev_image_ref = format!("{registry}/{name}/dev:{tag}");
 
     let event = crate::store::eventbus::PlatformEvent::DevImageBuilt {
         project_id,
@@ -1218,7 +1219,7 @@ mod tests {
     }
 
     fn build_image_ref(registry: &str, project_name: &str, tag: &str) -> String {
-        format!("{registry}/{project_name}:{tag}")
+        format!("{registry}/{project_name}/app:{tag}")
     }
 
     // -- slug --
@@ -1733,13 +1734,13 @@ mod tests {
     #[test]
     fn image_ref_format() {
         let r = build_image_ref("registry.example.com", "my-app", "abc123");
-        assert_eq!(r, "registry.example.com/my-app:abc123");
+        assert_eq!(r, "registry.example.com/my-app/app:abc123");
     }
 
     #[test]
     fn image_ref_latest_tag() {
         let r = build_image_ref("localhost:5000", "proj", "latest");
-        assert_eq!(r, "localhost:5000/proj:latest");
+        assert_eq!(r, "localhost:5000/proj/app:latest");
     }
 
     // -- registry secret mount --

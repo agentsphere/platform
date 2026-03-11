@@ -1208,3 +1208,205 @@ async fn seed_all_skips_nonexistent_directory(pool: PgPool) {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Registry tag pattern scoping
+// ---------------------------------------------------------------------------
+
+/// Helper: create an API token with a `registry_tag_pattern` in the DB.
+/// Returns the raw token string.
+async fn create_token_with_tag_pattern(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    pattern: Option<&str>,
+) -> String {
+    let (raw_token, token_hash) = platform::auth::token::generate_api_token();
+    sqlx::query(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, registry_tag_pattern)
+         VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(user_id)
+    .bind("tag-pattern-test")
+    .bind(&token_hash)
+    .bind(pattern)
+    .execute(pool)
+    .await
+    .unwrap();
+    raw_token
+}
+
+/// Helper: push a manifest, returning the status code (does NOT assert 201).
+async fn registry_push_manifest_status(
+    app: &axum::Router,
+    token: &str,
+    repo_name: &str,
+    reference: &str,
+    config_digest: &str,
+    layer_digests: &[&str],
+) -> StatusCode {
+    let layers: Vec<serde_json::Value> = layer_digests
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": d,
+                "size": 100,
+            })
+        })
+        .collect();
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": 100,
+        },
+        "layers": layers,
+    });
+
+    let body = serde_json::to_vec(&manifest).unwrap();
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/v2/{repo_name}/manifests/{reference}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    resp.status()
+}
+
+/// Token with matching tag pattern can push a manifest.
+#[sqlx::test(migrations = "./migrations")]
+async fn tag_pattern_allows_matching_push(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let _proj_id = create_project(&app, &admin_token, "myapp-dev", "private").await;
+
+    // Get admin user ID
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    // Create token with tag pattern that allows myapp-dev:session-*
+    let scoped_token =
+        create_token_with_tag_pattern(&pool, admin_id, Some("myapp-dev:session-*")).await;
+
+    // Upload blobs first (with admin token — blob upload is not tag-scoped)
+    let admin_api = {
+        let (s, b) = helpers::post_json(
+            &app,
+            &admin_token,
+            "/api/tokens",
+            serde_json::json!({ "name": "admin-reg", "expires_in_days": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        b["token"].as_str().unwrap().to_owned()
+    };
+    let config_digest = registry_upload_blob(&app, &admin_api, "myapp-dev", b"{}").await;
+    let layer_digest = registry_upload_blob(&app, &admin_api, "myapp-dev", b"layer-data").await;
+
+    // Push manifest with matching tag — should succeed
+    let status = registry_push_manifest_status(
+        &app,
+        &scoped_token,
+        "myapp-dev",
+        "session-abc12345",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "matching tag pattern should allow push"
+    );
+}
+
+/// Token with tag pattern rejects push to non-matching tag.
+#[sqlx::test(migrations = "./migrations")]
+async fn tag_pattern_rejects_non_matching_push(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let _proj_id = create_project(&app, &admin_token, "myapp-dev2", "private").await;
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    // Token scoped to myapp-dev2:session-*
+    let scoped_token =
+        create_token_with_tag_pattern(&pool, admin_id, Some("myapp-dev2:session-*")).await;
+
+    // Upload blobs with admin token
+    let admin_api = {
+        let (s, b) = helpers::post_json(
+            &app,
+            &admin_token,
+            "/api/tokens",
+            serde_json::json!({ "name": "admin-reg2", "expires_in_days": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        b["token"].as_str().unwrap().to_owned()
+    };
+    let config_digest = registry_upload_blob(&app, &admin_api, "myapp-dev2", b"{}").await;
+    let layer_digest = registry_upload_blob(&app, &admin_api, "myapp-dev2", b"layer2").await;
+
+    // Push with non-matching tag — should be denied
+    let status = registry_push_manifest_status(
+        &app,
+        &scoped_token,
+        "myapp-dev2",
+        "latest",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-matching tag should be denied"
+    );
+}
+
+/// Token without tag pattern (NULL) can push any tag (backward compat).
+#[sqlx::test(migrations = "./migrations")]
+async fn null_tag_pattern_allows_any_push(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let _proj_id = create_project(&app, &admin_token, "myapp-dev3", "private").await;
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    // Token with no tag pattern (NULL)
+    let unscoped_token = create_token_with_tag_pattern(&pool, admin_id, None).await;
+
+    // Upload blobs
+    let config_digest = registry_upload_blob(&app, &unscoped_token, "myapp-dev3", b"{}").await;
+    let layer_digest = registry_upload_blob(&app, &unscoped_token, "myapp-dev3", b"layer3").await;
+
+    // Push with any tag — should succeed
+    let status = registry_push_manifest_status(
+        &app,
+        &unscoped_token,
+        "myapp-dev3",
+        "latest",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "NULL tag pattern should allow any push"
+    );
+}

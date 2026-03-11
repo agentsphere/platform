@@ -11,6 +11,11 @@ use crate::store::AppState;
 use super::error::DeployerError;
 use super::{applier, ops_repo, renderer};
 
+/// Fixed name for the registry pull secret created in every project namespace.
+/// The secret is a `kubernetes.io/dockerconfigjson` type with credentials scoped
+/// to the project. All deploy templates can reference this name.
+pub const REGISTRY_PULL_SECRET_NAME: &str = "platform-registry-pull";
+
 // ---------------------------------------------------------------------------
 // Background reconciliation loop
 // ---------------------------------------------------------------------------
@@ -218,6 +223,9 @@ async fn handle_active(
 
     // Inject project secrets as a K8s Secret before applying manifests
     inject_project_secrets(state, deployment, &ns).await;
+
+    // Ensure a registry pull secret exists so pods can pull images
+    ensure_registry_pull_secret(state, deployment, &ns).await;
 
     let (rendered, sha) = render_manifests(state, deployment).await?;
 
@@ -571,6 +579,164 @@ async fn apply_k8s_secret(
     }
 }
 
+/// Ensure the fixed-name registry pull secret exists in the target namespace.
+///
+/// Creates or replaces `platform-registry-pull` with a `dockerconfigjson` secret
+/// so that pods can pull images from the platform's built-in registry.
+/// Uses the registry node URL (`DaemonSet` proxy) when available, falling back to
+/// the API-facing registry URL.
+///
+/// The token is scoped to the project owner and expires after 30 days.
+/// Each deploy refreshes the secret, so credentials stay current.
+#[tracing::instrument(skip(state, deployment), fields(project_id = %deployment.project_id, %namespace))]
+async fn ensure_registry_pull_secret(
+    state: &AppState,
+    deployment: &PendingDeployment,
+    namespace: &str,
+) {
+    let registry_url = state
+        .config
+        .registry_node_url
+        .as_deref()
+        .or(state.config.registry_url.as_deref());
+
+    let Some(registry_url) = registry_url else {
+        return; // No registry configured
+    };
+
+    let Some((owner_id, owner_name)) = resolve_project_owner(state, deployment.project_id).await
+    else {
+        return;
+    };
+
+    let Some(raw_token) = create_deploy_pull_token(state, owner_id, deployment.id).await else {
+        return;
+    };
+
+    let docker_config = build_deploy_docker_config(state, registry_url, &owner_name, &raw_token);
+
+    let secret = Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(REGISTRY_PULL_SECRET_NAME.to_owned()),
+            labels: Some(BTreeMap::from([
+                (
+                    "platform.io/project".into(),
+                    deployment.project_id.to_string(),
+                ),
+                ("platform.io/managed-by".into(), "deployer".into()),
+            ])),
+            ..Default::default()
+        },
+        type_: Some("kubernetes.io/dockerconfigjson".into()),
+        string_data: Some(BTreeMap::from([(
+            ".dockerconfigjson".into(),
+            docker_config.to_string(),
+        )])),
+        ..Default::default()
+    };
+
+    apply_or_replace_secret(state, namespace, &secret).await;
+}
+
+/// Resolve project owner ID and name.
+async fn resolve_project_owner(state: &AppState, project_id: Uuid) -> Option<(Uuid, String)> {
+    let owner_id: Option<(Uuid,)> =
+        sqlx::query_as("SELECT owner_id FROM projects WHERE id = $1 AND is_active = true")
+            .bind(project_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+
+    let (owner_id,) = owner_id?;
+
+    let owner_name: Option<(String,)> = sqlx::query_as("SELECT name FROM users WHERE id = $1")
+        .bind(owner_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+    Some((owner_id, owner_name?.0))
+}
+
+/// Create a 30-day API token for pulling images, returning the raw token.
+async fn create_deploy_pull_token(
+    state: &AppState,
+    owner_id: Uuid,
+    deployment_id: Uuid,
+) -> Option<String> {
+    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, now() + interval '30 days')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind(format!("deploy-pull-{}", &deployment_id.to_string()[..8]))
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %e, "failed to create deploy pull token");
+        return None;
+    }
+
+    Some(raw_token)
+}
+
+/// Build `dockerconfigjson` with auth for both registry URLs (node + API).
+fn build_deploy_docker_config(
+    state: &AppState,
+    registry_url: &str,
+    owner_name: &str,
+    raw_token: &str,
+) -> serde_json::Value {
+    let basic_auth = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{owner_name}:{raw_token}"),
+    );
+    let auth_entry = serde_json::json!({"auth": basic_auth});
+
+    let mut auths = serde_json::Map::new();
+    auths.insert(registry_url.to_owned(), auth_entry.clone());
+
+    // Also add API-facing registry URL if different from node URL
+    if let Some(api_url) = state.config.registry_url.as_deref()
+        && api_url != registry_url
+    {
+        auths.insert(api_url.to_owned(), auth_entry);
+    }
+
+    serde_json::json!({"auths": auths})
+}
+
+/// Create or replace a K8s Secret in the given namespace.
+async fn apply_or_replace_secret(state: &AppState, namespace: &str, secret: &Secret) {
+    let name = secret.metadata.name.as_deref().unwrap_or("unknown");
+
+    let api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
+    match api.create(&PostParams::default(), secret).await {
+        Ok(_) => {
+            tracing::info!(%namespace, %name, "created registry pull secret");
+        }
+        Err(kube::Error::Api(err)) if err.code == 409 => {
+            match api.replace(name, &PostParams::default(), secret).await {
+                Ok(_) => {
+                    tracing::info!(%namespace, %name, "refreshed registry pull secret");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, %name, "failed to refresh registry pull secret");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %name, "failed to create registry pull secret");
+        }
+    }
+}
+
 /// Render manifests from ops repo template or generate a basic deployment manifest.
 ///
 /// When an ops repo is linked, reads the template from the repo's working tree
@@ -671,12 +837,15 @@ fn generate_basic_manifest(deployment: &PendingDeployment) -> String {
          \x20     labels:\n\
          \x20       app: {name}\n\
          \x20   spec:\n\
+         \x20     imagePullSecrets:\n\
+         \x20     - name: {secret}\n\
          \x20     containers:\n\
          \x20     - name: app\n\
-         \x20       image: {}\n\
+         \x20       image: {image}\n\
          \x20       ports:\n\
          \x20       - containerPort: 8080\n",
-        deployment.image_ref,
+        secret = REGISTRY_PULL_SECRET_NAME,
+        image = deployment.image_ref,
     )
 }
 

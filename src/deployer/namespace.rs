@@ -1,5 +1,213 @@
 use serde_json::json;
 
+use crate::config::Config;
+
+/// Compute the session namespace name for an agent session.
+///
+/// Format: `{slug}-s-{short_id}` (or `{prefix}-{slug}-s-{short_id}` with `ns_prefix`).
+/// With 40-char slug max + `-s-` + 8-char ID = 51 chars max (safe under 63).
+pub fn session_namespace_name(config: &Config, slug: &str, short_id: &str) -> String {
+    match config.ns_prefix.as_deref() {
+        Some(prefix) => format!("{prefix}-{slug}-s-{short_id}"),
+        None => format!("{slug}-s-{short_id}"),
+    }
+}
+
+/// Build K8s RBAC objects (`ServiceAccount`, `Role`, `RoleBinding`) for an agent session namespace.
+///
+/// Returns 3 JSON objects for server-side apply:
+/// - `ServiceAccount` `agent-sa`
+/// - `Role` `agent-edit` with permissions for core, apps, and batch resources
+/// - `RoleBinding` `agent-edit-binding` linking SA to `Role`
+///
+/// Explicitly excludes `networking.k8s.io` (no `NetworkPolicy` modification).
+pub fn build_session_rbac(
+    ns_name: &str,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let sa = json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": "agent-sa",
+            "namespace": ns_name
+        }
+    });
+
+    let role = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": {
+            "name": "agent-edit",
+            "namespace": ns_name
+        },
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": [
+                    "pods", "pods/log", "pods/exec",
+                    "services", "configmaps", "secrets",
+                    "persistentvolumeclaims", "serviceaccounts", "events"
+                ],
+                "verbs": ["*"]
+            },
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments", "statefulsets", "daemonsets", "replicasets"],
+                "verbs": ["*"]
+            },
+            {
+                "apiGroups": ["batch"],
+                "resources": ["jobs", "cronjobs"],
+                "verbs": ["*"]
+            }
+        ]
+    });
+
+    let rb = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": "agent-edit-binding",
+            "namespace": ns_name
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": "agent-edit"
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": "agent-sa",
+            "namespace": ns_name
+        }]
+    });
+
+    (sa, role, rb)
+}
+
+/// Ensure a session namespace exists with RBAC and `NetworkPolicy`.
+///
+/// Creates: Namespace + `NetworkPolicy` (unless `dev_mode`) + `ServiceAccount` + `Role` + `RoleBinding`.
+/// All operations use server-side apply (idempotent).
+#[tracing::instrument(skip(kube_client), fields(%ns_name), err)]
+pub async fn ensure_session_namespace(
+    kube_client: &kube::Client,
+    ns_name: &str,
+    session_id: &str,
+    project_id: &str,
+    platform_namespace: &str,
+    dev_mode: bool,
+) -> Result<(), super::error::DeployerError> {
+    // 1. Namespace
+    ensure_namespace(kube_client, ns_name, "session", project_id).await?;
+
+    // 2. NetworkPolicy (unless dev mode)
+    if !dev_mode {
+        let _ = ensure_network_policy(kube_client, ns_name, platform_namespace).await;
+    }
+
+    // 3. RBAC objects
+    let (sa_json, role_json, rb_json) = build_session_rbac(ns_name);
+
+    // Apply ServiceAccount
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "",
+        "v1",
+        "ServiceAccount",
+        "serviceaccounts",
+        "agent-sa",
+        sa_json,
+    )
+    .await?;
+
+    // Apply Role
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "Role",
+        "roles",
+        "agent-edit",
+        role_json,
+    )
+    .await?;
+
+    // Apply RoleBinding
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "RoleBinding",
+        "rolebindings",
+        "agent-edit-binding",
+        rb_json,
+    )
+    .await?;
+
+    tracing::info!(%ns_name, %session_id, "session namespace with RBAC ensured");
+    Ok(())
+}
+
+/// Server-side apply a namespaced object.
+#[allow(clippy::too_many_arguments)]
+async fn apply_namespaced_object(
+    kube_client: &kube::Client,
+    ns_name: &str,
+    group: &str,
+    version: &str,
+    kind: &str,
+    plural: &str,
+    name: &str,
+    json_obj: serde_json::Value,
+) -> Result<(), super::error::DeployerError> {
+    let api_version = if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    };
+    let ar = kube::discovery::ApiResource {
+        group: group.into(),
+        version: version.into(),
+        api_version,
+        kind: kind.into(),
+        plural: plural.into(),
+    };
+    let api: kube::Api<kube::api::DynamicObject> =
+        kube::Api::namespaced_with(kube_client.clone(), ns_name, &ar);
+
+    let obj: kube::api::DynamicObject = serde_json::from_value(json_obj)
+        .map_err(|e| super::error::DeployerError::InvalidManifest(e.to_string()))?;
+
+    let patch_params = kube::api::PatchParams::apply("platform-deployer").force();
+    api.patch(name, &patch_params, &kube::api::Patch::Apply(&obj))
+        .await?;
+
+    Ok(())
+}
+
+/// Delete a K8s namespace. Ignores 404 (already deleted).
+pub async fn delete_namespace(kube: &kube::Client, ns_name: &str) -> Result<(), anyhow::Error> {
+    let namespaces: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(kube.clone());
+    match namespaces
+        .delete(ns_name, &kube::api::DeleteParams::default())
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(namespace = %ns_name, "namespace deleted");
+            Ok(())
+        }
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            tracing::debug!(namespace = %ns_name, "namespace already deleted");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Convert a project name into a K8s-safe namespace slug.
 ///
 /// - Lowercases
@@ -349,5 +557,133 @@ mod tests {
     fn network_policy_namespace_is_dev() {
         let np = build_network_policy("my-app-dev", "platform");
         assert_eq!(np["metadata"]["namespace"], "my-app-dev");
+    }
+
+    // -- session_namespace_name --
+
+    #[test]
+    fn session_namespace_name_basic() {
+        let config = Config::test_default();
+        assert_eq!(
+            session_namespace_name(&config, "myapp", "abc12345"),
+            "myapp-s-abc12345"
+        );
+    }
+
+    #[test]
+    fn session_namespace_name_with_prefix() {
+        let mut config = Config::test_default();
+        config.ns_prefix = Some("test".into());
+        assert_eq!(
+            session_namespace_name(&config, "myapp", "abc12345"),
+            "test-myapp-s-abc12345"
+        );
+    }
+
+    #[test]
+    fn session_namespace_name_long_slug() {
+        let config = Config::test_default();
+        let slug = "a".repeat(40);
+        let name = session_namespace_name(&config, &slug, "abc12345");
+        assert!(
+            name.len() <= 63,
+            "session namespace should fit DNS label limit, got {} chars",
+            name.len()
+        );
+    }
+
+    // -- build_session_rbac --
+
+    #[test]
+    fn build_session_rbac_service_account() {
+        let (sa, _, _) = build_session_rbac("test-ns");
+        assert_eq!(sa["metadata"]["name"], "agent-sa");
+        assert_eq!(sa["metadata"]["namespace"], "test-ns");
+        assert_eq!(sa["kind"], "ServiceAccount");
+    }
+
+    #[test]
+    fn build_session_rbac_role_includes_core_resources() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        assert_eq!(role["metadata"]["name"], "agent-edit");
+        let rules = role["rules"].as_array().unwrap();
+        let core_rule = &rules[0];
+        assert_eq!(core_rule["apiGroups"][0], "");
+        let resources: Vec<&str> = core_rule["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(resources.contains(&"pods"));
+        assert!(resources.contains(&"services"));
+        assert!(resources.contains(&"configmaps"));
+        assert!(resources.contains(&"secrets"));
+        assert!(resources.contains(&"pods/log"));
+        assert!(resources.contains(&"pods/exec"));
+    }
+
+    #[test]
+    fn build_session_rbac_role_includes_apps() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        let rules = role["rules"].as_array().unwrap();
+        let apps_rule = &rules[1];
+        assert_eq!(apps_rule["apiGroups"][0], "apps");
+        let resources: Vec<&str> = apps_rule["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(resources.contains(&"deployments"));
+        assert!(resources.contains(&"statefulsets"));
+        assert!(resources.contains(&"daemonsets"));
+        assert!(resources.contains(&"replicasets"));
+    }
+
+    #[test]
+    fn build_session_rbac_role_includes_batch() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        let rules = role["rules"].as_array().unwrap();
+        let batch_rule = &rules[2];
+        assert_eq!(batch_rule["apiGroups"][0], "batch");
+        let resources: Vec<&str> = batch_rule["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(resources.contains(&"jobs"));
+        assert!(resources.contains(&"cronjobs"));
+    }
+
+    #[test]
+    fn build_session_rbac_role_excludes_networkpolicies() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        let rules = role["rules"].as_array().unwrap();
+        for rule in rules {
+            let groups: Vec<&str> = rule["apiGroups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(
+                !groups.contains(&"networking.k8s.io"),
+                "role should not include networking.k8s.io API group"
+            );
+        }
+    }
+
+    #[test]
+    fn build_session_rbac_rolebinding_links_sa_to_role() {
+        let (_, _, rb) = build_session_rbac("test-ns");
+        assert_eq!(rb["metadata"]["name"], "agent-edit-binding");
+        assert_eq!(rb["roleRef"]["name"], "agent-edit");
+        assert_eq!(rb["roleRef"]["kind"], "Role");
+        let subjects = rb["subjects"].as_array().unwrap();
+        assert_eq!(subjects[0]["name"], "agent-sa");
+        assert_eq!(subjects[0]["kind"], "ServiceAccount");
+        assert_eq!(subjects[0]["namespace"], "test-ns");
     }
 }

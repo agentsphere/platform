@@ -101,27 +101,25 @@ pub async fn create_session(
     .fetch_one(&state.pool)
     .await?;
     let workspace_id = project_info.workspace_id;
-    let namespace = state
-        .config
-        .project_namespace(&project_info.namespace_slug, "dev");
 
-    // Ensure project namespace exists (lazy creation for DB-only projects)
-    crate::deployer::namespace::ensure_namespace(
+    // Compute session namespace (per-session isolation)
+    let session_ns = crate::deployer::namespace::session_namespace_name(
+        &state.config,
+        &project_info.namespace_slug,
+        short_id,
+    );
+
+    // Ensure session namespace exists with RBAC (SA + Role + RoleBinding + NetworkPolicy)
+    crate::deployer::namespace::ensure_session_namespace(
         &state.kube,
-        &namespace,
-        "dev",
+        &session_ns,
+        &session_id.to_string(),
         &project_id.to_string(),
+        &state.config.platform_namespace,
+        state.config.dev_mode,
     )
     .await
     .map_err(|e| AgentError::Other(e.into()))?;
-    if !state.config.dev_mode {
-        let _ = crate::deployer::namespace::ensure_network_policy(
-            &state.kube,
-            &namespace,
-            &state.config.platform_namespace,
-        )
-        .await;
-    }
 
     // 3. Create ephemeral agent identity with role-based permissions
     let agent_identity = identity::create_agent_identity(
@@ -161,7 +159,7 @@ pub async fn create_session(
     };
 
     // 4b. Query project secrets scoped to agent/all
-    let extra_env_vars = resolve_agent_secrets(state, project_id).await;
+    let mut extra_env_vars = resolve_agent_secrets(state, project_id).await;
 
     // 4c. Create registry pull secret if registry is configured
     // Use registry_node_url (DaemonSet proxy) for image refs that containerd pulls;
@@ -177,7 +175,7 @@ pub async fn create_session(
             &state.kube,
             reg_url,
             user_id,
-            &namespace,
+            &session_ns,
             "platform.io/session",
             &session_id.to_string(),
         )
@@ -188,6 +186,38 @@ pub async fn create_session(
                 tracing::warn!(error = %e, "failed to create registry pull secret for agent, continuing without");
                 None
             }
+        }
+    } else {
+        None
+    };
+
+    // 4d. Create registry push secret for Kaniko builds (tag-scoped)
+    let registry_push_secret = if let Some(reg_url) = node_registry_url {
+        // Look up project name for tag pattern
+        let project_name: Option<String> =
+            sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id)
+                .fetch_optional(&state.pool)
+                .await?;
+        if let Some(ref pname) = project_name {
+            match crate::registry::pull_secret::create_push_secret(
+                &state.pool,
+                &state.kube,
+                reg_url,
+                user_id,
+                &session_ns,
+                pname,
+                short_id,
+            )
+            .await
+            {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create registry push secret for agent, continuing without");
+                    None
+                }
+            }
+        } else {
+            None
         }
     } else {
         None
@@ -221,7 +251,13 @@ pub async fn create_session(
         allowed_child_roles: None,
         execution_mode: "pod".to_owned(),
         uses_pubsub: true,
+        session_namespace: Some(session_ns.clone()),
     };
+
+    // Inject REGISTRY_AUTH_SECRET env var if push secret was created
+    if let Some(ref ps) = registry_push_secret {
+        extra_env_vars.push(("REGISTRY_AUTH_SECRET".to_owned(), ps.secret_name.clone()));
+    }
 
     // Test/dev: mount host fixture path and set CLAUDE_CLI_PATH for mock CLI
     let host_mount_path = std::env::var("PLATFORM_HOST_MOUNT_PATH").ok();
@@ -233,7 +269,7 @@ pub async fn create_session(
         agent_api_token: &agent_identity.api_token,
         platform_api_url,
         repo_clone_url: &repo_clone_url,
-        namespace: &namespace,
+        namespace: &session_ns,
         project_agent_image: project_agent_image.as_deref(),
         anthropic_api_key: user_api_key.as_deref(),
         cli_oauth_token: cli_oauth_token.as_deref(),
@@ -246,6 +282,7 @@ pub async fn create_session(
         claude_cli_version: &state.config.claude_cli_version,
         host_mount_path: host_mount_path.as_deref(),
         claude_cli_path: claude_cli_path.as_deref(),
+        service_account_name: Some("agent-sa"),
     })?;
 
     let pod_name = pod
@@ -263,18 +300,19 @@ pub async fn create_session(
     )
     .await;
 
-    // 8. Create the pod (subscriber is already listening)
-    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
+    // 8. Create the pod in the session namespace (subscriber is already listening)
+    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &session_ns);
     if let Err(e) = pods.create(&PostParams::default(), &pod).await {
         let _ = super::valkey_acl::delete_session_acl(&state.valkey, session_id).await;
         return Err(AgentError::PodCreationFailed(e.to_string()));
     }
 
-    // 9. Update session to running with pod_name + uses_pubsub
+    // 9. Update session to running with pod_name + uses_pubsub + session_namespace
     sqlx::query!(
-        "UPDATE agent_sessions SET status = 'running', pod_name = $2, uses_pubsub = true WHERE id = $1",
+        "UPDATE agent_sessions SET status = 'running', pod_name = $2, uses_pubsub = true, session_namespace = $3 WHERE id = $1",
         session_id,
         pod_name,
+        session_ns,
     )
     .execute(&state.pool)
     .await?;
@@ -285,8 +323,8 @@ pub async fn create_session(
 
 /// Send a message to a running agent session.
 ///
-/// Routes `cli_subprocess` sessions to the in-memory pending-messages queue,
-/// `uses_pubsub` sessions via Valkey pub/sub, and pod sessions via stdin attach.
+/// Routes via Valkey pub/sub for `uses_pubsub` sessions, otherwise falls back
+/// to execution-mode-specific routing (`cli_subprocess`, pod stdin).
 #[tracing::instrument(skip(state, content), fields(%session_id), err)]
 pub async fn send_message(
     state: &AppState,
@@ -407,6 +445,13 @@ pub async fn stop_session(state: &AppState, session_id: Uuid) -> Result<(), Agen
     // Cleanup Valkey ACL user
     let _ = super::valkey_acl::delete_session_acl(&state.valkey, session_id).await;
 
+    // Delete session namespace (cascading delete removes all K8s resources)
+    if let Some(ref ns) = session.session_namespace
+        && let Err(e) = crate::deployer::namespace::delete_namespace(&state.kube, ns).await
+    {
+        tracing::warn!(error = %e, namespace = %ns, "failed to delete session namespace");
+    }
+
     Ok(())
 }
 
@@ -452,6 +497,7 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
     let running = sqlx::query!(
         r#"
         SELECT s.id as "id!", s.pod_name, s.agent_user_id, s.project_id,
+               s.session_namespace,
                p.namespace_slug as "namespace_slug?"
         FROM agent_sessions s
         LEFT JOIN projects p ON p.id = s.project_id
@@ -466,10 +512,15 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
     }
 
     for session in running {
-        let namespace = session.namespace_slug.as_deref().map_or_else(
-            || state.config.agent_namespace.clone(),
-            |s| state.config.project_namespace(s, "dev"),
-        );
+        // Use session_namespace if set, else fall back to project dev namespace
+        let namespace = if let Some(ref ns) = session.session_namespace {
+            ns.clone()
+        } else {
+            session.namespace_slug.as_deref().map_or_else(
+                || state.config.agent_namespace.clone(),
+                |s| state.config.project_namespace(s, "dev"),
+            )
+        };
         let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
         let Some(ref pod_name) = session.pod_name else {
             continue;
@@ -490,61 +541,32 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
                 };
 
                 if let Some(status) = final_status {
-                    // Capture logs before cleanup
                     capture_session_logs(&pods, pod_name, state, session.id).await;
-
-                    sqlx::query!(
-                        "UPDATE agent_sessions SET status = $2, finished_at = now() WHERE id = $1",
+                    finalize_reaped_session(
+                        state,
+                        &pods,
+                        pod_name,
                         session.id,
+                        session.agent_user_id,
+                        session.project_id,
+                        session.session_namespace.as_deref(),
                         status,
                     )
-                    .execute(&state.pool)
                     .await?;
-
-                    // Cleanup pod
-                    let _ = pods.delete(pod_name, &DeleteParams::default()).await;
-
-                    // Cleanup agent identity + Valkey ACL
-                    if let Some(agent_uid) = session.agent_user_id {
-                        let _ =
-                            identity::cleanup_agent_identity(&state.pool, &state.valkey, agent_uid)
-                                .await;
-                    }
-                    let _ = super::valkey_acl::delete_session_acl(&state.valkey, session.id).await;
-
-                    // Fire webhook (only if session has a project)
-                    if let Some(pid) = session.project_id {
-                        fire_agent_webhook(&state.pool, pid, session.id, status).await;
-                    }
-
-                    // Notify parent (Manager) session if this is a child
-                    notify_parent_of_completion(state, session.id, status).await;
-
-                    tracing::info!(session_id = %session.id, %status, "reaped agent session");
                 }
             }
             Err(kube::Error::Api(err)) if err.code == 404 => {
-                // Pod disappeared — mark as failed
-                sqlx::query!(
-                    "UPDATE agent_sessions SET status = 'failed', finished_at = now() WHERE id = $1",
+                finalize_reaped_session(
+                    state,
+                    &pods,
+                    pod_name,
                     session.id,
+                    session.agent_user_id,
+                    session.project_id,
+                    session.session_namespace.as_deref(),
+                    "failed",
                 )
-                .execute(&state.pool)
                 .await?;
-
-                if let Some(agent_uid) = session.agent_user_id {
-                    let _ = identity::cleanup_agent_identity(&state.pool, &state.valkey, agent_uid)
-                        .await;
-                }
-                let _ = super::valkey_acl::delete_session_acl(&state.valkey, session.id).await;
-
-                if let Some(pid) = session.project_id {
-                    fire_agent_webhook(&state.pool, pid, session.id, "failed").await;
-                }
-
-                // Notify parent (Manager) session if this is a child
-                notify_parent_of_completion(state, session.id, "failed").await;
-
                 tracing::warn!(session_id = %session.id, "agent pod disappeared, marking failed");
             }
             Err(e) => {
@@ -556,18 +578,66 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Finalize a reaped session: update DB, clean up pod/identity/namespace, fire webhooks.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_reaped_session(
+    state: &AppState,
+    pods: &Api<Pod>,
+    pod_name: &str,
+    session_id: Uuid,
+    agent_user_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    session_namespace: Option<&str>,
+    status: &str,
+) -> Result<(), AgentError> {
+    sqlx::query!(
+        "UPDATE agent_sessions SET status = $2, finished_at = now() WHERE id = $1",
+        session_id,
+        status,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    let _ = pods.delete(pod_name, &DeleteParams::default()).await;
+
+    if let Some(agent_uid) = agent_user_id {
+        let _ = identity::cleanup_agent_identity(&state.pool, &state.valkey, agent_uid).await;
+    }
+    let _ = super::valkey_acl::delete_session_acl(&state.valkey, session_id).await;
+
+    if let Some(ns) = session_namespace
+        && let Err(e) = crate::deployer::namespace::delete_namespace(&state.kube, ns).await
+    {
+        tracing::warn!(error = %e, namespace = %ns, "failed to delete session namespace");
+    }
+
+    if let Some(pid) = project_id {
+        fire_agent_webhook(&state.pool, pid, session_id, status).await;
+    }
+
+    notify_parent_of_completion(state, session_id, status).await;
+    tracing::info!(%session_id, %status, "reaped agent session");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the K8s namespace for a session based on its project's `namespace_slug`.
-/// Falls back to `fallback_namespace` for sessions without a project.
+/// Resolve the K8s namespace for a session.
+///
+/// Priority: `session.session_namespace` (new per-session ns) > project dev namespace > fallback.
 async fn resolve_session_namespace(
     pool: &PgPool,
     session: &AgentSession,
     fallback_namespace: &str,
     config: &crate::config::Config,
 ) -> Result<String, AgentError> {
+    // New sessions have session_namespace set
+    if let Some(ref ns) = session.session_namespace {
+        return Ok(ns.clone());
+    }
+    // Backward compat: old sessions use project dev namespace
     if let Some(project_id) = session.project_id {
         let slug = sqlx::query_scalar!(
             "SELECT namespace_slug FROM projects WHERE id = $1 AND is_active = true",
@@ -622,7 +692,7 @@ pub async fn fetch_session(pool: &PgPool, session_id: Uuid) -> Result<AgentSessi
                branch, pod_name, provider, provider_config,
                cost_tokens, created_at, finished_at,
                parent_session_id, spawn_depth, allowed_child_roles,
-               execution_mode, uses_pubsub
+               execution_mode, uses_pubsub, session_namespace
         FROM agent_sessions WHERE id = $1
         "#,
         session_id,
@@ -650,6 +720,7 @@ pub async fn fetch_session(pool: &PgPool, session_id: Uuid) -> Result<AgentSessi
         allowed_child_roles: row.allowed_child_roles,
         execution_mode: row.execution_mode,
         uses_pubsub: row.uses_pubsub,
+        session_namespace: row.session_namespace,
     })
 }
 
@@ -730,16 +801,32 @@ pub async fn create_global_session(
         let oauth = cli_oauth_token.clone();
         let api_key = user_api_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = super::create_app::run_create_app_loop(
+            let result = super::create_app::run_create_app_loop(
                 &state_clone,
                 handle,
                 prompt_owned,
                 oauth,
                 api_key,
             )
+            .await;
+
+            let final_status = match &result {
+                Ok(()) => "completed",
+                Err(e) => {
+                    tracing::error!(error = %e, %session_id, "create-app loop failed");
+                    "failed"
+                }
+            };
+
+            if let Err(e) = sqlx::query(
+                "UPDATE agent_sessions SET status = $2, finished_at = now() WHERE id = $1 AND status = 'running'",
+            )
+            .bind(session_id)
+            .bind(final_status)
+            .execute(&state_clone.pool)
             .await
             {
-                tracing::error!(error = %e, %session_id, "create-app loop failed");
+                tracing::error!(error = %e, %session_id, "failed to update session status after create-app loop");
             }
         });
     } else {

@@ -279,9 +279,11 @@ export PLATFORM_SEED_IMAGES_PATH="/tmp/platform-e2e/seed-images"
 export PLATFORM_AGENT_RUNNER_DIR="${RUNNER_DIR}"
 export CLAUDE_CLI_PATH="${PROJECT_DIR}/tests/fixtures/mock-claude-cli.sh"
 
-# Copy mock CLI to shared mount so it's accessible inside Kind pods
+# Copy mock CLIs to shared mount so they're accessible inside Kind pods
 cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli.sh" "/tmp/platform-e2e/mock-claude-cli.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli.sh"
+cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli-git.sh" "/tmp/platform-e2e/mock-claude-cli-git.sh"
+chmod +x "/tmp/platform-e2e/mock-claude-cli-git.sh"
 export PLATFORM_HOST_MOUNT_PATH="/tmp/platform-e2e"
 # Override CLAUDE_CLI_PATH for pod-accessible path (hostPath mount)
 export CLAUDE_CLI_PATH="/tmp/platform-e2e/mock-claude-cli.sh"
@@ -292,7 +294,7 @@ export CLAUDE_CLI_PATH="/tmp/platform-e2e/mock-claude-cli.sh"
 export SQLX_OFFLINE=true
 
 # Test report file — written after tests complete
-REPORT_FILE="${PROJECT_DIR}/test-report-${RUN_ID}.txt"
+REPORT_FILE="${PROJECT_DIR}/test-report.txt"
 JUNIT_FILE="${PROJECT_DIR}/target/nextest/ci/junit.xml"
 
 # ── Coverage: clean previous data ────────────────────────────────────────

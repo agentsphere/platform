@@ -108,7 +108,7 @@ test-e2e filter="":
     bash {{test_script}} --type e2e {{ if filter != "" { "--expr 'test(" + filter + ")'" } else { "" } }}
 
 test-llm:
-    cargo nextest run --test llm_create_app --run-ignored ignored-only
+    cargo nextest run --test llm_create_app --test llm_create_app_e2e --run-ignored ignored-only
 
 test-mcp:
     cd mcp && npm test

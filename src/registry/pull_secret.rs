@@ -107,6 +107,83 @@ fn build_secret_name(label_value: &str) -> String {
     format!("regpull-{short_label}")
 }
 
+/// Result of creating a registry push secret for Kaniko builds.
+#[allow(dead_code)]
+pub struct PushSecretResult {
+    /// K8s Secret name (to reference as `REGISTRY_AUTH_SECRET` env var).
+    pub secret_name: String,
+    /// Token hash (for DB cleanup of the short-lived API token).
+    pub token_hash: String,
+}
+
+/// Create a tag-scoped API token and a K8s `Opaque` Secret with Docker config
+/// so that Kaniko builds can push images to the platform registry.
+///
+/// The Secret uses `config.json` as the data key (Kaniko expects `/kaniko/.docker/config.json`).
+/// The API token is tag-scoped via `registry_tag_pattern` to restrict pushes.
+#[tracing::instrument(skip(pool, kube), fields(%user_id, %namespace, %short_id), err)]
+pub async fn create_push_secret(
+    pool: &PgPool,
+    kube: &kube::Client,
+    registry_url: &str,
+    user_id: Uuid,
+    namespace: &str,
+    project_name: &str,
+    short_id: &str,
+) -> anyhow::Result<PushSecretResult> {
+    // Create a short-lived API token (1 hour) with tag pattern restriction
+    let (raw_token, token_hash) = token::generate_api_token();
+    let tag_pattern = format!("{project_name}-dev:session-{short_id}-*");
+
+    sqlx::query(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, registry_tag_pattern)
+         VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(format!("registry-push-{short_id}"))
+    .bind(&token_hash)
+    .bind(&tag_pattern)
+    .execute(pool)
+    .await?;
+
+    // Look up the username for Docker config
+    let user_name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("user not found: {user_id}"))?;
+
+    let docker_config = build_docker_config(registry_url, &user_name, &raw_token);
+    let secret_name = format!("registry-push-{short_id}");
+
+    let secret = Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(secret_name.clone()),
+            labels: Some(BTreeMap::from([(
+                "platform.io/session".to_string(),
+                short_id.to_string(),
+            )])),
+            ..Default::default()
+        },
+        type_: Some("Opaque".into()),
+        string_data: Some(BTreeMap::from([(
+            "config.json".into(),
+            docker_config.to_string(),
+        )])),
+        ..Default::default()
+    };
+
+    let secrets: Api<Secret> = Api::namespaced(kube.clone(), namespace);
+    secrets.create(&PostParams::default(), &secret).await?;
+
+    tracing::debug!(%secret_name, %tag_pattern, "created registry push secret");
+    Ok(PushSecretResult {
+        secret_name,
+        token_hash,
+    })
+}
+
 /// Clean up a registry pull secret and its associated API token.
 #[allow(dead_code)]
 pub async fn cleanup_pull_secret(
@@ -178,5 +255,22 @@ mod tests {
     fn secret_name_empty_label() {
         let name = build_secret_name("");
         assert_eq!(name, "regpull-");
+    }
+
+    #[test]
+    fn push_secret_name_format() {
+        let name = format!("registry-push-{}", "abc12345");
+        assert_eq!(name, "registry-push-abc12345");
+    }
+
+    #[test]
+    fn push_secret_docker_config_structure() {
+        let config = build_docker_config("registry.example.com:5000", "agent-user", "tok_push");
+        let auths = config["auths"].as_object().unwrap();
+        assert!(auths.contains_key("registry.example.com:5000"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(auths["registry.example.com:5000"]["auth"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "agent-user:tok_push");
     }
 }

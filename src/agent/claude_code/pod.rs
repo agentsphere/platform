@@ -52,6 +52,8 @@ pub struct PodBuildParams<'a> {
     pub host_mount_path: Option<&'a str>,
     /// Override CLI binary path inside the pod (for mock CLI in tests).
     pub claude_cli_path: Option<&'a str>,
+    /// K8s `ServiceAccount` name for the pod (e.g. `agent-sa` for session RBAC).
+    pub service_account_name: Option<&'a str>,
 }
 
 /// Resolves the container image for an agent pod.
@@ -176,6 +178,7 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
                 fs_group: Some(1000),
                 ..Default::default()
             }),
+            service_account_name: params.service_account_name.map(String::from),
             image_pull_secrets: params.registry_secret_name.map(|name| {
                 vec![LocalObjectReference {
                     name: name.to_string(),
@@ -190,20 +193,6 @@ pub fn build_agent_pod(params: &PodBuildParams<'_>) -> Pod {
     }
 }
 
-/// System prompt injected into every Worker Agent pod.
-///
-/// Ensures the agent works in the git repo and commits/pushes its output,
-/// regardless of what the Manager's spawn prompt says.
-const WORKER_AGENT_SYSTEM_PROMPT: &str = "\
-You are a coding agent running inside a container. Your working directory is /workspace, \
-which is a git repository cloned from the platform.\n\n\
-RULES:\n\
-1. Create ALL files directly in /workspace (the current directory). NEVER use /tmp or other paths.\n\
-2. After you finish creating/modifying files, you MUST stage, commit, and push:\n\
-   git add -A && git commit -m \"your commit message\" && git push origin main\n\
-3. Git credentials are pre-configured — push will work without extra setup.\n\
-4. The platform automatically builds and deploys your code when you push to main.";
-
 fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
     let cli_path = params
         .claude_cli_path
@@ -217,8 +206,6 @@ fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
         "/workspace".to_owned(),
         "--permission-mode".to_owned(),
         "bypassPermissions".to_owned(),
-        "--system-prompt".to_owned(),
-        WORKER_AGENT_SYSTEM_PROMPT.to_owned(),
     ];
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
@@ -246,15 +233,21 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "BRANCH",
     "AGENT_ROLE",
     "PROJECT_ID",
-    "GIT_AUTH_TOKEN",
     "GIT_ASKPASS",
+    "GIT_AUTH_TOKEN",
     "GIT_BRANCH",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
     "BROWSER_ENABLED",
     "BROWSER_CDP_URL",
     "BROWSER_ALLOWED_ORIGINS",
     "DISABLE_AUTOUPDATER",
     "DISABLE_TELEMETRY",
     "PATH",
+    "SESSION_NAMESPACE",
+    "REGISTRY_URL",
+    "REGISTRY_AUTH_SECRET",
 ];
 
 fn is_reserved_env_var(name: &str) -> bool {
@@ -282,9 +275,17 @@ fn build_env_vars(
         env_var("DISABLE_TELEMETRY", "1"),
         env_var("BRANCH", branch),
         env_var("AGENT_ROLE", role),
-        // GIT_ASKPASS env var — more reliable than repo-local core.askPass config
-        // because it works even if the agent runs git commands outside the repo directory.
+        // GIT_ASKPASS env var — enables git push from the main container.
+        // The script reads PLATFORM_API_TOKEN and is created by the git-clone init container
+        // on the shared workspace volume.
         env_var("GIT_ASKPASS", "/workspace/.platform/bin/git-askpass.sh"),
+        // The git-clone init container runs as root but the main container runs
+        // as a non-root user. Mark /workspace as safe to avoid "dubious ownership"
+        // errors. GIT_CONFIG_COUNT/KEY/VALUE env vars inject config entries without
+        // requiring a file.
+        env_var("GIT_CONFIG_COUNT", "1"),
+        env_var("GIT_CONFIG_KEY_0", "safe.directory"),
+        env_var("GIT_CONFIG_VALUE_0", "/workspace"),
     ];
 
     // Auth priority: CLI OAuth token (subscription) > Anthropic API key.
@@ -304,6 +305,12 @@ fn build_env_vars(
     }
     if let Some(pid) = params.session.project_id {
         vars.push(env_var("PROJECT_ID", &pid.to_string()));
+    }
+    if let Some(ref session_ns) = params.session.session_namespace {
+        vars.push(env_var("SESSION_NAMESPACE", session_ns));
+    }
+    if let Some(reg_url) = params.registry_url {
+        vars.push(env_var("REGISTRY_URL", reg_url));
     }
     // Browser sidecar env vars
     if let Some(ref browser) = params.config.browser {
@@ -325,39 +332,27 @@ fn build_env_vars(
     vars
 }
 
-/// Build the shell script for the setup-tools init container.
+/// Build the setup-tools init container that downloads agent-runner from the
+/// platform server and installs Claude CLI.
 ///
-/// Detects baked-in binaries (PATH + common locations) before attempting downloads.
-fn build_setup_script(claude_cli_version: &str) -> String {
-    format!(
+/// Uses the same image as the main container (no extra image pull).
+/// Tools are installed to `/workspace/.platform/bin/` (shared workspace volume).
+/// Idempotent: skips each tool if already present.
+fn build_setup_tools_container(
+    params: &PodBuildParams<'_>,
+    image: &str,
+    pull_policy: &str,
+) -> Container {
+    let setup_script = format!(
         r#"set -eu
 BIN_DIR=/workspace/.platform/bin
 mkdir -p "$BIN_DIR"
 
-# Helper: find a binary on PATH or in common install locations
-find_binary() {{
-  name="$1"
-  # Check PATH first
-  if command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"
-    return 0
-  fi
-  # Check common install locations (baked-in images)
-  for dir in /usr/local/bin /usr/bin /opt/bin /home/agent/.local/bin; do
-    if [ -x "$dir/$name" ]; then
-      echo "$dir/$name"
-      return 0
-    fi
-  done
-  return 1
-}}
-
 # 1. Setup agent-runner: prefer baked-in binary, fallback to download
 if [ ! -x "$BIN_DIR/agent-runner" ]; then
-  FOUND=$(find_binary agent-runner || true)
-  if [ -n "$FOUND" ]; then
-    ln -sf "$FOUND" "$BIN_DIR/agent-runner"
-    echo "[setup] agent-runner found at $FOUND, symlinked"
+  if command -v agent-runner >/dev/null 2>&1; then
+    ln -sf "$(command -v agent-runner)" "$BIN_DIR/agent-runner"
+    echo "[setup] agent-runner found on PATH, symlinked"
   else
     ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
     echo "[setup] Downloading agent-runner ($ARCH)..."
@@ -379,25 +374,20 @@ if [ ! -x "$BIN_DIR/agent-runner" ]; then
       exit 1
     fi
     chmod +x "$BIN_DIR/agent-runner"
-    echo "[setup] agent-runner installed via download"
+    echo "[setup] agent-runner installed"
   fi
 fi
 
-# 2. Setup Claude CLI: prefer baked-in binary, fallback to npm/installer
-if [ ! -x "$BIN_DIR/claude" ]; then
-  FOUND=$(find_binary claude || true)
-  if [ -n "$FOUND" ]; then
-    ln -sf "$FOUND" "$BIN_DIR/claude"
-    echo "[setup] Claude CLI found at $FOUND, symlinked"
-  elif command -v npm >/dev/null 2>&1; then
+# 2. Setup Claude CLI: prefer baked-in binary, fallback to install
+if [ ! -x "$BIN_DIR/claude" ] && command -v claude >/dev/null 2>&1; then
+  ln -sf "$(command -v claude)" "$BIN_DIR/claude"
+  echo "[setup] claude found on PATH, symlinked"
+elif [ ! -x "$BIN_DIR/claude" ]; then
+  if command -v npm >/dev/null 2>&1; then
     echo "[setup] Installing Claude CLI v{claude_cli_version} via npm..."
     npm install -g --prefix /workspace/.platform \
       @anthropic-ai/claude-code@{claude_cli_version} 2>&1 | tail -1
-    # npm global bin may land in /workspace/.platform/bin or lib/node_modules/.bin
-    if [ ! -x "$BIN_DIR/claude" ] && [ -x /workspace/.platform/lib/node_modules/.bin/claude ]; then
-      ln -sf /workspace/.platform/lib/node_modules/.bin/claude "$BIN_DIR/claude"
-    fi
-    echo "[setup] Claude CLI installed via npm"
+    echo "[setup] Claude CLI installed"
   elif command -v curl >/dev/null 2>&1; then
     echo "[setup] Installing Claude CLI via native installer..."
     export HOME=/workspace/.platform
@@ -405,7 +395,7 @@ if [ ! -x "$BIN_DIR/claude" ]; then
     if [ -x /workspace/.platform/.local/bin/claude ]; then
       ln -sf /workspace/.platform/.local/bin/claude "$BIN_DIR/claude"
     fi
-    echo "[setup] Claude CLI installed via native installer"
+    echo "[setup] Claude CLI installed"
   else
     echo '[setup] WARNING: no npm or curl — Claude CLI not installed' >&2
     echo '[setup] Ensure claude is available on PATH in the main container' >&2
@@ -413,21 +403,8 @@ if [ ! -x "$BIN_DIR/claude" ]; then
 fi
 
 echo "[setup] Auto-setup complete""#,
-    )
-}
-
-/// Build the setup-tools init container that downloads agent-runner from the
-/// platform server and installs Claude CLI.
-///
-/// Uses the same image as the main container (no extra image pull).
-/// Tools are installed to `/workspace/.platform/bin/` (shared workspace volume).
-/// Idempotent: skips each tool if already present.
-fn build_setup_tools_container(
-    params: &PodBuildParams<'_>,
-    image: &str,
-    pull_policy: &str,
-) -> Container {
-    let setup_script = build_setup_script(params.claude_cli_version);
+        claude_cli_version = params.claude_cli_version,
+    );
 
     Container {
         name: "setup-tools".into(),
@@ -531,23 +508,7 @@ fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str
              git config user.email 'agent@platform.local'; \
              mkdir -p /workspace/.platform/bin; \
              printf '#!/bin/sh\\necho \"$PLATFORM_API_TOKEN\"\\n' > /workspace/.platform/bin/git-askpass.sh; \
-             chmod +x /workspace/.platform/bin/git-askpass.sh; \
-             git config core.askPass /workspace/.platform/bin/git-askpass.sh; \
-             git config credential.helper ''; \
-             cat > /workspace/CLAUDE.md << 'CLAUDEMD'\n\
-# Agent Instructions\n\
-\n\
-You are working in /workspace, a git repository. ALL files must be created here (the current directory).\n\
-NEVER create files in /tmp, /private, or any other directory.\n\
-\n\
-After you finish creating/modifying ALL files, you MUST commit and push:\n\
-```\n\
-git add -A && git commit -m \"Initial app scaffold\" && git push origin main\n\
-```\n\
-\n\
-Git credentials are pre-configured. Push will work without extra setup.\n\
-Do NOT test or verify the app — just create files, commit, and push.\n\
-CLAUDEMD",
+             chmod +x /workspace/.platform/bin/git-askpass.sh",
         )]),
         env: Some(vec![
             env_var("GIT_AUTH_TOKEN", api_token),
@@ -689,6 +650,7 @@ mod tests {
             allowed_child_roles: None,
             execution_mode: "pod".to_owned(),
             uses_pubsub: false,
+            session_namespace: None,
         }
     }
 
@@ -712,6 +674,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         assert_eq!(pod.metadata.name.as_deref(), Some("agent-12345678"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("platform-agents"));
@@ -737,6 +700,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["platform.io/component"], "agent-session");
@@ -767,6 +731,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let claude_container = &spec.containers[0];
@@ -795,6 +760,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -825,6 +791,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -854,6 +821,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -897,6 +865,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -929,6 +898,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -960,6 +930,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
@@ -989,6 +960,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1040,6 +1012,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1071,6 +1044,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1113,6 +1087,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let resources = spec.containers[0].resources.as_ref().unwrap();
@@ -1141,6 +1116,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -1234,6 +1210,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -1261,6 +1238,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let main = &spec.containers[0];
@@ -1292,6 +1270,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1327,6 +1306,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1353,6 +1333,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1381,6 +1362,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1413,6 +1395,7 @@ mod tests {
             claude_cli_version: "2.1.63",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1453,6 +1436,7 @@ mod tests {
             claude_cli_version: "2.1.63",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1482,6 +1466,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = spec.init_containers.unwrap();
@@ -1509,6 +1494,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let pod_spec = pod.spec.unwrap();
         let init = pod_spec.init_containers.unwrap();
@@ -1550,6 +1536,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 2, "should have claude + browser");
@@ -1577,6 +1564,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers.len(), 1, "should have only claude");
@@ -1603,6 +1591,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1637,6 +1626,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let volumes = spec.volumes.unwrap();
@@ -1664,6 +1654,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1699,6 +1690,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1733,6 +1725,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1763,6 +1756,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let browser = &spec.containers[1];
@@ -1795,6 +1789,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let psc = spec.security_context.unwrap();
@@ -1824,6 +1819,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let container = &spec.containers[0];
@@ -1854,6 +1850,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let init = &spec.init_containers.unwrap()[0];
@@ -1889,6 +1886,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1921,6 +1919,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod_without.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -1957,6 +1956,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2003,6 +2003,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let secrets = spec.image_pull_secrets.unwrap();
@@ -2030,6 +2031,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         assert!(
@@ -2060,6 +2062,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2090,6 +2093,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2119,6 +2123,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2169,6 +2174,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2205,6 +2211,7 @@ mod tests {
             claude_cli_version: "stable",
             host_mount_path: None,
             claude_cli_path: None,
+            service_account_name: None,
         });
         let spec = pod.spec.unwrap();
         let env = spec.containers[0].env.as_ref().unwrap();
@@ -2216,5 +2223,157 @@ mod tests {
             env.iter().all(|e| e.name != "CLAUDE_CODE_OAUTH_TOKEN"),
             "CLAUDE_CODE_OAUTH_TOKEN should not be set when no auth configured"
         );
+    }
+
+    #[test]
+    fn pod_has_service_account_when_set() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: Some("agent-sa"),
+        });
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.service_account_name.as_deref(), Some("agent-sa"));
+    }
+
+    #[test]
+    fn pod_no_service_account_when_unset() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+        });
+        let spec = pod.spec.unwrap();
+        assert!(spec.service_account_name.is_none());
+    }
+
+    #[test]
+    fn pod_has_session_namespace_env() {
+        let mut session = test_session();
+        session.session_namespace = Some("myapp-s-abc12345".to_string());
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let ns_var = env
+            .iter()
+            .find(|e| e.name == "SESSION_NAMESPACE")
+            .expect("SESSION_NAMESPACE should be set");
+        assert_eq!(ns_var.value.as_deref(), Some("myapp-s-abc12345"));
+    }
+
+    #[test]
+    fn pod_no_session_namespace_env_when_none() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        assert!(
+            env.iter().all(|e| e.name != "SESSION_NAMESPACE"),
+            "SESSION_NAMESPACE should not be set when session_namespace is None"
+        );
+    }
+
+    #[test]
+    fn pod_has_registry_url_env() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: Some("host.docker.internal:8080"),
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let reg_var = env
+            .iter()
+            .find(|e| e.name == "REGISTRY_URL")
+            .expect("REGISTRY_URL should be set");
+        assert_eq!(reg_var.value.as_deref(), Some("host.docker.internal:8080"));
+    }
+
+    #[test]
+    fn reserved_env_vars_includes_session_and_registry() {
+        assert!(is_reserved_env_var("SESSION_NAMESPACE"));
+        assert!(is_reserved_env_var("REGISTRY_URL"));
+        assert!(is_reserved_env_var("REGISTRY_AUTH_SECRET"));
     }
 }

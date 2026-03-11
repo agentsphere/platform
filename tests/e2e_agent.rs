@@ -1,5 +1,7 @@
 mod e2e_helpers;
 
+use std::fmt::Write;
+
 use axum::http::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -187,8 +189,17 @@ async fn agent_pod_spec_correct(pool: PgPool) {
         use k8s_openapi::api::core::v1::Pod;
         use kube::Api;
 
-        let namespace = &state.config.agent_namespace;
-        let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+        // Look up session namespace from DB (not in API response)
+        let session_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+        let session_ns: Option<String> =
+            sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let session_ns = session_ns.expect("session_namespace should be set");
+
+        let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &session_ns);
 
         if let Ok(pod) = pods.get(pod_name).await
             && let Some(spec) = &pod.spec
@@ -199,12 +210,19 @@ async fn agent_pod_spec_correct(pool: PgPool) {
                 "pod should have at least one container"
             );
 
+            // Verify service account is set
+            assert_eq!(
+                spec.service_account_name.as_deref(),
+                Some("agent-sa"),
+                "pod should use agent-sa service account"
+            );
+
             let container = &containers[0];
             if let Some(envs) = &container.env {
                 let env_names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
 
                 // These env vars should be present in the agent pod
-                for expected in &["SESSION_ID", "PROJECT_ID"] {
+                for expected in &["SESSION_ID", "PROJECT_ID", "SESSION_NAMESPACE"] {
                     assert!(
                         env_names.contains(expected),
                         "pod should have {expected} env var, found: {env_names:?}"
@@ -457,7 +475,7 @@ async fn agent_role_determines_mcp_config(pool: PgPool) {
 }
 
 /// Test 8: Full agent session pub/sub flow — create session → pod runs mock CLI →
-/// agent-runner publishes events → persistence subscriber writes to agent_messages →
+/// agent-runner publishes events → persistence subscriber writes to `agent_messages` →
 /// session detail shows messages.
 ///
 /// This requires:
@@ -499,13 +517,14 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
     let pod_name = body["pod_name"]
         .as_str()
         .expect("session response should have pod_name");
-    let namespace_slug: String =
-        sqlx::query_scalar("SELECT namespace_slug FROM projects WHERE id = $1")
-            .bind(project_id)
+    // Pod is now in the session namespace, not the project dev namespace
+    let namespace: Option<String> =
+        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    let namespace = state.config.project_namespace(&namespace_slug, "dev");
+    let namespace = namespace.expect("session_namespace should be set");
 
     let phase = e2e_helpers::wait_for_pod(&state.kube, &namespace, pod_name, 120).await;
     eprintln!("pod {pod_name} finished with phase: {phase}");
@@ -594,7 +613,160 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
     );
 }
 
-/// Test 9: Agent identity is fully cleaned up after session ends.
+/// Test 9: Agent pod can clone via init container and push from main container.
+///
+/// Validates the full git auth chain:
+///   - git-clone init container: `GIT_ASKPASS` → token → smart HTTP clone
+///   - main container (mock CLI): `GIT_ASKPASS` → `PLATFORM_API_TOKEN` → git push
+///
+/// Uses `mock-claude-cli-git.sh` which creates a file, commits, and pushes.
+#[ignore = "requires Kind cluster"]
+#[sqlx::test(migrations = "./migrations")]
+async fn e2e_agent_git_clone_push(pool: PgPool) {
+    // 1. Start real TCP server (pod needs to reach platform API for git HTTP)
+    let (state, admin_token, _server) = e2e_helpers::start_agent_server(pool.clone()).await;
+    let app = e2e_helpers::test_router(state.clone());
+
+    // 2. Create project with bare repo + initial commit
+    let project_id = setup_agent_project(&state, &app, &admin_token, "agent-git-push").await;
+
+    // Get the bare repo path for later verification
+    let repo_path: String = sqlx::query_scalar("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Record initial commit count
+    let initial_log = e2e_helpers::git_cmd(
+        std::path::Path::new(&repo_path),
+        &["log", "--oneline", "main"],
+    );
+    let initial_commit_count = initial_log.lines().count();
+
+    // 3. Swap the mock CLI file to the git-pushing variant.
+    //    CLAUDE_CLI_PATH is read from env at session creation time and we can't
+    //    use set_var (unsafe_code = forbid). Instead, we replace the file at the
+    //    existing CLAUDE_CLI_PATH with the git-push variant and restore it after.
+    let cli_path = std::env::var("CLAUDE_CLI_PATH")
+        .expect("CLAUDE_CLI_PATH must be set — run via: just test-e2e");
+    let backup_path = format!("{cli_path}.bak-git-test");
+    let git_mock_source = std::env::var("PLATFORM_HOST_MOUNT_PATH").map_or_else(
+        |_| {
+            format!(
+                "{}/tests/fixtures/mock-claude-cli-git.sh",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        },
+        |p| format!("{p}/mock-claude-cli-git.sh"),
+    );
+    std::fs::rename(&cli_path, &backup_path).expect("backup original mock CLI");
+    std::fs::copy(&git_mock_source, &cli_path).expect("install git mock CLI");
+
+    // 4. Create session with branch: "main" so init container checks out main
+    let (status, body) = e2e_helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions"),
+        serde_json::json!({
+            "prompt": "Git push integration test",
+            "provider": "claude-code",
+            "branch": "main",
+        }),
+    )
+    .await;
+
+    if status != StatusCode::CREATED {
+        // Restore before panicking
+        std::fs::rename(&backup_path, &cli_path).expect("restore original mock CLI");
+        panic!("expected session creation to succeed, got {status}: {body}");
+    }
+
+    let session_id_str = body["id"].as_str().unwrap();
+    let session_id: Uuid = session_id_str.parse().unwrap();
+    let pod_name = body["pod_name"]
+        .as_str()
+        .expect("session response should have pod_name");
+
+    // 5. Get session namespace for pod lookups (pods now use per-session namespaces)
+    let namespace: Option<String> =
+        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let namespace = namespace.expect("session_namespace should be set");
+
+    // 6. Wait for pod to complete (clone + commit + push + NDJSON)
+    //    Keep the git mock in place until the pod finishes — the pod reads
+    //    the script from the hostPath mount at execution time, not at creation.
+    let phase = e2e_helpers::wait_for_pod(&state.kube, &namespace, pod_name, 180).await;
+    eprintln!("pod {pod_name} finished with phase: {phase}");
+
+    // Restore original mock CLI after pod completes
+    std::fs::rename(&backup_path, &cli_path).expect("restore original mock CLI");
+
+    // On failure, dump all container logs for debugging
+    if phase != "Succeeded" {
+        let mut all_logs = String::new();
+        for container in &["git-clone", "setup-tools", "claude"] {
+            let logs =
+                e2e_helpers::pod_logs_container(&state.kube, &namespace, pod_name, container).await;
+            write!(all_logs, "\n=== {container} ===\n{logs}\n").unwrap();
+        }
+        panic!(
+            "pod should succeed with mock-claude-cli-git.sh, got phase: {phase}\n\
+             Pod logs:{all_logs}"
+        );
+    }
+
+    // 7. Run reaper to transition session to completed
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    platform::agent::service::run_reaper_once(&state).await;
+
+    let final_status =
+        e2e_helpers::poll_session_status(&pool, session_id, &["completed", "failed"], 30).await;
+    assert_eq!(
+        final_status, "completed",
+        "session should be completed after successful pod"
+    );
+
+    // 8. Verify push: bare repo should have one more commit on main
+    let final_log = e2e_helpers::git_cmd(
+        std::path::Path::new(&repo_path),
+        &["log", "--oneline", "main"],
+    );
+    let final_commit_count = final_log.lines().count();
+    assert_eq!(
+        final_commit_count,
+        initial_commit_count + 1,
+        "bare repo should have exactly 1 new commit on main (initial: {initial_commit_count}, final: {final_commit_count})"
+    );
+
+    // 9. Verify commit message
+    let last_subject = e2e_helpers::git_cmd(
+        std::path::Path::new(&repo_path),
+        &["log", "-1", "--format=%s", "main"],
+    );
+    assert!(
+        last_subject.trim().contains("agent push test"),
+        "last commit subject should contain 'agent push test', got: '{}'",
+        last_subject.trim()
+    );
+
+    // 10. Verify file content
+    let file_content = e2e_helpers::git_cmd(
+        std::path::Path::new(&repo_path),
+        &["show", "main:agent-test-file.txt"],
+    );
+    assert_eq!(
+        file_content.trim(),
+        "agent-pushed-content",
+        "pushed file content should match"
+    );
+}
+
+/// Test 10: Agent identity is fully cleaned up after session ends.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn agent_identity_cleanup(pool: PgPool) {
@@ -707,4 +879,55 @@ async fn agent_identity_cleanup(pool: PgPool) {
         token_count.0, 0,
         "no active tokens should remain for the agent identity"
     );
+}
+
+/// Test 10: Two sessions for the same project get different namespaces.
+#[ignore = "requires Kind cluster"]
+#[sqlx::test(migrations = "./migrations")]
+async fn agent_session_namespace_isolation(pool: PgPool) {
+    let (state, admin_token) = e2e_helpers::e2e_state(pool.clone()).await;
+    let app = e2e_helpers::test_router(state.clone());
+
+    let project_id = setup_agent_project(&state, &app, &admin_token, "agent-iso").await;
+
+    // Create two sessions
+    let mut namespaces = Vec::new();
+    for i in 0..2 {
+        let (status, body) = e2e_helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/sessions"),
+            serde_json::json!({
+                "prompt": format!("Isolation test {i}"),
+                "provider": "claude-code",
+            }),
+        )
+        .await;
+
+        if status != StatusCode::CREATED {
+            eprintln!("session {i} creation failed ({status}): {body}");
+            return;
+        }
+
+        let session_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+        let ns: Option<String> =
+            sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        namespaces.push(ns.expect("session_namespace should be set"));
+    }
+
+    assert_ne!(
+        namespaces[0], namespaces[1],
+        "two sessions for the same project should have different namespaces"
+    );
+
+    // Cleanup: delete both session namespaces
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    for ns in &namespaces {
+        let _ = ns_api.delete(ns, &kube::api::DeleteParams::default()).await;
+    }
 }

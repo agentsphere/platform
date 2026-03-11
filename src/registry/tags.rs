@@ -60,3 +60,16 @@ pub async fn list_tags(
 
     Ok(Json(TagListResponse { name, tags }))
 }
+
+// ---------------------------------------------------------------------------
+// Namespaced wrapper (two-segment: {ns}/{repo})
+// ---------------------------------------------------------------------------
+
+pub async fn list_tags_ns(
+    state: State<AppState>,
+    user: OptionalRegistryUser,
+    Path((ns, repo)): Path<(String, String)>,
+    query: Query<TagListQuery>,
+) -> Result<Json<TagListResponse>, RegistryError> {
+    list_tags(state, user, Path(format!("{ns}/{repo}")), query).await
+}

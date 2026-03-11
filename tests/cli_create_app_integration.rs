@@ -16,6 +16,8 @@ use fred::interfaces::PubsubInterface;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use tower::ServiceExt;
+
 use helpers::{
     assign_role, create_user, post_json, set_user_api_key, test_router, test_state_with_cli,
 };
@@ -238,7 +240,7 @@ async fn cli_create_app_completes_tool_loop(pool: PgPool) {
 // Manager→Worker communication tests (PR 1)
 // ---------------------------------------------------------------------------
 
-/// `create_session()` with `parent_session_id` links child to parent and sets spawn_depth.
+/// `create_session()` with `parent_session_id` links child to parent and sets `spawn_depth`.
 #[sqlx::test(migrations = "./migrations")]
 async fn create_session_with_parent_links_child(pool: PgPool) {
     let (state, admin_token) = test_state_with_cli(pool.clone(), false).await;
@@ -253,7 +255,7 @@ async fn create_session_with_parent_links_child(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -336,7 +338,7 @@ async fn send_message_rejects_non_child(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -412,7 +414,7 @@ async fn check_progress_returns_messages(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -497,7 +499,7 @@ async fn child_completion_notifies_parent(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -594,7 +596,7 @@ async fn tree_subscription_receives_from_multiple_sessions(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -708,7 +710,7 @@ async fn manager_worker_full_lifecycle(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -861,7 +863,7 @@ async fn sse_include_children_streams_child_events(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -916,7 +918,6 @@ async fn sse_include_children_streams_child_events(pool: PgPool) {
     });
 
     // Send SSE request with include_children=true
-    use tower::ServiceExt;
     let req = axum::http::Request::builder()
         .uri(format!(
             "/api/sessions/{}/events?include_children=true",
@@ -946,7 +947,7 @@ async fn user_sends_message_to_child_session(pool: PgPool) {
     let ws_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name, owner_id) VALUES ($1, $2, $3)")
         .bind(ws_id)
-        .bind(&format!("ws-{}", ws_id))
+        .bind(format!("ws-{ws_id}"))
         .bind(user_id)
         .execute(&pool)
         .await
@@ -1046,7 +1047,6 @@ async fn sse_global_without_children_param_works(pool: PgPool) {
 
     // Verify SSE endpoint is accessible (we can't easily consume SSE in tests,
     // but we can verify the route exists and returns the right content type)
-    use tower::ServiceExt;
     let req = axum::http::Request::builder()
         .uri(format!("/api/sessions/{session_id}/events"))
         .header("Authorization", format!("Bearer {token}"))

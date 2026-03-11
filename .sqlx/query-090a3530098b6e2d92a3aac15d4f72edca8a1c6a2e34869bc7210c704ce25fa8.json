@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT u.id as \"user_id!\", u.name as \"user_name!\", u.is_active as \"is_active!\",\n               t.project_id as \"scope_project_id?\", t.scope_workspace_id\n        FROM api_tokens t\n        JOIN users u ON u.id = t.user_id\n        WHERE t.token_hash = $1\n          AND u.name = $2\n          AND (t.expires_at IS NULL OR t.expires_at > now())\n        ",
+  "query": "\n        SELECT u.id as \"user_id!\", u.name as \"user_name!\", u.is_active as \"is_active!\",\n               t.project_id as \"scope_project_id?\", t.scope_workspace_id,\n               t.registry_tag_pattern\n        FROM api_tokens t\n        JOIN users u ON u.id = t.user_id\n        WHERE t.token_hash = $1\n          AND u.name = $2\n          AND (t.expires_at IS NULL OR t.expires_at > now())\n        ",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,11 @@
         "ordinal": 4,
         "name": "scope_workspace_id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "registry_tag_pattern",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -40,8 +45,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "080436ba2f76ec8af1545f3e609aeca08be2c2dc4d9f4050c442a55d7e2104e0"
+  "hash": "090a3530098b6e2d92a3aac15d4f72edca8a1c6a2e34869bc7210c704ce25fa8"
 }

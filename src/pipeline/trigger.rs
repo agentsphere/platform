@@ -247,8 +247,10 @@ async fn insert_dev_image_step(
         "/kaniko/executor \
         --dockerfile={dockerfile} \
         --context=/workspace \
-        --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}-dev:${{COMMIT_SHA:-latest}} \
+        --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/dev:${{COMMIT_SHA:-latest}} \
+        --build-arg=PLATFORM_RUNNER_IMAGE=${{REGISTRY}}/platform-runner:latest \
         --insecure \
+        --insecure-pull \
         --cache=true"
     );
     let commands: Vec<&str> = vec![&cmd];

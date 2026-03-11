@@ -20,6 +20,8 @@ pub struct RegistryUser {
     pub boundary_project_id: Option<Uuid>,
     /// Hard workspace boundary from API token.
     pub boundary_workspace_id: Option<Uuid>,
+    /// When non-NULL, limits which image name:tag this token can push to (glob pattern).
+    pub registry_tag_pattern: Option<String>,
 }
 
 /// Rejection type for registry auth — returns OCI-compliant 401 with Www-Authenticate.
@@ -51,6 +53,7 @@ struct TokenLookup {
     is_active: bool,
     scope_project_id: Option<Uuid>,
     scope_workspace_id: Option<Uuid>,
+    registry_tag_pattern: Option<String>,
 }
 
 impl FromRequestParts<AppState> for RegistryUser {
@@ -80,6 +83,7 @@ impl FromRequestParts<AppState> for RegistryUser {
                     user_name: user.user_name,
                     boundary_project_id: user.scope_project_id,
                     boundary_workspace_id: user.scope_workspace_id,
+                    registry_tag_pattern: user.registry_tag_pattern,
                 });
             }
             return Err(RegistryAuthRejection);
@@ -98,6 +102,7 @@ impl FromRequestParts<AppState> for RegistryUser {
                     user_name: user.user_name,
                     boundary_project_id: user.scope_project_id,
                     boundary_workspace_id: user.scope_workspace_id,
+                    registry_tag_pattern: user.registry_tag_pattern,
                 });
             }
             return Err(RegistryAuthRejection);
@@ -115,7 +120,8 @@ async fn lookup_api_token(pool: &sqlx::PgPool, raw_token: &str) -> Option<TokenL
         TokenLookup,
         r#"
         SELECT u.id as "user_id!", u.name as "user_name!", u.is_active as "is_active!",
-               t.project_id as "scope_project_id?", t.scope_workspace_id
+               t.project_id as "scope_project_id?", t.scope_workspace_id,
+               t.registry_tag_pattern
         FROM api_tokens t
         JOIN users u ON u.id = t.user_id
         WHERE t.token_hash = $1
@@ -156,7 +162,8 @@ async fn lookup_basic_auth(
         TokenLookup,
         r#"
         SELECT u.id as "user_id!", u.name as "user_name!", u.is_active as "is_active!",
-               t.project_id as "scope_project_id?", t.scope_workspace_id
+               t.project_id as "scope_project_id?", t.scope_workspace_id,
+               t.registry_tag_pattern
         FROM api_tokens t
         JOIN users u ON u.id = t.user_id
         WHERE t.token_hash = $1

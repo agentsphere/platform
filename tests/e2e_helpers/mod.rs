@@ -713,12 +713,27 @@ fn host_addr_for_kind() -> String {
 /// Unlike `test_router`, this includes the git smart HTTP routes so that
 /// pipeline pods can clone repos via HTTP.
 pub fn pipeline_test_router(state: AppState) -> Router {
+    use axum::extract::DefaultBodyLimit;
+    use tower_http::limit::RequestBodyLimitLayer;
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(platform::api::router())
-        .merge(platform::git::git_protocol_router())
-        .merge(platform::registry::router())
+        // Git + registry routes need a higher body limit (500 MB).
+        // Both RequestBodyLimitLayer AND DefaultBodyLimit must be set because
+        // axum's Bytes extractor wraps the body in an *additional* Limited
+        // based on DefaultBodyLimit (see axum-core with_limited_body()).
+        .merge(
+            platform::git::git_protocol_router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
+        .merge(
+            platform::registry::router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
         .with_state(state)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
 }
 
 /// Start a real TCP server for pipeline E2E tests.

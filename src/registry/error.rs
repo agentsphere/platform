@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 /// OCI Distribution Spec error codes.
@@ -136,6 +136,17 @@ impl IntoResponse for RegistryError {
                 "detail": {}
             }]
         });
+
+        // 401 responses must include Www-Authenticate per OCI spec so that
+        // containerd/Docker know to retry with credentials from imagePullSecrets.
+        if status == StatusCode::UNAUTHORIZED {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                "www-authenticate",
+                HeaderValue::from_static(r#"Basic realm="platform-registry""#),
+            );
+            return (status, headers, axum::Json(body)).into_response();
+        }
 
         (status, axum::Json(body)).into_response()
     }

@@ -398,7 +398,7 @@ async fn llm_parse_cli_messages_roundtrip() {
 
 /// End-to-end test: `invoke_cli()` completes with real Claude CLI.
 ///
-/// This mirrors what the platform server does — same CliSpawnOptions,
+/// This mirrors what the platform server does — same `CliSpawnOptions`,
 /// same `close_stdin()` call, same timeout. Catches env/stdin/config
 /// issues that unit tests miss.
 #[tokio::test]

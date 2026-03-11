@@ -327,6 +327,62 @@ pub async fn complete_upload(
 }
 
 // ---------------------------------------------------------------------------
+// Namespaced wrappers (two-segment: {ns}/{repo})
+// ---------------------------------------------------------------------------
+
+pub async fn head_blob_ns(
+    state: State<AppState>,
+    user: OptionalRegistryUser,
+    Path((ns, repo, digest)): Path<(String, String, String)>,
+) -> Result<Response, RegistryError> {
+    head_blob(state, user, Path((format!("{ns}/{repo}"), digest))).await
+}
+
+pub async fn get_blob_ns(
+    state: State<AppState>,
+    user: OptionalRegistryUser,
+    Path((ns, repo, digest)): Path<(String, String, String)>,
+) -> Result<Response, RegistryError> {
+    get_blob(state, user, Path((format!("{ns}/{repo}"), digest))).await
+}
+
+pub async fn start_upload_ns(
+    state: State<AppState>,
+    user: RegistryUser,
+    Path((ns, repo)): Path<(String, String)>,
+    query: Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> Result<Response, RegistryError> {
+    start_upload(state, user, Path(format!("{ns}/{repo}")), query, body).await
+}
+
+pub async fn upload_chunk_ns(
+    state: State<AppState>,
+    user: RegistryUser,
+    Path((ns, repo, uuid)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
+) -> Result<Response, RegistryError> {
+    upload_chunk(state, user, Path((format!("{ns}/{repo}"), uuid)), body).await
+}
+
+pub async fn complete_upload_ns(
+    state: State<AppState>,
+    user: RegistryUser,
+    Path((ns, repo, uuid)): Path<(String, String, String)>,
+    query: Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> Result<Response, RegistryError> {
+    complete_upload(
+        state,
+        user,
+        Path((format!("{ns}/{repo}"), uuid)),
+        query,
+        body,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

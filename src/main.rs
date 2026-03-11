@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderName, HeaderValue};
 use tokio::signal;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -195,17 +196,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(api::router())
         .merge(observe::router(observe_channels))
-        // Git routes get a higher body limit (500 MB for push/LFS)
-        .merge(git::git_protocol_router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
-        // Registry routes get a higher body limit (500 MB for blob uploads)
-        .merge(registry::router().layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)))
+        // Git + registry routes need a higher body limit (500 MB for push/LFS/blob uploads).
+        // DefaultBodyLimit::disable() is required because axum's Bytes extractor applies
+        // an *additional* Limited wrapper from DefaultBodyLimit (see axum-core
+        // with_limited_body()). Without disabling it, the outer 10 MB default would
+        // cap these routes even though RequestBodyLimitLayer allows 500 MB.
+        .merge(
+            git::git_protocol_router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
+        .merge(
+            registry::router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
         .with_state(state)
         .fallback(ui::static_handler)
         // Default body limit: 10 MB for API endpoints.
-        // Uses axum's DefaultBodyLimit (not tower-http's RequestBodyLimitLayer) so that
-        // inner per-route RequestBodyLimitLayer overrides (e.g. 500 MB for git/registry)
-        // take precedence instead of being blocked by the outer global limit.
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         // Security response headers
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("x-frame-options"),

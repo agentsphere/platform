@@ -1,7 +1,7 @@
 //! Integration tests for Valkey pub/sub + ACL in the agent session pipeline.
 //!
 //! Validates the pub/sub pipeline WITHOUT K8s pods by simulating what
-//! agent-runner does: creating a fred::Client with scoped ACL credentials
+//! agent-runner does: creating a `fred::Client` with scoped ACL credentials
 //! and publishing/subscribing directly.
 
 mod helpers;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use platform::agent::provider::{ProgressEvent, ProgressKind};
 use platform::agent::{pubsub_bridge, valkey_acl};
 
-/// Insert an agent_sessions row directly (needed for FK on agent_messages).
+/// Insert an `agent_sessions` row directly (needed for FK on `agent_messages`).
 async fn insert_session(pool: &PgPool, project_id: Uuid, user_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -257,7 +257,7 @@ async fn acl_delete_idempotent(pool: PgPool) {
 // Pub/sub bridge tests
 // ---------------------------------------------------------------------------
 
-/// subscribe_session_events receives events and closes on terminal event.
+/// `subscribe_session_events` receives events and closes on terminal event.
 #[sqlx::test(migrations = "./migrations")]
 async fn subscribe_session_events_receives_events(pool: PgPool) {
     let (state, _admin_token) = helpers::test_state(pool).await;
@@ -316,7 +316,7 @@ async fn subscribe_session_events_receives_events(pool: PgPool) {
     );
 }
 
-/// subscribe_session_events exits on Error event too.
+/// `subscribe_session_events` exits on Error event too.
 #[sqlx::test(migrations = "./migrations")]
 async fn subscribe_session_events_exits_on_error(pool: PgPool) {
     let (state, _admin_token) = helpers::test_state(pool).await;
@@ -350,7 +350,7 @@ async fn subscribe_session_events_exits_on_error(pool: PgPool) {
     );
 }
 
-/// Persistence subscriber writes events to agent_messages and exits on Completed.
+/// Persistence subscriber writes events to `agent_messages` and exits on Completed.
 #[sqlx::test(migrations = "./migrations")]
 async fn persistence_subscriber_persists_and_exits(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
@@ -459,7 +459,7 @@ async fn persistence_subscriber_exits_on_error(pool: PgPool) {
     assert_eq!(count.0, 1, "error event should be persisted");
 }
 
-/// publish_control reaches scoped subscriber on input channel.
+/// `publish_control` reaches scoped subscriber on input channel.
 #[sqlx::test(migrations = "./migrations")]
 async fn publish_control_reaches_input_channel(pool: PgPool) {
     let (state, _admin_token) = helpers::test_state(pool).await;

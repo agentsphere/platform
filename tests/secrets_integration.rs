@@ -1112,7 +1112,7 @@ async fn dev_image_built_updates_project_agent_image(pool: PgPool) {
     // Simulate a DevImageBuilt event via direct handler call
     let event = platform::store::eventbus::PlatformEvent::DevImageBuilt {
         project_id: proj_id,
-        image_ref: "registry.local/devimg-proj-dev:abc123".into(),
+        image_ref: "registry.local/devimg-proj/dev:abc123".into(),
         pipeline_id: uuid::Uuid::new_v4(),
     };
     let payload = serde_json::to_string(&event).unwrap();
@@ -1129,7 +1129,7 @@ async fn dev_image_built_updates_project_agent_image(pool: PgPool) {
     let agent_image: Option<String> = row.get("agent_image");
     assert_eq!(
         agent_image.as_deref(),
-        Some("registry.local/devimg-proj-dev:abc123"),
+        Some("registry.local/devimg-proj/dev:abc123"),
         "agent_image should be updated"
     );
 }

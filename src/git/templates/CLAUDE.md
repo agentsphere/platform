@@ -40,6 +40,18 @@ Templates use minijinja syntax:
 - `{{ image_ref }}` — built container image reference
 - `{{ values.replicas | default(1) }}` — configurable values
 
+### Registry Pull Secret
+
+The platform automatically creates a `platform-registry-pull` imagePullSecret in each project namespace. Always include it in your deploy manifests:
+
+```yaml
+spec:
+  imagePullSecrets:
+    - name: platform-registry-pull
+```
+
+This secret is refreshed on every deploy — do not modify or delete it.
+
 ## Application Requirements
 
 - App must listen on port 8080

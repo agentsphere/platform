@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT s.id as \"id!\", s.pod_name, s.agent_user_id, s.project_id,\n               p.namespace_slug as \"namespace_slug?\"\n        FROM agent_sessions s\n        LEFT JOIN projects p ON p.id = s.project_id\n        WHERE s.status = 'running' AND s.pod_name IS NOT NULL\n        ",
+  "query": "\n        SELECT s.id as \"id!\", s.pod_name, s.agent_user_id, s.project_id,\n               s.session_namespace,\n               p.namespace_slug as \"namespace_slug?\"\n        FROM agent_sessions s\n        LEFT JOIN projects p ON p.id = s.project_id\n        WHERE s.status = 'running' AND s.pod_name IS NOT NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -25,6 +25,11 @@
       },
       {
         "ordinal": 4,
+        "name": "session_namespace",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "namespace_slug?",
         "type_info": "Text"
       }
@@ -37,8 +42,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "f5d11a105d64ea30e786ce974fd7cd54c6813078b34abce9eff6a346b338f109"
+  "hash": "1a5ba039302eb54c2c39e5faff3c5f545e67657828640a79ce2b4e1de02157e5"
 }

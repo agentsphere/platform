@@ -1,6 +1,3 @@
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-
 use fred::interfaces::ClientLike;
 use fred::interfaces::EventInterface;
 use fred::interfaces::PubsubInterface;
@@ -9,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::provider::{ProgressEvent, ProgressKind};
+use super::provider::ProgressEvent;
 use super::valkey_acl;
 
 /// Publish a `ProgressEvent` to the session's events channel.
@@ -143,7 +140,10 @@ async fn run_persistence_subscriber(
         .await;
 
         // Exit on terminal events
-        if matches!(event.kind, ProgressKind::Completed | ProgressKind::Error) {
+        if matches!(
+            event.kind,
+            super::provider::ProgressKind::Completed | super::provider::ProgressKind::Error
+        ) {
             break;
         }
     }
@@ -177,8 +177,10 @@ pub async fn subscribe_session_events(
             };
 
             if let Ok(event) = serde_json::from_str::<ProgressEvent>(&payload) {
-                let is_terminal =
-                    matches!(event.kind, ProgressKind::Completed | ProgressKind::Error);
+                let is_terminal = matches!(
+                    event.kind,
+                    super::provider::ProgressKind::Completed | super::provider::ProgressKind::Error
+                );
                 if tx.send(event).await.is_err() {
                     // Receiver dropped — unsubscribe and exit
                     break;
@@ -195,122 +197,10 @@ pub async fn subscribe_session_events(
     Ok(rx)
 }
 
-/// Subscribe to a session tree with dynamic child discovery.
-///
-/// Subscribes to the parent session's Valkey channel immediately, then polls the DB
-/// every 3 seconds for new child sessions and subscribes to their channels. This handles
-/// children spawned after the SSE connection was established.
-///
-/// Returns `(Uuid, ProgressEvent)` tuples so the caller knows which session emitted each event.
-/// Exits when the parent session and all known children have emitted terminal events.
-pub async fn subscribe_session_tree_dynamic(
-    valkey: &fred::clients::Pool,
-    pool: &PgPool,
-    parent_session_id: Uuid,
-) -> Result<mpsc::Receiver<(Uuid, ProgressEvent)>, anyhow::Error> {
-    let (tx, rx) = mpsc::channel(256);
-
-    let subscriber = valkey.next().clone_new();
-    subscriber.init().await?;
-
-    // Subscribe to parent channel
-    let parent_channel = valkey_acl::events_channel(parent_session_id);
-    subscriber.subscribe(&parent_channel).await?;
-
-    let mut known_children: HashSet<Uuid> = HashSet::new();
-    let mut channel_to_session: HashMap<String, Uuid> = HashMap::new();
-    channel_to_session.insert(parent_channel, parent_session_id);
-
-    // Subscribe to existing children
-    let initial_children: Vec<Uuid> =
-        sqlx::query_scalar("SELECT id FROM agent_sessions WHERE parent_session_id = $1")
-            .bind(parent_session_id)
-            .fetch_all(pool)
-            .await?;
-
-    for child_id in initial_children {
-        let ch = valkey_acl::events_channel(child_id);
-        subscriber.subscribe(&ch).await?;
-        channel_to_session.insert(ch, child_id);
-        known_children.insert(child_id);
-    }
-
-    let mut msg_rx = subscriber.message_rx();
-    let pool = pool.clone();
-
-    tokio::spawn(async move {
-        let mut child_poll = tokio::time::interval(Duration::from_secs(3));
-        let mut completed_sessions: HashSet<Uuid> = HashSet::new();
-
-        loop {
-            tokio::select! {
-                result = msg_rx.recv() => {
-                    let Ok(msg) = result else { break };
-                    let payload: String = match msg.value.convert() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let channel_name = msg.channel.to_string();
-                    let session_id = match channel_to_session.get(&channel_name) {
-                        Some(id) => *id,
-                        None => continue,
-                    };
-                    if let Ok(event) = serde_json::from_str::<ProgressEvent>(&payload) {
-                        let is_terminal = matches!(
-                            event.kind,
-                            ProgressKind::Completed | ProgressKind::Error
-                        );
-                        if tx.send((session_id, event)).await.is_err() {
-                            break;
-                        }
-                        if is_terminal {
-                            completed_sessions.insert(session_id);
-                            // Exit when parent + all known children are done
-                            let parent_done = completed_sessions.contains(&parent_session_id);
-                            let all_children_done = known_children.iter().all(|c| completed_sessions.contains(c));
-                            if parent_done && all_children_done {
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ = child_poll.tick() => {
-                    if let Ok(children) = sqlx::query_scalar::<_, Uuid>(
-                        "SELECT id FROM agent_sessions WHERE parent_session_id = $1",
-                    )
-                    .bind(parent_session_id)
-                    .fetch_all(&pool)
-                    .await
-                    {
-                        for child_id in children {
-                            if known_children.insert(child_id) {
-                                let ch = valkey_acl::events_channel(child_id);
-                                if subscriber.subscribe(&ch).await.is_ok() {
-                                    channel_to_session.insert(ch, child_id);
-                                    tracing::debug!(%child_id, %parent_session_id, "dynamically subscribed to child session");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for ch in channel_to_session.keys() {
-            let _ = subscriber.unsubscribe(ch).await;
-        }
-    });
-
-    Ok(rx)
-}
-
-/// Subscribe to events from multiple sessions (parent + children) with a static list.
+/// Subscribe to events from multiple sessions (parent + children).
 /// Returns `(Uuid, ProgressEvent)` tuples so the caller knows which session emitted each event.
 /// Exits when ALL sessions have emitted a terminal event (Completed/Error), or when the
 /// receiver is dropped.
-///
-/// Used by integration tests that pass explicit session IDs.
-#[allow(dead_code)] // Used in integration tests
 pub async fn subscribe_session_tree_events(
     valkey: &fred::clients::Pool,
     session_ids: &[Uuid],
@@ -360,8 +250,10 @@ pub async fn subscribe_session_tree_events(
             };
 
             if let Ok(event) = serde_json::from_str::<ProgressEvent>(&payload) {
-                let is_terminal =
-                    matches!(event.kind, ProgressKind::Completed | ProgressKind::Error);
+                let is_terminal = matches!(
+                    event.kind,
+                    super::provider::ProgressKind::Completed | super::provider::ProgressKind::Error
+                );
                 if tx.send((session_id, event)).await.is_err() {
                     break;
                 }
@@ -385,6 +277,7 @@ pub async fn subscribe_session_tree_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::provider::{ProgressEvent, ProgressKind};
 
     #[test]
     fn test_channel_names_correct() {

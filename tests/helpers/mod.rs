@@ -210,6 +210,8 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
 /// Includes the main API router plus observe (query + alerts) and registry routers.
 /// The observe ingest routes (OTLP) are omitted since they require background channels.
 pub fn test_router(state: AppState) -> Router {
+    use axum::extract::DefaultBodyLimit;
+    use tower_http::limit::RequestBodyLimitLayer;
     let ready_state = state.clone();
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
@@ -229,8 +231,17 @@ pub fn test_router(state: AppState) -> Router {
         .merge(platform::api::router())
         .merge(platform::observe::query::router())
         .merge(platform::observe::alert::router())
-        .merge(platform::registry::router())
+        // Registry routes need a higher body limit (500 MB).
+        // Both RequestBodyLimitLayer AND DefaultBodyLimit must be set because
+        // axum's Bytes extractor wraps the body in an *additional* Limited
+        // based on DefaultBodyLimit (see axum-core with_limited_body()).
+        .merge(
+            platform::registry::router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
         .with_state(state)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
 }
 
 /// Login as the bootstrap admin user. Returns the bearer token.

@@ -16,10 +16,6 @@ use crate::store::AppState;
 /// Maximum number of automatic tool rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 10;
 
-/// Delay before feeding `check_session_progress` results back to the LLM.
-/// Gives the worker pod time to make progress between polls.
-const POLL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
-
 // ---------------------------------------------------------------------------
 // Tool loop
 // ---------------------------------------------------------------------------
@@ -69,20 +65,34 @@ pub async fn run_create_app_loop(
             },
             oauth_token: oauth_token.clone(),
             anthropic_api_key: anthropic_api_key.clone(),
-            max_turns: Some(10),
+            max_turns: Some(1),
         };
 
         let (response, result_msg) = match cli_invoke::invoke_cli(params, &state.valkey).await {
             Ok(r) => r,
             Err(e) => {
-                publish_cli_error(&state.valkey, session_id, &e).await;
+                tracing::error!(error = %e, %session_id, "CLI invocation failed");
+                let _ = pubsub_bridge::publish_event(
+                    &state.valkey,
+                    session_id,
+                    &ProgressEvent {
+                        kind: ProgressKind::Error,
+                        message: format!("CLI invocation failed: {e}"),
+                        metadata: None,
+                    },
+                )
+                .await;
                 break;
             }
         };
 
-        // Update cost tracking + store CLI session ID for resume
+        // Update cost tracking
         if let Some(ref result) = result_msg {
             let _ = cli_invoke::update_session_cost(&state.pool, session_id, result).await;
+        }
+
+        // Store CLI session ID for resume
+        if let Some(ref result) = result_msg {
             let mut cli_sid = handle.cli_session_id.lock().await;
             *cli_sid = Some(result.session_id.clone());
         }
@@ -131,17 +141,6 @@ pub async fn run_create_app_loop(
         if handle.cancelled.load(Ordering::Relaxed) {
             tracing::info!(%session_id, "create-app loop cancelled after tool execution");
             break;
-        }
-
-        // Backoff: if the only tools were check_session_progress, wait before
-        // feeding results back so the worker has time to make progress.
-        let only_polls = response
-            .tools
-            .iter()
-            .all(|t| t.name == "check_session_progress");
-        if only_polls {
-            tracing::debug!(%session_id, "poll-only round, backing off {:?}", POLL_BACKOFF);
-            tokio::time::sleep(POLL_BACKOFF).await;
         }
 
         // Check for pending user messages (priority over tool results)
@@ -390,16 +389,35 @@ async fn execute_spawn_agent(
     input: &serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let project_id = parse_uuid_field(input, "project_id")?;
-    let prompt = input
+    let raw_prompt = input
         .get("prompt")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required field: prompt"))?;
+
+    // Augment the LLM's prompt with platform-required instructions that the
+    // worker agent must always follow, regardless of what the manager included.
+    let prompt = format!(
+        "{raw_prompt}\n\n\
+         IMPORTANT — after writing all code you MUST also:\n\
+         1. Create a multi-stage `Dockerfile` that builds and runs the app, EXPOSE port 8080\n\
+         2. Create `.platform.yaml` at the repo root with exactly this content:\n\
+         ```yaml\n\
+         pipeline:\n\
+           steps:\n\
+             - name: build\n\
+               image: gcr.io/kaniko-project/executor:debug\n\
+               commands:\n\
+                 - /kaniko/executor --context=/workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA --insecure\n\
+         ```\n\
+         3. Run: `git add -A && git commit -m \"initial app\" && git push origin main`\n\
+         Do NOT skip the git commit and push step — the pipeline triggers on push."
+    );
 
     let session = super::service::create_session(
         state,
         user_id,
         project_id,
-        prompt,
+        &prompt,
         "claude-code",
         Some("main"),
         None,
@@ -540,21 +558,6 @@ async fn execute_check_progress(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Publish a CLI invocation error and log it.
-async fn publish_cli_error(valkey: &fred::clients::Pool, session_id: Uuid, error: &AgentError) {
-    tracing::error!(error = %error, %session_id, "CLI invocation failed");
-    let _ = pubsub_bridge::publish_event(
-        valkey,
-        session_id,
-        &ProgressEvent {
-            kind: ProgressKind::Error,
-            message: format!("CLI invocation failed: {error}"),
-            metadata: None,
-        },
-    )
-    .await;
-}
-
 /// Drain pending messages from the session handle, joining with newlines.
 async fn drain_pending(handle: &CliSessionHandle) -> String {
     let mut msgs = handle.pending_messages.lock().await;
@@ -656,11 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn poll_backoff_is_ten_seconds() {
-        assert_eq!(POLL_BACKOFF.as_secs(), 10);
-    }
-
-    #[test]
     fn unknown_tool_returns_error() {
         let tool = ToolRequest {
             name: "nonexistent".into(),
@@ -739,7 +737,7 @@ mod tests {
         let input = serde_json::json!({"session_id": Uuid::new_v4().to_string()});
         let limit = input
             .get("limit")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(20)
             .min(50);
         assert_eq!(limit, 20);
@@ -750,7 +748,7 @@ mod tests {
         let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": 100});
         let limit = input
             .get("limit")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(20)
             .min(50);
         assert_eq!(limit, 50);

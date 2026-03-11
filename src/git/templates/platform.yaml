@@ -3,7 +3,7 @@ pipeline:
     - name: build
       image: gcr.io/kaniko-project/executor:debug
       commands:
-        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT:$COMMIT_SHA --insecure --cache=true
+        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA --insecure --cache=true
 
   dev_image:
     dockerfile: Dockerfile.dev

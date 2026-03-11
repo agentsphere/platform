@@ -108,10 +108,10 @@ pub async fn invoke_cli(
         );
     }
 
-    let (result_msg, cli_session_id) = result?;
+    let (result_msg, cli_session_id, assistant_structured) = result?;
 
-    // Parse structured output from result message
-    let structured = parse_structured_output(&result_msg);
+    // Parse structured output from result message (with assistant fallback)
+    let structured = parse_structured_output(&result_msg, assistant_structured.as_ref());
 
     tracing::debug!(
         session_id = %params.session_id,
@@ -132,9 +132,10 @@ async fn read_cli_output(
     transport: &mut SubprocessTransport,
     session_id: Uuid,
     valkey: &fred::clients::Pool,
-) -> Result<(ResultMessage, Option<String>), AgentError> {
+) -> Result<(ResultMessage, Option<String>, Option<serde_json::Value>), AgentError> {
     let mut result_msg: Option<ResultMessage> = None;
     let mut cli_session_id: Option<String> = None;
+    let mut assistant_structured: Option<serde_json::Value> = None;
     let mut first_message = true;
 
     loop {
@@ -170,6 +171,21 @@ async fn read_cli_output(
             cli_session_id = Some(sys.session_id.clone());
         }
 
+        // Capture structured output from assistant tool_use blocks.
+        // When --json-schema + --max-turns 1, Claude calls StructuredOutput as
+        // a tool_use but hits error_max_turns before the result is populated.
+        // We capture the tool_use input here as a fallback.
+        if let CliMessage::Assistant(ref a) = msg {
+            for block in &a.message.content {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && let Some(input) = block.get("input")
+                    && serde_json::from_value::<StructuredResponse>(input.clone()).is_ok()
+                {
+                    assistant_structured = Some(input.clone());
+                }
+            }
+        }
+
         // Publish progress event to Valkey pub/sub
         if let Some(event) = cli_message_to_progress(&msg) {
             let _ = pubsub_bridge::publish_event(valkey, session_id, &event).await;
@@ -188,7 +204,7 @@ async fn read_cli_output(
         ))
     })?;
 
-    Ok((result, cli_session_id))
+    Ok((result, cli_session_id, assistant_structured))
 }
 
 /// Collect stderr output from the transport's background task.
@@ -206,34 +222,31 @@ async fn collect_stderr(transport: &mut SubprocessTransport) -> String {
 /// Parse the structured output from a `ResultMessage`.
 ///
 /// Falls back to using `result` as text with empty tools if `structured_output`
-/// is absent or malformed. Handles both direct JSON objects and string-wrapped
-/// JSON (some CLI versions serialize structured output as a JSON string).
-fn parse_structured_output(result: &ResultMessage) -> StructuredResponse {
+/// is absent or malformed.
+fn parse_structured_output(
+    result: &ResultMessage,
+    assistant_fallback: Option<&serde_json::Value>,
+) -> StructuredResponse {
     if let Some(ref structured) = result.structured_output {
-        // Try direct deserialization (JSON object)
         if let Ok(response) = serde_json::from_value::<StructuredResponse>(structured.clone()) {
             return response;
         }
-        // Try string-wrapped JSON (CLI may serialize as string)
-        if let Some(s) = structured.as_str()
-            && let Ok(response) = serde_json::from_str::<StructuredResponse>(s)
-        {
-            return response;
-        }
-        tracing::warn!(
-            structured_output = %structured,
-            "failed to parse structured_output, falling back to result text"
-        );
-    } else {
-        tracing::warn!(
-            subtype = %result.subtype,
-            is_error = result.is_error,
-            has_result = result.result.is_some(),
-            "result message has no structured_output field"
-        );
+        tracing::warn!("failed to parse structured_output, falling back to result text");
     }
 
-    // Fallback: use result text with no tools
+    // Fallback: recover from assistant tool_use block (error_max_turns case)
+    if let Some(fallback) = assistant_fallback
+        && let Ok(response) = serde_json::from_value::<StructuredResponse>(fallback.clone())
+    {
+        tracing::info!(
+            subtype = %result.subtype,
+            tools_count = response.tools.len(),
+            "recovered structured output from assistant tool_use block"
+        );
+        return response;
+    }
+
+    // Final fallback: use result text with no tools
     StructuredResponse {
         text: result
             .result
@@ -409,14 +422,11 @@ mod tests {
     fn format_tool_results_success() {
         let results = vec![(
             "create_project".to_owned(),
-            Ok(serde_json::json!({"project_id": "abc", "_next": "Call spawn_coding_agent"})),
+            Ok(serde_json::json!({"project_id": "abc"})),
         )];
         let formatted = format_tool_results(&results);
         assert!(formatted.contains("[create_project] OK"));
         assert!(formatted.contains("project_id: abc"));
-        assert!(formatted.contains("→ Call spawn_coding_agent"));
-        // _next key should not appear as a data field
-        assert!(!formatted.contains("  _next:"));
     }
 
     #[test]
@@ -437,7 +447,7 @@ mod tests {
         ];
         let formatted = format_tool_results(&results);
         assert!(formatted.contains("[create_project] OK"));
-        assert!(formatted.contains("[spawn_coding_agent] ERROR"));
+        assert!(formatted.contains("[spawn_coding_agent] ERROR: failed"));
     }
 
     #[test]
@@ -448,14 +458,17 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_results_non_object_value() {
+    fn format_tool_results_with_hint() {
         let results = vec![(
-            "some_tool".to_owned(),
-            Ok(serde_json::json!("plain string")),
+            "create_project".to_owned(),
+            Ok(serde_json::json!({"project_id": "abc", "_next": "Now call spawn_coding_agent"})),
         )];
         let formatted = format_tool_results(&results);
-        assert!(formatted.contains("[some_tool] OK"));
-        assert!(formatted.contains("result: \"plain string\""));
+        assert!(formatted.contains("[create_project] OK"));
+        assert!(formatted.contains("project_id: abc"));
+        assert!(formatted.contains("→ Now call spawn_coding_agent"));
+        // _next should NOT appear as a regular key-value pair
+        assert!(!formatted.contains("_next:"));
     }
 
     #[test]
@@ -474,7 +487,7 @@ mod tests {
                 "tools": [{"name": "create_project", "parameters": {"name": "test"}}]
             })),
         };
-        let resp = parse_structured_output(&result);
+        let resp = parse_structured_output(&result, None);
         assert_eq!(resp.text, "Hello");
         assert_eq!(resp.tools.len(), 1);
     }
@@ -492,29 +505,9 @@ mod tests {
             usage: None,
             structured_output: None,
         };
-        let resp = parse_structured_output(&result);
+        let resp = parse_structured_output(&result, None);
         assert_eq!(resp.text, "Plain text response");
         assert!(resp.tools.is_empty());
-    }
-
-    #[test]
-    fn parse_structured_output_string_wrapped() {
-        let inner = r#"{"text":"Creating project","tools":[{"name":"create_project","parameters":{"name":"my-app"}}]}"#;
-        let result = ResultMessage {
-            subtype: "success".into(),
-            session_id: "s1".into(),
-            is_error: false,
-            result: None,
-            total_cost_usd: None,
-            duration_ms: None,
-            num_turns: None,
-            usage: None,
-            structured_output: Some(serde_json::Value::String(inner.into())),
-        };
-        let resp = parse_structured_output(&result);
-        assert_eq!(resp.text, "Creating project");
-        assert_eq!(resp.tools.len(), 1);
-        assert_eq!(resp.tools[0].name, "create_project");
     }
 
     #[test]
@@ -530,8 +523,97 @@ mod tests {
             usage: None,
             structured_output: Some(serde_json::json!({"not_valid": true})),
         };
-        let resp = parse_structured_output(&result);
+        let resp = parse_structured_output(&result, None);
         assert_eq!(resp.text, "Fallback text");
+        assert!(resp.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_structured_output_from_assistant_fallback() {
+        // error_max_turns: no structured_output in result, but assistant had tool_use
+        let result = ResultMessage {
+            subtype: "error_max_turns".into(),
+            session_id: "s1".into(),
+            is_error: true,
+            result: Some("Max turns reached".into()),
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: Some(1),
+            usage: None,
+            structured_output: None,
+        };
+        let fallback = serde_json::json!({
+            "text": "I'll create the project.",
+            "tools": [{"name": "create_project", "parameters": {"name": "my-app"}}]
+        });
+        let resp = parse_structured_output(&result, Some(&fallback));
+        assert_eq!(resp.text, "I'll create the project.");
+        assert_eq!(resp.tools.len(), 1);
+        assert_eq!(resp.tools[0].name, "create_project");
+    }
+
+    #[test]
+    fn parse_structured_output_prefers_result_over_fallback() {
+        // Both result.structured_output and assistant fallback present — result wins
+        let result = ResultMessage {
+            subtype: "success".into(),
+            session_id: "s1".into(),
+            is_error: false,
+            result: None,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            usage: None,
+            structured_output: Some(serde_json::json!({
+                "text": "From result",
+                "tools": [{"name": "create_project", "parameters": {"name": "winner"}}]
+            })),
+        };
+        let fallback = serde_json::json!({
+            "text": "From assistant",
+            "tools": [{"name": "spawn_coding_agent", "parameters": {"prompt": "loser"}}]
+        });
+        let resp = parse_structured_output(&result, Some(&fallback));
+        assert_eq!(resp.text, "From result");
+        assert_eq!(resp.tools[0].name, "create_project");
+    }
+
+    #[test]
+    fn parse_structured_output_ignores_invalid_fallback() {
+        // Invalid fallback JSON (not a StructuredResponse) → text fallback
+        let result = ResultMessage {
+            subtype: "error_max_turns".into(),
+            session_id: "s1".into(),
+            is_error: true,
+            result: Some("Max turns reached".into()),
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: Some(1),
+            usage: None,
+            structured_output: None,
+        };
+        let fallback = serde_json::json!({"invalid": "not a structured response"});
+        let resp = parse_structured_output(&result, Some(&fallback));
+        assert_eq!(resp.text, "Max turns reached");
+        assert!(resp.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_structured_output_no_fallback_no_structured_output() {
+        // Neither structured_output nor fallback → text fallback
+        let result = ResultMessage {
+            subtype: "error_max_turns".into(),
+            session_id: "s1".into(),
+            is_error: true,
+            result: Some("Max turns reached".into()),
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: Some(1),
+            usage: None,
+            structured_output: None,
+        };
+        let resp = parse_structured_output(&result, None);
+        assert_eq!(resp.text, "Max turns reached");
         assert!(resp.tools.is_empty());
     }
 

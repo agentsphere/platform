@@ -781,7 +781,7 @@ mod tests {
             },
             PlatformEvent::DevImageBuilt {
                 project_id: Uuid::nil(),
-                image_ref: "registry/app-dev:latest".into(),
+                image_ref: "registry/app/dev:latest".into(),
                 pipeline_id: Uuid::nil(),
             },
             PlatformEvent::AlertFired {
@@ -857,7 +857,7 @@ mod tests {
             (
                 PlatformEvent::DevImageBuilt {
                     project_id: Uuid::nil(),
-                    image_ref: "registry/app-dev:abc123".into(),
+                    image_ref: "registry/app/dev:abc123".into(),
                     pipeline_id: Uuid::nil(),
                 },
                 "DevImageBuilt",

@@ -12,6 +12,8 @@ spec:
       labels:
         app: "{{ project_name }}"
     spec:
+      imagePullSecrets:
+        - name: platform-registry-pull
       containers:
         - name: app
           image: "{{ image_ref }}"
