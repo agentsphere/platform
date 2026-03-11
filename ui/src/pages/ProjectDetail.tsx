@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, qs, type ListResponse } from '../lib/api';
-import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret } from '../lib/types';
+import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret, AgentSession } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { Badge } from '../components/Badge';
 import { StatusDot } from '../components/StatusDot';
 import { Pagination } from '../components/Pagination';
 import { Modal } from '../components/Modal';
+import { AgentChatPanel } from '../components/AgentChatPanel';
 import { Sessions } from './Sessions';
 
 interface Props { id?: string; tab?: string; }
@@ -14,10 +15,19 @@ const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'we
 
 export function ProjectDetail({ id, tab }: Props) {
   const [project, setProject] = useState<Project | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [hasActiveSession, setHasActiveSession] = useState(false);
   const currentTab = tab || 'files';
 
   useEffect(() => {
     if (id) api.get<Project>(`/api/projects/${id}`).then(setProject).catch(() => {});
+  }, [id]);
+
+  useEffect(() => {
+    if (id) {
+      api.get<ListResponse<AgentSession>>(`/api/projects/${id}/sessions?status=running&limit=1`)
+        .then(r => setHasActiveSession(r.items.length > 0)).catch(() => {});
+    }
   }, [id]);
 
   if (!project) return <div class="empty-state">Loading...</div>;
@@ -29,7 +39,12 @@ export function ProjectDetail({ id, tab }: Props) {
           <h2>{project.display_name || project.name}</h2>
           {project.description && <p class="text-muted text-sm mt-sm">{project.description}</p>}
         </div>
-        <Badge status={project.visibility} />
+        <div class="flex gap-sm" style="align-items:center">
+          <button class="btn btn-sm btn-primary" onClick={() => setChatOpen(true)}>
+            {hasActiveSession ? '\u25CF Agent' : 'Agent'}
+          </button>
+          <Badge status={project.visibility} />
+        </div>
       </div>
       <div class="tabs">
         {TABS.map(t => (
@@ -45,6 +60,7 @@ export function ProjectDetail({ id, tab }: Props) {
       {currentTab === 'sessions' && <Sessions projectId={id!} />}
       {currentTab === 'webhooks' && <WebhooksTab projectId={id!} />}
       {currentTab === 'settings' && <SettingsTab project={project} onUpdate={setProject} />}
+      <AgentChatPanel projectId={id!} open={chatOpen} onClose={() => setChatOpen(false)} />
     </div>
   );
 }
