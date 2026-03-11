@@ -62,6 +62,19 @@ MCP_JSON+='}}'
 echo "$MCP_JSON" > /tmp/mcp-config.json
 
 # ---------------------------------------------------------------------------
+# Write env vars to a discoverable file for tools that run inside claude's
+# sandbox (Claude CLI's Bash tool may not inherit all container env vars)
+# ---------------------------------------------------------------------------
+mkdir -p /workspace/.platform
+cat > /workspace/.platform/.env <<ENVEOF
+PROJECT_ID=${PROJECT_ID:-}
+BRANCH=${BRANCH:-}
+SESSION_ID=${SESSION_ID:-}
+PLATFORM_API_URL=${PLATFORM_API_URL:-}
+PLATFORM_API_TOKEN=${PLATFORM_API_TOKEN:-}
+ENVEOF
+
+# ---------------------------------------------------------------------------
 # Run Claude Code with MCP config, streaming JSON output
 # ---------------------------------------------------------------------------
 # MCP servers are generated above but currently disabled due to a Claude CLI

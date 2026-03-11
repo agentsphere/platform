@@ -20,6 +20,7 @@ After pushing code that includes a Dockerfile and `.platform.yaml`, you MUST ver
 
 1. Push your code: `git add -A && git commit -m "message" && git push origin $BRANCH`
 2. Run `platform-build-status` to wait for the pipeline to complete
+   (it reads PROJECT_ID and BRANCH from the environment or `.platform/.env`)
 3. If the build fails, read the error output carefully, fix the Dockerfile or pipeline config, commit, push, and run `platform-build-status` again
 4. Repeat up to 3 times. If the build still fails after 3 attempts, report the error and stop.
 

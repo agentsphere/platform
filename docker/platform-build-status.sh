@@ -20,6 +20,16 @@ TIMEOUT="${1:-300}"
 INTERVAL="${2:-5}"
 ELAPSED=0
 
+# Fallback: source .platform/.env if vars are missing (Claude CLI sandbox
+# may not inherit all container env vars)
+if [ -z "${PROJECT_ID:-}" ] || [ -z "${BRANCH:-}" ]; then
+  if [ -f /workspace/.platform/.env ]; then
+    set -a
+    . /workspace/.platform/.env
+    set +a
+  fi
+fi
+
 # Validate required env vars
 for var in PLATFORM_API_URL PLATFORM_API_TOKEN PROJECT_ID BRANCH; do
   if [ -z "${!var:-}" ]; then
