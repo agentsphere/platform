@@ -38,12 +38,12 @@
       "Left": []
     },
     "nullable": [
-      false,
       true,
       true,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
   "hash": "1a5ba039302eb54c2c39e5faff3c5f545e67657828640a79ce2b4e1de02157e5"
