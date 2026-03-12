@@ -412,6 +412,18 @@ async fn execute_create_project(
         tracing::warn!(error = %e, %project_id, "project infra setup incomplete (create-app)");
     }
 
+    // Auto-create default branch protection rule for main
+    if let Err(e) = sqlx::query(
+        "INSERT INTO branch_protection_rules (project_id, pattern) VALUES ($1, 'main') \
+         ON CONFLICT (project_id, pattern) DO NOTHING",
+    )
+    .bind(project_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %e, %project_id, "failed to create default branch protection (create-app)");
+    }
+
     // Audit
     write_audit(
         &state.pool,
@@ -451,6 +463,11 @@ async fn execute_spawn_agent(
 
     // Augment the LLM's prompt with platform-required instructions that the
     // worker agent must always follow, regardless of what the manager included.
+    let mr_curl = r#"curl -s -X POST "$PLATFORM_API_URL/api/projects/$PROJECT_ID/merge-requests" \
+                 -H "Authorization: Bearer $PLATFORM_API_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 -d '{"title":"Initial app","source_branch":"feature/initial-app","target_branch":"main"}'"#;
+
     let prompt = format!(
         "{raw_prompt}\n\n\
          IMPORTANT — after writing all code you MUST also:\n\
@@ -458,14 +475,27 @@ async fn execute_spawn_agent(
          2. Create `.platform.yaml` at the repo root with exactly this content:\n\
          ```yaml\n\
          pipeline:\n\
+           on:\n\
+             push:\n\
+               branches: [\"*\"]\n\
+             mr:\n\
+               actions: [opened, synchronized]\n\
            steps:\n\
              - name: build\n\
                image: gcr.io/kaniko-project/executor:debug\n\
                commands:\n\
                  - /kaniko/executor --context=/workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA --insecure\n\
          ```\n\
-         3. Run: `git add -A && git commit -m \"initial app\" && git push origin main`\n\
-         Do NOT skip the git commit and push step — the pipeline triggers on push."
+         3. The `main` branch is PROTECTED — direct pushes are blocked. You MUST:\n\
+            a. Run: `git add -A && git commit -m \"initial app\"`\n\
+            b. Push to your current feature branch: `git push origin feature/initial-app`\n\
+            c. Create a merge request via the platform API using this curl command:\n\
+               ```\n\
+               {mr_curl}\n\
+               ```\n\
+               The env vars $PLATFORM_API_URL, $PROJECT_ID, and $PLATFORM_API_TOKEN are already set in your shell.\n\
+         The CI pipeline triggers automatically when the MR is created. Once CI passes, the MR auto-merges and deploys.\n\
+         Do NOT skip the git commit, push, and MR creation steps — they are all required."
     );
 
     let session = super::service::create_session(
@@ -474,7 +504,7 @@ async fn execute_spawn_agent(
         project_id,
         &prompt,
         "claude-code",
-        Some("main"),
+        Some("feature/initial-app"),
         None,
         super::AgentRoleName::Dev,
         Some(manager_session_id), // Link child to Manager

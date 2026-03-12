@@ -2,6 +2,7 @@ pub mod browser;
 pub mod gpg_keys;
 pub mod hooks;
 pub mod lfs;
+pub mod protection;
 pub mod repo;
 pub mod signature;
 pub mod smart_http;

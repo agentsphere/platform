@@ -59,6 +59,7 @@ fn make_resolved_project(project_id: Uuid, visibility: &str) -> ResolvedProject 
         repo_disk_path: std::path::PathBuf::from("/tmp/nonexistent"),
         default_branch: "main".into(),
         visibility: visibility.into(),
+        owner_id: Uuid::nil(),
     }
 }
 

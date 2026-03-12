@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE branch_protection_rules SET\n            require_pr = COALESCE($3, require_pr),\n            block_force_push = COALESCE($4, block_force_push),\n            required_approvals = COALESCE($5, required_approvals),\n            dismiss_stale_reviews = COALESCE($6, dismiss_stale_reviews),\n            required_checks = COALESCE($7, required_checks),\n            require_up_to_date = COALESCE($8, require_up_to_date),\n            allow_admin_bypass = COALESCE($9, allow_admin_bypass),\n            merge_methods = COALESCE($10, merge_methods),\n            updated_at = now()\n        WHERE id = $1 AND project_id = $2\n        RETURNING id, project_id, pattern, require_pr, block_force_push,\n                  required_approvals, dismiss_stale_reviews, required_checks,\n                  require_up_to_date, allow_admin_bypass, merge_methods,\n                  created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "pattern",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "require_pr",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "block_force_push",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "required_approvals",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "dismiss_stale_reviews",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "required_checks",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 8,
+        "name": "require_up_to_date",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "allow_admin_bypass",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "merge_methods",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool",
+        "Bool",
+        "Int4",
+        "Bool",
+        "TextArray",
+        "Bool",
+        "Bool",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8a092e32aadd123cb4b52c4d04158c07899f05823a916fdffde96eb72b19d791"
+}

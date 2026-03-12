@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mr_reviews SET is_stale = true\n                    WHERE mr_id = $1 AND verdict = 'approve' AND is_stale = false",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0973a4200e57695fd4894b5b70649ce63176f5aac6b40044a10a0d74b4a0c937"
+}

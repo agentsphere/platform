@@ -144,6 +144,9 @@ PLATFORM_OPS_REPOS_PATH=/tmp/platform-ops-repos
 # --- Seed images (OCI tarballs imported into registry on startup) ---
 PLATFORM_SEED_IMAGES_PATH=/tmp/platform-e2e/seed-images
 
+# --- Agent runner binaries (worktree-scoped to avoid cross-worktree overwrites) ---
+PLATFORM_AGENT_RUNNER_DIR=/tmp/platform-e2e/${WORKTREE}/agent-runner
+
 # --- K8s config ---
 KUBECONFIG=${HOME}/.kube/kind-platform
 

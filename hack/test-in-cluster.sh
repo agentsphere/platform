@@ -145,65 +145,10 @@ echo "==> Local ports"
 echo "  Backend:  ${BACKEND_PORT}"
 echo "  Registry: ${REGISTRY_NODE_PORT} (node hostPort)"
 
-# ── Build seed images (cached by Dockerfile checksum) ────────────────────
-SEED_DIR="/tmp/platform-e2e/seed-images"
-mkdir -p "${SEED_DIR}"
-
-# Ensure a buildx builder that supports OCI export exists
-if ! docker buildx inspect platform-oci &>/dev/null; then
-  docker buildx create --name platform-oci --driver docker-container --bootstrap 2>/dev/null || true
-fi
-
-# build_seed_image <name> <dockerfile> [extra_checksum_dirs...]
-# Builds OCI tarball if missing or Dockerfile/source changed.
-build_seed_image() {
-  local name="$1" dockerfile="$2"
-  shift 2
-  local tarball="${SEED_DIR}/${name}.tar"
-  local checksum_file="${SEED_DIR}/.${name}-checksum"
-  local current_checksum
-  # Include Dockerfile + all extra source dirs in checksum
-  current_checksum=$(
-    { shasum -a 256 "${dockerfile}"
-      for dir in "$@"; do
-        find "${PROJECT_DIR}/${dir}" -type f -exec shasum -a 256 {} +
-      done
-    } | sort | shasum -a 256 | awk '{print $1}'
-  )
-
-  if [[ -f "${tarball}" && -f "${checksum_file}" && "$(cat "${checksum_file}")" == "${current_checksum}" ]]; then
-    echo "  ${name}: cached"
-    return
-  fi
-
-  echo "  ${name}: building..."
-  docker buildx build \
-    --builder platform-oci \
-    --file "${dockerfile}" \
-    --output "type=oci,dest=${tarball}" \
-    "${PROJECT_DIR}"
-  echo "${current_checksum}" > "${checksum_file}"
-}
-
-echo "==> Seed images"
-build_seed_image "platform-runner" "${PROJECT_DIR}/docker/Dockerfile.platform-runner" \
-  "cli/agent-runner/src" "mcp"
-build_seed_image "platform-runner-bare" "${PROJECT_DIR}/docker/Dockerfile.platform-runner-bare"
-
-# ── Build agent-runner binaries (cached by source checksum) ───────────
-RUNNER_DIR="/tmp/platform-e2e/agent-runner"
-mkdir -p "${RUNNER_DIR}"
-RUNNER_CHECKSUM_FILE="${RUNNER_DIR}/.checksum"
-RUNNER_CURRENT_CHECKSUM=$(find cli/agent-runner/src -name '*.rs' -exec shasum -a 256 {} + | sort | shasum -a 256 | awk '{print $1}')
-
-if [[ -f "${RUNNER_DIR}/arm64" && -f "${RUNNER_DIR}/amd64" && \
-      -f "${RUNNER_CHECKSUM_FILE}" && "$(cat "${RUNNER_CHECKSUM_FILE}")" == "${RUNNER_CURRENT_CHECKSUM}" ]]; then
-  echo "  agent-runner: cached"
-else
-  echo "  agent-runner: building..."
-  just cli-cross "${RUNNER_DIR}"
-  echo "${RUNNER_CURRENT_CHECKSUM}" > "${RUNNER_CHECKSUM_FILE}"
-fi
+# ── Build seed images + agent-runner binaries (cached, worktree-scoped) ───
+bash "${SCRIPT_DIR}/build-agent-images.sh"
+WORKTREE="$(bash "${SCRIPT_DIR}/detect-worktree.sh")"
+RUNNER_DIR="/tmp/platform-e2e/${WORKTREE}/agent-runner"
 
 # ── Deploy services + registry proxy using shared script ──────────────────
 REGISTRY_BACKEND_HOST="${PLATFORM_HOST}" \

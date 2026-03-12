@@ -27,6 +27,8 @@ pub struct PostReceiveParams {
     /// Branch names that were updated (stripped of `refs/heads/` prefix).
     /// When empty, falls back to `default_branch`.
     pub pushed_branches: Vec<String>,
+    /// Tag names that were pushed (stripped of `refs/tags/` prefix).
+    pub pushed_tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +50,22 @@ pub fn extract_pushed_branches(updates: &[RefUpdate]) -> Vec<String> {
             }
             // Only process branch refs
             u.refname.strip_prefix("refs/heads/").map(str::to_string)
+        })
+        .collect()
+}
+
+/// Extract tag names from ref updates, filtering to `refs/tags/*` only.
+///
+/// Strips the `refs/tags/` prefix and skips deletions.
+pub fn extract_pushed_tags(updates: &[RefUpdate]) -> Vec<String> {
+    let zero_sha = "0".repeat(40);
+    updates
+        .iter()
+        .filter_map(|u| {
+            if u.new_sha == zero_sha {
+                return None;
+            }
+            u.refname.strip_prefix("refs/tags/").map(str::to_string)
         })
         .collect()
 }
@@ -201,12 +219,131 @@ pub async fn post_receive(state: &AppState, params: &PostReceiveParams) -> Resul
         crate::api::webhooks::fire_webhooks(&state.pool, params.project_id, "push", &payload).await;
     }
 
+    // Handle MR sync on push: update head_sha and trigger MR pipelines
+    for branch in &branches {
+        handle_mr_sync_on_push(state, params, branch).await;
+    }
+
+    // Handle tag pushes
+    for tag_name in &params.pushed_tags {
+        let commit_sha = get_tag_sha(&params.repo_path, tag_name).await;
+        let tag_params = crate::pipeline::trigger::TagTriggerParams {
+            project_id: params.project_id,
+            user_id: params.user_id,
+            repo_path: params.repo_path.clone(),
+            tag_name: tag_name.clone(),
+            commit_sha: commit_sha.clone(),
+        };
+
+        match crate::pipeline::trigger::on_tag(&state.pool, &tag_params).await {
+            Ok(Some(pipeline_id)) => {
+                crate::pipeline::trigger::notify_executor(state, pipeline_id).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, %tag_name, "tag pipeline trigger failed");
+            }
+        }
+
+        let payload = serde_json::json!({
+            "ref": format!("refs/tags/{tag_name}"),
+            "project_id": params.project_id,
+            "pusher": params.user_name,
+        });
+        crate::api::webhooks::fire_webhooks(&state.pool, params.project_id, "push", &payload).await;
+    }
+
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------
+
+/// Handle MR sync when a branch is pushed: update `head_sha`, dismiss stale reviews, trigger MR pipeline.
+async fn handle_mr_sync_on_push(state: &AppState, params: &PostReceiveParams, branch: &str) {
+    let commit_sha = get_branch_sha(&params.repo_path, branch).await;
+    let sha_str = commit_sha.as_deref().unwrap_or("");
+
+    // Find open MRs where source_branch matches
+    let open_mrs = sqlx::query!(
+        r#"
+        SELECT id, number FROM merge_requests
+        WHERE project_id = $1 AND source_branch = $2 AND status = 'open'
+        "#,
+        params.project_id,
+        branch,
+    )
+    .fetch_all(&state.pool)
+    .await;
+
+    let Ok(open_mrs) = open_mrs else {
+        return;
+    };
+
+    for mr in open_mrs {
+        // Update head_sha
+        let _ = sqlx::query!(
+            "UPDATE merge_requests SET head_sha = $1, updated_at = now() WHERE id = $2",
+            sha_str,
+            mr.id,
+        )
+        .execute(&state.pool)
+        .await;
+
+        // Dismiss stale reviews if protection rule says so
+        if let Ok(Some(rule)) =
+            crate::git::protection::get_protection(&state.pool, params.project_id, branch).await
+            && rule.dismiss_stale_reviews
+        {
+            let _ = sqlx::query!(
+                r#"UPDATE mr_reviews SET is_stale = true
+                    WHERE mr_id = $1 AND verdict = 'approve' AND is_stale = false"#,
+                mr.id,
+            )
+            .execute(&state.pool)
+            .await;
+        }
+
+        // Trigger MR pipeline
+        let mr_params = crate::pipeline::trigger::MrTriggerParams {
+            project_id: params.project_id,
+            user_id: params.user_id,
+            repo_path: params.repo_path.clone(),
+            source_branch: branch.to_string(),
+            commit_sha: commit_sha.clone(),
+            action: "synchronized".into(),
+        };
+
+        match crate::pipeline::trigger::on_mr(&state.pool, &mr_params).await {
+            Ok(Some(pipeline_id)) => {
+                crate::pipeline::trigger::notify_executor(state, pipeline_id).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, mr_number = mr.number, "MR pipeline trigger on push failed");
+            }
+        }
+    }
+}
+
+/// Get the SHA of a tag.
+async fn get_tag_sha(repo_path: &Path, tag_name: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("rev-parse")
+        .arg(format!("refs/tags/{tag_name}"))
+        .output()
+        .await
+        .ok()?;
+
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        None
+    }
+}
 
 /// Check if a file exists in a git repo at a given ref.
 #[allow(dead_code)] // available for future use; trigger module uses read_file_at_ref instead

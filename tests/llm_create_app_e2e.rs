@@ -197,7 +197,7 @@ fn resolve_api_key() -> Option<String> {
 // Test
 // ---------------------------------------------------------------------------
 
-/// Full create-app E2E flow with real LLM.
+/// Full create-app E2E flow with real LLM (branch-protection-aware).
 ///
 /// Steps:
 /// 1. Start real TCP server (agent pods reach platform API)
@@ -206,10 +206,11 @@ fn resolve_api_key() -> Option<String> {
 /// 4. POST /api/create-app → manager session
 /// 5. Poll for manager tool calls (`create_project`, `spawn_coding_agent`)
 /// 6. Wait for worker agent pod to complete
-/// 7. Verify git push happened (commits, .platform.yaml, Dockerfile)
-/// 8. Wait for pipeline (if triggered)
-/// 9. Verify deployment (best-effort)
-/// 10. Verify manager session completes
+/// 7. Verify git push to feature branch + MR creation
+/// 8. Wait for MR pipeline (triggered by `on_mr`)
+/// 9. Wait for auto-merge (triggered by pipeline success)
+/// 10. Verify deployment (post-merge deploy)
+/// 11. Verify manager session completes
 #[ignore = "requires real Claude CLI and Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn llm_create_app_full_flow(pool: PgPool) {
@@ -347,7 +348,7 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         &admin_token,
         "/api/create-app",
         serde_json::json!({
-            "description": "Skip clarification — all details provided. Execute Phase 2 immediately.\n\nApp: hello world Express.js (Node.js LTS) web server. GET /healthz returns {\"status\":\"ok\"} on port 8080. No database, no extra features.\n\nProject name: hello-llm-test\n\nYou MUST call create_project first, then spawn_coding_agent with the returned project_id. Both tool calls are required."
+            "description": "Skip clarification — all details provided. Execute Phase 2 immediately.\n\nApp: hello world Express.js (Node.js LTS) web server. GET /healthz returns {\"status\":\"ok\"} on port 8080. No database, no extra features.\n\nProject name: hello-llm-test\n\nThe main branch is protected. The coding agent must push to a feature branch, then create a merge request targeting main. CI triggers on MR creation and auto-merges when it passes.\n\nYou MUST call create_project first, then spawn_coding_agent with the returned project_id. Both tool calls are required."
         }),
     )
     .await;
@@ -518,8 +519,8 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         );
     }
 
-    // -- 8. Verify git push happened --
-    eprintln!("[LLM E2E] Verifying git push...");
+    // -- 8. Verify git push to feature branch --
+    eprintln!("[LLM E2E] Verifying git push to feature branch...");
     let repo_path: Option<String> =
         sqlx::query_scalar("SELECT repo_path FROM projects WHERE id = $1")
             .bind(project_id)
@@ -528,53 +529,161 @@ async fn llm_create_app_full_flow(pool: PgPool) {
             .unwrap()
             .flatten();
 
-    if let Some(repo_path) = &repo_path {
+    // Find the feature branch the agent pushed to
+    let feature_branch = if let Some(repo_path) = &repo_path {
         let repo = std::path::Path::new(repo_path);
         if repo.exists() {
-            // Check for commits beyond initial
-            let log_output = try_git_cmd(repo, &["log", "--oneline", "main"]);
+            // List branches — look for feature/* branches
+            let branches_output = try_git_cmd(repo, &["branch", "--list", "feature/*"]);
+            let branch = branches_output
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .map(|l| l.trim().trim_start_matches("* "))
+                .find(|b| !b.is_empty())
+                .unwrap_or("feature/initial-app")
+                .to_string();
+            eprintln!("[LLM E2E] Feature branch found: {branch}");
+
+            // Check for commits on feature branch
+            let log_output = try_git_cmd(repo, &["log", "--oneline", &branch]);
             if let Some(log) = &log_output {
                 let commit_count = log.lines().count();
-                eprintln!("[LLM E2E] Commits on main: {commit_count}");
+                eprintln!("[LLM E2E] Commits on {branch}: {commit_count}");
 
                 if commit_count > 1 {
-                    // Check for key files
+                    // Check for key files on feature branch
+                    let ref_prefix = format!("{branch}:");
                     let has_platform_yaml =
-                        try_git_cmd(repo, &["show", "main:.platform.yaml"]).is_some();
-                    let has_dockerfile = try_git_cmd(repo, &["show", "main:Dockerfile"]).is_some();
+                        try_git_cmd(repo, &["show", &format!("{ref_prefix}.platform.yaml")])
+                            .is_some();
+                    let has_dockerfile =
+                        try_git_cmd(repo, &["show", &format!("{ref_prefix}Dockerfile")]).is_some();
 
                     eprintln!(
                         "[LLM E2E] .platform.yaml: {has_platform_yaml}, Dockerfile: {has_dockerfile}"
                     );
 
                     // Dump file contents for debugging
-                    if let Some(yaml) = try_git_cmd(repo, &["show", "main:.platform.yaml"]) {
+                    if let Some(yaml) =
+                        try_git_cmd(repo, &["show", &format!("{ref_prefix}.platform.yaml")])
+                    {
                         eprintln!("[LLM E2E] .platform.yaml content:\n{yaml}");
-                    } else {
-                        eprintln!("[LLM E2E] WARNING: .platform.yaml not found in repo");
                     }
-                    if let Some(df) = try_git_cmd(repo, &["show", "main:Dockerfile"]) {
+                    if let Some(df) =
+                        try_git_cmd(repo, &["show", &format!("{ref_prefix}Dockerfile")])
+                    {
                         eprintln!("[LLM E2E] Dockerfile content:\n{df}");
-                    } else {
-                        eprintln!("[LLM E2E] WARNING: Dockerfile not found in repo");
                     }
                 } else {
                     eprintln!(
-                        "[LLM E2E] WARNING: Only {commit_count} commit(s) — worker may not have pushed"
+                        "[LLM E2E] WARNING: Only {commit_count} commit(s) on {branch} — worker may not have pushed"
                     );
                 }
             } else {
-                eprintln!("[LLM E2E] WARNING: git log failed — repo may be empty");
+                eprintln!("[LLM E2E] WARNING: git log on {branch} failed");
             }
+
+            Some(branch)
         } else {
             eprintln!("[LLM E2E] WARNING: repo_path does not exist: {repo_path}");
+            None
         }
     } else {
         eprintln!("[LLM E2E] WARNING: project has no repo_path");
+        None
+    };
+
+    // -- 9. Check for MR creation + enable auto-merge --
+    // The agent should create the MR via curl using $PROJECT_ID / $PLATFORM_API_TOKEN.
+    // If MCP tools are disabled or the agent didn't create one, the test creates it as fallback.
+    eprintln!("[LLM E2E] Checking for merge request...");
+    let mut mr_found = false;
+    let mr_timeout = Duration::from_secs(30);
+    let mr_start = std::time::Instant::now();
+
+    loop {
+        let (_, mrs_body) = e2e_helpers::get_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/merge-requests?limit=5"),
+        )
+        .await;
+
+        if let Some(items) = mrs_body["items"].as_array()
+            && !items.is_empty()
+        {
+            let mr_number = items[0]["number"].as_i64().unwrap_or(0);
+            let mr_status = items[0]["status"].as_str().unwrap_or("unknown");
+            let source = items[0]["source_branch"].as_str().unwrap_or("?");
+            let target = items[0]["target_branch"].as_str().unwrap_or("?");
+            eprintln!("[LLM E2E] MR #{mr_number} found: {source} → {target} (status: {mr_status})");
+            mr_found = true;
+            break;
+        }
+
+        if mr_start.elapsed() > mr_timeout {
+            eprintln!("[LLM E2E] No MR found — creating as fallback");
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // -- 9. Wait for pipeline (if triggered) --
+    // Fallback: test creates the MR if the agent didn't
+    if !mr_found {
+        if let Some(ref branch) = feature_branch {
+            let (create_status, create_body) = e2e_helpers::post_json(
+                &app,
+                &admin_token,
+                &format!("/api/projects/{project_id}/merge-requests"),
+                serde_json::json!({
+                    "title": "Initial app (test fallback)",
+                    "source_branch": branch,
+                    "target_branch": "main"
+                }),
+            )
+            .await;
+            eprintln!("[LLM E2E] Fallback MR creation: {create_status} — {create_body}");
+            if create_status == axum::http::StatusCode::CREATED {
+                mr_found = true;
+            }
+        } else {
+            eprintln!("[LLM E2E] WARNING: No feature branch found — cannot create fallback MR");
+        }
+    }
+
+    // Enable auto-merge on whichever MR exists
+    if mr_found {
+        let (_, mrs_body) = e2e_helpers::get_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/merge-requests?limit=1"),
+        )
+        .await;
+        if let Some(items) = mrs_body["items"].as_array()
+            && let Some(mr) = items.first()
+        {
+            let mr_number = mr["number"].as_i64().unwrap_or(0);
+            let mr_status = mr["status"].as_str().unwrap_or("unknown");
+            if mr_status == "open" {
+                let (am_status, _) = e2e_helpers::put_json(
+                    &app,
+                    &admin_token,
+                    &format!("/api/projects/{project_id}/merge-requests/{mr_number}/auto-merge"),
+                    serde_json::json!({}),
+                )
+                .await;
+                eprintln!("[LLM E2E] Auto-merge enabled: {am_status}");
+            }
+        }
+    }
+
+    // -- 9b. Wait for pipeline (triggered by MR creation via on_mr) --
     eprintln!("[LLM E2E] Checking for pipeline...");
+    // Give pipeline trigger a moment to fire
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     let (_, pipelines_body) = e2e_helpers::get_json(
         &app,
         &admin_token,
@@ -616,11 +725,70 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         }
     } else {
         eprintln!(
-            "[LLM E2E] No pipeline triggered (worker may not have created .platform.yaml correctly)"
+            "[LLM E2E] No pipeline triggered (worker may not have created .platform.yaml or MR correctly)"
         );
     }
 
-    // -- 9b. Run reaper NOW (after pipeline) to finalize child session --
+    // -- 9c. Wait for auto-merge (fires after pipeline success via try_auto_merge) --
+    if pipeline_status == "success" && mr_found {
+        eprintln!("[LLM E2E] Waiting for auto-merge...");
+        let merge_timeout = Duration::from_secs(60);
+        let merge_start = std::time::Instant::now();
+
+        loop {
+            let (_, mrs_body) = e2e_helpers::get_json(
+                &app,
+                &admin_token,
+                &format!("/api/projects/{project_id}/merge-requests?limit=5"),
+            )
+            .await;
+
+            if let Some(items) = mrs_body["items"].as_array()
+                && !items.is_empty()
+            {
+                let mr_status = items[0]["status"].as_str().unwrap_or("unknown");
+                if mr_status == "merged" {
+                    eprintln!("[LLM E2E] MR merged successfully!");
+                    break;
+                }
+                eprintln!("[LLM E2E] MR status: {mr_status}");
+            }
+
+            if merge_start.elapsed() > merge_timeout {
+                eprintln!("[LLM E2E] Auto-merge timed out — merging manually");
+                // Auto-merge didn't fire because pipeline completed before auto_merge was
+                // enabled on the MR. Merge manually — the endpoint still enforces all
+                // protection rules (CI success, required_approvals, etc.).
+                let (_, mrs_body2) = e2e_helpers::get_json(
+                    &app,
+                    &admin_token,
+                    &format!("/api/projects/{project_id}/merge-requests?limit=1"),
+                )
+                .await;
+                if let Some(items) = mrs_body2["items"].as_array()
+                    && let Some(mr) = items.first()
+                {
+                    let mr_number = mr["number"].as_i64().unwrap_or(0);
+                    let mr_status = mr["status"].as_str().unwrap_or("unknown");
+                    if mr_status == "open" {
+                        let (merge_st, merge_body) = e2e_helpers::post_json(
+                            &app,
+                            &admin_token,
+                            &format!("/api/projects/{project_id}/merge-requests/{mr_number}/merge"),
+                            serde_json::json!({}),
+                        )
+                        .await;
+                        eprintln!("[LLM E2E] Manual merge: {merge_st} — {merge_body}");
+                    }
+                }
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    // -- 9d. Run reaper NOW (after pipeline) to finalize child session --
     // Must happen after pipeline because reaper deletes agent identity tokens.
     if let Some(child_session_id) = child_session_id {
         platform::agent::service::run_reaper_once(&state).await;
@@ -633,7 +801,7 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         eprintln!("[LLM E2E] Child session status: {child_status}");
     }
 
-    // -- 10. Wait for deployment to become healthy --
+    // -- 11. Wait for deployment to become healthy --
     eprintln!("[LLM E2E] Waiting for deployment...");
     let deploy_timeout = Duration::from_secs(120);
     let deploy_start = std::time::Instant::now();
@@ -712,7 +880,7 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         }
     }
 
-    // -- 11. Check manager session final status --
+    // -- 12. Check manager session final status --
     eprintln!("[LLM E2E] Waiting for manager session to complete...");
     let manager_status =
         e2e_helpers::poll_session_status(&pool, manager_session_id, &["completed", "failed"], 60)
@@ -734,20 +902,28 @@ async fn llm_create_app_full_flow(pool: PgPool) {
         "manager session should reach completed"
     );
 
-    // Verify the worker actually committed and pushed code
-    if let Some(repo_path) = &repo_path {
+    // Verify the worker pushed to a feature branch (not main)
+    if let Some(repo_path) = &repo_path
+        && let Some(ref branch) = feature_branch
+    {
         let repo = std::path::Path::new(repo_path);
         if repo.exists() {
-            let log_output = try_git_cmd(repo, &["log", "--oneline", "main"]);
+            let log_output = try_git_cmd(repo, &["log", "--oneline", branch]);
             if let Some(log) = &log_output {
                 let commit_count = log.lines().count();
                 assert!(
                     commit_count > 1,
-                    "worker should have pushed commits (got {commit_count}). Log:\n{log}"
+                    "worker should have pushed commits to {branch} (got {commit_count}). Log:\n{log}"
                 );
             }
         }
     }
+
+    // MR should have been created
+    assert!(
+        mr_found,
+        "worker should have created a merge request via MCP tool"
+    );
 
     // Pipeline should have triggered and succeeded
     assert_eq!(

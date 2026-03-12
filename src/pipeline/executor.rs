@@ -112,6 +112,8 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
         SELECT pl.git_ref as "git_ref!: String",
                pl.commit_sha,
                p.owner_id as "owner_id!",
+               pl.triggered_by,
+               pl.version,
                p.name as "project_name!: String",
                p.namespace_slug as "namespace_slug!: String",
                u.name as "owner_name!: String"
@@ -143,6 +145,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     let meta = PipelineMeta {
         git_ref: pipeline.git_ref,
         commit_sha: pipeline.commit_sha,
+        version: pipeline.version,
         project_name: pipeline.project_name,
         repo_clone_url,
         git_auth_token: git_token.0,
@@ -192,6 +195,8 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     if all_succeeded {
         detect_and_write_deployment(state, pipeline_id, project_id).await;
         detect_and_publish_dev_image(state, pipeline_id, project_id).await;
+        // Try auto-merge for any open MRs with auto_merge enabled
+        crate::api::merge_requests::try_auto_merge(state, project_id).await;
     }
 
     fire_build_webhook(&state.pool, project_id, pipeline_id, final_status).await;
@@ -203,6 +208,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
 struct PipelineMeta {
     git_ref: String,
     commit_sha: Option<String>,
+    version: Option<String>,
     project_name: String,
     repo_clone_url: String,
     /// Short-lived API token for authenticating git clone via `GIT_ASKPASS`.
@@ -313,6 +319,7 @@ async fn execute_single_step(
         &pipeline.git_ref,
         pipeline.commit_sha.as_deref(),
         &step.name,
+        pipeline.version.as_deref(),
     );
 
     let pod_name = format!("pl-{}-{}", &pipeline_id.to_string()[..8], slug(&step.name));
@@ -796,6 +803,7 @@ fn node_registry_url(config: &crate::config::Config) -> Option<&str> {
         .or(config.registry_url.as_deref())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_env_vars(
     state: &AppState,
     pipeline_id: Uuid,
@@ -804,6 +812,7 @@ fn build_env_vars(
     git_ref: &str,
     commit_sha: Option<&str>,
     step_name: &str,
+    version: Option<&str>,
 ) -> Vec<EnvVar> {
     build_env_vars_core(
         pipeline_id,
@@ -815,10 +824,12 @@ fn build_env_vars(
         // REGISTRY env var for Kaniko push — uses the actual platform API URL
         // (not the node proxy) since Kaniko pushes from inside the pod.
         state.config.registry_url.as_deref(),
+        version,
     )
 }
 
 /// Core env var builder with no dependency on `AppState`.
+#[allow(clippy::too_many_arguments)]
 fn build_env_vars_core(
     pipeline_id: Uuid,
     project_id: Uuid,
@@ -827,6 +838,7 @@ fn build_env_vars_core(
     commit_sha: Option<&str>,
     step_name: &str,
     registry_url: Option<&str>,
+    version: Option<&str>,
 ) -> Vec<EnvVar> {
     let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
 
@@ -842,7 +854,12 @@ fn build_env_vars_core(
 
     if let Some(sha) = commit_sha {
         vars.push(env_var("COMMIT_SHA", sha));
+        let short_sha = &sha[..sha.len().min(7)];
+        vars.push(env_var("SHORT_SHA", short_sha));
+        vars.push(env_var("IMAGE_TAG", &format!("sha-{short_sha}")));
     }
+
+    vars.push(env_var("VERSION", version.unwrap_or("")));
 
     if let Some(registry) = registry_url {
         vars.push(env_var("REGISTRY", registry));
@@ -1590,6 +1607,7 @@ mod tests {
             None,
             "build",
             None,
+            None,
         );
         assert!(find_env(&vars, "PLATFORM_PROJECT_ID").is_some());
         assert!(find_env(&vars, "PLATFORM_PROJECT_NAME").is_some());
@@ -1610,6 +1628,7 @@ mod tests {
             Some("abc123"),
             "test",
             None,
+            None,
         );
         assert_eq!(find_env(&vars, "COMMIT_SHA"), Some("abc123".into()));
     }
@@ -1623,6 +1642,7 @@ mod tests {
             "refs/heads/main",
             None,
             "test",
+            None,
             None,
         );
         assert!(find_env(&vars, "COMMIT_SHA").is_none());
@@ -1638,6 +1658,7 @@ mod tests {
             None,
             "test",
             Some("registry.example.com"),
+            None,
         );
         assert_eq!(
             find_env(&vars, "REGISTRY"),
@@ -1647,8 +1668,16 @@ mod tests {
 
     #[test]
     fn env_vars_registry_absent_when_none() {
-        let vars =
-            build_env_vars_core(Uuid::nil(), Uuid::nil(), "proj", "main", None, "test", None);
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+        );
         assert!(find_env(&vars, "REGISTRY").is_none());
     }
 
@@ -1661,6 +1690,7 @@ mod tests {
             "refs/heads/feature/login",
             None,
             "test",
+            None,
             None,
         );
         assert_eq!(
@@ -1675,8 +1705,16 @@ mod tests {
 
     #[test]
     fn env_vars_bare_ref_used_as_branch() {
-        let vars =
-            build_env_vars_core(Uuid::nil(), Uuid::nil(), "proj", "main", None, "test", None);
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+        );
         assert_eq!(find_env(&vars, "COMMIT_BRANCH"), Some("main".into()));
     }
 
@@ -1859,6 +1897,7 @@ mod tests {
             None,
             "test",
             Some("registry.example.com"),
+            None,
         );
         assert_eq!(
             find_env(&vars, "DOCKER_CONFIG"),
@@ -1868,8 +1907,16 @@ mod tests {
 
     #[test]
     fn env_vars_docker_config_absent_when_no_registry() {
-        let vars =
-            build_env_vars_core(Uuid::nil(), Uuid::nil(), "proj", "main", None, "test", None);
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+        );
         assert!(find_env(&vars, "DOCKER_CONFIG").is_none());
     }
 
@@ -2160,6 +2207,7 @@ mod tests {
             None,
             "test",
             None,
+            None,
         );
         // refs/tags/ is NOT stripped by the branch logic — only refs/heads/ is
         assert_eq!(
@@ -2182,6 +2230,7 @@ mod tests {
             None,
             "build",
             None,
+            None,
         );
         assert_eq!(find_env(&vars, "PROJECT"), Some("My-App-v2".into()));
         assert_eq!(
@@ -2199,6 +2248,7 @@ mod tests {
             "main",
             None,
             "deploy-production",
+            None,
             None,
         );
         assert_eq!(

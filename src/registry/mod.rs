@@ -269,6 +269,61 @@ fn glob_match(pattern: &str, input: &str) -> bool {
     true
 }
 
+/// Copy a manifest from one tag to another within the same repository.
+///
+/// Metadata-only — blobs are shared via content-addressable storage.
+/// Returns error if `dest_tag` already exists (immutable alias tags).
+pub async fn copy_tag(
+    pool: &sqlx::PgPool,
+    repo_name: &str,
+    source_tag: &str,
+    dest_tag: &str,
+) -> Result<(), error::RegistryError> {
+    // Look up repository
+    let repo = sqlx::query_scalar!(
+        "SELECT id FROM registry_repositories WHERE name = $1",
+        repo_name,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(error::RegistryError::NameUnknown)?;
+
+    // Get digest for source tag
+    let source_digest = sqlx::query_scalar!(
+        "SELECT manifest_digest FROM registry_tags WHERE repository_id = $1 AND name = $2",
+        repo,
+        source_tag,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(error::RegistryError::ManifestUnknown)?;
+
+    // Check dest_tag doesn't already exist
+    let existing = sqlx::query_scalar!(
+        "SELECT manifest_digest FROM registry_tags WHERE repository_id = $1 AND name = $2",
+        repo,
+        dest_tag,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if existing.is_some() {
+        return Err(error::RegistryError::TagExists(dest_tag.to_string()));
+    }
+
+    // Create tag pointing to the same digest
+    sqlx::query!(
+        "INSERT INTO registry_tags (repository_id, name, manifest_digest) VALUES ($1, $2, $3)",
+        repo,
+        dest_tag,
+        source_digest,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         // Version check

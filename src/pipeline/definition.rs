@@ -15,7 +15,7 @@ pub struct PipelineFile {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields consumed via serde + executor
+#[allow(dead_code)] // artifacts consumed via serde for future use
 pub struct PipelineDefinition {
     pub steps: Vec<StepDef>,
     #[serde(default)]
@@ -55,10 +55,10 @@ pub struct ArtifactDef {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // mr field consumed via serde + matches_mr
 pub struct TriggerConfig {
     pub push: Option<PushTrigger>,
     pub mr: Option<MrTrigger>,
+    pub tag: Option<TagTrigger>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,9 +67,13 @@ pub struct PushTrigger {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // consumed via serde + matches_mr
 pub struct MrTrigger {
     pub actions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagTrigger {
+    pub patterns: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,13 +155,12 @@ pub fn matches_push(trigger: Option<&TriggerConfig>, branch: &str) -> bool {
     }
     push.branches
         .iter()
-        .any(|pattern| match_pattern(pattern, branch))
+        .any(|pattern| crate::validation::match_glob_pattern(pattern, branch))
 }
 
 /// Check if an MR action matches the trigger configuration.
 ///
 /// If no trigger config or no MR trigger is defined, all actions match.
-#[allow(dead_code)] // used by trigger::on_mr, wired in MR integration
 pub fn matches_mr(trigger: Option<&TriggerConfig>, action: &str) -> bool {
     let Some(config) = trigger else {
         return true;
@@ -171,31 +174,23 @@ pub fn matches_mr(trigger: Option<&TriggerConfig>, action: &str) -> bool {
     mr.actions.iter().any(|a| a == action)
 }
 
-/// Simple glob-like pattern matching for branch names.
+/// Check if a tag name matches the trigger configuration.
 ///
-/// Supports `*` as a wildcard matching any sequence of characters.
-fn match_pattern(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
+/// If no trigger config or no tag trigger is defined, returns false
+/// (tags don't trigger by default, unlike pushes/MRs).
+pub fn matches_tag(trigger: Option<&TriggerConfig>, tag_name: &str) -> bool {
+    let Some(config) = trigger else {
+        return false;
+    };
+    let Some(tag) = &config.tag else {
+        return false;
+    };
+    if tag.patterns.is_empty() {
         return true;
     }
-
-    if !pattern.contains('*') {
-        return pattern == value;
-    }
-
-    let parts: Vec<&str> = pattern.split('*').collect();
-
-    // Pattern like "feature/*"
-    if parts.len() == 2 {
-        let prefix = parts[0];
-        let suffix = parts[1];
-        return value.starts_with(prefix)
-            && value.ends_with(suffix)
-            && value.len() >= prefix.len() + suffix.len();
-    }
-
-    // Fallback: exact match for complex patterns
-    pattern == value
+    tag.patterns
+        .iter()
+        .any(|pattern| crate::validation::match_glob_pattern(pattern, tag_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -377,36 +372,77 @@ pipeline:
 
     #[test]
     fn match_pattern_exact_no_wildcard() {
-        assert!(match_pattern("main", "main"));
-        assert!(!match_pattern("main", "develop"));
+        use crate::validation::match_glob_pattern;
+        assert!(match_glob_pattern("main", "main"));
+        assert!(!match_glob_pattern("main", "develop"));
     }
 
     #[test]
     fn match_pattern_prefix_wildcard() {
+        use crate::validation::match_glob_pattern;
         // "*-release" should match "v1-release"
-        assert!(match_pattern("*-release", "v1-release"));
-        assert!(match_pattern("*-release", "hotfix-release"));
-        assert!(!match_pattern("*-release", "release-v1"));
+        assert!(match_glob_pattern("*-release", "v1-release"));
+        assert!(match_glob_pattern("*-release", "hotfix-release"));
+        assert!(!match_glob_pattern("*-release", "release-v1"));
     }
 
     #[test]
     fn match_pattern_suffix_wildcard() {
-        assert!(match_pattern("release/*", "release/v1"));
-        assert!(match_pattern("release/*", "release/"));
-        assert!(!match_pattern("release/*", "hotfix/v1"));
+        use crate::validation::match_glob_pattern;
+        assert!(match_glob_pattern("release/*", "release/v1"));
+        assert!(match_glob_pattern("release/*", "release/"));
+        assert!(!match_glob_pattern("release/*", "hotfix/v1"));
     }
 
     #[test]
     fn match_pattern_multi_wildcard_falls_to_exact() {
+        use crate::validation::match_glob_pattern;
         // Complex patterns with 2+ wildcards fall to exact match
         assert!(
-            !match_pattern("a/*/b/*", "a/x/b/y"),
+            !match_glob_pattern("a/*/b/*", "a/x/b/y"),
             "multi-wildcard falls to exact match"
         );
         assert!(
-            match_pattern("a/*/b/*", "a/*/b/*"),
+            match_glob_pattern("a/*/b/*", "a/*/b/*"),
             "multi-wildcard matches itself exactly"
         );
+    }
+
+    #[test]
+    fn matches_tag_patterns() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    tag:
+      patterns: ["v*"]
+"#;
+        let def = parse(yaml).unwrap();
+        assert!(matches_tag(def.trigger.as_ref(), "v1.0.0"));
+        assert!(matches_tag(def.trigger.as_ref(), "v2.0"));
+        assert!(!matches_tag(def.trigger.as_ref(), "release-1.0"));
+    }
+
+    #[test]
+    fn matches_tag_no_trigger_returns_false() {
+        assert!(!matches_tag(None, "v1.0.0"));
+    }
+
+    #[test]
+    fn matches_tag_no_tag_trigger_returns_false() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+  on:
+    push:
+      branches: [main]
+";
+        let def = parse(yaml).unwrap();
+        assert!(!matches_tag(def.trigger.as_ref(), "v1.0.0"));
     }
 
     #[test]

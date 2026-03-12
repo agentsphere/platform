@@ -358,6 +358,7 @@ async fn handle_post_push(
         repo_path: project.repo_disk_path.clone(),
         default_branch: project.default_branch.clone(),
         pushed_branches: Vec::new(), // SSH path: fall back to default_branch for now
+        pushed_tags: Vec::new(),
     };
     if let Err(e) = hooks::post_receive(state, &params).await {
         tracing::error!(error = %e, "SSH post-receive hook failed");

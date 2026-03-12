@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by)\n        VALUES ($1, $2, $3, $4, 'pending', $5)\n        RETURNING id\n        ",
+  "query": "\n        INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by, version)\n        VALUES ($1, $2, $3, $4, 'pending', $5, $6)\n        RETURNING id\n        ",
   "describe": {
     "columns": [
       {
@@ -15,12 +15,13 @@
         "Text",
         "Text",
         "Text",
-        "Uuid"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "de2dc78405c0c2546c019d7a9d5b0b11d17e49f064c9bb0fc4db51b7ea268045"
+  "hash": "e6fcab2818e9d678be5cd0919beac5d195bd031c0295b5d07d5c858e489eff34"
 }

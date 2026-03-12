@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, source_branch, target_branch, status\n        FROM merge_requests WHERE project_id = $1 AND number = $2\n        ",
+  "query": "\n        SELECT id, source_branch, target_branch, status, head_sha\n        FROM merge_requests WHERE project_id = $1 AND number = $2\n        ",
   "describe": {
     "columns": [
       {
@@ -22,6 +22,11 @@
         "ordinal": 3,
         "name": "status",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "head_sha",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -34,8 +39,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "1b0343c0faf59730d44a3a9efe348c190985bd5a9820634ca69e5288ddb8461c"
+  "hash": "04375bba0a14560a72d0d93cd9f221ee83ccc8b1e8c191dec70072bb98997f8e"
 }

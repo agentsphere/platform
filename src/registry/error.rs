@@ -76,6 +76,8 @@ pub enum RegistryError {
     Unauthorized,
     #[error("denied")]
     Denied,
+    #[error("tag already exists: {0}")]
+    TagExists(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error(transparent)]
@@ -97,7 +99,7 @@ impl RegistryError {
             Self::ManifestUnknown => OciErrorCode::ManifestUnknown,
             Self::NameUnknown => OciErrorCode::NameUnknown,
             Self::Unauthorized => OciErrorCode::Unauthorized,
-            Self::Denied => OciErrorCode::Denied,
+            Self::Denied | Self::TagExists(_) => OciErrorCode::Denied,
         }
     }
 }
@@ -126,6 +128,7 @@ impl IntoResponse for RegistryError {
         // For DB/storage/internal errors, use 500 instead of the OCI code
         let status = match &self {
             Self::Db(_) | Self::Storage(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::TagExists(_) => StatusCode::CONFLICT,
             _ => code.status(),
         };
 

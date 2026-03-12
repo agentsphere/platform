@@ -666,6 +666,25 @@ pub async fn patch_json(app: &Router, token: &str, path: &str, body: Value) -> (
     (status, body)
 }
 
+/// Send a PUT request with Bearer auth and JSON body.
+pub async fn put_json(app: &Router, token: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("Content-Type", "application/json");
+    if !token.is_empty() {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    (status, body)
+}
+
 /// Send a DELETE request with Bearer auth.
 pub async fn delete_json(app: &Router, token: &str, path: &str) -> (StatusCode, Value) {
     let mut builder = Request::builder().method("DELETE").uri(path);

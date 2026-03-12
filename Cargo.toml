@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTP + SSE
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace", "fs", "limit", "set-header"] }

@@ -39,6 +39,7 @@ pub struct GitUser {
 /// Resolved project from /:owner/:repo path.
 pub struct ResolvedProject {
     pub project_id: Uuid,
+    pub owner_id: Uuid,
     pub repo_disk_path: PathBuf,
     pub default_branch: String,
     pub visibility: String,
@@ -254,7 +255,7 @@ pub async fn resolve_project(
 
     let row = sqlx::query!(
         r#"
-        SELECT p.id, p.repo_path, p.default_branch, p.visibility
+        SELECT p.id, p.owner_id, p.repo_path, p.default_branch, p.visibility
         FROM projects p
         JOIN users u ON u.id = p.owner_id
         WHERE u.name = $1 AND p.name = $2 AND p.is_active = true
@@ -278,6 +279,7 @@ pub async fn resolve_project(
 
     Ok(ResolvedProject {
         project_id: row.id,
+        owner_id: row.owner_id,
         repo_disk_path,
         default_branch: row.default_branch,
         visibility: row.visibility,
@@ -370,6 +372,60 @@ async fn upload_pack(
     run_git_service(&project.repo_disk_path, "upload-pack", request.into_body())
 }
 
+/// Check branch protection rules for all ref updates in a push.
+async fn enforce_push_protection(
+    state: &AppState,
+    project: &ResolvedProject,
+    git_user: &GitUser,
+    ref_updates: &[super::hooks::RefUpdate],
+) -> Result<(), ApiError> {
+    for update in ref_updates {
+        let Some(branch) = update.refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let rule = super::protection::get_protection(&state.pool, project.project_id, branch)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("protection check: {e}")))?;
+
+        let Some(rule) = rule else { continue };
+
+        let is_admin = if rule.allow_admin_bypass {
+            resolver::has_permission(
+                &state.pool,
+                &state.valkey,
+                git_user.user_id,
+                Some(project.project_id),
+                Permission::AdminUsers,
+            )
+            .await
+            .unwrap_or(false)
+                || project.owner_id == git_user.user_id
+        } else {
+            false
+        };
+
+        if is_admin {
+            continue;
+        }
+
+        if rule.require_pr {
+            return Err(ApiError::Forbidden);
+        }
+
+        if rule.block_force_push
+            && super::protection::is_force_push(
+                &project.repo_disk_path,
+                &update.old_sha,
+                &update.new_sha,
+            )
+            .await
+        {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
 /// `POST /:owner/:repo/git-receive-pack`
 ///
 /// Push: collects full body/stdout (waits for completion to run hooks).
@@ -412,6 +468,9 @@ async fn receive_pack(
     let ref_updates = super::hooks::parse_pack_commands(&body_bytes);
     let pushed_branches = super::hooks::extract_pushed_branches(&ref_updates);
 
+    // Check branch protection rules before piping to git
+    enforce_push_protection(&state, &project, &git_user, &ref_updates).await?;
+
     // Pipe body to stdin and read stdout concurrently
     let (stdin_result, stdout_bytes) = tokio::join!(
         async {
@@ -443,6 +502,7 @@ async fn receive_pack(
         );
         // Run post-receive hooks in background
         let hook_state = state.clone();
+        let pushed_tags = super::hooks::extract_pushed_tags(&ref_updates);
         let params = super::hooks::PostReceiveParams {
             project_id: project.project_id,
             user_id: git_user.user_id,
@@ -450,6 +510,7 @@ async fn receive_pack(
             repo_path: project.repo_disk_path.clone(),
             default_branch: project.default_branch.clone(),
             pushed_branches,
+            pushed_tags,
         };
         tokio::spawn(async move {
             if let Err(e) = super::hooks::post_receive(&hook_state, &params).await {

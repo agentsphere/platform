@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO merge_requests (project_id, number, author_id, source_branch, target_branch, title, body)\n        VALUES ($1, $2, $3, $4, $5, $6, $7)\n        RETURNING id, project_id, number, author_id, source_branch, target_branch, title, body,\n                  status, merged_by, merged_at, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO merge_requests (project_id, number, author_id, source_branch, target_branch, title, body, head_sha)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING id, project_id, number, author_id, source_branch, target_branch, title, body,\n                  status, merged_by, merged_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -77,6 +77,7 @@
         "Text",
         "Text",
         "Text",
+        "Text",
         "Text"
       ]
     },
@@ -96,5 +97,5 @@
       false
     ]
   },
-  "hash": "37426a2dbb64f4d5192b2bf5a2f5ed86f63543f30ad44174c647d0b5577e677c"
+  "hash": "fe6636d379a7a9457b7386d522a5ae6f928a5baf222cf561f4f286ae451b05cd"
 }

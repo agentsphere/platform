@@ -42,7 +42,8 @@ The coding agent runs in a K8s pod with the project's git repo already cloned in
      (The env vars $REGISTRY, $PROJECT, $COMMIT_SHA are injected by the pipeline executor)
    - Create a `deploy/production.yaml` file with plain K8s manifests (Deployment + Service) using minijinja template variables: `{{ project_name }}` for resource names, `{{ image_ref }}` for the container image, `{{ values.replicas | default(1) }}` for replica count
    - Add OpenTelemetry SDK instrumentation that reads OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_SERVICE_NAME env vars to send traces, logs, and metrics
-   - Commit ALL files and push to the `main` branch (not a feature branch)
+   - Commit ALL files, push to a feature branch, and create a merge request targeting main. The `main` branch is protected — direct pushes are blocked. The workflow is: push to feature branch → create MR → CI runs automatically → auto-merge when CI passes → deploy.
+   - Use the `create_merge_request` MCP tool (from platform-issues) to create the MR after pushing. Pass `source_branch` (the feature branch name) and `target_branch: "main"`.
 
 CRITICAL RULE: After calling create_project and receiving a successful result with a project_id, your VERY NEXT response MUST include spawn_coding_agent in the tools array. Never return tools: [] between create_project and spawn_coding_agent.
 
@@ -62,10 +63,10 @@ Best practices:
 After all tools succeed, tell the user:
 "Your project is being set up! Here's what happens next:
 1. A coding agent is writing your application code, Dockerfile, pipeline config, and deploy manifests.
-2. When it pushes to main, the CI pipeline will automatically build a container image.
-3. The deploy manifests will be synced to the ops repo and applied to your production namespace.
+2. When it pushes to a feature branch and creates a merge request, CI will automatically build and test a container image.
+3. Once CI passes, the MR auto-merges into main. The deploy manifests are synced to the ops repo and applied to your production namespace.
 4. Once running, telemetry (traces, logs, metrics) will appear in the Observe dashboard.
-You can track progress in the Sessions and Pipelines pages."
+You can track progress in the Sessions, Merge Requests, and Pipelines pages."
 
 Keep all responses concise. Never ask more than two questions at a time."#;
 
@@ -105,5 +106,14 @@ mod tests {
         assert!(prompt.contains("healthz"));
         assert!(prompt.contains("OTEL_EXPORTER_OTLP_ENDPOINT"));
         assert!(prompt.contains("deploy/production.yaml"));
+    }
+
+    #[test]
+    fn system_prompt_uses_feature_branch_workflow() {
+        let prompt = build_create_app_system_prompt();
+        assert!(prompt.contains("feature branch"));
+        assert!(prompt.contains("merge request"));
+        assert!(prompt.contains("branch is protected"));
+        assert!(prompt.contains("create_merge_request"));
     }
 }

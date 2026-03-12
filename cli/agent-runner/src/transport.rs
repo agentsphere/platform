@@ -416,14 +416,17 @@ pub(crate) fn build_env(opts: &CliSpawnOptions) -> Vec<(String, String)> {
         env.push(("CLAUDE_CONFIG_DIR".to_owned(), dir.display().to_string()));
     }
 
-    // Git auth — PLATFORM_API_TOKEN is used by the GIT_ASKPASS script
-    // to authenticate git push/pull against the platform's smart HTTP endpoint.
+    // Platform context — PLATFORM_API_TOKEN is used by GIT_ASKPASS for git
+    // push/pull auth and by the agent for platform API calls (e.g. creating MRs).
+    // PROJECT_ID and BRANCH are needed so the agent can reference them in API calls.
     // GIT_CONFIG_* vars inject safe.directory config (init container runs as
     // different UID than main container — avoids "dubious ownership" errors).
     for var in [
         "PLATFORM_API_TOKEN",
-        "GIT_ASKPASS",
         "PLATFORM_API_URL",
+        "PROJECT_ID",
+        "BRANCH",
+        "GIT_ASKPASS",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_KEY_0",
         "GIT_CONFIG_VALUE_0",

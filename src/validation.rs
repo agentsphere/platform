@@ -224,6 +224,34 @@ pub fn check_setup_commands(commands: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Simple glob-like pattern matching for branch/tag names.
+///
+/// Supports `*` as a wildcard matching any sequence of characters.
+/// Used by branch protection rules and pipeline trigger matching.
+pub fn match_glob_pattern(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+
+    // Single wildcard: "feature/*" or "*-release"
+    if parts.len() == 2 {
+        let prefix = parts[0];
+        let suffix = parts[1];
+        return value.starts_with(prefix)
+            && value.ends_with(suffix)
+            && value.len() >= prefix.len() + suffix.len();
+    }
+
+    // Fallback: exact match for complex patterns
+    pattern == value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

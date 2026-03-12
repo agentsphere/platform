@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT status FROM pipelines\n            WHERE project_id = $1 AND git_ref = $2 AND trigger IN ('push', 'mr')\n            ORDER BY created_at DESC LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c6276d0b57c99f5927c70877a3aa9960764a87833e92e6fdb803f88eb3427d86"
+}

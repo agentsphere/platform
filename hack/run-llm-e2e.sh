@@ -46,15 +46,10 @@ BACKEND_PORT=$(find_free_port)
 REGISTRY_NODE_PORT=$(find_free_node_port)
 echo "Node: ${NODE_IP}  Backend: ${BACKEND_PORT}  Registry: ${REGISTRY_NODE_PORT}"
 
-# Check seed images exist
-SEED_DIR="/tmp/platform-e2e/seed-images"
-RUNNER_DIR="/tmp/platform-e2e/agent-runner"
-for f in "${SEED_DIR}/platform-runner.tar" "${SEED_DIR}/platform-runner-bare.tar" "${RUNNER_DIR}/arm64"; do
-  if [[ ! -f "$f" ]]; then
-    echo "MISSING: $f — run 'just test-e2e' first to build seed images"
-    exit 1
-  fi
-done
+# Build seed images + agent-runner binaries (cached, worktree-scoped)
+bash "${SCRIPT_DIR}/build-agent-images.sh"
+WORKTREE="$(bash "${SCRIPT_DIR}/detect-worktree.sh")"
+RUNNER_DIR="/tmp/platform-e2e/${WORKTREE}/agent-runner"
 
 # Deploy services
 echo "==> Deploying services"

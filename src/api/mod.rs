@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod branch_protection;
 pub mod cli_auth;
 pub mod commands;
 pub mod dashboard;
@@ -13,6 +14,7 @@ pub mod notifications;
 pub mod passkeys;
 pub mod pipelines;
 pub mod projects;
+pub mod releases;
 pub mod secrets;
 pub mod sessions;
 pub mod setup;
@@ -44,6 +46,8 @@ pub fn router() -> Router<AppState> {
         .merge(ssh_keys::router())
         .merge(gpg_keys::router())
         .merge(workspaces::router())
+        .merge(branch_protection::router())
+        .merge(releases::router())
         .merge(dashboard::router())
         .merge(setup::router())
         .merge(cli_auth::router())

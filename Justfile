@@ -7,6 +7,10 @@ export DATABASE_URL := env("DATABASE_URL", "postgres://platform:dev@localhost:54
 export VALKEY_URL := env("VALKEY_URL", "redis://localhost:6379")
 export KUBECONFIG := env("KUBECONFIG", env("HOME", "/tmp") / ".kube/kind-platform")
 
+# Detect worktree name for path isolation (avoids cross-worktree binary overwrites)
+worktree := `bash hack/detect-worktree.sh`
+agent_runner_dir := "/tmp/platform-e2e/" + worktree + "/agent-runner"
+
 # Detect in-cluster environment (KUBERNETES_SERVICE_HOST is set automatically in pods)
 # Routes test commands to test-in-pod.sh (DNS) vs test-in-cluster.sh (port-forward)
 in_cluster := env("KUBERNETES_SERVICE_HOST", "")
@@ -203,11 +207,16 @@ build:
     SQLX_OFFLINE=true cargo build --release
 
 # -- Agent Runner CLI -----------------------------------------------
+# Build seed images + cross-compiled agent-runner (cached, worktree-scoped)
+build-agent-images:
+    bash hack/build-agent-images.sh
+
 cli-build:
     cargo build --release --manifest-path cli/agent-runner/Cargo.toml
 
 # Cross-compile agent-runner for linux/amd64 and linux/arm64 (uses Docker)
-cli-cross dir="/tmp/platform-e2e/agent-runner":
+# Default dir is worktree-scoped to avoid overwrites between parallel worktrees.
+cli-cross dir=agent_runner_dir:
     mkdir -p {{ dir }}
     docker run --rm \
       -v "$(pwd)/cli/agent-runner:/src" \

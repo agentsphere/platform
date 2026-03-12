@@ -24,7 +24,6 @@ pub struct PushTriggerParams {
     pub commit_sha: Option<String>,
 }
 
-#[allow(dead_code)] // used when MR integration is wired
 pub struct MrTriggerParams {
     pub project_id: Uuid,
     pub user_id: Uuid,
@@ -69,6 +68,7 @@ pub async fn on_push(
     };
 
     let git_ref = format!("refs/heads/{}", params.branch);
+    let version = read_version_at_ref(&params.repo_path, &params.branch).await;
     let pipeline_id = create_pipeline_with_steps(
         pool,
         params.project_id,
@@ -78,6 +78,7 @@ pub async fn on_push(
         "push",
         &def,
         dev_dockerfile,
+        version.as_deref(),
     )
     .await?;
 
@@ -90,7 +91,6 @@ pub async fn on_push(
 // ---------------------------------------------------------------------------
 
 /// Handle a merge request event: read `.platform.yaml`, check trigger match, create pipeline + steps.
-#[allow(dead_code)] // wired when MR integration is complete
 #[tracing::instrument(skip(pool, params), fields(project_id = %params.project_id, source_branch = %params.source_branch), err)]
 pub async fn on_mr(pool: &PgPool, params: &MrTriggerParams) -> Result<Option<Uuid>, PipelineError> {
     let Some(yaml) =
@@ -106,6 +106,7 @@ pub async fn on_mr(pool: &PgPool, params: &MrTriggerParams) -> Result<Option<Uui
     }
 
     let git_ref = format!("refs/heads/{}", params.source_branch);
+    let version = read_version_at_ref(&params.repo_path, &params.source_branch).await;
     let pipeline_id = create_pipeline_with_steps(
         pool,
         params.project_id,
@@ -115,10 +116,61 @@ pub async fn on_mr(pool: &PgPool, params: &MrTriggerParams) -> Result<Option<Uui
         "mr",
         &def,
         None,
+        version.as_deref(),
     )
     .await?;
 
     tracing::info!(pipeline_id = %pipeline_id, "pipeline triggered by MR");
+    Ok(Some(pipeline_id))
+}
+
+// ---------------------------------------------------------------------------
+// Tag trigger
+// ---------------------------------------------------------------------------
+
+pub struct TagTriggerParams {
+    pub project_id: Uuid,
+    pub user_id: Uuid,
+    pub repo_path: std::path::PathBuf,
+    pub tag_name: String,
+    pub commit_sha: Option<String>,
+}
+
+/// Handle a tag push event: read `.platform.yaml`, check trigger match, create pipeline + steps.
+#[tracing::instrument(skip(pool, params), fields(project_id = %params.project_id, tag_name = %params.tag_name), err)]
+pub async fn on_tag(
+    pool: &PgPool,
+    params: &TagTriggerParams,
+) -> Result<Option<Uuid>, PipelineError> {
+    // Read .platform.yaml from the tagged commit
+    let git_ref = params.commit_sha.as_deref().unwrap_or("HEAD");
+    let Some(yaml) = read_file_at_ref(&params.repo_path, git_ref, ".platform.yaml").await else {
+        return Ok(None);
+    };
+
+    let def = definition::parse(&yaml)?;
+
+    if !definition::matches_tag(def.trigger.as_ref(), &params.tag_name) {
+        return Ok(None);
+    }
+
+    let tag_ref = format!("refs/tags/{}", params.tag_name);
+    let version = read_version_at_ref(&params.repo_path, git_ref).await;
+
+    let pipeline_id = create_pipeline_with_steps(
+        pool,
+        params.project_id,
+        &tag_ref,
+        params.commit_sha.as_deref(),
+        params.user_id,
+        "tag",
+        &def,
+        None,
+        version.as_deref(),
+    )
+    .await?;
+
+    tracing::info!(pipeline_id = %pipeline_id, "pipeline triggered by tag");
     Ok(Some(pipeline_id))
 }
 
@@ -147,6 +199,7 @@ pub async fn on_api(
     let def = definition::parse(&yaml)?;
 
     let commit_sha = get_ref_sha(repo_path, git_ref).await;
+    let version = read_version_at_ref(repo_path, branch).await;
 
     create_pipeline_with_steps(
         pool,
@@ -157,6 +210,7 @@ pub async fn on_api(
         "api",
         &def,
         None,
+        version.as_deref(),
     )
     .await
 }
@@ -179,13 +233,14 @@ async fn create_pipeline_with_steps(
     trigger_type: &str,
     def: &PipelineDefinition,
     dev_image_dockerfile: Option<&str>,
+    version: Option<&str>,
 ) -> Result<Uuid, PipelineError> {
     let mut tx = pool.begin().await?;
 
     let pipeline_id = sqlx::query_scalar!(
         r#"
-        INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by)
-        VALUES ($1, $2, $3, $4, 'pending', $5)
+        INSERT INTO pipelines (project_id, trigger, git_ref, commit_sha, status, triggered_by, version)
+        VALUES ($1, $2, $3, $4, 'pending', $5, $6)
         RETURNING id
         "#,
         project_id,
@@ -193,6 +248,7 @@ async fn create_pipeline_with_steps(
         git_ref,
         commit_sha,
         triggered_by,
+        version,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -282,7 +338,7 @@ async fn has_dockerfile_dev(repo_path: &Path, git_ref: &str) -> bool {
 }
 
 /// Read a file's contents from a git repo at a given ref.
-async fn read_file_at_ref(repo_path: &Path, git_ref: &str, file_path: &str) -> Option<String> {
+pub async fn read_file_at_ref(repo_path: &Path, git_ref: &str, file_path: &str) -> Option<String> {
     let output = match tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -304,6 +360,18 @@ async fn read_file_at_ref(repo_path: &Path, git_ref: &str, file_path: &str) -> O
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(git_ref, file_path, ?repo_path, %stderr, "file not found at ref");
         None
+    }
+}
+
+/// Read the VERSION file from a git repo at a given ref.
+/// Returns the trimmed contents, or None if the file doesn't exist.
+pub async fn read_version_at_ref(repo_path: &Path, git_ref: &str) -> Option<String> {
+    let content = read_file_at_ref(repo_path, git_ref, "VERSION").await?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 

@@ -453,6 +453,19 @@ async fn create_project(
         tracing::warn!(error = %e, project_id = %project.id, "project infra setup incomplete");
     }
 
+    // Auto-create default branch protection rule for the default branch
+    if let Err(e) = sqlx::query!(
+        r#"INSERT INTO branch_protection_rules (project_id, pattern) VALUES ($1, $2)
+           ON CONFLICT (project_id, pattern) DO NOTHING"#,
+        project.id,
+        default_branch,
+    )
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %e, project_id = %project.id, "failed to create default branch protection");
+    }
+
     write_audit(
         &state.pool,
         &AuditEntry {
