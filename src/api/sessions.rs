@@ -27,7 +27,8 @@ use crate::validation;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
-    pub prompt: String,
+    /// Initial prompt. If omitted, session starts idle and waits for a follow-up message.
+    pub prompt: Option<String>,
     pub provider: Option<String>,
     pub branch: Option<String>,
     pub config: Option<serde_json::Value>,
@@ -266,7 +267,8 @@ async fn create_session(
     .await?;
 
     // Input validation
-    validation::check_length("prompt", &body.prompt, 1, 100_000)?;
+    let prompt = body.prompt.as_deref().unwrap_or("Hello");
+    validation::check_length("prompt", prompt, 1, 100_000)?;
     let provider = body.provider.as_deref().unwrap_or("claude-code");
     validation::check_length("provider", provider, 1, 50)?;
     if let Some(ref branch) = body.branch {
@@ -300,7 +302,7 @@ async fn create_session(
         &state,
         auth.user_id,
         id,
-        &body.prompt,
+        prompt,
         provider,
         body.branch.as_deref(),
         body.config,
@@ -886,6 +888,10 @@ fn session_to_response(
 
 /// SSE handler: streams agent output in real-time via Valkey pub/sub.
 /// Auth is validated via the `AuthUser` extractor (cookies sent by `EventSource`).
+///
+/// Replays any stored events from `agent_messages` first (so late-connecting
+/// clients don't miss events published before SSE subscription), then streams
+/// live pub/sub events.
 async fn sse_session_events(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -901,16 +907,56 @@ async fn sse_session_events(
         return Err(ApiError::NotFound("session".into()));
     }
 
+    // Replay stored events from DB (persisted by the persistence subscriber)
+    let stored = replay_stored_events(&state.pool, session_id).await;
+
+    // Subscribe to live events
     let rx = crate::agent::pubsub_bridge::subscribe_session_events(&state.valkey, session_id)
         .await
         .map_err(ApiError::Internal)?;
 
-    let stream = ReceiverStream::new(rx).map(|event| {
-        let json = serde_json::to_string(&event).unwrap_or_default();
+    let replay_stream =
+        tokio_stream::iter(stored.into_iter().map(Ok::<_, std::convert::Infallible>));
+    let live_stream = ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
+    let stream = replay_stream.chain(live_stream).map(|event| {
+        let json = serde_json::to_string(&event.unwrap()).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(json))
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Load stored events from `agent_messages` and convert back to `ProgressEvent`.
+async fn replay_stored_events(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+) -> Vec<crate::agent::provider::ProgressEvent> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        "SELECT role, content, metadata FROM agent_messages WHERE session_id = $1 ORDER BY created_at",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let kind_str: String = row.get("role");
+            let content: String = row.get("content");
+            let metadata: Option<serde_json::Value> = row.get("metadata");
+            // Parse kind from the stored role string (e.g. "Milestone", "WaitingForInput")
+            let kind_json = format!("\"{kind_str}\"");
+            let kind: crate::agent::provider::ProgressKind =
+                serde_json::from_str(&kind_json).ok()?;
+            Some(crate::agent::provider::ProgressEvent {
+                kind,
+                message: content,
+                metadata,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

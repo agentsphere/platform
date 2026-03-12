@@ -523,12 +523,12 @@ async fn llm_pubsub_event_conversion() {
         "milestone should mention session started"
     );
 
-    // Last event should be Completed (from Result)
+    // Last event should be WaitingForInput (from non-error Result)
     let last = events.last().unwrap();
     assert_eq!(
         last.kind,
-        PubSubKind::Completed,
-        "last event should be Completed"
+        PubSubKind::WaitingForInput,
+        "last event should be WaitingForInput"
     );
 
     // Should have at least one content event from assistant

@@ -481,10 +481,17 @@ pub async fn run_reaper(state: AppState, mut shutdown: tokio::sync::watch::Recei
             }
             () = tokio::time::sleep(Duration::from_secs(30)) => {
                 match reap_terminated_sessions(&state).await {
-                    Ok(()) => state.task_registry.heartbeat("agent_reaper"),
+                    Ok(()) => {}
                     Err(e) => {
                         state.task_registry.report_error("agent_reaper", &e.to_string());
                         tracing::error!(error = %e, "error reaping agent sessions");
+                    }
+                }
+                match reap_idle_sessions(&state).await {
+                    Ok(()) => state.task_registry.heartbeat("agent_reaper"),
+                    Err(e) => {
+                        state.task_registry.report_error("agent_reaper", &e.to_string());
+                        tracing::error!(error = %e, "error reaping idle agent sessions");
                     }
                 }
             }
@@ -573,6 +580,102 @@ async fn reap_terminated_sessions(state: &AppState) -> Result<(), AgentError> {
                 tracing::error!(error = %e, session_id = %session.id, "error checking agent pod");
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Row returned by the idle-session query.
+#[derive(sqlx::FromRow)]
+struct IdleSession {
+    id: Uuid,
+    pod_name: Option<String>,
+    execution_mode: String,
+    agent_user_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    session_namespace: Option<String>,
+}
+
+/// Find running sessions that have been idle for longer than the configured timeout
+/// and finalize them.
+async fn reap_idle_sessions(state: &AppState) -> Result<(), AgentError> {
+    let timeout_interval = format!("{} seconds", state.config.session_idle_timeout_secs);
+
+    // Find running sessions where the latest message (or session creation if no messages)
+    // is older than the idle timeout.
+    let idle_sessions: Vec<IdleSession> = sqlx::query_as(
+        "SELECT s.id, s.pod_name, s.execution_mode, s.agent_user_id, s.project_id, s.session_namespace \
+         FROM agent_sessions s \
+         WHERE s.status = 'running' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM agent_messages m \
+             WHERE m.session_id = s.id AND m.created_at > NOW() - $1::interval \
+           ) \
+           AND s.created_at < NOW() - $1::interval",
+    )
+    .bind(&timeout_interval)
+    .fetch_all(&state.pool)
+    .await?;
+
+    for s in idle_sessions {
+        tracing::info!(session_id = %s.id, execution_mode = %s.execution_mode, "reaping idle agent session");
+
+        match s.execution_mode.as_str() {
+            "cli_subprocess" => {
+                stop_cli_session(state, s.id).await;
+            }
+            _ => {
+                if let Some(ref pn) = s.pod_name {
+                    let namespace = s
+                        .session_namespace
+                        .as_deref()
+                        .unwrap_or(&state.config.agent_namespace);
+                    let pods: Api<Pod> = Api::namespaced(state.kube.clone(), namespace);
+                    capture_session_logs(&pods, pn, state, s.id).await;
+                    let _ = pods.delete(pn, &DeleteParams::default()).await;
+                }
+            }
+        }
+
+        // Update status to completed
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'completed', finished_at = now() \
+             WHERE id = $1 AND status = 'running'",
+        )
+        .bind(s.id)
+        .execute(&state.pool)
+        .await?;
+
+        // Cleanup agent identity
+        if let Some(agent_uid) = s.agent_user_id {
+            let _ = identity::cleanup_agent_identity(&state.pool, &state.valkey, agent_uid).await;
+        }
+        let _ = super::valkey_acl::delete_session_acl(&state.valkey, s.id).await;
+
+        // Delete session namespace
+        if let Some(ref ns) = s.session_namespace
+            && let Err(e) = crate::deployer::namespace::delete_namespace(&state.kube, ns).await
+        {
+            tracing::warn!(error = %e, namespace = %ns, "failed to delete idle session namespace");
+        }
+
+        // Publish completed event so subscribers know
+        let _ = super::pubsub_bridge::publish_event(
+            &state.valkey,
+            s.id,
+            &ProgressEvent {
+                kind: ProgressKind::Completed,
+                message: "Session closed due to inactivity".into(),
+                metadata: None,
+            },
+        )
+        .await;
+
+        if let Some(pid) = s.project_id {
+            fire_agent_webhook(&state.pool, pid, s.id, "completed").await;
+        }
+
+        tracing::info!(session_id = %s.id, "idle agent session reaped");
     }
 
     Ok(())

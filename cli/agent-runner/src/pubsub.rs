@@ -21,6 +21,7 @@ pub enum PubSubKind {
     Milestone,
     Error,
     Completed,
+    WaitingForInput,
 }
 
 /// Event published by agent-runner to `session:{id}:events`.
@@ -34,6 +35,7 @@ pub struct PubSubEvent {
 
 /// Input received from platform via `session:{id}:input`.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields read via serde deserialization + tests
 #[serde(tag = "type")]
 pub enum PubSubInput {
     #[serde(rename = "prompt")]
@@ -164,16 +166,17 @@ fn convert_result(r: &ResultMessage) -> PubSubEvent {
             .unwrap_or("Agent completed with error")
             .to_owned()
     } else {
-        r.result
-            .as_deref()
-            .unwrap_or("Agent completed successfully")
-            .to_owned()
+        // Non-error: turn completed, session stays open for follow-ups
+        "Turn completed — waiting for input".to_owned()
     };
 
+    // Non-error Result means the turn is done but session stays alive.
+    // Publish WaitingForInput so persistence subscriber and SSE don't exit.
+    // Completed is only published when the REPL truly exits (CLI process dies).
     let kind = if r.is_error {
         PubSubKind::Error
     } else {
-        PubSubKind::Completed
+        PubSubKind::WaitingForInput
     };
 
     PubSubEvent {
@@ -298,6 +301,10 @@ impl PubSubClient {
 /// - `"manager"` → `[From manager agent] ...`
 /// - `"user"` → `[From user] ...`
 /// - `None` → no prefix (backward compatible)
+///
+/// Note: In per-turn spawn mode, this is not used (prompts go via `-p` arg).
+/// Kept for local REPL mode and tests.
+#[allow(dead_code)]
 pub async fn dispatch_input(
     transport: &crate::transport::SubprocessTransport,
     input: PubSubInput,
@@ -717,8 +724,8 @@ mod tests {
             usage: None,
         });
         let event = cli_message_to_event(&msg).unwrap();
-        assert_eq!(event.kind, PubSubKind::Completed);
-        assert_eq!(event.message, "Done.");
+        assert_eq!(event.kind, PubSubKind::WaitingForInput);
+        assert_eq!(event.message, "Turn completed — waiting for input");
     }
 
     #[test]
@@ -885,8 +892,8 @@ mod tests {
             usage: None,
         });
         let event = cli_message_to_event(&msg).unwrap();
-        assert_eq!(event.kind, PubSubKind::Completed);
-        assert_eq!(event.message, "Agent completed successfully");
+        assert_eq!(event.kind, PubSubKind::WaitingForInput);
+        assert_eq!(event.message, "Turn completed — waiting for input");
     }
 
     #[test]

@@ -57,8 +57,8 @@ pub async fn run_create_app_loop(
     // If we already have a CLI session ID from a prior invocation, resume it
     // (e.g. user sent a follow-up message after the first turn completed)
     let mut is_resume = handle.cli_session_id.lock().await.is_some();
-    let mut any_tools_executed = false;
     let mut outcome = LoopOutcome::Completed;
+    let mut any_tools_executed = false;
 
     for round in 0..MAX_TOOL_ROUNDS {
         // Check cancellation
@@ -131,27 +131,27 @@ pub async fn run_create_app_loop(
             // No tools — check for pending user messages
             let pending = drain_pending(&handle).await;
             if pending.is_empty() {
-                // Decide outcome: if we never executed tools, the LLM is asking
-                // a clarification question — stay running for user reply.
                 if any_tools_executed {
+                    // Tools ran in prior rounds, LLM is done — session complete.
                     let _ = pubsub_bridge::publish_event(
                         &state.valkey,
                         session_id,
                         &ProgressEvent {
                             kind: ProgressKind::Completed,
-                            message: "Turn completed".into(),
+                            message: "Create-app completed".into(),
                             metadata: None,
                         },
                     )
                     .await;
                     outcome = LoopOutcome::Completed;
                 } else {
+                    // No tools executed at all (clarification question) — wait for input.
                     let _ = pubsub_bridge::publish_event(
                         &state.valkey,
                         session_id,
                         &ProgressEvent {
                             kind: ProgressKind::WaitingForInput,
-                            message: "Waiting for user input".into(),
+                            message: "Turn completed — waiting for input".into(),
                             metadata: None,
                         },
                     )

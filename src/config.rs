@@ -70,6 +70,9 @@ pub struct Config {
     pub health_check_interval_secs: u64,
     /// Minimum tracing level for platform self-observability (default "warn").
     pub self_observe_level: String,
+    /// Idle timeout for agent sessions in seconds (default 1800 = 30 min).
+    /// Sessions with no messages for this duration are auto-completed by the reaper.
+    pub session_idle_timeout_secs: u64,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -162,6 +165,10 @@ impl Config {
                 .unwrap_or(15),
             self_observe_level: env::var("PLATFORM_SELF_OBSERVE_LEVEL")
                 .unwrap_or_else(|_| "warn".into()),
+            session_idle_timeout_secs: env::var("PLATFORM_SESSION_IDLE_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800),
         }
     }
 
@@ -232,6 +239,7 @@ impl Config {
             seed_images_path: "/tmp/seed-images".into(),
             health_check_interval_secs: 15,
             self_observe_level: "warn".into(),
+            session_idle_timeout_secs: 1800,
         }
     }
 }
@@ -454,6 +462,12 @@ mod tests {
     fn test_default_ns_prefix_is_none() {
         let config = Config::test_default();
         assert!(config.ns_prefix.is_none());
+    }
+
+    #[test]
+    fn test_default_session_idle_timeout() {
+        let config = Config::test_default();
+        assert_eq!(config.session_idle_timeout_secs, 1800);
     }
 
     #[test]

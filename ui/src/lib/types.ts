@@ -96,7 +96,7 @@ export type { ListResponse } from './generated/ListResponse';
 
 // WebSocket progress events from agent sessions
 export interface ProgressEvent {
-  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'Text' | 'SecretRequest';
+  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'WaitingForInput' | 'Text' | 'SecretRequest';
   message: string;
   metadata?: Record<string, any>;
 }

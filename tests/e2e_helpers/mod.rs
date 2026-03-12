@@ -195,6 +195,7 @@ pub async fn e2e_state_with_api_url(
             .map_or_else(|_| "/tmp/seed-images".into(), std::path::PathBuf::from),
         health_check_interval_secs: 15,
         self_observe_level: "warn".into(),
+        session_idle_timeout_secs: 1800,
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)

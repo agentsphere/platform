@@ -90,6 +90,7 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         seed_images_path: "/tmp/seed-images".into(),
         health_check_interval_secs: 15,
         self_observe_level: "warn".into(),
+        session_idle_timeout_secs: 1800,
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");

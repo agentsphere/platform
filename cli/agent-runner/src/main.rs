@@ -17,7 +17,7 @@ use anyhow::{bail, Context};
 use clap::Parser;
 
 use pubsub::PubSubClient;
-use transport::{CliSpawnOptions, SubprocessTransport};
+use transport::CliSpawnOptions;
 
 // ---------------------------------------------------------------------------
 // Reserved env vars — cannot be overridden via --extra-env
@@ -98,6 +98,10 @@ struct Cli {
     /// Additional KEY=VALUE env vars to pass to the CLI (repeatable)
     #[arg(long = "extra-env")]
     extra_env: Vec<String>,
+
+    /// Use --dangerously-skip-permissions instead of --permission-mode
+    #[arg(long)]
+    dangerously_skip_permissions: bool,
 
     /// Disable MCP server integration even when PLATFORM_API_TOKEN is set.
     #[arg(long)]
@@ -224,11 +228,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 6. Resolve initial prompt
-    //    --input-format stream-json requires --print per Claude CLI docs,
-    //    so we always need an initial prompt. If not provided via -p, read
-    //    the first line from stdin.
+    //    In pod mode (pubsub active), prompt is optional — agent starts idle
+    //    and waits for messages via pub/sub.
+    //    In local REPL mode, prompt is required (read from -p flag or stdin).
     let initial_prompt = if let Some(prompt) = cli.prompt {
-        prompt
+        Some(prompt)
+    } else if pubsub_config.is_some() {
+        // Pod mode: no prompt needed — agent starts idle, waits for pub/sub input
+        None
     } else {
         eprintln!("Enter your prompt (then press Enter):");
         eprint!("> ");
@@ -240,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
         if trimmed.is_empty() {
             bail!("no initial prompt provided");
         }
-        trimmed
+        Some(trimmed)
     };
 
     // 7. Generate MCP config (if platform vars available and not disabled)
@@ -275,6 +282,11 @@ async fn main() -> anyhow::Result<()> {
 
     let is_pod_mode = pubsub_config.is_some();
 
+    // Resolve initial_session_id from SESSION_ID env var (pod mode sets this)
+    let initial_session_id = pubsub_config
+        .as_ref()
+        .map(|ps| ps.session_id.clone());
+
     let opts = CliSpawnOptions {
         cli_path: cli.cli_path,
         cwd: cli.cwd,
@@ -289,13 +301,12 @@ async fn main() -> anyhow::Result<()> {
         extra_env,
         isolate_env: is_pod_mode,
         mcp_config: mcp_config_path,
+        dangerously_skip_permissions: cli.dangerously_skip_permissions,
+        initial_session_id,
         ..Default::default()
     };
 
-    // 9. Spawn CLI subprocess
-    let transport = SubprocessTransport::spawn(opts).context("failed to spawn Claude CLI")?;
-
-    // 10. Spawn stdin reader and pass channel to REPL
+    // 9. Spawn stdin reader and pass channel to REPL
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
     tokio::spawn(async move {
         let stdin = tokio::io::stdin();
@@ -308,7 +319,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    repl::run(transport, pubsub, initial_prompt, stdin_rx).await?;
+    // 10. Run per-turn spawn REPL (opts are cloned per turn)
+    repl::run(opts, pubsub, initial_prompt, stdin_rx).await?;
 
     // config_dir is dropped here (auto-cleanup)
     Ok(())

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use uuid::Uuid;
+
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, EmptyDirVolumeSource, EnvVar, LocalObjectReference, Pod,
     PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
@@ -200,13 +202,17 @@ fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
     let mut args = vec![
         "--cli-path".to_owned(),
         cli_path.to_owned(),
-        "--prompt".to_owned(),
-        params.session.prompt.clone(),
         "--cwd".to_owned(),
         "/workspace".to_owned(),
-        "--permission-mode".to_owned(),
-        "bypassPermissions".to_owned(),
+        "--dangerously-skip-permissions".to_owned(),
     ];
+    // Only pass --prompt if the user provided a real prompt (not the default).
+    // Without --prompt, agent-runner starts idle and waits for pub/sub messages.
+    let prompt = params.session.prompt.trim();
+    if !prompt.is_empty() && prompt != "Hello" {
+        args.push("--prompt".to_owned());
+        args.push(params.session.prompt.clone());
+    }
     if let Some(ref model) = params.config.model {
         args.push("--model".to_owned());
         args.push(model.clone());
@@ -348,33 +354,45 @@ fn build_setup_tools_container(
 BIN_DIR=/workspace/.platform/bin
 mkdir -p "$BIN_DIR"
 
-# 1. Setup agent-runner: prefer baked-in binary, fallback to download
-if [ ! -x "$BIN_DIR/agent-runner" ]; then
+# 1. Setup agent-runner: prefer API download (always latest), fallback to baked-in
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+DOWNLOADED=0
+if [ -n "$PLATFORM_API_URL" ] && [ -n "$PLATFORM_API_TOKEN" ]; then
+  echo "[setup] Downloading agent-runner ($ARCH) from platform..."
+  if command -v curl >/dev/null 2>&1; then
+    if curl -sf -H "Authorization: Bearer $PLATFORM_API_TOKEN" \
+      "${{PLATFORM_API_URL}}/api/downloads/agent-runner?arch=${{ARCH}}" \
+      -o "$BIN_DIR/agent-runner"; then
+      chmod +x "$BIN_DIR/agent-runner"
+      echo "[setup] agent-runner downloaded"
+      DOWNLOADED=1
+    else
+      echo "[setup] agent-runner download failed, trying fallback..."
+    fi
+  elif command -v node >/dev/null 2>&1; then
+    if node -e "
+      const fs = require('fs');
+      const url = process.env.PLATFORM_API_URL + '/api/downloads/agent-runner?arch=' + '${{ARCH}}';
+      fetch(url, {{headers:{{'Authorization':'Bearer '+process.env.PLATFORM_API_TOKEN}}}})
+        .then(r => {{ if(!r.ok) throw new Error('HTTP '+r.status); return r.arrayBuffer(); }})
+        .then(b => fs.writeFileSync('$BIN_DIR/agent-runner', Buffer.from(b)))
+        .catch(e => {{ console.error(e); process.exit(1); }});
+    "; then
+      chmod +x "$BIN_DIR/agent-runner"
+      echo "[setup] agent-runner downloaded via node"
+      DOWNLOADED=1
+    else
+      echo "[setup] agent-runner download via node failed, trying fallback..."
+    fi
+  fi
+fi
+if [ "$DOWNLOADED" = "0" ] && [ ! -x "$BIN_DIR/agent-runner" ]; then
   if command -v agent-runner >/dev/null 2>&1; then
     ln -sf "$(command -v agent-runner)" "$BIN_DIR/agent-runner"
     echo "[setup] agent-runner found on PATH, symlinked"
   else
-    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-    echo "[setup] Downloading agent-runner ($ARCH)..."
-    if command -v curl >/dev/null 2>&1; then
-      curl -sf -H "Authorization: Bearer $PLATFORM_API_TOKEN" \
-        "${{PLATFORM_API_URL}}/api/downloads/agent-runner?arch=${{ARCH}}" \
-        -o "$BIN_DIR/agent-runner"
-    elif command -v node >/dev/null 2>&1; then
-      node -e "
-        const fs = require('fs');
-        const url = process.env.PLATFORM_API_URL + '/api/downloads/agent-runner?arch=' + '${{ARCH}}';
-        fetch(url, {{headers:{{'Authorization':'Bearer '+process.env.PLATFORM_API_TOKEN}}}})
-          .then(r => {{ if(!r.ok) throw new Error('HTTP '+r.status); return r.arrayBuffer(); }})
-          .then(b => fs.writeFileSync('$BIN_DIR/agent-runner', Buffer.from(b)))
-          .catch(e => {{ console.error(e); process.exit(1); }});
-      "
-    else
-      echo '[setup] ERROR: need curl or node to download agent-runner' >&2
-      exit 1
-    fi
-    chmod +x "$BIN_DIR/agent-runner"
-    echo "[setup] agent-runner installed"
+    echo '[setup] ERROR: need curl or node to download agent-runner' >&2
+    exit 1
   fi
 fi
 
@@ -444,7 +462,13 @@ fn build_init_containers(params: &PodBuildParams<'_>, branch: &str) -> Vec<Conta
     let pull_policy = image_pull_policy(&resolved_image);
 
     let mut containers = vec![
-        build_git_clone_container(params.repo_clone_url, branch, params.agent_api_token),
+        build_git_clone_container(
+            params.repo_clone_url,
+            branch,
+            params.agent_api_token,
+            params.session.project_id,
+            params.session.id,
+        ),
         build_setup_tools_container(params, &resolved_image, &pull_policy),
     ];
 
@@ -483,7 +507,13 @@ fn build_init_containers(params: &PodBuildParams<'_>, branch: &str) -> Vec<Conta
     containers
 }
 
-fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str) -> Container {
+fn build_git_clone_container(
+    repo_clone_url: &str,
+    branch: &str,
+    api_token: &str,
+    project_id: Option<Uuid>,
+    session_id: Uuid,
+) -> Container {
     // Use GIT_ASKPASS to provide the API token for HTTP auth.
     // The askpass script echoes the token when git prompts for a password.
     // This avoids embedding tokens in clone URLs (which leak to logs/proc/pod spec).
@@ -508,11 +538,19 @@ fn build_git_clone_container(repo_clone_url: &str, branch: &str, api_token: &str
              git config user.email 'agent@platform.local'; \
              mkdir -p /workspace/.platform/bin; \
              printf '#!/bin/sh\\necho \"$PLATFORM_API_TOKEN\"\\n' > /workspace/.platform/bin/git-askpass.sh; \
-             chmod +x /workspace/.platform/bin/git-askpass.sh",
+             chmod +x /workspace/.platform/bin/git-askpass.sh; \
+             printf 'PROJECT_ID=%s\\nBRANCH=%s\\nSESSION_ID=%s\\n' \
+               \"$INIT_PROJECT_ID\" \"$GIT_BRANCH\" \"$INIT_SESSION_ID\" \
+               > /workspace/.platform/.env",
         )]),
         env: Some(vec![
             env_var("GIT_AUTH_TOKEN", api_token),
             env_var("GIT_BRANCH", branch),
+            env_var(
+                "INIT_PROJECT_ID",
+                &project_id.map_or_else(String::new, |id: Uuid| id.to_string()),
+            ),
+            env_var("INIT_SESSION_ID", &session_id.to_string()),
         ]),
         volume_mounts: Some(vec![workspace_mount()]),
         security_context: Some(container_security()),

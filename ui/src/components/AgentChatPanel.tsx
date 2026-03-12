@@ -23,10 +23,12 @@ function normalizeKind(kind: string | undefined): ProgressEvent['kind'] {
   const map: Record<string, ProgressEvent['kind']> = {
     text: 'Text', thinking: 'Thinking', tool_call: 'ToolCall',
     tool_result: 'ToolResult', milestone: 'Milestone', error: 'Error',
-    completed: 'Completed', secret_request: 'SecretRequest',
+    completed: 'Completed', waiting_for_input: 'WaitingForInput',
+    secret_request: 'SecretRequest',
     Text: 'Text', Thinking: 'Thinking', ToolCall: 'ToolCall',
     ToolResult: 'ToolResult', Milestone: 'Milestone', Error: 'Error',
-    Completed: 'Completed', SecretRequest: 'SecretRequest',
+    Completed: 'Completed', WaitingForInput: 'WaitingForInput',
+    SecretRequest: 'SecretRequest',
   };
   return map[kind] || 'Text';
 }
@@ -72,7 +74,7 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
     return () => { sseRef.current?.close(); };
   }, []);
 
-  // On open, check for existing running session
+  // On open, check for existing running session or auto-create one
   useEffect(() => {
     if (!open) return;
     if (sessionId) return; // already have a session
@@ -82,9 +84,11 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
           const s = r.items[0];
           setSessionId(s.id);
           setStatus('connecting');
-          // Load existing messages
           loadSessionMessages(s.id);
           connectSse(s.id);
+        } else {
+          // No running session — auto-create one (no prompt = agent starts idle)
+          autoCreateSession();
         }
       })
       .catch(() => {});
@@ -181,6 +185,11 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
             setMessages(prev => [...prev, { role: 'system', content: message }]);
             break;
           }
+          case 'WaitingForInput': {
+            streamBuf.current = '';
+            setStatus('ready');
+            break;
+          }
           case 'Completed': {
             streamBuf.current = '';
             setStatus('completed');
@@ -207,6 +216,23 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
       },
     });
     sseRef.current = sse;
+  }
+
+  async function autoCreateSession() {
+    setStatus('creating');
+    try {
+      const resp = await api.post<AgentSession>(`/api/projects/${projectId}/sessions`, {
+        provider: 'claude-code',
+      });
+      setSessionId(resp.id);
+      setStatus('connecting');
+      streamBuf.current = '';
+      connectSse(resp.id);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to create session';
+      setMessages(prev => [...prev, { role: 'system', content: `Error: ${msg}` }]);
+      setStatus('idle');
+    }
   }
 
   async function createSession(prompt: string) {
@@ -274,8 +300,9 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
     sseRef.current = null;
     setSessionId(null);
     setMessages([]);
-    setStatus('idle');
     streamBuf.current = '';
+    // Auto-create a new session immediately
+    autoCreateSession();
   }
 
   const inputDisabled = status === 'creating' || status === 'connecting' || status === 'waiting' || status === 'working';
@@ -313,9 +340,9 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
         )}
 
         <div class="agent-chat-messages">
-          {messages.length === 0 && status === 'idle' && (
+          {messages.length === 0 && (status === 'idle' || status === 'creating' || status === 'connecting' || status === 'waiting') && (
             <div style="text-align:center;padding:2rem;color:var(--text-muted)">
-              <p style="margin-bottom:0.5rem">What should the agent work on?</p>
+              <p style="margin-bottom:0.5rem">{status === 'idle' ? 'Starting agent...' : 'Agent is starting...'}</p>
               <p class="text-xs">The agent will have access to this project's code and can make changes.</p>
             </div>
           )}
@@ -342,14 +369,14 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
               class="input"
               style="flex:1;min-height:36px;max-height:120px;resize:none"
               rows={1}
-              placeholder={sessionId ? 'Send a message...' : 'Describe the task...'}
+              placeholder="Send a message..."
               value={input}
               onInput={(e) => setInput((e.target as HTMLTextAreaElement).value)}
               onKeyDown={handleKeyDown}
               disabled={inputDisabled}
             />
             <button type="submit" class="btn btn-primary btn-sm" disabled={inputDisabled || !input.trim()}>
-              {sessionId ? 'Send' : 'Start'}
+              Send
             </button>
           </form>
         )}

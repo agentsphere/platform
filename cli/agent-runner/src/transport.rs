@@ -19,7 +19,7 @@ use crate::messages::{parse_cli_message, CliMessage, CliUserInput};
 /// messages over stdin/stdout.
 pub struct SubprocessTransport {
     pub(crate) child: Child,
-    pub(crate) stdin: Mutex<BufWriter<ChildStdin>>,
+    pub(crate) stdin: Mutex<Option<BufWriter<ChildStdin>>>,
     pub(crate) stdout: Mutex<BufReader<ChildStdout>>,
     pub(crate) stderr_task: Option<JoinHandle<String>>,
     pub(crate) session_id: Mutex<Option<String>>,
@@ -29,7 +29,7 @@ pub struct SubprocessTransport {
 /// Options for spawning the Claude CLI subprocess.
 ///
 /// All fields are optional — reasonable defaults are used when absent.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CliSpawnOptions {
     /// Override CLI binary path.
     pub cli_path: Option<PathBuf>,
@@ -68,6 +68,13 @@ pub struct CliSpawnOptions {
     /// When false, inherits parent env (REPL/local mode — needed for
     /// config-dir OAuth credentials to work).
     pub isolate_env: bool,
+    /// `-p <text>` — one-shot prompt mode. When set, `--input-format stream-json`
+    /// is omitted from args (stdin is not used in `-p` mode).
+    pub prompt: Option<String>,
+    /// `--session-id <id>` — set CLI session ID (first invocation).
+    pub initial_session_id: Option<String>,
+    /// `--dangerously-skip-permissions` flag.
+    pub dangerously_skip_permissions: bool,
 }
 
 impl SubprocessTransport {
@@ -138,7 +145,7 @@ impl SubprocessTransport {
 
         Ok(Self {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task,
             session_id: Mutex::new(None),
@@ -205,6 +212,15 @@ impl SubprocessTransport {
         self.write_json(&request).await
     }
 
+    /// Close stdin, sending EOF to the subprocess.
+    ///
+    /// Used in `-p` mode where the prompt is passed as a CLI arg
+    /// and stdin is not needed.
+    pub async fn close_stdin(&self) {
+        let mut stdin = self.stdin.lock().await;
+        *stdin = None; // Drop sends EOF
+    }
+
     /// Get the CLI session ID (available after receiving the System init message).
     pub async fn session_id(&self) -> Option<String> {
         self.session_id.lock().await.clone()
@@ -257,7 +273,8 @@ impl SubprocessTransport {
             CliError::StdinWrite(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         json.push('\n');
-        let mut stdin = self.stdin.lock().await;
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or(CliError::NotRunning)?;
         stdin
             .write_all(json.as_bytes())
             .await
@@ -328,17 +345,21 @@ fn find_claude_cli(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
 
 /// Build CLI arguments from spawn options.
 ///
-/// Always uses `--input-format stream-json --output-format stream-json`.
-/// The initial prompt is NOT passed as a CLI arg — it must be sent as a
-/// JSON user message on stdin after spawn (see `send_message`).
+/// When `prompt` is `Some`, uses `-p` mode and omits `--input-format stream-json`.
+/// When `prompt` is `None`, uses stdin-based `--input-format stream-json` mode.
+/// Always includes `--output-format stream-json --verbose`.
 pub(crate) fn build_args(opts: &CliSpawnOptions) -> Vec<String> {
-    let mut args = vec![
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-        "--input-format".to_owned(),
-        "stream-json".to_owned(),
-        "--verbose".to_owned(),
-    ];
+    let mut args = Vec::new();
+
+    // Input format: only when NOT using -p mode (stdin-based interaction)
+    if opts.prompt.is_none() {
+        args.push("--input-format".to_owned());
+        args.push("stream-json".to_owned());
+    }
+
+    args.push("--output-format".to_owned());
+    args.push("stream-json".to_owned());
+    args.push("--verbose".to_owned());
 
     if let Some(ref model) = opts.model {
         args.push("--model".to_owned());
@@ -360,7 +381,9 @@ pub(crate) fn build_args(opts: &CliSpawnOptions) -> Vec<String> {
         args.push(tools.join(","));
     }
 
-    if let Some(ref mode) = opts.permission_mode {
+    if opts.dangerously_skip_permissions {
+        args.push("--dangerously-skip-permissions".to_owned());
+    } else if let Some(ref mode) = opts.permission_mode {
         args.push("--permission-mode".to_owned());
         args.push(mode.clone());
     }
@@ -382,6 +405,18 @@ pub(crate) fn build_args(opts: &CliSpawnOptions) -> Vec<String> {
 
     if opts.include_partial {
         args.push("--include-partial-messages".to_owned());
+    }
+
+    // -p mode: prompt as CLI arg (one-shot)
+    if let Some(ref prompt) = opts.prompt {
+        args.push("-p".to_owned());
+        args.push(prompt.clone());
+    }
+
+    // --session-id: set CLI session ID (first invocation only, not resume)
+    if let Some(ref sid) = opts.initial_session_id {
+        args.push("--session-id".to_owned());
+        args.push(sid.clone());
     }
 
     args
@@ -477,14 +512,50 @@ mod tests {
     }
 
     #[test]
-    fn build_args_always_includes_stream_json() {
+    fn build_args_default_includes_input_format() {
         let opts = CliSpawnOptions::default();
         let args = build_args(&opts);
         assert!(args.contains(&"--output-format".to_owned()));
         assert!(args.contains(&"--input-format".to_owned()));
         assert!(args.contains(&"--verbose".to_owned()));
-        // No --print: initial prompt is sent via stdin, not CLI arg
-        assert!(!args.contains(&"--print".to_owned()));
+    }
+
+    #[test]
+    fn build_args_prompt_mode_skips_input_format() {
+        let opts = CliSpawnOptions {
+            prompt: Some("hello".into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        assert!(args.contains(&"--output-format".to_owned()));
+        assert!(args.contains(&"--verbose".to_owned()));
+        assert!(!args.contains(&"--input-format".to_owned()));
+        assert!(args.contains(&"-p".to_owned()));
+        assert!(args.contains(&"hello".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_session_id() {
+        let opts = CliSpawnOptions {
+            initial_session_id: Some("sid-123".into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        assert!(args.contains(&"--session-id".to_owned()));
+        assert!(args.contains(&"sid-123".to_owned()));
+    }
+
+    #[test]
+    fn build_args_dangerously_skip_permissions() {
+        let opts = CliSpawnOptions {
+            dangerously_skip_permissions: true,
+            permission_mode: Some("bypassPermissions".into()),
+            ..Default::default()
+        };
+        let args = build_args(&opts);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+        // permission_mode should be skipped when dangerously_skip_permissions is set
+        assert!(!args.contains(&"--permission-mode".to_owned()));
     }
 
     #[test]
@@ -702,7 +773,7 @@ mod tests {
 
         SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task: None,
             session_id: Mutex::new(None),
@@ -725,7 +796,8 @@ mod tests {
         // Write a valid NDJSON system message — cat echoes it back
         let msg = r#"{"type":"system","subtype":"init","session_id":"test-123"}"#;
         {
-            let mut stdin = transport.stdin.lock().await;
+            let mut guard = transport.stdin.lock().await;
+            let stdin = guard.as_mut().unwrap();
             stdin
                 .write_all(format!("{msg}\n").as_bytes())
                 .await
@@ -779,7 +851,7 @@ mod tests {
 
         let transport = SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task: None,
             session_id: Mutex::new(None),
@@ -798,7 +870,8 @@ mod tests {
 
         // Write invalid JSON then valid JSON
         {
-            let mut stdin = transport.stdin.lock().await;
+            let mut guard = transport.stdin.lock().await;
+            let stdin = guard.as_mut().unwrap();
             stdin.write_all(b"not json\n").await.unwrap();
             stdin
                 .write_all(br#"{"type":"system","subtype":"init","session_id":"after-invalid"}"#)
@@ -864,7 +937,8 @@ mod tests {
 
         let msg = r#"{"type":"system","subtype":"init","session_id":"sess-42"}"#;
         {
-            let mut stdin = transport.stdin.lock().await;
+            let mut guard = transport.stdin.lock().await;
+            let stdin = guard.as_mut().unwrap();
             stdin
                 .write_all(format!("{msg}\n").as_bytes())
                 .await
@@ -907,7 +981,7 @@ mod tests {
 
         let transport = SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task,
             session_id: Mutex::new(None),
@@ -933,7 +1007,7 @@ mod tests {
 
         let transport = SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task: None,
             session_id: Mutex::new(None),
@@ -977,7 +1051,7 @@ mod tests {
 
         let transport = SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task,
             session_id: Mutex::new(None),
@@ -1099,7 +1173,7 @@ mod tests {
 
         let transport = SubprocessTransport {
             child,
-            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdin: Mutex::new(Some(BufWriter::new(stdin))),
             stdout: Mutex::new(BufReader::new(stdout)),
             stderr_task: None,
             session_id: Mutex::new(None),
