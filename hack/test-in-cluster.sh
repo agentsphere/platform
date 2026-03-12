@@ -90,7 +90,7 @@ cleanup() {
   # DaemonSet cleanup happens automatically with namespace deletion
 
   # Clean up seed cache/lock files scoped to this run
-  find "${SEED_DIR}" -name "*.${NS_PREFIX}.seed-cache.*" -delete 2>/dev/null || true
+  find "${SEED_DIR:-/tmp/platform-e2e/seed-images}" -name "*.${NS_PREFIX}.seed-cache.*" -delete 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

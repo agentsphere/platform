@@ -630,6 +630,14 @@ async fn e2e_agent_git_clone_push(pool: PgPool) {
     // 2. Create project with bare repo + initial commit
     let project_id = setup_agent_project(&state, &app, &admin_token, "agent-git-push").await;
 
+    // Remove auto-created branch protection so the mock CLI can push directly to main.
+    // This test verifies basic git clone+push, not branch protection (tested separately).
+    sqlx::query("DELETE FROM branch_protection_rules WHERE project_id = $1")
+        .bind(project_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
     // Get the bare repo path for later verification
     let repo_path: String = sqlx::query_scalar("SELECT repo_path FROM projects WHERE id = $1")
         .bind(project_id)
