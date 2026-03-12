@@ -53,6 +53,71 @@ spec:
 
 This secret is refreshed on every deploy — do not modify or delete it.
 
+## Deploying Dependencies (Databases, Caches, etc.)
+
+The agent pod runs inside Kubernetes with a service account that has deploy access to the project namespace. `kubectl` is not pre-installed — install it first:
+
+```bash
+curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/$(uname -m | sed 's/aarch64/arm64/' | sed 's/x86_64/amd64/')/kubectl"
+chmod +x kubectl && mv kubectl /usr/local/bin/
+```
+
+Use the in-cluster service account (auto-mounted at `/var/run/secrets/kubernetes.io/serviceaccount/`):
+
+```bash
+export KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST}
+export KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT}
+kubectl get pods  # should work with in-cluster config
+```
+
+### Example: PostgreSQL
+
+```bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: app
+            - name: POSTGRES_USER
+              value: app
+            - name: POSTGRES_PASSWORD
+              value: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+EOF
+```
+
+Connection string: `postgresql://app:password@postgres:5432/app`
+
+The same pattern works for Redis, MinIO, or any other dependency. Deploy to the current namespace and reference by service name.
+
 ## Application Requirements
 
 - App must listen on port 8080

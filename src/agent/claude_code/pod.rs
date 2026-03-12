@@ -206,10 +206,10 @@ fn build_agent_runner_args(params: &PodBuildParams<'_>) -> Vec<String> {
         "/workspace".to_owned(),
         "--dangerously-skip-permissions".to_owned(),
     ];
-    // Only pass --prompt if the user provided a real prompt (not the default).
+    // Only pass --prompt if the user provided a non-empty prompt.
     // Without --prompt, agent-runner starts idle and waits for pub/sub messages.
     let prompt = params.session.prompt.trim();
-    if !prompt.is_empty() && prompt != "Hello" {
+    if !prompt.is_empty() {
         args.push("--prompt".to_owned());
         args.push(params.session.prompt.clone());
     }
