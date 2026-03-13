@@ -256,6 +256,7 @@ pub fn test_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(platform::api::router())
+        .merge(platform::api::preview::router())
         .with_state(state)
 }
 

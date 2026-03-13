@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             }),
         )
         .merge(api::router())
+        .merge(api::preview::router())
         .merge(observe::router(observe_channels))
         // Git + registry routes need a higher body limit (500 MB for push/LFS/blob uploads).
         // DefaultBodyLimit::disable() is required because axum's Bytes extractor applies
@@ -216,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         // Default body limit: 10 MB for API endpoints.
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         // Security response headers
-        .layer(SetResponseHeaderLayer::overriding(
+        .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("DENY"),
         ))

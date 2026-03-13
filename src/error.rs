@@ -25,6 +25,9 @@ pub enum ApiError {
     #[error("too many requests")]
     TooManyRequests,
 
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
+
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
@@ -54,6 +57,7 @@ impl IntoResponse for ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 serde_json::json!({ "error": "validation error", "fields": errors }),
             ),
+            Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, serde_json::json!({ "error": msg })),
             Self::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({ "error": msg }),
@@ -161,6 +165,12 @@ mod tests {
     fn validation_returns_422() {
         let resp = ApiError::Validation(vec!["field".into()]).into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn bad_gateway_returns_502() {
+        let resp = ApiError::BadGateway("upstream".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
