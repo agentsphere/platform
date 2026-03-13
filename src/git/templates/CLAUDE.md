@@ -123,3 +123,39 @@ The same pattern works for Redis, MinIO, or any other dependency. Deploy to the 
 - App must listen on port 8080
 - Include a `GET /healthz` endpoint returning `{"status": "ok"}`
 - Configure OpenTelemetry SDK reading `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` env vars
+
+## Visual Preview (Dev Server)
+
+The platform provides a live preview iframe in the session view. To use it:
+
+1. **Start a dev server on port 8000**, binding to all interfaces:
+
+   **Vite (React/Vue/Svelte/Preact):**
+   ```bash
+   npx vite --host 0.0.0.0 --port 8000 --base './'
+   ```
+
+   **Next.js:**
+   ```bash
+   npx next dev -H 0.0.0.0 -p 8000
+   ```
+
+   **Webpack Dev Server:**
+   ```bash
+   npx webpack serve --host 0.0.0.0 --port 8000 --public-path './'
+   ```
+
+   **Python (static files):**
+   ```bash
+   python3 -m http.server 8000 --bind 0.0.0.0
+   ```
+
+2. **Use relative base paths** (`base: './'` for vite, `publicPath: './'` for webpack). This ensures assets load correctly through the platform proxy.
+
+3. **Port 8000 is reserved** for preview. The `PREVIEW_PORT` env var is set to `8000`.
+
+4. The preview automatically appears in the session view once the dev server starts responding.
+
+5. Hot Module Replacement (HMR) works automatically — the platform proxies WebSocket connections.
+
+6. **Additional preview ports**: To expose more UIs (monorepo), create K8s Services in the session namespace with label `platform.io/component: iframe-preview` and a port named `iframe`. They will be auto-discovered.

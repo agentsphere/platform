@@ -44,6 +44,7 @@ The coding agent runs in a K8s pod with the project's git repo already cloned in
    - Add OpenTelemetry SDK instrumentation that reads OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_SERVICE_NAME env vars to send traces, logs, and metrics
    - Commit ALL files, push to a feature branch, and create a merge request targeting main. The `main` branch is protected — direct pushes are blocked. The workflow is: push to feature branch → create MR → CI runs automatically → auto-merge when CI passes → deploy.
    - Use the `create_merge_request` MCP tool (from platform-issues) to create the MR after pushing. Pass `source_branch` (the feature branch name) and `target_branch: "main"`.
+   - Start a dev server on port 8000 (use `PREVIEW_PORT` env var) with `--host 0.0.0.0` and relative base path. The dev server should run in the background while you continue working. This enables the live preview iframe in the session view.
 
 CRITICAL RULE: After calling create_project and receiving a successful result with a project_id, your VERY NEXT response MUST include spawn_coding_agent in the tools array. Never return tools: [] between create_project and spawn_coding_agent.
 
@@ -115,5 +116,17 @@ mod tests {
         assert!(prompt.contains("merge request"));
         assert!(prompt.contains("branch is protected"));
         assert!(prompt.contains("create_merge_request"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_preview_port() {
+        let prompt = build_create_app_system_prompt();
+        assert!(prompt.contains("port 8000") || prompt.contains("PREVIEW_PORT"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_dev_server() {
+        let prompt = build_create_app_system_prompt();
+        assert!(prompt.contains("dev server"));
     }
 }

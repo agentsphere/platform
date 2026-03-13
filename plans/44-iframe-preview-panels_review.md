@@ -1,94 +1,71 @@
-# Review: 44-iframe-preview-panels (PR 2)
+# Review: 44-iframe-preview-panels (PR 3 + PR 4)
 
 **Date:** 2026-03-13
-**Scope:** `src/agent/preview_watcher.rs` (new), `src/agent/provider.rs`, `src/agent/mod.rs`, `src/api/sessions.rs`, `src/main.rs`, `ui/src/lib/types.ts`, `ui/src/pages/SessionDetail.tsx`, `ui/src/components/AgentChatPanel.tsx`
+**Scope:** PR 3 (Frontend Session View Redesign + Iframe Panels) + PR 4 (Agent Instructions + Templates)
+- `ui/src/pages/SessionDetail.tsx` (modified — workspace layout redesign)
+- `ui/src/components/IframePanel.tsx` (new — iframe preview component)
+- `ui/src/style.css` (modified — workspace/iframe/session-bar CSS)
+- `src/agent/create_app_prompt.rs` (modified — +1 prompt line, +2 unit tests)
+- `src/git/templates.rs` (modified — +3 unit tests)
+- `src/git/templates/CLAUDE.md` (modified — +36 lines Visual Preview section)
+- `plans/44-iframe-preview-panels.md` (modified — progress checkboxes)
+
 **Overall:** PASS WITH FINDINGS
 
 ## Summary
-- Clean K8s Service informer implementation with proper shutdown handling, error restart, and well-tested pure helper functions. ProgressKind enum extension is backward-compatible.
-- 0 critical, 1 high, 4 medium, 4 low findings
-- 11 unit tests added (8 preview_watcher + 3 provider); 0 integration tests for new handler (gap)
-- Touched-line coverage: not measured; `list_iframes` handler entirely uncovered by tests
-
-## Critical & High Findings (must fix)
-
-### R1: [HIGH] `list_iframes` handler has zero integration tests
-- **File:** `src/api/sessions.rs:903-955`
-- **Domain:** Tests
-- **Description:** The new `list_iframes` handler has 5 distinct code paths (happy path, auth failure, permission denial, session not found, project mismatch) with no integration tests. Every other handler in `sessions.rs` has integration tests in `tests/session_integration.rs`.
-- **Risk:** Regressions in auth checks, permission enforcement, or error handling will not be caught.
-- **Suggested fix:** Add 5 integration tests to `tests/session_integration.rs`:
-  - `list_iframes_returns_empty_for_session` — happy path (empty result since no K8s Services exist in test)
-  - `list_iframes_no_auth_returns_401` — GET without token
-  - `list_iframes_no_permission_returns_404` — unprivileged user on private project
-  - `list_iframes_nonexistent_session_returns_404` — random session UUID
-  - `list_iframes_wrong_project_returns_404` — session belongs to different project
+- Clean implementation: workspace layout, iframe panel, template additions all well-structured
+- 0 critical, 0 high, 2 medium findings
+- 5 new unit tests added (PR 4), all passing. No backend test gaps — PR 3 is UI-only, PR 4 is template/prompt text
+- Touched-line coverage: 100% for Rust changes (all new lines are in unit-tested `const` strings and `#[cfg(test)]` blocks)
 
 ## Medium Findings (should fix)
 
-### R2: [MEDIUM] `handle_service_applied` and `handle_service_deleted` are 90% duplicated
-- **File:** `src/agent/preview_watcher.rs:59-108`
-- **Domain:** Rust Quality
-- **Description:** Both functions have identical logic: extract session_id, get service name, iterate iframe ports, build event, publish. Only the `ProgressKind` differs.
-- **Suggested fix:** Extract a shared helper:
-  ```rust
-  async fn handle_service_event(state: &AppState, svc: &Service, kind: ProgressKind) { ... }
+### R1: [MEDIUM] Unused `timeAgo` import after sidebar removal
+- **File:** `ui/src/pages/SessionDetail.tsx:4`
+- **Domain:** UI / Code cleanliness
+- **Description:** `timeAgo` is imported from `../lib/format` but is no longer used. The sidebar that displayed `timeAgo(session.created_at)` was removed in the workspace redesign. The UI build doesn't flag unused TS imports but this is dead code.
+- **Suggested fix:** Remove `timeAgo` from the import: `import { duration } from '../lib/format';`
+
+### R2: [MEDIUM] `activeTab` state can become stale when panels list shrinks
+- **File:** `ui/src/components/IframePanel.tsx:14`
+- **Domain:** UI / Logic
+- **Description:** If the panels list shrinks (e.g., iframe service removed while viewing tab 3 of 3), `activeTab` stays at index 2 but only 2 panels remain. The `|| panels[0]` fallback shows correct content, but the tab bar would display no tab as "active" since the active index doesn't match any tab. This is a minor visual glitch, not a crash.
+- **Suggested fix:** Clamp `activeTab` when panels change:
+  ```tsx
+  const clamped = Math.min(activeTab, panels.length - 1);
+  const active = panels[clamped];
   ```
-
-### R3: [MEDIUM] Missing `#[tracing::instrument]` on async functions with side effects
-- **File:** `src/api/sessions.rs:903`, `src/agent/preview_watcher.rs:59,85`
-- **Domain:** Observability
-- **Description:** `list_iframes` performs K8s API calls and `handle_service_applied`/`handle_service_deleted` perform Valkey pub/sub, but none have tracing instrumentation. Other mutation handlers in sessions.rs have it.
-- **Suggested fix:** Add `#[tracing::instrument(skip(state), fields(%id, %session_id), err)]` to `list_iframes` and `#[tracing::instrument(skip_all)]` to the watcher helpers.
-
-### R4: [MEDIUM] `SessionDetail.tsx` normalizeKind missing `WaitingForInput` mapping
-- **File:** `ui/src/pages/SessionDetail.tsx:18-28`
-- **Domain:** UI
-- **Description:** `SessionDetail.tsx`'s `normalizeKind` map does NOT include `waiting_for_input: 'WaitingForInput'` or `WaitingForInput: 'WaitingForInput'`. `AgentChatPanel.tsx` has them. This pre-dates PR 2 but was exposed when both files were updated for iframe events.
-- **Suggested fix:** Add the missing entries to SessionDetail.tsx's normalizeKind map.
-
-### R5: [MEDIUM] All-namespace watcher trusts K8s labels without namespace cross-check
-- **File:** `src/agent/preview_watcher.rs:26-28`
-- **Domain:** Security
-- **Description:** The watcher uses `Api::all()` and trusts the `platform.io/session` label to route events. A Service in any namespace with a valid session UUID label could inject iframe events into that session's Valkey channel. Impact is limited to bogus notifications (no data exfiltration), and K8s RBAC restricts Service creation.
-- **Suggested fix:** After extracting session_id, verify the Service's namespace matches the session's expected namespace. Alternatively, add `.page_size(100)` to the watcher config for defensive memory management. Given the controlled environment, this can be deferred.
+  Or reset to 0 when `panels` reference changes via `useEffect`.
 
 ## Low Findings (optional)
 
-- [LOW] R6: `src/api/sessions.rs:924` — No namespace format validation before K8s API call. The `preview.rs` handler validates via `validate_namespace_format()` but `list_iframes` uses `session_namespace` directly. Defense-in-depth; namespace is constructed from validated slugs. Fix: add validation or extract shared helper.
-- [LOW] R7: `src/agent/preview_watcher.rs:67-68` — Unnecessary `String` allocation: `.unwrap_or("unknown").to_owned()` when `build_iframe_event` takes `&str`. Fix: use `as_deref().unwrap_or("unknown")` without `.to_owned()`.
-- [LOW] R8: `src/api/sessions.rs:934-952` — `filter_map().flatten()` allocates intermediate `Vec` per service. Fix: replace with `.flat_map()` returning an iterator directly.
-- [LOW] R9: `src/agent/preview_watcher.rs` — Minor edge case tests missing: unnamed ports, multiple iframe ports on one Service, empty ports vec, non-iframe ProgressKind branch in `build_iframe_event`.
+- [LOW] R3: `ui/src/pages/SessionDetail.tsx:43` — `sseRef` is set but never read. Pre-existing (not introduced in this PR), but worth noting for future cleanup.
 
 ## Coverage — Touched Lines
 
 | File | Lines changed | Lines covered | Coverage % | Uncovered lines |
 |---|---|---|---|---|
-| `src/agent/preview_watcher.rs` | 163 (new) | ~75 (unit-testable helpers) | ~46% | 22-56 (run loop), 59-108 (handlers) |
-| `src/agent/provider.rs` | 36 | 36 | 100% | — |
-| `src/agent/mod.rs` | 1 | — | N/A | Module declaration |
-| `src/api/sessions.rs` | 72 | 0 | 0% | 886-955 (entire list_iframes) |
-| `src/main.rs` | 4 | 0 | N/A | Background task spawn wiring |
-| `ui/src/lib/types.ts` | 10 | N/A | N/A | TypeScript |
-| `ui/src/pages/SessionDetail.tsx` | 4 | N/A | N/A | TypeScript |
-| `ui/src/components/AgentChatPanel.tsx` | 2 | N/A | N/A | TypeScript |
+| `src/agent/create_app_prompt.rs` | 3 (prompt + tests) | 3 | 100% | — |
+| `src/git/templates.rs` | 24 (tests) | 24 | 100% | — |
+| `src/git/templates/CLAUDE.md` | 36 (template text) | N/A (static string) | 100% | — |
+| `ui/src/pages/SessionDetail.tsx` | ~80 | N/A (UI) | N/A | — |
+| `ui/src/components/IframePanel.tsx` | 53 | N/A (UI) | N/A | — |
+| `ui/src/style.css` | ~40 | N/A (CSS) | N/A | — |
 
-### Uncovered Paths
-- `src/api/sessions.rs:903-955` — Entire `list_iframes` handler (0% coverage); needs 5 integration tests (R1)
-- `src/agent/preview_watcher.rs:22-56` — `run()` loop; requires live K8s watcher (covered by E2E only)
-- `src/agent/preview_watcher.rs:59-108` — `handle_service_applied/deleted`; requires live Valkey pub/sub (covered by E2E only)
+### Notes
+- All Rust changes are either `const` string literals (embedded at compile time, tested via unit tests that check content) or `#[cfg(test)]` blocks. 100% covered.
+- UI/CSS changes have no automated test coverage (standard for this project — Preact components are validated via build + manual testing).
 
 ## Checklist Results
 
 | Category | Status | Notes |
 |---|---|---|
-| Error handling | PASS | Proper use of `?`, `map_err`, no unwrap in production |
-| Auth & permissions | PASS | `require_project_read` + session-project ownership check |
-| Input validation | PASS | UUID path params type-safe; namespace from DB |
-| Audit logging | N/A | Read-only endpoint — no mutations |
-| Tracing instrumentation | FAIL | Missing `#[tracing::instrument]` on list_iframes and watcher helpers (R3) |
-| Clippy compliance | PASS | Clean |
-| Test patterns | FAIL | Zero integration tests for new handler (R1) |
-| Migration safety | N/A | No migrations in PR 2 |
-| Backward compatibility | PASS | `#[serde(other)] Unknown` remains last variant |
-| UI consistency | FAIL | SessionDetail.tsx normalizeKind diverges from AgentChatPanel.tsx (R4) |
+| Error handling | PASS | No new error paths |
+| Auth & permissions | PASS | No new handlers |
+| Input validation | PASS | No new user input |
+| Audit logging | PASS | No new mutations |
+| Tracing instrumentation | PASS | No new async functions |
+| Clippy compliance | PASS | `cargo clippy` clean |
+| Test patterns | PASS | 5 new unit tests follow existing patterns |
+| Migration safety | PASS | No migrations |
+| Touched-line coverage | PASS | 100% for Rust code |
