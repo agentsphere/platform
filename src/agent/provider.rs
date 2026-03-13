@@ -134,6 +134,8 @@ pub enum ProgressKind {
     Completed,
     WaitingForInput,
     Text,
+    IframeAvailable,
+    IframeRemoved,
     /// Forward-compatible catch-all for unknown event kinds from agent-runner.
     #[serde(other)]
     Unknown,
@@ -253,6 +255,40 @@ mod tests {
         assert_eq!(json, r#""waiting_for_input""#);
         let back: ProgressKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ProgressKind::WaitingForInput);
+    }
+
+    #[test]
+    fn progress_kind_iframe_available_roundtrip() {
+        let json = serde_json::to_string(&ProgressKind::IframeAvailable).unwrap();
+        assert_eq!(json, r#""iframe_available""#);
+        let back: ProgressKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProgressKind::IframeAvailable);
+    }
+
+    #[test]
+    fn progress_kind_iframe_removed_roundtrip() {
+        let json = serde_json::to_string(&ProgressKind::IframeRemoved).unwrap();
+        assert_eq!(json, r#""iframe_removed""#);
+        let back: ProgressKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProgressKind::IframeRemoved);
+    }
+
+    #[test]
+    fn progress_event_iframe_with_metadata() {
+        let event = ProgressEvent {
+            kind: ProgressKind::IframeAvailable,
+            message: "Preview available".into(),
+            metadata: Some(serde_json::json!({
+                "service_name": "preview-abc12345",
+                "port": 8000,
+                "port_name": "iframe",
+                "preview_url": "/preview/00000000-0000-0000-0000-000000000000/"
+            })),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ProgressEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, ProgressKind::IframeAvailable);
+        assert_eq!(back.metadata.unwrap()["port"], 8000);
     }
 
     #[test]

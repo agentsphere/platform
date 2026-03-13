@@ -101,9 +101,10 @@ pub async fn ensure_session_namespace(
     // 1. Namespace
     ensure_namespace(kube_client, ns_name, "session", project_id).await?;
 
-    // 2. NetworkPolicy (unless dev mode)
+    // 2. NetworkPolicy (unless dev mode) — session namespaces use a variant that
+    //    allows ingress from the platform namespace on port 8000 for preview proxying.
     if !dev_mode {
-        let _ = ensure_network_policy(kube_client, ns_name, platform_namespace).await;
+        let _ = ensure_session_network_policy(kube_client, ns_name, platform_namespace).await;
     }
 
     // 3. RBAC objects
@@ -263,6 +264,84 @@ pub fn build_namespace_object(ns_name: &str, env: &str, project_id: &str) -> ser
     })
 }
 
+/// Build a `NetworkPolicy` for a session namespace.
+///
+/// Same egress rules as `build_network_policy()` (platform API, DNS, internet) but
+/// additionally allows ingress from the platform namespace on port 8000 TCP for
+/// iframe preview proxying.
+pub fn build_session_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": "agent-isolation",
+            "namespace": ns_name
+        },
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "platform.io/component": "agent-session"
+                }
+            },
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{
+                "from": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": platform_namespace
+                        }
+                    }
+                }],
+                "ports": [{"port": 8000, "protocol": "TCP"}]
+            }],
+            "egress": [
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": platform_namespace
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8080, "protocol": "TCP"}]
+                },
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": "kube-system"
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "k8s-app": "kube-dns"
+                            }
+                        }
+                    }],
+                    "ports": [
+                        {"port": 53, "protocol": "UDP"},
+                        {"port": 53, "protocol": "TCP"}
+                    ]
+                },
+                {
+                    "to": [{
+                        "ipBlock": {
+                            "cidr": "0.0.0.0/0",
+                            "except": [
+                                "10.0.0.0/8",
+                                "172.16.0.0/12",
+                                "192.168.0.0/16",
+                                "100.64.0.0/10",
+                                "169.254.0.0/16"
+                            ]
+                        }
+                    }]
+                }
+            ]
+        }
+    })
+}
+
 /// Build a `NetworkPolicy` JSON object for the `-dev` namespace.
 ///
 /// Allows:
@@ -364,6 +443,40 @@ pub async fn ensure_namespace(
         .await?;
 
     tracing::info!(%ns_name, "namespace ensured");
+    Ok(())
+}
+
+/// Ensure the session `NetworkPolicy` (with preview ingress) exists in the given namespace.
+#[tracing::instrument(skip(kube_client), fields(%ns_name), err)]
+pub async fn ensure_session_network_policy(
+    kube_client: &kube::Client,
+    ns_name: &str,
+    platform_namespace: &str,
+) -> Result<(), super::error::DeployerError> {
+    let np_json = build_session_network_policy(ns_name, platform_namespace);
+
+    let ar = kube::discovery::ApiResource {
+        group: "networking.k8s.io".into(),
+        version: "v1".into(),
+        api_version: "networking.k8s.io/v1".into(),
+        kind: "NetworkPolicy".into(),
+        plural: "networkpolicies".into(),
+    };
+    let api: kube::Api<kube::api::DynamicObject> =
+        kube::Api::namespaced_with(kube_client.clone(), ns_name, &ar);
+
+    let obj: kube::api::DynamicObject = serde_json::from_value(np_json)
+        .map_err(|e| super::error::DeployerError::InvalidManifest(e.to_string()))?;
+
+    let patch_params = kube::api::PatchParams::apply("platform-deployer").force();
+    api.patch(
+        "agent-isolation",
+        &patch_params,
+        &kube::api::Patch::Apply(&obj),
+    )
+    .await?;
+
+    tracing::info!(%ns_name, "session network policy ensured");
     Ok(())
 }
 
@@ -590,6 +703,38 @@ mod tests {
             "session namespace should fit DNS label limit, got {} chars",
             name.len()
         );
+    }
+
+    // -- build_session_rbac --
+
+    // -- build_session_network_policy --
+
+    #[test]
+    fn session_network_policy_ingress_allows_platform() {
+        let np = build_session_network_policy("my-app", "platform");
+        let ingress = np["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 1);
+        let rule = &ingress[0];
+        let ns_selector = &rule["from"][0]["namespaceSelector"]["matchLabels"];
+        assert_eq!(ns_selector["kubernetes.io/metadata.name"], "platform");
+        let ports = rule["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0]["port"], 8000);
+        assert_eq!(ports[0]["protocol"], "TCP");
+    }
+
+    #[test]
+    fn session_network_policy_egress_unchanged() {
+        let session_np = build_session_network_policy("my-app", "platform");
+        let project_np = build_network_policy("my-app", "platform");
+        assert_eq!(session_np["spec"]["egress"], project_np["spec"]["egress"]);
+    }
+
+    #[test]
+    fn project_network_policy_still_denies_ingress() {
+        // Verify build_network_policy hasn't been accidentally modified
+        let np = build_network_policy("my-app", "platform");
+        assert!(np["spec"]["ingress"].is_null());
     }
 
     // -- build_session_rbac --

@@ -230,6 +230,7 @@ pub fn test_router(state: AppState) -> Router {
             }),
         )
         .merge(platform::api::router())
+        .merge(platform::api::preview::router())
         .merge(platform::observe::query::router())
         .merge(platform::observe::alert::router())
         // Registry routes need a higher body limit (500 MB).

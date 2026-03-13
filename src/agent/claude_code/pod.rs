@@ -311,6 +311,7 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "REGISTRY",
     "PROJECT",
     "SESSION_SHORT_ID",
+    "PREVIEW_PORT",
 ];
 
 fn is_reserved_env_var(name: &str) -> bool {
@@ -376,6 +377,7 @@ fn build_env_vars(
     if let Some(ref session_ns) = params.session.session_namespace {
         vars.push(env_var("SESSION_NAMESPACE", session_ns));
     }
+    vars.push(env_var("PREVIEW_PORT", "8000"));
     if let Some(reg_url) = params.registry_url {
         vars.push(env_var("REGISTRY_URL", reg_url));
     }
@@ -732,6 +734,8 @@ fn build_main_container(
     image: &str,
     pull_policy: &str,
 ) -> Container {
+    use k8s_openapi::api::core::v1::ContainerPort;
+
     Container {
         name: "claude".into(),
         image: Some(image.to_owned()),
@@ -742,6 +746,12 @@ fn build_main_container(
         tty: Some(false),
         working_dir: Some("/workspace".into()),
         env: Some(env_vars),
+        ports: Some(vec![ContainerPort {
+            name: Some("preview".into()),
+            container_port: 8000,
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        }]),
         volume_mounts: Some(vec![workspace_mount()]),
         security_context: Some(main_container_security()),
         resources: Some(ResourceRequirements {
@@ -2895,5 +2905,81 @@ mod tests {
             env.iter().all(|e| e.name != "SESSION_SHORT_ID"),
             "SESSION_SHORT_ID should not be set without session_short_id"
         );
+    }
+
+    // -- Preview port tests --
+
+    #[test]
+    fn pod_has_preview_container_port() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+            registry_push_secret_name: None,
+            project_name: None,
+            session_short_id: None,
+        });
+        let spec = pod.spec.unwrap();
+        let ports = spec.containers[0].ports.as_ref().unwrap();
+        let preview_port = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("preview"))
+            .expect("should have a port named 'preview'");
+        assert_eq!(preview_port.container_port, 8000);
+        assert_eq!(preview_port.protocol.as_deref(), Some("TCP"));
+    }
+
+    #[test]
+    fn pod_has_preview_port_env_var() {
+        let session = test_session();
+        let pod = build_agent_pod(&PodBuildParams {
+            session: &session,
+            config: &ProviderConfig::default(),
+            agent_api_token: "tok",
+            platform_api_url: "http://platform:8080",
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            namespace: "ns",
+            project_agent_image: None,
+            anthropic_api_key: None,
+            cli_oauth_token: None,
+            extra_env_vars: &[],
+            registry_url: None,
+            registry_secret_name: None,
+            valkey_url: None,
+            claude_cli_version: "stable",
+            host_mount_path: None,
+            claude_cli_path: None,
+            service_account_name: None,
+            registry_push_secret_name: None,
+            project_name: None,
+            session_short_id: None,
+        });
+        let spec = pod.spec.unwrap();
+        let env = spec.containers[0].env.as_ref().unwrap();
+        let preview_env = env
+            .iter()
+            .find(|e| e.name == "PREVIEW_PORT")
+            .expect("PREVIEW_PORT env var should be set");
+        assert_eq!(preview_env.value.as_deref(), Some("8000"));
+    }
+
+    #[test]
+    fn reserved_env_vars_includes_preview_port() {
+        assert!(is_reserved_env_var("PREVIEW_PORT"));
     }
 }

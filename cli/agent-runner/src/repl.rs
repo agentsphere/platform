@@ -574,7 +574,7 @@ mod tests {
 
         let (tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(1);
         drop(tx); // Close stdin so run() exits after first turn
-        let result = run(opts, None, Some("Hello agent".into()), stdin_rx).await;
+        let result = run(opts, None, Some("Hello agent".into()), stdin_rx, false).await;
         assert!(result.is_ok());
     }
 
@@ -590,7 +590,7 @@ mod tests {
         };
 
         let (_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(1);
-        let result = run(opts, None, Some("test".into()), stdin_rx).await;
+        let result = run(opts, None, Some("test".into()), stdin_rx, false).await;
         assert!(result.is_ok());
     }
 
@@ -604,7 +604,7 @@ mod tests {
         };
 
         let (_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(1);
-        let result = run(opts, None, Some("test".into()), stdin_rx).await;
+        let result = run(opts, None, Some("test".into()), stdin_rx, false).await;
         // run() handles init failure gracefully (logs error, breaks loop)
         assert!(result.is_ok());
     }
@@ -622,7 +622,7 @@ mod tests {
         };
 
         let (_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(1);
-        let result = run(opts, None, Some("test".into()), stdin_rx).await;
+        let result = run(opts, None, Some("test".into()), stdin_rx, false).await;
         assert!(result.is_ok());
     }
 

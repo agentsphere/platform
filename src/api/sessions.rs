@@ -135,6 +135,10 @@ pub fn router() -> Router<AppState> {
             get(list_children),
         )
         .route(
+            "/api/projects/{id}/sessions/{session_id}/iframes",
+            get(list_iframes),
+        )
+        .route(
             "/api/projects/{id}/sessions/{session_id}/events",
             get(sse_session_events),
         )
@@ -883,6 +887,81 @@ fn session_to_response(
         browser_enabled,
         execution_mode: session.execution_mode.clone(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Iframe panels
+// ---------------------------------------------------------------------------
+
+/// Response type for iframe panels discovered from K8s Services.
+#[derive(Debug, Serialize)]
+struct IframePanel {
+    service_name: String,
+    port: i32,
+    port_name: String,
+    preview_url: String,
+}
+
+/// List iframe panels for a session (queries K8s Services in the session namespace).
+#[tracing::instrument(skip(state, auth), fields(%id, %session_id), err)]
+async fn list_iframes(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, session_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<IframePanel>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    let session = service::fetch_session(&state.pool, session_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    if session.project_id != Some(id) {
+        return Err(ApiError::NotFound("session".into()));
+    }
+
+    let ns = session
+        .session_namespace
+        .as_deref()
+        .ok_or_else(|| ApiError::NotFound("session namespace".into()))?;
+
+    // Defence-in-depth: namespace comes from DB but validate format before K8s API call
+    if ns.is_empty()
+        || !ns
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ApiError::NotFound("session namespace".into()));
+    }
+
+    let api: kube::Api<k8s_openapi::api::core::v1::Service> =
+        kube::Api::namespaced(state.kube.clone(), ns);
+    let lp = kube::api::ListParams::default().labels("platform.io/component=iframe-preview");
+    let svcs = api
+        .list(&lp)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let panels: Vec<IframePanel> = svcs
+        .items
+        .iter()
+        .flat_map(|svc| {
+            let spec = svc.spec.as_ref();
+            let ports = spec.and_then(|s| s.ports.as_ref());
+            let name = svc.metadata.name.clone().unwrap_or_default();
+            ports
+                .into_iter()
+                .flatten()
+                .filter(|p| p.name.as_deref() == Some("iframe"))
+                .map(move |p| IframePanel {
+                    service_name: name.clone(),
+                    port: p.port,
+                    port_name: "iframe".into(),
+                    preview_url: format!("/preview/{session_id}/"),
+                })
+        })
+        .collect();
+
+    Ok(Json(panels))
 }
 
 // ---------------------------------------------------------------------------

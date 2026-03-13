@@ -38,6 +38,7 @@ CLAUDE.md already covers all of the following (so your prompt should NOT repeat 
    - Git workflow: main is protected, push to feature branch, create MR via platform API curl, auto-merge on CI pass
    - kubectl and kaniko usage for local testing before commit
    - Build verification with platform-build-status
+   - Visual Preview: dev server on port 8000 (`PREVIEW_PORT` env var), `--host 0.0.0.0`, relative base path — live preview iframe in session view
 
 Your prompt to the coding agent MUST be a SHORT, high-level description of WHAT to build. Include ONLY:
    - What to build: the user's specific requirements (tech stack, features, endpoints, business logic)
@@ -139,5 +140,17 @@ mod tests {
         assert!(prompt.contains("File paths or directory structures"));
         assert!(prompt.contains("BAD prompt"));
         assert!(prompt.contains("GOOD prompt"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_preview_port() {
+        let prompt = build_create_app_system_prompt();
+        assert!(prompt.contains("port 8000") || prompt.contains("PREVIEW_PORT"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_dev_server() {
+        let prompt = build_create_app_system_prompt();
+        assert!(prompt.contains("dev server"));
     }
 }

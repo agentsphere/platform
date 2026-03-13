@@ -1329,3 +1329,141 @@ async fn session_namespace_null_for_old_sessions(pool: PgPool) {
 
     assert!(ns.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// List iframes
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_iframes_returns_empty_for_session(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "iframe-empty", "private").await;
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_id,
+        admin_id,
+        "iframe test",
+        "running",
+        Some("iframe-empty-dev"),
+    )
+    .await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // No K8s Services exist in test namespace — empty array
+    let arr = body.as_array().unwrap();
+    assert!(arr.is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_iframes_no_permission_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "iframe-perm", "private").await;
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_id,
+        admin_id,
+        "iframe perm",
+        "running",
+        Some("iframe-perm-dev"),
+    )
+    .await;
+
+    let (_uid, user_token) = create_user(
+        &app,
+        &admin_token,
+        "no-iframe-read",
+        "noread-iframe@test.com",
+    )
+    .await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_iframes_nonexistent_session_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-noexist", "private").await;
+    let fake_session = Uuid::new_v4();
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{fake_session}/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_iframes_wrong_project_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_a = create_project(&app, &admin_token, "iframe-proj-a", "private").await;
+    let project_b = create_project(&app, &admin_token, "iframe-proj-b", "private").await;
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_a,
+        admin_id,
+        "iframe wrong proj",
+        "running",
+        Some("iframe-a-dev"),
+    )
+    .await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_b}/sessions/{session_id}/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_iframes_no_namespace_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "iframe-no-ns", "private").await;
+    // Insert session without namespace (NULL)
+    let session_id = insert_session(&pool, project_id, admin_id, "no namespace", "running").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

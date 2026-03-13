@@ -13,6 +13,7 @@ pub mod merge_requests;
 pub mod notifications;
 pub mod passkeys;
 pub mod pipelines;
+pub mod preview;
 pub mod projects;
 pub mod releases;
 pub mod secrets;

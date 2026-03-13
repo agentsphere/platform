@@ -25,10 +25,12 @@ function normalizeKind(kind: string | undefined): ProgressEvent['kind'] {
     tool_result: 'ToolResult', milestone: 'Milestone', error: 'Error',
     completed: 'Completed', waiting_for_input: 'WaitingForInput',
     secret_request: 'SecretRequest',
+    iframe_available: 'IframeAvailable', iframe_removed: 'IframeRemoved',
     Text: 'Text', Thinking: 'Thinking', ToolCall: 'ToolCall',
     ToolResult: 'ToolResult', Milestone: 'Milestone', Error: 'Error',
     Completed: 'Completed', WaitingForInput: 'WaitingForInput',
     SecretRequest: 'SecretRequest',
+    IframeAvailable: 'IframeAvailable', IframeRemoved: 'IframeRemoved',
   };
   return map[kind] || 'Text';
 }

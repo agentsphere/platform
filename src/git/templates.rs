@@ -191,4 +191,28 @@ mod tests {
         assert!(f.content.contains("uvicorn"));
         assert!(f.content.contains("8080"));
     }
+
+    #[test]
+    fn template_claude_md_has_visual_preview_section() {
+        let files = project_template_files("test");
+        let f = files.iter().find(|f| f.path == "CLAUDE.md").unwrap();
+        assert!(f.content.contains("Visual Preview"));
+        assert!(f.content.contains("port 8000"));
+        assert!(f.content.contains("PREVIEW_PORT"));
+    }
+
+    #[test]
+    fn template_claude_md_has_vite_instructions() {
+        let files = project_template_files("test");
+        let f = files.iter().find(|f| f.path == "CLAUDE.md").unwrap();
+        assert!(f.content.contains("--host 0.0.0.0"));
+        assert!(f.content.contains("--port 8000"));
+    }
+
+    #[test]
+    fn template_claude_md_has_relative_base() {
+        let files = project_template_files("test");
+        let f = files.iter().find(|f| f.path == "CLAUDE.md").unwrap();
+        assert!(f.content.contains("base: './'"));
+    }
 }

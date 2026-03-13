@@ -6,6 +6,7 @@ pub mod create_app;
 pub mod create_app_prompt;
 pub mod error;
 pub mod identity;
+pub mod preview_watcher;
 pub mod provider;
 pub mod pubsub_bridge;
 pub mod service;

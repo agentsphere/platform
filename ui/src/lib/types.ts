@@ -96,9 +96,17 @@ export type { ListResponse } from './generated/ListResponse';
 
 // WebSocket progress events from agent sessions
 export interface ProgressEvent {
-  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'WaitingForInput' | 'Text' | 'SecretRequest';
+  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'WaitingForInput' | 'Text' | 'SecretRequest' | 'IframeAvailable' | 'IframeRemoved';
   message: string;
   metadata?: Record<string, any>;
+}
+
+// Iframe panel info returned by GET /api/projects/{id}/sessions/{sessionId}/iframes
+export interface IframePanel {
+  service_name: string;
+  port: number;
+  port_name: string;
+  preview_url: string;
 }
 
 // Secret request metadata (within ProgressEvent.metadata for kind='SecretRequest')

@@ -348,3 +348,39 @@ This is a Kubernetes-native platform. Do NOT create:
 - `docker-compose.yml` — there is no Docker Compose; use `kubectl` for local services
 - `.env.example` — the app reads `DATABASE_URL` from the K8s environment
 - Extra README files — `CLAUDE.md` is the project documentation
+
+## Visual Preview (Dev Server)
+
+The platform provides a live preview iframe in the session view. To use it:
+
+1. **Start a dev server on port 8000**, binding to all interfaces:
+
+   **Vite (React/Vue/Svelte/Preact):**
+   ```bash
+   npx vite --host 0.0.0.0 --port 8000 --base './'
+   ```
+
+   **Next.js:**
+   ```bash
+   npx next dev -H 0.0.0.0 -p 8000
+   ```
+
+   **Webpack Dev Server:**
+   ```bash
+   npx webpack serve --host 0.0.0.0 --port 8000 --public-path './'
+   ```
+
+   **Python (static files):**
+   ```bash
+   python3 -m http.server 8000 --bind 0.0.0.0
+   ```
+
+2. **Use relative base paths** (`base: './'` for vite, `publicPath: './'` for webpack). This ensures assets load correctly through the platform proxy.
+
+3. **Port 8000 is reserved** for preview. The `PREVIEW_PORT` env var is set to `8000`.
+
+4. The preview automatically appears in the session view once the dev server starts responding.
+
+5. Hot Module Replacement (HMR) works automatically — the platform proxies WebSocket connections.
+
+6. **Additional preview ports**: To expose more UIs (monorepo), create K8s Services in the session namespace with label `platform.io/component: iframe-preview` and a port named `iframe`. They will be auto-discovered.

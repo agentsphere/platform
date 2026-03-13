@@ -335,6 +335,11 @@ pub async fn create_session(
         return Err(AgentError::PodCreationFailed(e.to_string()));
     }
 
+    // 8b. Create the preview Service for iframe access (port 8000)
+    if let Err(e) = create_preview_service(state, &session_ns, session_id, short_id).await {
+        tracing::warn!(error = %e, %session_id, "preview service creation failed (non-fatal)");
+    }
+
     // 9. Update session to running with pod_name + uses_pubsub + session_namespace
     sqlx::query!(
         "UPDATE agent_sessions SET status = 'running', pod_name = $2, uses_pubsub = true, session_namespace = $3 WHERE id = $1",
@@ -427,6 +432,62 @@ pub async fn send_message(
     .execute(&state.pool)
     .await?;
 
+    Ok(())
+}
+
+/// Create a K8s Service for the session's preview port (8000).
+///
+/// The Service selector matches the pod's `platform.io/session` label so traffic
+/// routes to the correct pod. The Service name uses `preview-{short_id}` to stay
+/// under the 63-char DNS limit and to be predictable for the reverse proxy.
+#[tracing::instrument(skip(state), fields(%session_id, %short_id), err)]
+async fn create_preview_service(
+    state: &AppState,
+    session_ns: &str,
+    session_id: Uuid,
+    short_id: &str,
+) -> Result<(), anyhow::Error> {
+    let svc_name = format!("preview-{short_id}");
+    let svc_json = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": svc_name,
+            "namespace": session_ns,
+            "labels": {
+                "platform.io/component": "iframe-preview",
+                "platform.io/session": session_id.to_string(),
+            }
+        },
+        "spec": {
+            "selector": {
+                "platform.io/session": session_id.to_string(),
+            },
+            "ports": [{
+                "name": "iframe",
+                "port": 8000,
+                "targetPort": 8000,
+                "protocol": "TCP"
+            }]
+        }
+    });
+
+    let ar = kube::discovery::ApiResource {
+        group: String::new(),
+        version: "v1".into(),
+        api_version: "v1".into(),
+        kind: "Service".into(),
+        plural: "services".into(),
+    };
+    let api: kube::Api<kube::api::DynamicObject> =
+        kube::Api::namespaced_with(state.kube.clone(), session_ns, &ar);
+
+    let obj: kube::api::DynamicObject = serde_json::from_value(svc_json)?;
+    let patch_params = kube::api::PatchParams::apply("platform-agent").force();
+    api.patch(&svc_name, &patch_params, &kube::api::Patch::Apply(&obj))
+        .await?;
+
+    tracing::info!(%session_id, %svc_name, %session_ns, "preview service created");
     Ok(())
 }
 

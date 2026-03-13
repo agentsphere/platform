@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { api } from '../lib/api';
-import type { AgentSession, ProgressEvent, SecretRequestMeta } from '../lib/types';
-import { timeAgo, duration } from '../lib/format';
+import type { AgentSession, ProgressEvent, SecretRequestMeta, IframePanel } from '../lib/types';
+import { duration } from '../lib/format';
 import { Badge } from '../components/Badge';
 import { StatusDot } from '../components/StatusDot';
 import { SecretRequestModal } from '../components/SecretRequestModal';
+import { IframePreview } from '../components/IframePanel';
 import { createSse, type EventSourceClient } from '../lib/sse';
 
 interface Props {
@@ -18,11 +19,15 @@ function normalizeKind(kind: string | undefined): ProgressEvent['kind'] {
   const map: Record<string, ProgressEvent['kind']> = {
     text: 'Text', thinking: 'Thinking', tool_call: 'ToolCall',
     tool_result: 'ToolResult', milestone: 'Milestone', error: 'Error',
-    completed: 'Completed', secret_request: 'SecretRequest',
+    completed: 'Completed', waiting_for_input: 'WaitingForInput',
+    secret_request: 'SecretRequest',
+    iframe_available: 'IframeAvailable', iframe_removed: 'IframeRemoved',
     // Already PascalCase — pass through
     Text: 'Text', Thinking: 'Thinking', ToolCall: 'ToolCall',
     ToolResult: 'ToolResult', Milestone: 'Milestone', Error: 'Error',
-    Completed: 'Completed', SecretRequest: 'SecretRequest',
+    Completed: 'Completed', WaitingForInput: 'WaitingForInput',
+    SecretRequest: 'SecretRequest',
+    IframeAvailable: 'IframeAvailable', IframeRemoved: 'IframeRemoved',
   };
   return map[kind] || 'Text';
 }
@@ -33,8 +38,17 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [secretRequest, setSecretRequest] = useState<SecretRequestMeta | null>(null);
+  const [iframes, setIframes] = useState<IframePanel[]>([]);
   const eventsEndRef = useRef<HTMLDivElement>(null);
   const sseRef = useRef<EventSourceClient | null>(null);
+
+  // Fetch iframe panels
+  const refreshIframes = () => {
+    if (!projectId || !sessionId) return;
+    api.get<IframePanel[]>(`/api/projects/${projectId}/sessions/${sessionId}/iframes`)
+      .then(setIframes)
+      .catch(() => {});
+  };
 
   useEffect(() => {
     if (!projectId || !sessionId) return;
@@ -51,6 +65,8 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
         })));
       }
     }).catch(() => {});
+    // Also fetch initial iframes
+    refreshIframes();
   }, [projectId, sessionId]);
 
   // SSE for live streaming
@@ -74,6 +90,9 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
             prompt: event.metadata.prompt || event.message,
             environments: event.metadata.environments,
           });
+        }
+        if (event.kind === 'IframeAvailable' || event.kind === 'IframeRemoved') {
+          refreshIframes();
         }
         if (event.kind === 'Completed' || event.kind === 'Error') {
           // Refresh session to get updated status
@@ -122,30 +141,33 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
       : 0;
 
   const isLive = session.status === 'running' || session.status === 'pending';
+  const hasIframes = iframes.length > 0;
 
   return (
-    <div>
-      <div class="mb-md">
-        <a href={`/projects/${projectId}/sessions`} class="text-sm text-muted">Back to sessions</a>
-      </div>
-
-      <div class="flex-between mb-md">
-        <div>
-          <h2>
-            Session <span class="mono text-sm">{sessionId?.substring(0, 8)}...</span>
-          </h2>
-          <div class="flex gap-md text-sm mt-sm">
-            <StatusDot status={session.status} label={session.status} />
-            <span class="text-muted">{duration(elapsed)}</span>
-          </div>
+    <div class="session-workspace">
+      {/* Session bar */}
+      <div class="session-bar">
+        <div class="session-bar-left">
+          <a href={`/projects/${projectId}/sessions`} class="text-sm text-muted">Sessions</a>
+          <span class="text-muted">/</span>
+          <span class="mono text-sm">{sessionId?.substring(0, 8)}</span>
         </div>
-        {isLive && (
-          <button class="btn btn-danger" onClick={stopSession}>Stop</button>
-        )}
+        <div class="session-bar-center">
+          <StatusDot status={session.status} label={session.status} />
+          <span class="text-sm text-muted">{duration(elapsed)}</span>
+          {session.branch && <span class="mono text-xs text-muted">{session.branch}</span>}
+          {hasIframes && <Badge label={`Preview (${iframes.length})`} />}
+        </div>
+        <div class="session-bar-right">
+          {isLive && (
+            <button class="btn btn-danger btn-sm" onClick={stopSession}>Stop</button>
+          )}
+        </div>
       </div>
 
-      <div class="session-layout">
-        <div class="session-main">
+      {/* Main workspace: events + optional iframe preview */}
+      <div class={`session-panels ${hasIframes ? 'session-panels-split' : ''}`}>
+        <div class="session-events-panel">
           <div class="card session-events">
             <div class="session-events-scroll">
               {events.length === 0 ? (
@@ -187,45 +209,11 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
           </div>
         </div>
 
-        <div class="session-sidebar">
-          <div class="card">
-            <div class="card-title mb-md">Session Info</div>
-            <div class="session-meta-list">
-              <div class="session-meta-row">
-                <span class="text-muted text-sm">Prompt</span>
-                <span class="text-sm">{session.prompt}</span>
-              </div>
-              <div class="session-meta-row">
-                <span class="text-muted text-sm">Provider</span>
-                <span class="text-sm">{session.provider}</span>
-              </div>
-              {session.branch && (
-                <div class="session-meta-row">
-                  <span class="text-muted text-sm">Branch</span>
-                  <span class="mono text-xs">{session.branch}</span>
-                </div>
-              )}
-              {session.pod_name && (
-                <div class="session-meta-row">
-                  <span class="text-muted text-sm">Pod</span>
-                  <span class="mono text-xs">{session.pod_name}</span>
-                </div>
-              )}
-              <div class="session-meta-row">
-                <span class="text-muted text-sm">Tokens</span>
-                <span class="text-sm">{session.cost_tokens != null ? session.cost_tokens.toLocaleString() : '--'}</span>
-              </div>
-              <div class="session-meta-row">
-                <span class="text-muted text-sm">Created</span>
-                <span class="text-sm">{timeAgo(session.created_at)}</span>
-              </div>
-              <div class="session-meta-row">
-                <span class="text-muted text-sm">Duration</span>
-                <span class="text-sm">{duration(elapsed)}</span>
-              </div>
-            </div>
+        {hasIframes && (
+          <div class="session-iframe-panel">
+            <IframePreview panels={iframes} />
           </div>
-        </div>
+        )}
       </div>
 
       {secretRequest && projectId && (
@@ -259,6 +247,8 @@ function getEventIcon(kind: string): string {
     case 'Completed': return '[=]';
     case 'Text': return '[-]';
     case 'SecretRequest': return '[?]';
+    case 'IframeAvailable': return '[F]';
+    case 'IframeRemoved': return '[x]';
     default: return '[ ]';
   }
 }
