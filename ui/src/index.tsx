@@ -22,18 +22,25 @@ import { Users } from './pages/admin/Users';
 import { Roles } from './pages/admin/Roles';
 import { Delegations } from './pages/admin/Delegations';
 import { Health } from './pages/admin/Health';
+import { Commands as AdminCommands } from './pages/admin/Commands';
 import { Tokens } from './pages/admin/Tokens';
 import { ProviderKeys } from './pages/ProviderKeys';
 import { AccountSettings } from './pages/AccountSettings';
 import { Workspaces } from './pages/Workspaces';
 import { WorkspaceDetail } from './pages/WorkspaceDetail';
 import { CreateApp } from './pages/CreateApp';
+import { Onboarding } from './pages/Onboarding';
 import { OnboardingProvider } from './lib/onboarding';
 import { OnboardingOverlay } from './components/OnboardingOverlay';
+
+interface WizardStatus {
+  show_wizard: boolean;
+}
 
 function AppRouter() {
   const { user, loading } = useAuth();
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
+  const [showWizard, setShowWizard] = useState<boolean | null>(null);
 
   useEffect(() => {
     fetch('/api/setup/status')
@@ -42,9 +49,22 @@ function AppRouter() {
       .catch(() => setNeedsSetup(false));
   }, []);
 
+  // Check wizard status after auth is resolved
+  useEffect(() => {
+    if (!user) return;
+    fetch('/api/onboarding/wizard-status', { credentials: 'include' })
+      .then(r => r.json())
+      .then((d: WizardStatus) => setShowWizard(d.show_wizard))
+      .catch(() => setShowWizard(false));
+  }, [user]);
+
   if (loading || needsSetup === null) return <div class="loading">Loading...</div>;
   if (needsSetup) return <Setup />;
   if (!user) return <Login />;
+
+  // Show wizard for first-time admin before main app
+  if (showWizard === null) return <div class="loading">Loading...</div>;
+  if (showWizard) return <Onboarding />;
 
   return (
     <OnboardingProvider>
@@ -69,6 +89,7 @@ function AppRouter() {
           <Users path="/admin/users" />
           <Roles path="/admin/roles" />
           <Delegations path="/admin/delegations" />
+          <AdminCommands path="/admin/skills" />
           <Health path="/admin/health" />
           <AccountSettings path="/settings/account" />
           <Tokens path="/settings/tokens" />

@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ project_name }}-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ project_name }}-db
+  template:
+    metadata:
+      labels:
+        app: {{ project_name }}-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: app
+            - name: POSTGRES_USER
+              value: app
+            - name: POSTGRES_PASSWORD
+              value: "{{ values.db_password | default('changeme') }}"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ project_name }}-db
+spec:
+  selector:
+    app: {{ project_name }}-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ project_name }}-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ project_name }}-cache
+  template:
+    metadata:
+      labels:
+        app: {{ project_name }}-cache
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ project_name }}-cache
+spec:
+  selector:
+    app: {{ project_name }}-cache
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ project_name }}-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ project_name }}-app
+  template:
+    metadata:
+      labels:
+        app: {{ project_name }}-app
+    spec:
+      imagePullSecrets:
+        - name: platform-registry-pull
+      containers:
+        - name: app
+          image: {{ image_ref }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://app:{{ values.db_password | default('changeme') }}@{{ project_name }}-db:5432/app"
+            - name: CACHE_URL
+              value: "redis://{{ project_name }}-cache:6379"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ project_name }}-app
+spec:
+  selector:
+    app: {{ project_name }}-app
+  ports:
+    - port: 8080
+      targetPort: 8080

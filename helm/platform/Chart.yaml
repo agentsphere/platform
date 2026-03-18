@@ -1,0 +1,19 @@
+apiVersion: v2
+name: platform
+description: AgentSphere Platform - AI-powered development platform
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: postgresql
+    version: "~16.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: valkey
+    version: "~2.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: valkey.enabled
+  - name: minio
+    version: "~14.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: minio.enabled

@@ -1,0 +1,12 @@
+dependencies:
+- name: postgresql
+  repository: https://charts.bitnami.com/bitnami
+  version: 16.7.27
+- name: valkey
+  repository: https://charts.bitnami.com/bitnami
+  version: 2.4.7
+- name: minio
+  repository: https://charts.bitnami.com/bitnami
+  version: 14.10.5
+digest: sha256:48a4e4a14fb0e0e807d9f8777ae86d4dbde0f65db070b6977f87e26eff3c59ce
+generated: "2026-03-17T10:10:05.523083+01:00"

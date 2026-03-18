@@ -25,33 +25,36 @@ use crate::workspace;
 /// Resolved repository access — returned by `resolve_repo_with_access`.
 pub struct RepoAccess {
     pub repository_id: Uuid,
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
 }
 
 /// Resolved project info from a repository lookup.
 struct RepoProject {
     repository_id: Uuid,
-    project_id: Uuid,
-    owner_id: Uuid,
-    workspace_id: Uuid,
-    visibility: String,
+    project_id: Option<Uuid>,
+    owner_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    visibility: Option<String>,
 }
 
-/// Look up a repository by name, joining to its parent project.
+/// Look up a repository by name, `LEFT JOIN`ing to its parent project.
 ///
+/// System/global repos (e.g. `platform-runner`) have `project_id = NULL`.
 /// The URL path segment is a **repository** name (which may differ from
-/// the project name, e.g. `platform-runner-bare` repo under `platform-runner` project).
+/// the project name for project-scoped repos).
 async fn lookup_repo_and_project(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<Option<RepoProject>, sqlx::Error> {
     sqlx::query_as!(
         RepoProject,
-        r#"SELECT r.id AS "repository_id!", p.id AS "project_id!",
-                  p.owner_id AS "owner_id!", p.workspace_id AS "workspace_id!",
-                  p.visibility AS "visibility!"
+        r#"SELECT r.id AS "repository_id!",
+                  r.project_id AS "project_id?",
+                  p.owner_id AS "owner_id?",
+                  p.workspace_id AS "workspace_id?",
+                  p.visibility AS "visibility?"
            FROM registry_repositories r
-           JOIN projects p ON p.id = r.project_id AND p.is_active = true
+           LEFT JOIN projects p ON p.id = r.project_id AND p.is_active = true
            WHERE r.name = $1"#,
         name,
     )
@@ -61,8 +64,8 @@ async fn lookup_repo_and_project(
 
 /// Resolve a repository name to a project, checking ownership and permissions.
 ///
-/// Looks up by repository name first (supports multi-repo projects like
-/// `platform-runner-bare` under project `platform-runner`). Falls back to
+/// System/global repos (`project_id = NULL`) allow pull but deny push.
+/// Project-scoped repos look up by repository name first. Falls back to
 /// project-name lookup with lazy repo creation for push operations.
 ///
 /// Returns 404 (not 403) if user lacks access to avoid leaking existence.
@@ -75,12 +78,27 @@ pub async fn resolve_repo_with_access(
     // 1. Try to find existing repository → project
     let resolved = lookup_repo_and_project(&state.pool, name).await?;
 
+    // Handle system/global repos (project_id IS NULL): pull OK, push denied
+    if let Some(ref rp) = resolved
+        && rp.project_id.is_none()
+    {
+        if need_push {
+            return Err(RegistryError::Denied);
+        }
+        return Ok(RepoAccess {
+            repository_id: rp.repository_id,
+            project_id: None,
+        });
+    }
+
     let (repository_id, project_id, owner_id, workspace_id) = if let Some(rp) = resolved {
+        // project_id is Some here (system repos handled above)
         (
             Some(rp.repository_id),
-            rp.project_id,
-            rp.owner_id,
-            rp.workspace_id,
+            rp.project_id.expect("project_id checked above"),
+            rp.owner_id.expect("owner_id present when project_id set"),
+            rp.workspace_id
+                .expect("workspace_id present when project_id set"),
         )
     } else if need_push {
         // No repo found — for push, fall back to project-name lookup + lazy-create.
@@ -177,7 +195,7 @@ pub async fn resolve_repo_with_access(
 
     Ok(RepoAccess {
         repository_id,
-        project_id,
+        project_id: Some(project_id),
     })
 }
 
@@ -200,12 +218,20 @@ pub async fn resolve_repo_with_optional_access(
         return Err(RegistryError::Unauthorized);
     }
 
-    // Look up repository → project (must exist and be public)
+    // Look up repository → project (must exist and be public or system)
     let rp = lookup_repo_and_project(&state.pool, name)
         .await?
         .ok_or(RegistryError::NameUnknown)?;
 
-    if rp.visibility != "public" {
+    // System repos (project_id IS NULL) are publicly pullable
+    if rp.project_id.is_none() {
+        return Ok(RepoAccess {
+            repository_id: rp.repository_id,
+            project_id: None,
+        });
+    }
+
+    if rp.visibility.as_deref() != Some("public") {
         // Return 401 (not 404) so containerd/Docker retries with credentials
         // from imagePullSecrets. Returning 404 would make it give up immediately.
         return Err(RegistryError::Unauthorized);

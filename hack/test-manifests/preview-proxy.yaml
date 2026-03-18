@@ -10,7 +10,21 @@ data:
       resolver kube-dns.kube-system.svc.cluster.local valid=5s;
       server {
         listen 8080;
-        # URL format: /{service}.{namespace}/{path}
+        # Port-aware format: /{service}.{namespace}.{port}/{path}
+        location ~ ^/([^./]+)\.([^./]+)\.([0-9]+)/(.*)$ {
+          set $target_svc $1;
+          set $target_ns  $2;
+          set $target_port $3;
+          set $target_path $4;
+          proxy_pass http://$target_svc.$target_ns.svc.cluster.local:$target_port/$target_path$is_args$args;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_set_header Host $host;
+          proxy_read_timeout 120s;
+          proxy_connect_timeout 5s;
+        }
+        # Legacy format: /{service}.{namespace}/{path} (default port 8000)
         location ~ ^/([^./]+)\.([^./]+)/(.*)$ {
           set $target_svc $1;
           set $target_ns  $2;

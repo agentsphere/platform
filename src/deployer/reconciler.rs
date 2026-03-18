@@ -222,12 +222,19 @@ async fn handle_active(
     .await?;
 
     // Inject project secrets as a K8s Secret before applying manifests
-    inject_project_secrets(state, deployment, &ns).await;
+    let secrets_name = inject_project_secrets(state, deployment, &ns).await;
 
     // Ensure a registry pull secret exists so pods can pull images
     ensure_registry_pull_secret_for(state, deployment.project_id, deployment.id, &ns).await;
 
     let (rendered, sha) = render_manifests(state, deployment).await?;
+
+    // Inject envFrom into workload containers so pods receive the secret env vars
+    let rendered = if let Some(ref secret_name) = secrets_name {
+        applier::inject_env_from_secret(&rendered, secret_name)?
+    } else {
+        rendered
+    };
 
     // Build new resource inventory before applying
     let new_tracked = applier::build_tracked_inventory(&rendered, &ns);
@@ -329,7 +336,19 @@ async fn handle_rollback(
         &deployment.namespace_slug,
         &deployment.environment,
     );
+
+    // Inject project secrets for rollback (same as active deploy)
+    let secrets_name = inject_project_secrets(state, deployment, &ns).await;
+
     let (rendered, sha) = render_manifests(state, &rollback_deployment).await?;
+
+    // Inject envFrom into workload containers
+    let rendered = if let Some(ref secret_name) = secrets_name {
+        applier::inject_env_from_secret(&rendered, secret_name)?
+    } else {
+        rendered
+    };
+
     let applied =
         applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(deployment.id)).await?;
 
@@ -379,8 +398,15 @@ async fn handle_stopped(
 
 /// Query deploy-scoped secrets for a project, decrypt, inject OTEL config,
 /// and create/update a K8s Secret in the target namespace. Best-effort.
+///
+/// Returns the secret name when created (so callers can inject `envFrom`),
+/// or `None` when no data was collected.
 #[tracing::instrument(skip(state, deployment), fields(project_id = %deployment.project_id, %namespace))]
-async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment, namespace: &str) {
+async fn inject_project_secrets(
+    state: &AppState,
+    deployment: &PendingDeployment,
+    namespace: &str,
+) -> Option<String> {
     let mut data: BTreeMap<String, String> = BTreeMap::new();
 
     // Collect deploy-scoped secrets (requires master key)
@@ -414,7 +440,7 @@ async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment
     inject_otel_env_vars(state, deployment, &mut data).await;
 
     if data.is_empty() {
-        return;
+        return None;
     }
 
     let secret_name = format!(
@@ -424,6 +450,7 @@ async fn inject_project_secrets(state: &AppState, deployment: &PendingDeployment
     );
 
     apply_k8s_secret(state, namespace, &secret_name, deployment.project_id, data).await;
+    Some(secret_name)
 }
 
 /// Inject OTEL env vars into the secrets data map for automatic observability.
@@ -438,6 +465,10 @@ async fn inject_otel_env_vars(
         state.config.platform_api_url.clone(),
     );
     data.insert("OTEL_SERVICE_NAME".into(), deployment.project_name.clone());
+    data.insert(
+        "OTEL_RESOURCE_ATTRIBUTES".into(),
+        format!("platform.project_id={}", deployment.project_id),
+    );
 
     // Auto-create or rotate a scoped OTLP token
     match ensure_otlp_token(state, deployment.project_id).await {

@@ -154,6 +154,18 @@ async fn setup(
 
     tracing::info!(user_id = %admin_id, name = %body.name, "setup completed — admin user created");
 
+    // Auto-create demo project + trigger pipeline in background
+    let demo_state = state.clone();
+    tokio::spawn(async move {
+        // Small delay so background tasks (executor, reconciler) are running
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Err(e) =
+            crate::onboarding::demo_project::create_and_trigger_demo(&demo_state, admin_id).await
+        {
+            tracing::warn!(error = %e, "auto demo project creation failed");
+        }
+    });
+
     Ok((
         StatusCode::OK,
         Json(SetupResponse {

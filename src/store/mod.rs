@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod commands_seed;
 pub mod eventbus;
 pub mod pool;
 pub mod valkey;
@@ -10,6 +11,7 @@ use sqlx::PgPool;
 use crate::agent::claude_cli::CliSessionManager;
 use crate::config::Config;
 use crate::health::{HealthSnapshot, TaskRegistry};
+use crate::onboarding::claude_auth::CliAuthManager;
 use crate::secrets::request::SecretRequests;
 
 #[derive(Clone)]
@@ -33,4 +35,6 @@ pub struct AppState {
     pub health: Arc<std::sync::RwLock<HealthSnapshot>>,
     /// In-memory heartbeat tracker for background tasks.
     pub task_registry: Arc<TaskRegistry>,
+    /// Manages active Claude CLI auth sessions for onboarding.
+    pub cli_auth_manager: Arc<CliAuthManager>,
 }

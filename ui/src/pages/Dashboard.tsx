@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, type ListResponse } from '../lib/api';
-import type { Project, AuditLogEntry } from '../lib/types';
-import { timeAgo } from '../lib/format';
-import { Badge } from '../components/Badge';
+import type { Project } from '../lib/types';
+import { useAuth } from '../lib/auth';
+import { ProjectCard } from '../components/ProjectCard';
 
 interface DashboardStats {
   projects: number;
@@ -14,134 +14,136 @@ interface DashboardStats {
 }
 
 export function Dashboard() {
+  const { user } = useAuth();
   const [projects, setProjects] = useState<Project[]>([]);
-  const [total, setTotal] = useState(0);
+  const [total, setTotal] = useState<number | null>(null);
   const [stats, setStats] = useState<DashboardStats | null>(null);
-  const [activity, setActivity] = useState<AuditLogEntry[]>([]);
 
   useEffect(() => {
-    api.get<ListResponse<Project>>('/api/projects?limit=10')
+    api.get<ListResponse<Project>>('/api/projects?limit=20')
       .then(r => { setProjects(r.items); setTotal(r.total); })
-      .catch(() => {});
-
-    // Load dashboard stats
+      .catch(() => setTotal(0));
     api.get<DashboardStats>('/api/dashboard/stats')
       .then(setStats)
-      .catch(() => {
-        // Fallback: build stats from project count
-        setStats({ projects: 0, active_sessions: 0, running_builds: 0, failed_builds: 0, healthy_deployments: 0, degraded_deployments: 0 });
-      });
-
-    // Load recent activity
-    api.get<ListResponse<AuditLogEntry>>('/api/audit-log?limit=10')
-      .then(r => setActivity(r.items))
-      .catch(() => setActivity([]));
+      .catch(() => {});
   }, []);
 
+  // Still loading
+  if (total === null) {
+    return <div class="empty-state">Loading...</div>;
+  }
+
+  const displayName = user?.display_name || user?.name || 'there';
+
+  // Mode A: No projects — hero screen
+  if (total === 0) {
+    return <HeroDashboard displayName={displayName} />;
+  }
+
+  // Mode B: Has projects — card grid
   return (
     <div>
-      <h2 style="margin-bottom:1rem">Dashboard</h2>
-
-      {/* Status summary cards */}
-      <div class="stats-grid mb-md">
-        <div class="stat-card">
-          <div class="stat-value">{stats?.projects ?? total}</div>
-          <div class="stat-label">Projects</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value">{stats?.active_sessions ?? 0}</div>
-          <div class="stat-label">Active Sessions</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value">
-            {stats?.running_builds ?? 0}
-            {(stats?.failed_builds ?? 0) > 0 && (
-              <span class="stat-sub" style="color:var(--danger)"> / {stats?.failed_builds} failed</span>
-            )}
+      <div class="dashboard-grid">
+        {/* Subtle stats badge */}
+        {stats && stats.active_sessions > 0 && (
+          <div style="text-align:right">
+            <span class="badge badge-running">{stats.active_sessions} active session{stats.active_sessions !== 1 ? 's' : ''}</span>
           </div>
-          <div class="stat-label">Running Builds</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value">
-            {stats?.healthy_deployments ?? 0}
-            {(stats?.degraded_deployments ?? 0) > 0 && (
-              <span class="stat-sub" style="color:var(--warning)"> / {stats?.degraded_deployments} degraded</span>
-            )}
-          </div>
-          <div class="stat-label">Deployments</div>
-        </div>
-      </div>
-
-      {/* Create App card */}
-      <div class="card mb-md create-app-card" style="cursor:pointer;border:2px dashed var(--border);text-align:center;padding:1.5rem" onClick={() => { window.location.href = '/create-app'; }}>
-        <h3 style="margin:0 0 0.5rem">Create New App</h3>
-        <p class="text-muted" style="margin:0">Describe your idea — AI will set up everything</p>
-      </div>
-
-      {/* Quick actions */}
-      <div class="flex gap-sm mb-md">
-        <a href="/projects" class="btn btn-primary btn-sm">New Project</a>
-        <a href="/observe/logs" class="btn btn-sm">View Logs</a>
-        <a href="/observe/traces" class="btn btn-sm">View Traces</a>
-        <a href="/observe/metrics" class="btn btn-sm">View Metrics</a>
-      </div>
-
-      {/* Recent activity */}
-      {activity.length > 0 && (
-        <div class="card mb-md">
-          <div class="card-header">
-            <span class="card-title">Recent Activity</span>
-          </div>
-          <div class="activity-feed">
-            {activity.map(entry => (
-              <div key={entry.id} class="activity-item">
-                <span class="activity-actor">{entry.actor_name}</span>
-                <span class="activity-action">{formatAction(entry.action)}</span>
-                {entry.resource && (
-                  <span class="activity-resource">{entry.resource}</span>
-                )}
-                <span class="activity-time">{timeAgo(entry.created_at)}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Recent projects */}
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Recent Projects</span>
-          <span class="text-muted text-sm">{total} total</span>
-        </div>
-        {projects.length === 0 ? (
-          <div class="empty-state">No projects yet</div>
-        ) : (
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Visibility</th>
-                <th>Branch</th>
-                <th>Updated</th>
-              </tr>
-            </thead>
-            <tbody>
-              {projects.map(p => (
-                <tr key={p.id} class="table-link" onClick={() => { window.location.href = `/projects/${p.id}`; }}>
-                  <td><a href={`/projects/${p.id}`}>{p.display_name || p.name}</a></td>
-                  <td><Badge status={p.visibility} /></td>
-                  <td class="mono text-sm">{p.default_branch}</td>
-                  <td class="text-muted text-sm">{timeAgo(p.updated_at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         )}
+        {projects.map(p => (
+          <ProjectCard key={p.id} project={p} />
+        ))}
+
+        {/* New project card */}
+        <a href="/create-app" class="project-card-new">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 4v16m8-8H4" />
+          </svg>
+          New Project
+        </a>
       </div>
     </div>
   );
 }
 
-function formatAction(action: string): string {
-  return action.replace(/\./g, ' ').replace(/_/g, ' ');
+function HeroDashboard({ displayName }: { displayName: string }) {
+  const [input, setInput] = useState('');
+
+  const go = (prompt: string) => {
+    const encoded = encodeURIComponent(prompt);
+    window.location.href = `/create-app?prompt=${encoded}`;
+  };
+
+  const handleSubmit = (e: Event) => {
+    e.preventDefault();
+    if (input.trim()) go(input.trim());
+  };
+
+  return (
+    <div style="position:relative">
+      <div class="aurora-bg">
+        <div class="aurora-blob-3" />
+      </div>
+      <div class="hero-container">
+        <h1 class="hero-greeting">Hey {displayName}, bring your idea to life</h1>
+
+        <form onSubmit={handleSubmit} style="width:100%;max-width:560px;display:flex;gap:0.5rem">
+          <input
+            type="text"
+            class="hero-chat-input"
+            placeholder="Describe what you want to build..."
+            value={input}
+            onInput={(e) => setInput((e.target as HTMLInputElement).value)}
+            autoFocus
+          />
+          <button type="submit" class="btn btn-primary" style="border-radius:12px;padding:0.9rem 1.5rem" disabled={!input.trim()}>
+            Create
+          </button>
+        </form>
+
+        <div class="hero-options">
+          <div class="hero-option-card" onClick={() => go('Import my existing repository from GitHub')}>
+            <div class="hero-option-title">Import from GitHub</div>
+            <div class="hero-option-desc">Bring an existing repo to the platform</div>
+          </div>
+          <TemplateOption onSelect={go} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TemplateOption({ onSelect }: { onSelect: (prompt: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const templates = [
+    { label: 'REST API + Postgres', prompt: 'Create a REST API with Postgres database, auth, and CRUD endpoints' },
+    { label: 'Static Site', prompt: 'Create a static website with Markdown content' },
+    { label: 'Full-Stack App', prompt: 'Create a full-stack web app with React frontend and API backend' },
+  ];
+
+  if (expanded) {
+    return (
+      <div style="display:flex;flex-direction:column;align-items:center">
+        <div class="hero-option-card" onClick={() => setExpanded(false)}>
+          <div class="hero-option-title">Start from Template</div>
+          <div class="hero-option-desc">Pick a starter to get going fast</div>
+        </div>
+        <div class="hero-templates">
+          {templates.map(t => (
+            <button key={t.label} class="hero-template-chip" onClick={() => onSelect(t.prompt)}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div class="hero-option-card" onClick={() => setExpanded(true)}>
+      <div class="hero-option-title">Start from Template</div>
+      <div class="hero-option-desc">Pick a starter to get going fast</div>
+    </div>
+  );
 }

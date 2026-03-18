@@ -271,12 +271,19 @@ async fn create_pipeline_with_steps(
             .deploy_test
             .as_ref()
             .map(|dt| serde_json::to_value(dt).unwrap_or_default());
+        let depends_on: Vec<&str> = step.depends_on.iter().map(String::as_str).collect();
+        let environment_json = if step.environment.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&step.environment).unwrap_or_default())
+        };
 
         sqlx::query!(
             r#"
             INSERT INTO pipeline_steps (pipeline_id, project_id, step_order, name, image, commands,
-                                        condition_events, condition_branches, deploy_test)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                        condition_events, condition_branches, deploy_test,
+                                        depends_on, environment, gate)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
             pipeline_id,
             project_id,
@@ -287,6 +294,9 @@ async fn create_pipeline_with_steps(
             &condition_events as &[&str],
             &condition_branches as &[&str],
             deploy_test_json,
+            &depends_on as &[&str],
+            environment_json,
+            step.gate,
         )
         .execute(&mut *tx)
         .await?;
@@ -379,6 +389,55 @@ pub async fn read_file_at_ref(repo_path: &Path, git_ref: &str, file_path: &str) 
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(git_ref, file_path, ?repo_path, %stderr, "file not found at ref");
         None
+    }
+}
+
+/// Read all `.yaml`/`.yml` files from a directory in a git repo at a given ref.
+///
+/// Uses `git ls-tree` to list entries, then `git show` to read each file.
+/// Returns concatenated content separated by `---\n`.
+pub async fn read_dir_at_ref(repo_path: &Path, git_ref: &str, dir_path: &str) -> Option<String> {
+    let dir_path = dir_path.trim_end_matches('/');
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("ls-tree")
+        .arg("--name-only")
+        .arg(format!("{git_ref}:{dir_path}"))
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let yaml_files: Vec<&str> = listing
+        .lines()
+        .filter(|f| {
+            std::path::Path::new(f).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+            })
+        })
+        .collect();
+
+    if yaml_files.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for file in yaml_files {
+        let file_path = format!("{dir_path}/{file}");
+        if let Some(content) = read_file_at_ref(repo_path, git_ref, &file_path).await {
+            parts.push(content);
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("---\n"))
     }
 }
 

@@ -139,6 +139,10 @@ pub fn router() -> Router<AppState> {
             get(list_iframes),
         )
         .route(
+            "/api/projects/{id}/sessions/{session_id}/progress",
+            get(get_session_progress),
+        )
+        .route(
             "/api/projects/{id}/sessions/{session_id}/events",
             get(sse_session_events),
         )
@@ -967,6 +971,33 @@ async fn list_iframes(
 // ---------------------------------------------------------------------------
 // SSE (Server-Sent Events)
 // ---------------------------------------------------------------------------
+
+/// Get the latest progress update for a session.
+///
+/// Returns the most recent `progress_update` message content, or 404 if none exists.
+async fn get_session_progress(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, session_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    let row: Option<(String,)> = sqlx::query_as(
+        r"SELECT content FROM agent_messages
+        WHERE session_id = $1
+          AND role = 'progress_update'
+        ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    match row {
+        Some((content,)) => Ok(Json(serde_json::json!({ "message": content }))),
+        None => Err(ApiError::NotFound("progress".into())),
+    }
+}
 
 /// SSE handler: streams agent output in real-time via Valkey pub/sub.
 /// Auth is validated via the `AuthUser` extractor (cookies sent by `EventSource`).

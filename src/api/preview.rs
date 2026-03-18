@@ -37,6 +37,18 @@ pub fn router() -> Router<AppState> {
         .route("/preview/{session_id}", any(preview_proxy))
         .route("/preview/{session_id}/", any(preview_proxy))
         .route("/preview/{session_id}/{*path}", any(preview_proxy))
+        .route(
+            "/deploy-preview/{project_id}/{service_name}",
+            any(deploy_preview_proxy),
+        )
+        .route(
+            "/deploy-preview/{project_id}/{service_name}/",
+            any(deploy_preview_proxy),
+        )
+        .route(
+            "/deploy-preview/{project_id}/{service_name}/{*path}",
+            any(deploy_preview_proxy),
+        )
         // All preview responses (including errors) must allow framing by the platform UI.
         // This overrides the global X-Frame-Options: DENY set in main.rs.
         .layer(SetResponseHeaderLayer::overriding(
@@ -47,7 +59,7 @@ pub fn router() -> Router<AppState> {
 
 /// Validate that a namespace string is safe for URL construction.
 /// Allows only lowercase alphanumeric and hyphens (`[a-z0-9-]+`).
-fn validate_namespace_format(ns: &str) -> bool {
+pub fn validate_namespace_format(ns: &str) -> bool {
     !ns.is_empty()
         && ns
             .bytes()
@@ -65,14 +77,16 @@ pub fn build_target_url(
     path: &str,
     query: Option<&str>,
     proxy_base_url: Option<&str>,
+    port: Option<u16>,
 ) -> String {
+    let port = port.unwrap_or(8000);
     let path = path.trim_start_matches('/');
     let base = match proxy_base_url {
         Some(proxy) => format!(
-            "{}/{svc_name}.{namespace}/{path}",
+            "{}/{svc_name}.{namespace}.{port}/{path}",
             proxy.trim_end_matches('/')
         ),
-        None => format!("http://{svc_name}.{namespace}.svc.cluster.local:8000/{path}"),
+        None => format!("http://{svc_name}.{namespace}.svc.cluster.local:{port}/{path}"),
     };
     match query {
         Some(q) if !q.is_empty() => format!("{base}?{q}"),
@@ -205,6 +219,7 @@ async fn preview_proxy(
         path,
         query.as_deref(),
         state.config.preview_proxy_url.as_deref(),
+        None,
     );
     tracing::info!(
         %target_url,
@@ -356,6 +371,128 @@ struct PreviewPath {
     path: Option<String>,
 }
 
+/// Path parameters for deploy preview routes.
+#[derive(Debug, serde::Deserialize)]
+struct DeployPreviewPath {
+    project_id: Uuid,
+    service_name: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Optional query params for deploy preview (environment selection).
+#[derive(Debug, serde::Deserialize)]
+struct DeployPreviewQuery {
+    #[serde(default = "default_env")]
+    env: String,
+}
+
+fn default_env() -> String {
+    "production".into()
+}
+
+/// Deploy preview proxy handler. Routes to K8s Services labeled
+/// `platform.io/component=iframe-preview` in the project's deploy namespace.
+#[tracing::instrument(skip(state, auth, req), fields(project_id, service_name), err)]
+async fn deploy_preview_proxy(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(params): Path<DeployPreviewPath>,
+    axum::extract::Query(query): axum::extract::Query<DeployPreviewQuery>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let project_id = params.project_id;
+    let service_name = &params.service_name;
+    tracing::Span::current().record("project_id", tracing::field::display(project_id));
+    tracing::Span::current().record("service_name", tracing::field::display(service_name));
+
+    // Validate service_name format (reuse namespace validation — same charset)
+    if !validate_namespace_format(service_name) {
+        return Err(ApiError::BadRequest("invalid service name".into()));
+    }
+
+    // Look up project namespace_slug
+    let project = sqlx::query!(
+        r#"SELECT namespace_slug FROM projects WHERE id = $1 AND is_active = true"#,
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project".into()))?;
+
+    let slug = &project.namespace_slug;
+    if slug.is_empty() {
+        return Err(ApiError::BadRequest("project has no namespace".into()));
+    }
+
+    // Auth check
+    super::helpers::require_project_read(&state, &auth, project_id).await?;
+
+    // Compute deploy namespace
+    let namespace = crate::deployer::reconciler::target_namespace(&state.config, slug, &query.env);
+    if !validate_namespace_format(&namespace) {
+        return Err(ApiError::BadRequest("invalid namespace format".into()));
+    }
+
+    // Verify K8s Service exists with correct label
+    let svc_api: kube::Api<k8s_openapi::api::core::v1::Service> =
+        kube::Api::namespaced(state.kube.clone(), &namespace);
+    let svc = svc_api.get(service_name).await.map_err(|e| match e {
+        kube::Error::Api(ref resp) if resp.code == 404 => ApiError::NotFound("service".into()),
+        other => ApiError::Internal(other.into()),
+    })?;
+
+    // Verify label
+    let labels = svc.metadata.labels.as_ref();
+    let has_label = labels
+        .and_then(|l| l.get("platform.io/component"))
+        .is_some_and(|v| v == "iframe-preview");
+    if !has_label {
+        return Err(ApiError::NotFound("service".into()));
+    }
+
+    // Extract iframe port (fallback 8000)
+    let port = svc
+        .spec
+        .as_ref()
+        .and_then(|s| s.ports.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|p| p.name.as_deref() == Some("iframe"))
+        .and_then(|p| u16::try_from(p.port).ok())
+        .unwrap_or(8000);
+
+    let path = params.path.as_deref().unwrap_or("");
+    let req_query = req.uri().query().map(String::from);
+    let target_url = build_target_url(
+        service_name,
+        &namespace,
+        path,
+        req_query.as_deref(),
+        state.config.preview_proxy_url.as_deref(),
+        Some(port),
+    );
+    tracing::info!(%target_url, "deploy preview proxy request");
+
+    // WebSocket upgrade path
+    if is_websocket_upgrade(req.headers()) {
+        let ws_url = target_url.replacen("http://", "ws://", 1);
+        let ws = WebSocketUpgrade::from_request(req, &state)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "websocket upgrade failed");
+                ApiError::BadRequest("websocket upgrade failed".into())
+            })?;
+        return Ok(ws.on_upgrade(move |client_ws| async move {
+            if let Err(e) = bridge_websocket(client_ws, &ws_url).await {
+                tracing::debug!(error = %e, "websocket bridge closed");
+            }
+        }));
+    }
+
+    proxy_http(req, &target_url).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_build_backend_url() {
-        let url = build_target_url("preview-abc12345", "my-ns", "index.html", None, None);
+        let url = build_target_url("preview-abc12345", "my-ns", "index.html", None, None, None);
         assert_eq!(
             url,
             "http://preview-abc12345.my-ns.svc.cluster.local:8000/index.html"
@@ -373,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_build_backend_url_empty_path() {
-        let url = build_target_url("preview-abc12345", "my-ns", "", None, None);
+        let url = build_target_url("preview-abc12345", "my-ns", "", None, None, None);
         assert_eq!(url, "http://preview-abc12345.my-ns.svc.cluster.local:8000/");
     }
 
@@ -385,6 +522,7 @@ mod tests {
             "api/data",
             Some("page=1&limit=10"),
             None,
+            None,
         );
         assert_eq!(
             url,
@@ -394,7 +532,14 @@ mod tests {
 
     #[test]
     fn test_build_backend_url_strips_leading_slash() {
-        let url = build_target_url("preview-abc12345", "my-ns", "/assets/app.js", None, None);
+        let url = build_target_url(
+            "preview-abc12345",
+            "my-ns",
+            "/assets/app.js",
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             url,
             "http://preview-abc12345.my-ns.svc.cluster.local:8000/assets/app.js"
@@ -409,10 +554,11 @@ mod tests {
             "index.html",
             None,
             Some("http://172.18.0.2:31500"),
+            None,
         );
         assert_eq!(
             url,
-            "http://172.18.0.2:31500/preview-abc12345.my-ns/index.html"
+            "http://172.18.0.2:31500/preview-abc12345.my-ns.8000/index.html"
         );
     }
 
@@ -424,10 +570,11 @@ mod tests {
             "api/data",
             Some("q=1"),
             Some("http://172.18.0.2:31500/"),
+            None,
         );
         assert_eq!(
             url,
-            "http://172.18.0.2:31500/preview-abc12345.my-ns/api/data?q=1"
+            "http://172.18.0.2:31500/preview-abc12345.my-ns.8000/api/data?q=1"
         );
     }
 
@@ -439,8 +586,28 @@ mod tests {
             "",
             None,
             Some("http://172.18.0.2:31500"),
+            None,
         );
-        assert_eq!(url, "http://172.18.0.2:31500/preview-abc12345.my-ns/");
+        assert_eq!(
+            url,
+            "http://172.18.0.2:31500/preview-abc12345.my-ns.8000/"
+        );
+    }
+
+    #[test]
+    fn test_build_backend_url_with_proxy_custom_port() {
+        let url = build_target_url(
+            "my-app",
+            "prod-ns",
+            "index.html",
+            None,
+            Some("http://172.18.0.2:31500"),
+            Some(8080),
+        );
+        assert_eq!(
+            url,
+            "http://172.18.0.2:31500/my-app.prod-ns.8080/index.html"
+        );
     }
 
     // -- strip_request_headers --
@@ -504,5 +671,32 @@ mod tests {
         assert!(!validate_namespace_format("has space"));
         assert!(!validate_namespace_format("UPPER"));
         assert!(!validate_namespace_format("my_ns"));
+    }
+
+    // -- build_target_url with custom port --
+
+    #[test]
+    fn test_build_target_url_with_custom_port() {
+        let url = build_target_url(
+            "my-svc",
+            "my-app-prod",
+            "index.html",
+            None,
+            None,
+            Some(3000),
+        );
+        assert_eq!(
+            url,
+            "http://my-svc.my-app-prod.svc.cluster.local:3000/index.html"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_default_port_none() {
+        let url = build_target_url("my-svc", "my-app-prod", "index.html", None, None, None);
+        assert_eq!(
+            url,
+            "http://my-svc.my-app-prod.svc.cluster.local:8000/index.html"
+        );
     }
 }

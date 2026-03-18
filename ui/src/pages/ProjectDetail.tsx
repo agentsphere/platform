@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, qs, type ListResponse } from '../lib/api';
-import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret, AgentSession } from '../lib/types';
+import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret, AgentSession, IframePanel } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { Badge } from '../components/Badge';
 import { StatusDot } from '../components/StatusDot';
@@ -11,12 +11,17 @@ import { Sessions } from './Sessions';
 
 interface Props { id?: string; tab?: string; }
 
-const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'webhooks', 'settings'];
+const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'skills', 'webhooks', 'settings'];
 
 export function ProjectDetail({ id, tab }: Props) {
   const [project, setProject] = useState<Project | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
-  const [hasActiveSession, setHasActiveSession] = useState(false);
+  const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [iframes, setIframes] = useState<IframePanel[]>([]);
+  const [deployIframes, setDeployIframes] = useState<IframePanel[]>([]);
+  const [activePreviewIdx, setActivePreviewIdx] = useState(0);
+  const [progressText, setProgressText] = useState<string | null>(null);
   const currentTab = tab || 'files';
 
   useEffect(() => {
@@ -24,19 +29,62 @@ export function ProjectDetail({ id, tab }: Props) {
   }, [id]);
 
   useEffect(() => {
-    if (id) {
-      api.get<ListResponse<AgentSession>>(`/api/projects/${id}/sessions?status=running&limit=1`)
-        .then(r => setHasActiveSession(r.items.length > 0)).catch(() => {});
-    }
+    if (!id) return;
+    api.get<ListResponse<AgentSession>>(`/api/projects/${id}/sessions?status=running&limit=1`)
+      .then(r => { if (r.items.length > 0) setActiveSession(r.items[0]); })
+      .catch(() => {});
+    api.get<ListResponse<Deployment>>(`/api/projects/${id}/deployments?limit=5`)
+      .then(r => setDeployments(r.items))
+      .catch(() => {});
   }, [id]);
 
+  // Fetch iframes + progress for active session
+  useEffect(() => {
+    if (!activeSession || !id) return;
+    api.get<IframePanel[]>(`/api/projects/${id}/sessions/${activeSession.id}/iframes`)
+      .then(setIframes).catch(() => setIframes([]));
+    api.get<{ message: string }>(`/api/projects/${id}/sessions/${activeSession.id}/progress`)
+      .then(r => setProgressText(r.message)).catch(() => {});
+  }, [activeSession, id]);
+
+  // Fetch deploy iframes when no session iframes
+  useEffect(() => {
+    if (!id || iframes.length > 0) return;
+    api.get<IframePanel[]>(`/api/projects/${id}/deploy-preview/iframes`)
+      .then(setDeployIframes)
+      .catch(() => setDeployIframes([]));
+  }, [id, iframes.length]);
+
   if (!project) return <div class="empty-state">Loading...</div>;
+
+  const displayName = project.display_name || project.name;
+  const initial = displayName.charAt(0).toUpperCase();
+  const activeIframes = iframes.length > 0 ? iframes : deployIframes;
+  const clampedIdx = Math.min(activePreviewIdx, Math.max(0, activeIframes.length - 1));
+  const currentIframe = activeIframes[clampedIdx];
+  const previewUrl = currentIframe?.preview_url ?? null;
+  const hasActiveSession = !!activeSession;
+
+  // Group deployments by env for the header
+  const envSummary = new Map<string, string>();
+  for (const d of deployments) {
+    if (!envSummary.has(d.environment)) {
+      envSummary.set(d.environment, d.current_status);
+    }
+  }
+
+  const statusColor = (s: string): string => {
+    if (s === 'healthy' || s === 'success' || s === 'running') return 'var(--success)';
+    if (s === 'degraded' || s === 'syncing' || s === 'pending') return 'var(--warning)';
+    if (s === 'failure' || s === 'failed' || s === 'error') return 'var(--danger)';
+    return 'var(--text-muted)';
+  };
 
   return (
     <div>
       <div class="flex-between mb-md">
         <div>
-          <h2>{project.display_name || project.name}</h2>
+          <h2>{displayName}</h2>
           {project.description && <p class="text-muted text-sm mt-sm">{project.description}</p>}
         </div>
         <div class="flex gap-sm" style="align-items:center">
@@ -46,7 +94,56 @@ export function ProjectDetail({ id, tab }: Props) {
           <Badge status={project.visibility} />
         </div>
       </div>
-      <div class="tabs">
+
+      {/* Preview + status header */}
+      <div class="project-header-card">
+        <div class="project-header-preview" style="position:relative">
+          {previewUrl ? (
+            <iframe src={previewUrl} tabIndex={-1} loading="lazy" />
+          ) : (
+            <div class="project-header-preview-placeholder">{initial}</div>
+          )}
+          {activeIframes.length > 1 && (
+            <div class="project-card-preview-dots">
+              {activeIframes.map((_, i) => (
+                <button key={i} class={`preview-dot ${i === clampedIdx ? 'active' : ''}`}
+                  onClick={() => setActivePreviewIdx(i)} />
+              ))}
+            </div>
+          )}
+        </div>
+        <div class="project-header-status">
+          {Array.from(envSummary.entries()).map(([env, status]) => (
+            <div key={env} class="project-header-status-row">
+              <span class="project-header-status-label" style="text-transform:capitalize">{env}</span>
+              <span class="project-header-status-value">
+                <span class="status-dot" style={`background:${statusColor(status)}`} />
+                {status}
+              </span>
+            </div>
+          ))}
+          {envSummary.size === 0 && (
+            <div class="project-header-status-row">
+              <span class="project-header-status-label">Deploy</span>
+              <span style="color:var(--text-muted)">Not deployed</span>
+            </div>
+          )}
+          <div class="project-header-status-row">
+            <span class="project-header-status-label">Session</span>
+            {activeSession ? (
+              <span class="project-header-status-value">
+                <span class="status-dot" style="background:var(--success)" />
+                {progressText || 'Running...'}
+              </span>
+            ) : (
+              <span style="color:var(--text-muted)">No active session</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Glass tab bar */}
+      <div class="tabs-glass">
         {TABS.map(t => (
           <a key={t} class={`tab${currentTab === t ? ' active' : ''}`}
             href={`/projects/${id}/${t}`}>{t === 'mrs' ? 'MRs' : t === 'sessions' ? 'Sessions' : t[0].toUpperCase() + t.slice(1)}</a>
@@ -58,6 +155,7 @@ export function ProjectDetail({ id, tab }: Props) {
       {currentTab === 'builds' && <BuildsTab projectId={id!} />}
       {currentTab === 'deployments' && <DeploymentsTab projectId={id!} />}
       {currentTab === 'sessions' && <Sessions projectId={id!} />}
+      {currentTab === 'skills' && <SkillsTab projectId={id!} />}
       {currentTab === 'webhooks' && <WebhooksTab projectId={id!} />}
       {currentTab === 'settings' && <SettingsTab project={project} onUpdate={setProject} />}
       <AgentChatPanel projectId={id!} open={chatOpen} onClose={() => setChatOpen(false)} />
@@ -508,6 +606,97 @@ function DeploymentsTab({ projectId }: { projectId: string }) {
           <button class="btn" onClick={() => setShowRollback(false)}>Cancel</button>
           <button class="btn btn-primary" onClick={rollback} disabled={!rollbackImage}>Deploy</button>
         </div>
+      </Modal>
+    </div>
+  );
+}
+
+interface ResolvedCommand {
+  name: string;
+  prompt_template: string;
+  scope: string;
+  persistent_session: boolean;
+}
+
+function SkillsTab({ projectId }: { projectId: string }) {
+  const [resolved, setResolved] = useState<ResolvedCommand[]>([]);
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState({ name: '', description: '', prompt_template: '', persistent_session: false });
+  const [error, setError] = useState('');
+
+  const load = () => {
+    api.get<ResolvedCommand[]>(`/api/commands/resolved${qs({ project_id: projectId })}`)
+      .then(setResolved).catch(() => {});
+  };
+  useEffect(load, [projectId]);
+
+  const create = async (e: Event) => {
+    e.preventDefault();
+    setError('');
+    try {
+      await api.post('/api/commands', { ...form, project_id: projectId });
+      setShowCreate(false);
+      setForm({ name: '', description: '', prompt_template: '', persistent_session: false });
+      load();
+    } catch (err: any) { setError(err.message); }
+  };
+
+  return (
+    <div>
+      <div class="flex-between mb-md">
+        <span class="text-muted text-sm">
+          Showing resolved skills (project overrides workspace overrides global). Repo commands (.claude/commands/) take highest priority at runtime.
+        </span>
+        <button class="btn btn-primary btn-sm" onClick={() => { setShowCreate(true); setError(''); }}>New Project Skill</button>
+      </div>
+      <div class="card">
+        {resolved.length === 0 ? <div class="empty-state">No skills defined</div> : (
+          <table class="table">
+            <thead><tr><th>Name</th><th>Scope</th><th>Persistent</th></tr></thead>
+            <tbody>
+              {resolved.map(c => (
+                <tr key={c.name}>
+                  <td class="mono">/{c.name}</td>
+                  <td><Badge status={c.scope} /></td>
+                  <td>{c.persistent_session ? 'Yes' : ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="New Project Skill">
+        <form onSubmit={create}>
+          <div class="form-group">
+            <label>Name</label>
+            <input class="input" required placeholder="e.g. dev, review" value={form.name}
+              onInput={(e) => setForm({ ...form, name: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input class="input" value={form.description}
+              onInput={(e) => setForm({ ...form, description: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Prompt Template</label>
+            <textarea class="input mono" rows={8} required value={form.prompt_template}
+              placeholder="Use $ARGUMENTS for user input"
+              onInput={(e) => setForm({ ...form, prompt_template: (e.target as HTMLTextAreaElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>
+              <input type="checkbox" checked={form.persistent_session}
+                onChange={() => setForm({ ...form, persistent_session: !form.persistent_session })} />
+              {' '}Persistent session
+            </label>
+          </div>
+          {error && <div class="error-msg">{error}</div>}
+          <div class="modal-actions">
+            <button type="button" class="btn" onClick={() => setShowCreate(false)}>Cancel</button>
+            <button type="submit" class="btn btn-primary">Create</button>
+          </div>
+        </form>
       </Modal>
     </div>
   );

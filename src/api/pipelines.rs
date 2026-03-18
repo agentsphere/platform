@@ -67,6 +67,8 @@ pub struct StepResponse {
     pub exit_code: Option<i32>,
     pub duration_ms: Option<i32>,
     pub log_ref: Option<String>,
+    pub gate: bool,
+    pub depends_on: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -254,7 +256,8 @@ async fn get_pipeline(
 
     let steps = sqlx::query!(
         r#"
-        SELECT id, step_order, name, image, status, exit_code, duration_ms, log_ref, created_at
+        SELECT id, step_order, name, image, status, exit_code, duration_ms, log_ref,
+               gate, depends_on, created_at
         FROM pipeline_steps
         WHERE pipeline_id = $1
         ORDER BY step_order ASC
@@ -275,6 +278,8 @@ async fn get_pipeline(
             exit_code: s.exit_code,
             duration_ms: s.duration_ms,
             log_ref: s.log_ref,
+            gate: s.gate,
+            depends_on: s.depends_on,
             created_at: s.created_at,
         })
         .collect();

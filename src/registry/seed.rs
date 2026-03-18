@@ -131,16 +131,27 @@ pub async fn seed_all(
             continue;
         };
 
-        // Look up repository by name
-        let repo_id: Option<Uuid> =
+        // Look up or auto-create system repository (project_id = NULL)
+        let existing: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM registry_repositories WHERE name = $1")
                 .bind(&repo_name)
                 .fetch_optional(pool)
                 .await?;
 
-        let Some(repo_id) = repo_id else {
-            tracing::debug!(repo = %repo_name, "no registry_repository found, skipping seed");
-            continue;
+        let repo_id = if let Some(id) = existing {
+            id
+        } else {
+            let new_id = Uuid::new_v4();
+            sqlx::query_scalar(
+                "INSERT INTO registry_repositories (id, project_id, name) \
+                 VALUES ($1, NULL, $2) \
+                 ON CONFLICT (name) DO UPDATE SET updated_at = now() \
+                 RETURNING id",
+            )
+            .bind(new_id)
+            .bind(&repo_name)
+            .fetch_one(pool)
+            .await?
         };
 
         match seed_image_cached(pool, minio, repo_id, &path, "latest").await {

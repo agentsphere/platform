@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.id AS \"repository_id!\",\n                  r.project_id AS \"project_id?\",\n                  p.owner_id AS \"owner_id?\",\n                  p.workspace_id AS \"workspace_id?\",\n                  p.visibility AS \"visibility?\"\n           FROM registry_repositories r\n           LEFT JOIN projects p ON p.id = r.project_id AND p.is_active = true\n           WHERE r.name = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "owner_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "visibility?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9ebafac4d17f70fc652411ebd3cb0c0d87643ad89333428becccc2f61f84b4b4"
+}

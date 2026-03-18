@@ -8,9 +8,21 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { appendFileSync } from "node:fs";
 import { apiGet, apiPost, apiPatch, apiDelete, PROJECT_ID } from "../lib/client.js";
 
 const SESSION_ID = process.env.SESSION_ID || "";
+const ENV_DEV_PATH = "/workspace/.env.dev";
+
+/** Append a secret to .env.dev so the agent can source it for app dev. */
+function appendToEnvDev(name, value) {
+  try {
+    const escaped = value.replace(/'/g, "'\\''");
+    appendFileSync(ENV_DEV_PATH, `${name}='${escaped}'\n`);
+  } catch {
+    // Non-fatal — workspace may not be writable
+  }
+}
 
 const server = new Server(
   { name: "platform-core", version: "0.1.0" },
@@ -143,7 +155,7 @@ const TOOLS = [
     description:
       "Request a secret from the user (e.g. API key, password). " +
       "Creates a pending secret request that appears in the UI. " +
-      "The user enters the value in a modal, then this tool returns it. " +
+      "The user enters the value in a modal, then this tool returns the secret value. " +
       "Polls until the user responds or the request times out (5 min).",
     inputSchema: {
       type: "object",
@@ -167,6 +179,50 @@ const TOOLS = [
         },
       },
       required: ["name", "prompt"],
+    },
+  },
+  {
+    name: "get_worker_progress",
+    description:
+      "Get the latest progress/task list from a worker agent session. " +
+      "Returns the structured progress markdown that the worker maintains at .platform/progress.md.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "Worker session UUID",
+        },
+        project_id: {
+          type: "string",
+          description: "Project UUID (defaults to current project)",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "read_secret",
+    description:
+      "Read a stored secret value by name. Returns the decrypted value. " +
+      "Use this to retrieve secrets that were previously stored (e.g. via ask_for_secret or the UI).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Secret name (e.g. STRIPE_API_KEY)",
+        },
+        scope: {
+          type: "string",
+          description: "Secret scope filter (default: 'agent'). One of: agent, pipeline, deploy, all.",
+        },
+        project_id: {
+          type: "string",
+          description: "Project UUID (defaults to current project)",
+        },
+      },
+      required: ["name"],
     },
   },
 ];
@@ -264,16 +320,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await new Promise((r) => setTimeout(r, 2000));
         const status = await apiGet(`/api/projects/${p}/secret-requests/${requestId}`);
         if (status.status === "completed") {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                secret_request_id: requestId,
-                status: "completed",
-                name: status.name,
-              }, null, 2),
-            }],
-          };
+          // Read the decrypted secret value
+          try {
+            const secret = await apiGet(`/api/projects/${p}/secrets/${encodeURIComponent(args.name)}`, {
+              query: { scope: "agent" },
+            });
+            appendToEnvDev(secret.name, secret.value);
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "completed",
+                  name: secret.name,
+                  value: secret.value,
+                }, null, 2),
+              }],
+            };
+          } catch (readErr) {
+            // Fallback: secret was stored but we couldn't read it back
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "completed",
+                  name: status.name,
+                  note: "Secret stored but could not be read back: " + readErr.message,
+                }, null, 2),
+              }],
+            };
+          }
         }
         if (status.status === "timed_out") {
           return {
@@ -286,6 +361,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         content: [{ type: "text", text: `Secret request polling timed out for "${args.name}".` }],
         isError: true,
+      };
+    }
+    case "get_worker_progress": {
+      const p = args.project_id || PROJECT_ID;
+      if (!p) throw new Error("PROJECT_ID not set and no project_id provided");
+      try {
+        const data = await apiGet(`/api/projects/${p}/sessions/${args.session_id}/progress`);
+        return { content: [{ type: "text", text: data.content || "No progress updates yet." }] };
+      } catch (err) {
+        if (err.message && err.message.includes("404")) {
+          return { content: [{ type: "text", text: "No progress updates yet for this session." }] };
+        }
+        throw err;
+      }
+    }
+    case "read_secret": {
+      const p = args.project_id || PROJECT_ID;
+      if (!p) throw new Error("PROJECT_ID not set and no project_id provided");
+      const scope = args.scope || "agent";
+      const secret = await apiGet(`/api/projects/${p}/secrets/${encodeURIComponent(args.name)}`, {
+        query: { scope },
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(secret, null, 2) }],
       };
     }
     default:

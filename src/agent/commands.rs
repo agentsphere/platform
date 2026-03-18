@@ -29,12 +29,22 @@ pub struct ResolvedCommand {
 pub struct CommandRecord {
     pub id: Uuid,
     pub project_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
     pub name: String,
     pub description: String,
     pub prompt_template: String,
     pub persistent_session: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A resolved command file entry (for the `/api/commands/resolved` endpoint).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolvedCommandFile {
+    pub name: String,
+    pub prompt_template: String,
+    pub scope: String,
+    pub persistent_session: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,24 +123,25 @@ pub fn render_template(template: &str, arguments: &str) -> String {
 // Resolution (DB lookup)
 // ---------------------------------------------------------------------------
 
-/// Resolve a command by name, checking project-scoped first, then global.
+/// Resolve a command by name, checking project → workspace → global.
 ///
 /// Returns the rendered prompt with `$ARGUMENTS` replaced.
 #[tracing::instrument(skip(pool), err)]
 pub async fn resolve_command(
     pool: &PgPool,
     project_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
     input: &str,
 ) -> Result<ResolvedCommand, ApiError> {
     let parsed = parse_command_input(input)
         .ok_or_else(|| ApiError::BadRequest("input is not a command (must start with /)".into()))?;
 
-    // Try project-scoped first, then global
+    // Try project-scoped first, then workspace, then global
     let record = if let Some(pid) = project_id {
         let project_cmd = sqlx::query_as!(
             CommandRecord,
             r#"
-            SELECT id, project_id, name, description, prompt_template,
+            SELECT id, project_id, workspace_id, name, description, prompt_template,
                    persistent_session, created_at, updated_at
             FROM platform_commands
             WHERE name = $1 AND project_id = $2
@@ -143,10 +154,10 @@ pub async fn resolve_command(
 
         match project_cmd {
             Some(cmd) => cmd,
-            None => fetch_global_command(pool, &parsed.name).await?,
+            None => fetch_workspace_or_global(pool, workspace_id, &parsed.name).await?,
         }
     } else {
-        fetch_global_command(pool, &parsed.name).await?
+        fetch_workspace_or_global(pool, workspace_id, &parsed.name).await?
     };
 
     let prompt = render_template(&record.prompt_template, &parsed.arguments);
@@ -158,20 +169,97 @@ pub async fn resolve_command(
     })
 }
 
+/// Try workspace-scoped first, then global.
+async fn fetch_workspace_or_global(
+    pool: &PgPool,
+    workspace_id: Option<Uuid>,
+    name: &str,
+) -> Result<CommandRecord, ApiError> {
+    if let Some(wid) = workspace_id {
+        let ws_cmd = sqlx::query_as!(
+            CommandRecord,
+            r#"
+            SELECT id, project_id, workspace_id, name, description, prompt_template,
+                   persistent_session, created_at, updated_at
+            FROM platform_commands
+            WHERE name = $1 AND workspace_id = $2 AND project_id IS NULL
+            "#,
+            name,
+            wid,
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(cmd) = ws_cmd {
+            return Ok(cmd);
+        }
+    }
+    fetch_global_command(pool, name).await
+}
+
 async fn fetch_global_command(pool: &PgPool, name: &str) -> Result<CommandRecord, ApiError> {
     sqlx::query_as!(
         CommandRecord,
         r#"
-        SELECT id, project_id, name, description, prompt_template,
+        SELECT id, project_id, workspace_id, name, description, prompt_template,
                persistent_session, created_at, updated_at
         FROM platform_commands
-        WHERE name = $1 AND project_id IS NULL
+        WHERE name = $1 AND project_id IS NULL AND workspace_id IS NULL
         "#,
         name,
     )
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("command '{name}' not found")))
+}
+
+/// Resolve all commands for a project, applying the override hierarchy:
+/// project > workspace > global. Returns the merged set with scope annotations.
+#[tracing::instrument(skip(pool), err)]
+pub async fn resolve_all_commands(
+    pool: &PgPool,
+    project_id: Uuid,
+    workspace_id: Option<Uuid>,
+) -> Result<Vec<ResolvedCommandFile>, ApiError> {
+    let rows = sqlx::query_as!(
+        CommandRecord,
+        r#"
+        SELECT DISTINCT ON (name)
+            id, project_id, workspace_id, name, description, prompt_template,
+            persistent_session, created_at, updated_at
+        FROM platform_commands
+        WHERE (project_id IS NULL AND workspace_id IS NULL)
+           OR (workspace_id = $1 AND project_id IS NULL)
+           OR (project_id = $2)
+        ORDER BY name,
+            CASE WHEN project_id IS NOT NULL THEN 1
+                 WHEN workspace_id IS NOT NULL THEN 2
+                 ELSE 3 END
+        "#,
+        workspace_id,
+        project_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let scope = if r.project_id.is_some() {
+                "project"
+            } else if r.workspace_id.is_some() {
+                "workspace"
+            } else {
+                "global"
+            };
+            ResolvedCommandFile {
+                name: r.name,
+                prompt_template: r.prompt_template,
+                scope: scope.to_owned(),
+                persistent_session: r.persistent_session,
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -120,7 +120,7 @@ pub async fn start_upload(
     let upload_id = Uuid::new_v4();
     let session = UploadSession {
         repository_id: repository_id.to_string(),
-        project_id: project_id.to_string(),
+        project_id: project_id.map(|id| id.to_string()).unwrap_or_default(),
         user_id: user.user_id.to_string(),
         offset: 0,
         part_count: 0,

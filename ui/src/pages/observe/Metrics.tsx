@@ -2,6 +2,13 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { api, qs, type ListResponse } from '../../lib/api';
 import type { MetricSeries, Project } from '../../lib/types';
 
+interface MetricNameEntry {
+  name: string;
+  labels: Record<string, unknown>;
+  metric_type: string;
+  unit: string | null;
+}
+
 const TIME_RANGES: { value: string; label: string; seconds: number }[] = [
   { value: '1h', label: '1 hour', seconds: 3600 },
   { value: '6h', label: '6 hours', seconds: 21600 },
@@ -27,10 +34,20 @@ export function Metrics() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const intervalRef = useRef<number | null>(null);
 
+  // Fetch metric names (refetch when project changes)
   useEffect(() => {
-    api.get<string[]>('/api/observe/metrics/names')
-      .then(n => { setNames(n); if (n.length > 0 && !selectedMetric) setSelectedMetric(n[0]); })
+    const params: Record<string, string> = {};
+    if (selectedProject) params.project_id = selectedProject;
+    api.get<MetricNameEntry[]>(`/api/observe/metrics/names${qs(params)}`)
+      .then(entries => {
+        const unique = [...new Set(entries.map(e => e.name))].sort();
+        setNames(unique);
+        if (unique.length > 0 && !unique.includes(selectedMetric)) setSelectedMetric(unique[0]);
+      })
       .catch(() => {});
+  }, [selectedProject]);
+
+  useEffect(() => {
     api.get<ListResponse<Project>>('/api/projects?limit=100')
       .then(r => setProjects(r.items))
       .catch(() => {});
@@ -51,7 +68,7 @@ export function Metrics() {
 
   useEffect(() => {
     loadData();
-  }, [selectedMetric, timeRange]);
+  }, [selectedMetric, timeRange, selectedProject]);
 
   useEffect(() => {
     if (autoRefresh) {

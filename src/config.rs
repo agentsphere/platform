@@ -52,6 +52,9 @@ pub struct Config {
     /// Directory containing cross-compiled agent-runner binaries.
     /// Expected layout: `{dir}/amd64`, `{dir}/arm64`
     pub agent_runner_dir: PathBuf,
+    /// Path to the MCP servers tarball served to agent pods at startup.
+    /// Built by `just build` / `hack/build-agent-images.sh`.
+    pub mcp_servers_tarball: PathBuf,
     /// Claude CLI version for auto-setup in agent pods.
     /// Used by the setup init container: `npm install -g @anthropic-ai/claude-code@<version>`.
     pub claude_cli_version: String,
@@ -66,6 +69,8 @@ pub struct Config {
     pub registry_node_url: Option<String>,
     /// Directory containing OCI layout tarballs to seed into the registry on startup.
     pub seed_images_path: PathBuf,
+    /// Directory containing `.md` command templates to seed as global commands on startup.
+    pub seed_commands_path: PathBuf,
     /// Health check interval in seconds (default 15).
     pub health_check_interval_secs: u64,
     /// Minimum tracing level for platform self-observability (default "warn").
@@ -77,6 +82,8 @@ pub struct Config {
     /// When set, preview requests route through this proxy instead of direct K8s DNS.
     /// Example: `http://172.18.0.2:31500`
     pub preview_proxy_url: Option<String>,
+    /// Maximum concurrent pipeline step pods per pipeline (default 4).
+    pub pipeline_max_parallel: usize,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -155,6 +162,8 @@ impl Config {
             valkey_agent_host,
             agent_runner_dir: env::var("PLATFORM_AGENT_RUNNER_DIR")
                 .map_or_else(|_| PathBuf::from("/data/agent-runner"), PathBuf::from),
+            mcp_servers_tarball: env::var("PLATFORM_MCP_SERVERS_TARBALL")
+                .map_or_else(|_| PathBuf::from("/data/mcp-servers.tar.gz"), PathBuf::from),
             claude_cli_version: env::var("PLATFORM_CLAUDE_CLI_VERSION")
                 .unwrap_or_else(|_| "stable".into()),
             ns_prefix: env::var("PLATFORM_NS_PREFIX").ok(),
@@ -163,6 +172,8 @@ impl Config {
             registry_node_url: env::var("PLATFORM_REGISTRY_NODE_URL").ok(),
             seed_images_path: env::var("PLATFORM_SEED_IMAGES_PATH")
                 .map_or_else(|_| PathBuf::from("/data/seed-images"), PathBuf::from),
+            seed_commands_path: env::var("PLATFORM_SEED_COMMANDS_PATH")
+                .map_or_else(|_| PathBuf::from("/data/seed-commands"), PathBuf::from),
             health_check_interval_secs: env::var("PLATFORM_HEALTH_CHECK_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -174,6 +185,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
             preview_proxy_url: env::var("PLATFORM_PREVIEW_PROXY_URL").ok(),
+            pipeline_max_parallel: env::var("PLATFORM_PIPELINE_MAX_PARALLEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
         }
     }
 
@@ -237,15 +252,18 @@ impl Config {
             max_cli_subprocesses: 10,
             valkey_agent_host: "localhost:6379".into(),
             agent_runner_dir: "/tmp/test-agent-runner".into(),
+            mcp_servers_tarball: "/tmp/test-mcp-servers.tar.gz".into(),
             claude_cli_version: "stable".into(),
             ns_prefix: None,
             cli_spawn_enabled: true,
             registry_node_url: None,
             seed_images_path: "/tmp/seed-images".into(),
+            seed_commands_path: "/tmp/seed-commands".into(),
             health_check_interval_secs: 15,
             self_observe_level: "warn".into(),
             session_idle_timeout_secs: 1800,
             preview_proxy_url: None,
+            pipeline_max_parallel: 4,
         }
     }
 }

@@ -151,9 +151,15 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         registry_node_url: std::env::var("PLATFORM_REGISTRY_NODE_URL").ok(),
         seed_images_path: std::env::var("PLATFORM_SEED_IMAGES_PATH")
             .map_or_else(|_| "/tmp/seed-images".into(), std::path::PathBuf::from),
+        seed_commands_path: std::env::var("PLATFORM_SEED_COMMANDS_PATH")
+            .map_or_else(|_| "/tmp/seed-commands".into(), std::path::PathBuf::from),
         health_check_interval_secs: 15,
         self_observe_level: "warn".into(),
         session_idle_timeout_secs: 1800,
+        preview_proxy_url: std::env::var("PLATFORM_PREVIEW_PROXY_URL").ok(),
+        pipeline_max_parallel: 4,
+        mcp_servers_tarball: std::env::var("PLATFORM_MCP_SERVERS_TARBALL")
+            .map_or_else(|_| "/tmp/mcp-servers.tar.gz".into(), PathBuf::from),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)
@@ -183,6 +189,7 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
             platform::health::HealthSnapshot::default(),
         )),
         task_registry: Arc::new(platform::health::TaskRegistry::new()),
+        cli_auth_manager: Arc::new(platform::onboarding::claude_auth::CliAuthManager::new()),
     };
 
     // Create an API token for the bootstrap admin directly in the DB,

@@ -11,23 +11,43 @@ const MCP_SERVERS: &[&str] = &[
     "platform-observe",
 ];
 
-/// Base path for MCP server JS files inside the container.
-const MCP_SERVER_BASE_PATH: &str = "/opt/mcp/servers";
+/// Workspace-downloaded MCP path (init container extracts here).
+const MCP_WORKSPACE_PATH: &str = "/workspace/.platform/mcp/servers";
+/// Baked-in MCP path from Docker image (fallback).
+const MCP_BAKED_IN_PATH: &str = "/usr/local/lib/mcp/servers";
+
+/// Resolve the MCP server base path: prefer workspace download, fallback to baked-in.
+fn mcp_server_base_path() -> &'static str {
+    if Path::new(MCP_WORKSPACE_PATH).is_dir() {
+        MCP_WORKSPACE_PATH
+    } else {
+        MCP_BAKED_IN_PATH
+    }
+}
+
+/// Context vars passed to each MCP server process.
+pub struct McpContext<'a> {
+    pub platform_api_url: &'a str,
+    pub platform_api_token: &'a str,
+    pub session_id: &'a str,
+    pub project_id: &'a str,
+}
 
 /// Generate MCP config JSON for the agent's Claude CLI invocation.
-///
-/// Returns `None` if `PLATFORM_API_TOKEN` or `PLATFORM_API_URL` are not set.
-pub fn generate_mcp_config(platform_api_url: &str, platform_api_token: &str) -> serde_json::Value {
+pub fn generate_mcp_config(ctx: &McpContext<'_>) -> serde_json::Value {
+    let base_path = mcp_server_base_path();
     let mut servers = serde_json::Map::new();
 
     for server_name in MCP_SERVERS {
-        let server_path = format!("{MCP_SERVER_BASE_PATH}/{server_name}.js");
+        let server_path = format!("{base_path}/{server_name}.js");
         let server_config = serde_json::json!({
             "command": "node",
             "args": [server_path],
             "env": {
-                "PLATFORM_API_URL": platform_api_url,
-                "PLATFORM_API_TOKEN": platform_api_token,
+                "PLATFORM_API_URL": ctx.platform_api_url,
+                "PLATFORM_API_TOKEN": ctx.platform_api_token,
+                "SESSION_ID": ctx.session_id,
+                "PROJECT_ID": ctx.project_id,
             }
         });
         servers.insert((*server_name).to_owned(), server_config);
@@ -54,30 +74,47 @@ pub fn resolve_mcp_config() -> Option<serde_json::Value> {
     let api_token = std::env::var("PLATFORM_API_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())?;
-    Some(generate_mcp_config(&api_url, &api_token))
+    let session_id = std::env::var("SESSION_ID").unwrap_or_default();
+    let project_id = std::env::var("PROJECT_ID").unwrap_or_default();
+    Some(generate_mcp_config(&McpContext {
+        platform_api_url: &api_url,
+        platform_api_token: &api_token,
+        session_id: &session_id,
+        project_id: &project_id,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_ctx() -> McpContext<'static> {
+        McpContext {
+            platform_api_url: "http://platform:8080",
+            platform_api_token: "tok-123",
+            session_id: "sess-abc",
+            project_id: "proj-xyz",
+        }
+    }
+
     #[test]
     fn test_generate_mcp_config_valid_json() {
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let config = generate_mcp_config(&test_ctx());
         let servers = config["mcpServers"].as_object().unwrap();
         assert_eq!(servers.len(), 5, "should have 5 MCP servers");
     }
 
     #[test]
     fn test_generate_mcp_config_correct_paths() {
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let base = mcp_server_base_path();
+        let config = generate_mcp_config(&test_ctx());
         let servers = config["mcpServers"].as_object().unwrap();
         for (name, server) in servers {
             let args = server["args"].as_array().unwrap();
             let path = args[0].as_str().unwrap();
             assert_eq!(
                 path,
-                format!("/opt/mcp/servers/{name}.js"),
+                format!("{base}/{name}.js"),
                 "server path mismatch for {name}"
             );
             assert_eq!(server["command"], "node");
@@ -86,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_generate_mcp_config_excludes_admin() {
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let config = generate_mcp_config(&test_ctx());
         let servers = config["mcpServers"].as_object().unwrap();
         assert!(
             !servers.contains_key("platform-admin"),
@@ -96,19 +133,27 @@ mod tests {
 
     #[test]
     fn test_generate_mcp_config_injects_env_vars() {
-        let config = generate_mcp_config("http://my-platform:8080", "my-token");
+        let ctx = McpContext {
+            platform_api_url: "http://my-platform:8080",
+            platform_api_token: "my-token",
+            session_id: "my-session",
+            project_id: "my-project",
+        };
+        let config = generate_mcp_config(&ctx);
         let servers = config["mcpServers"].as_object().unwrap();
         for (_name, server) in servers {
             let env = server["env"].as_object().unwrap();
             assert_eq!(env["PLATFORM_API_URL"], "http://my-platform:8080");
             assert_eq!(env["PLATFORM_API_TOKEN"], "my-token");
+            assert_eq!(env["SESSION_ID"], "my-session");
+            assert_eq!(env["PROJECT_ID"], "my-project");
         }
     }
 
     #[test]
     fn test_generate_mcp_config_file_written() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let config = generate_mcp_config(&test_ctx());
         let path = write_mcp_config(dir.path(), &config).unwrap();
         assert!(path.exists(), "config file should exist");
         let content: serde_json::Value =
@@ -118,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_mcp_config_all_server_names() {
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let config = generate_mcp_config(&test_ctx());
         let servers = config["mcpServers"].as_object().unwrap();
         let names: Vec<&str> = servers.keys().map(|s| s.as_str()).collect();
         assert!(names.contains(&"platform-core"));
@@ -237,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_write_mcp_config_to_nonexistent_dir_fails() {
-        let config = generate_mcp_config("http://platform:8080", "tok-123");
+        let config = generate_mcp_config(&test_ctx());
         let result = write_mcp_config(Path::new("/nonexistent/dir/path"), &config);
         assert!(result.is_err());
     }

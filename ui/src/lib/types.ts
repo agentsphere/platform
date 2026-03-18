@@ -92,11 +92,30 @@ export type { ValidateKeyResponse } from './generated/ValidateKeyResponse';
 // Pagination (also re-exported from api.ts)
 export type { ListResponse } from './generated/ListResponse';
 
+// Commands / Skills
+export interface Command {
+  id: string;
+  project_id: string | null;
+  workspace_id: string | null;
+  name: string;
+  description: string;
+  persistent_session: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ResolvedCommand {
+  name: string;
+  prompt_template: string;
+  scope: 'global' | 'workspace' | 'project';
+  persistent_session: boolean;
+}
+
 // --- Manual types (not backed by a Rust struct) ---
 
 // WebSocket progress events from agent sessions
 export interface ProgressEvent {
-  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'WaitingForInput' | 'Text' | 'SecretRequest' | 'IframeAvailable' | 'IframeRemoved';
+  kind: 'Thinking' | 'ToolCall' | 'ToolResult' | 'Milestone' | 'Error' | 'Completed' | 'WaitingForInput' | 'Text' | 'SecretRequest' | 'IframeAvailable' | 'IframeRemoved' | 'ProgressUpdate';
   message: string;
   metadata?: Record<string, any>;
 }

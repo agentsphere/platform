@@ -1,0 +1,1 @@
+{"description": "Full dev workflow: read CLAUDE.md, install tools, deploy deps, write tests, implement, test locally, push + create MR", "persistent_session": true}

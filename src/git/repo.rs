@@ -54,6 +54,48 @@ pub async fn init_bare_repo(
     Ok(repo_dir)
 }
 
+/// Initialize a bare repo with custom template files (instead of the default project templates).
+/// Used by demo project creation to provide demo-specific files.
+#[tracing::instrument(skip(repos_path, files), fields(%owner, %name, %default_branch), err)]
+pub async fn init_bare_repo_with_files(
+    repos_path: &Path,
+    owner: &str,
+    name: &str,
+    default_branch: &str,
+    files: &[templates::TemplateFile],
+) -> anyhow::Result<PathBuf> {
+    let repo_dir = repos_path.join(owner).join(format!("{name}.git"));
+
+    tokio::fs::create_dir_all(&repo_dir)
+        .await
+        .context("failed to create repo directory")?;
+
+    let output = tokio::process::Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg(&repo_dir)
+        .output()
+        .await
+        .context("failed to run git init")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git init failed: {stderr}");
+    }
+
+    let head_ref = format!("ref: refs/heads/{default_branch}\n");
+    tokio::fs::write(repo_dir.join("HEAD"), head_ref)
+        .await
+        .context("failed to set HEAD")?;
+
+    create_initial_commit(&repo_dir, default_branch, files)
+        .await
+        .context("failed to create initial commit")?;
+
+    tracing::info!(path = %repo_dir.display(), "bare repository initialized with custom files");
+    Ok(repo_dir)
+}
+
 /// Create the initial commit with template files in a bare repo using git plumbing.
 ///
 /// Supports arbitrarily nested paths (e.g. `.claude/commands/dev.md`) by

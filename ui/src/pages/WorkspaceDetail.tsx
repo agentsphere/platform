@@ -6,6 +6,17 @@ import { Badge } from '../components/Badge';
 import { Modal } from '../components/Modal';
 import { useAuth } from '../lib/auth';
 
+interface WsCommand {
+  id: string;
+  project_id: string | null;
+  workspace_id: string | null;
+  name: string;
+  description: string;
+  persistent_session: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 interface Props {
   id?: string;
   path?: string;
@@ -17,8 +28,12 @@ export function WorkspaceDetail({ id }: Props) {
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectTotal, setProjectTotal] = useState(0);
-  const [tab, setTab] = useState<'projects' | 'members' | 'settings'>('projects');
+  const [tab, setTab] = useState<'projects' | 'members' | 'skills' | 'settings'>('projects');
   const [showAddMember, setShowAddMember] = useState(false);
+  const [skills, setSkills] = useState<WsCommand[]>([]);
+  const [showCreateSkill, setShowCreateSkill] = useState(false);
+  const [skillForm, setSkillForm] = useState({ name: '', description: '', prompt_template: '', persistent_session: false });
+  const [skillError, setSkillError] = useState('');
   const [addForm, setAddForm] = useState({ user_id: '', role: 'member' });
   const [editForm, setEditForm] = useState({ display_name: '', description: '' });
   const [error, setError] = useState('');
@@ -43,7 +58,12 @@ export function WorkspaceDetail({ id }: Props) {
       .catch(() => {});
   };
 
-  useEffect(() => { loadWorkspace(); loadMembers(); loadProjects(); }, [id]);
+  const loadSkills = () => {
+    if (!id) return;
+    api.get<{ items: WsCommand[]; total: number }>(`/api/workspaces/${id}/commands`).then(r => setSkills(r.items)).catch(() => {});
+  };
+
+  useEffect(() => { loadWorkspace(); loadMembers(); loadProjects(); loadSkills(); }, [id]);
 
   const isOwnerOrAdmin = members.some(
     m => m.user_id === user?.id && (m.role === 'owner' || m.role === 'admin')
@@ -98,6 +118,24 @@ export function WorkspaceDetail({ id }: Props) {
     }
   };
 
+  const createSkill = async (e: Event) => {
+    e.preventDefault();
+    setSkillError('');
+    try {
+      await api.post(`/api/workspaces/${id}/commands`, skillForm);
+      setShowCreateSkill(false);
+      setSkillForm({ name: '', description: '', prompt_template: '', persistent_session: false });
+      loadSkills();
+    } catch (err: any) { setSkillError(err.message); }
+  };
+
+  const deleteSkill = async (cmdId: string) => {
+    try {
+      await api.del(`/api/workspaces/${id}/commands/${cmdId}`);
+      loadSkills();
+    } catch (err: any) { setError(err.message); }
+  };
+
   if (!ws) return <div class="loading">Loading...</div>;
 
   return (
@@ -115,6 +153,9 @@ export function WorkspaceDetail({ id }: Props) {
         </button>
         <button class={`tab${tab === 'members' ? ' active' : ''}`} onClick={() => setTab('members')}>
           Members ({members.length})
+        </button>
+        <button class={`tab${tab === 'skills' ? ' active' : ''}`} onClick={() => setTab('skills')}>
+          Skills
         </button>
         {isOwnerOrAdmin && (
           <button class={`tab${tab === 'settings' ? ' active' : ''}`} onClick={() => setTab('settings')}>
@@ -179,6 +220,45 @@ export function WorkspaceDetail({ id }: Props) {
         </div>
       )}
 
+      {tab === 'skills' && (
+        <div class="card">
+          {isOwnerOrAdmin && (
+            <div class="mb-md">
+              <button class="btn btn-primary btn-sm" onClick={() => { setShowCreateSkill(true); setSkillError(''); }}>New Workspace Skill</button>
+            </div>
+          )}
+          {skills.length === 0 ? <div class="empty-state">No skills defined</div> : (
+            <table class="table">
+              <thead><tr><th>Name</th><th>Scope</th><th>Description</th><th>Persistent</th>{isOwnerOrAdmin && <th />}</tr></thead>
+              <tbody>
+                {skills.map(c => (
+                  <tr key={c.id}>
+                    <td class="mono">/{c.name}</td>
+                    <td><Badge status={c.workspace_id ? 'workspace' : 'global'} /></td>
+                    <td class="text-sm">{c.description || <span class="text-muted">-</span>}</td>
+                    <td>{c.persistent_session ? 'Yes' : ''}</td>
+                    {isOwnerOrAdmin && (
+                      <td>
+                        {c.workspace_id && (
+                          <button class="btn btn-ghost btn-sm" onClick={() => deleteSkill(c.id)}>Delete</button>
+                        )}
+                        {!c.workspace_id && (
+                          <button class="btn btn-ghost btn-sm" onClick={() => {
+                            setSkillForm({ name: c.name, description: c.description, prompt_template: '', persistent_session: c.persistent_session });
+                            setShowCreateSkill(true);
+                            setSkillError('');
+                          }}>Override</button>
+                        )}
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
       {tab === 'settings' && isOwnerOrAdmin && (
         <div class="card">
           <form onSubmit={updateWorkspace}>
@@ -201,6 +281,39 @@ export function WorkspaceDetail({ id }: Props) {
           </div>
         </div>
       )}
+
+      <Modal open={showCreateSkill} onClose={() => setShowCreateSkill(false)} title="New Workspace Skill">
+        <form onSubmit={createSkill}>
+          <div class="form-group">
+            <label>Name</label>
+            <input class="input" required placeholder="e.g. dev, plan-review" value={skillForm.name}
+              onInput={(e) => setSkillForm({ ...skillForm, name: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input class="input" value={skillForm.description}
+              onInput={(e) => setSkillForm({ ...skillForm, description: (e.target as HTMLInputElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>Prompt Template</label>
+            <textarea class="input mono" rows={8} required value={skillForm.prompt_template}
+              placeholder="Use $ARGUMENTS for user input"
+              onInput={(e) => setSkillForm({ ...skillForm, prompt_template: (e.target as HTMLTextAreaElement).value })} />
+          </div>
+          <div class="form-group">
+            <label>
+              <input type="checkbox" checked={skillForm.persistent_session}
+                onChange={() => setSkillForm({ ...skillForm, persistent_session: !skillForm.persistent_session })} />
+              {' '}Persistent session
+            </label>
+          </div>
+          {skillError && <div class="error-msg">{skillError}</div>}
+          <div class="modal-actions">
+            <button type="button" class="btn" onClick={() => setShowCreateSkill(false)}>Cancel</button>
+            <button type="submit" class="btn btn-primary">Create</button>
+          </div>
+        </form>
+      </Modal>
 
       <Modal open={showAddMember} onClose={() => setShowAddMember(false)} title="Add Member">
         <form onSubmit={addMember}>

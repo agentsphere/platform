@@ -143,6 +143,9 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     let git_token =
         create_git_auth_token(state, pipeline_id, project_id, Some(auth_user_id)).await?;
 
+    // Create a short-lived OTLP token for pipeline pods to emit telemetry
+    let otlp_token = create_pipeline_otlp_token(state, project_id, pipeline_id).await;
+
     let meta = PipelineMeta {
         git_ref: pipeline.git_ref,
         commit_sha: pipeline.commit_sha,
@@ -155,6 +158,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
             .project_namespace(&pipeline.namespace_slug, "dev"),
         trigger_type: pipeline.trigger,
         namespace_slug: pipeline.namespace_slug,
+        otlp_token,
     };
 
     // Ensure project namespace exists (lazy creation for DB-only projects)
@@ -172,6 +176,17 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     } else {
         None
     };
+
+    let pipeline_svc = format!("pipeline/{}", meta.project_name);
+    emit_pipeline_log(
+        &state.pool,
+        project_id,
+        &pipeline_svc,
+        "info",
+        &format!("Pipeline started (trigger: {})", meta.trigger_type),
+        Some(serde_json::json!({"pipeline_id": pipeline_id.to_string(), "trigger": meta.trigger_type})),
+    )
+    .await;
 
     let registry_secret_name = registry_creds.as_ref().map(|(name, _)| name.as_str());
     let all_succeeded =
@@ -203,6 +218,18 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     }
 
     fire_build_webhook(&state.pool, project_id, pipeline_id, final_status).await;
+
+    let log_level = if all_succeeded { "info" } else { "error" };
+    emit_pipeline_log(
+        &state.pool,
+        project_id,
+        &pipeline_svc,
+        log_level,
+        &format!("Pipeline {final_status}"),
+        Some(serde_json::json!({"pipeline_id": pipeline_id.to_string(), "status": final_status})),
+    )
+    .await;
+
     tracing::info!(%pipeline_id, status = final_status, "pipeline finished");
     Ok(())
 }
@@ -222,9 +249,12 @@ struct PipelineMeta {
     trigger_type: String,
     /// Namespace slug for the project (needed for deploy-test).
     namespace_slug: String,
+    /// Short-lived OTLP token for pipeline pods to send telemetry.
+    otlp_token: Option<String>,
 }
 
 /// A pipeline step row loaded from the database.
+#[allow(dead_code)] // `gate` stored for API response; read via DB query in pipelines.rs
 struct StepRow {
     id: Uuid,
     step_order: i32,
@@ -234,6 +264,9 @@ struct StepRow {
     condition_events: Vec<String>,
     condition_branches: Vec<String>,
     deploy_test: Option<serde_json::Value>,
+    depends_on: Vec<String>,
+    environment: Option<serde_json::Value>,
+    gate: bool,
 }
 
 /// Ensure the project's dev namespace (and network policy) exist before running pods.
@@ -275,7 +308,7 @@ async fn run_all_steps(
         r#"
         SELECT id, step_order, name, image, commands,
                condition_events, condition_branches,
-               deploy_test
+               deploy_test, depends_on, environment, gate
         FROM pipeline_steps
         WHERE pipeline_id = $1
         ORDER BY step_order ASC
@@ -285,22 +318,57 @@ async fn run_all_steps(
     .fetch_all(&state.pool)
     .await?;
 
+    // Resolve pipeline secrets once for the entire pipeline
+    let pipeline_secrets = resolve_pipeline_secrets(state, project_id).await;
+
+    // Check if DAG mode: at least one step has non-empty depends_on
+    let has_deps = steps.iter().any(|s| !s.depends_on.is_empty());
+
+    if has_deps {
+        run_steps_dag(
+            state,
+            pipeline_id,
+            project_id,
+            pipeline,
+            registry_secret,
+            &steps,
+            &pipeline_secrets,
+        )
+        .await
+    } else {
+        run_steps_sequential(
+            state,
+            pipeline_id,
+            project_id,
+            pipeline,
+            registry_secret,
+            &steps,
+            &pipeline_secrets,
+        )
+        .await
+    }
+}
+
+/// Sequential execution (backward compat: no step has `depends_on`).
+#[allow(clippy::too_many_arguments)]
+async fn run_steps_sequential(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    pipeline: &PipelineMeta,
+    registry_secret: Option<&str>,
+    steps: &[StepRow],
+    secrets: &[(String, String)],
+) -> Result<bool, PipelineError> {
     let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &pipeline.namespace);
+    let branch = extract_branch(&pipeline.git_ref);
 
-    // Extract branch from git_ref for condition matching
-    let branch = pipeline
-        .git_ref
-        .strip_prefix("refs/heads/")
-        .or_else(|| pipeline.git_ref.strip_prefix("refs/tags/"))
-        .unwrap_or(&pipeline.git_ref);
-
-    for step in &steps {
+    for step in steps {
         if is_cancelled(&state.pool, pipeline_id).await? {
             skip_remaining_steps(&state.pool, pipeline_id).await?;
             return Ok(false);
         }
 
-        // Evaluate per-step conditions
         let condition = step_condition_from_row(step);
         if !super::definition::step_matches(condition.as_ref(), &pipeline.trigger_type, branch) {
             tracing::info!(
@@ -318,29 +386,17 @@ async fn run_all_steps(
             continue;
         }
 
-        // Check if this is a deploy-test step
-        let succeeded = if step.deploy_test.is_some() {
-            execute_deploy_test_step(
-                state,
-                pipeline_id,
-                project_id,
-                pipeline,
-                step,
-                registry_secret,
-            )
-            .await?
-        } else {
-            execute_single_step(
-                state,
-                &pods,
-                pipeline_id,
-                project_id,
-                pipeline,
-                step,
-                registry_secret,
-            )
-            .await?
-        };
+        let succeeded = execute_step_dispatch(
+            state,
+            &pods,
+            pipeline_id,
+            project_id,
+            pipeline,
+            step,
+            registry_secret,
+            secrets,
+        )
+        .await?;
 
         if !succeeded {
             skip_remaining_after(&state.pool, pipeline_id, step.step_order).await?;
@@ -349,6 +405,264 @@ async fn run_all_steps(
     }
 
     Ok(true)
+}
+
+/// DAG-based parallel execution.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_steps_dag(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    pipeline: &PipelineMeta,
+    registry_secret: Option<&str>,
+    steps: &[StepRow],
+    secrets: &[(String, String)],
+) -> Result<bool, PipelineError> {
+    use std::collections::{HashMap, HashSet};
+    use tokio::task::JoinSet;
+
+    let branch = extract_branch(&pipeline.git_ref);
+    let max_parallel = state.config.pipeline_max_parallel;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel));
+
+    // Build name → index map and adjacency
+    let name_to_idx: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+
+    let n = steps.len();
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, step) in steps.iter().enumerate() {
+        for dep_name in &step.depends_on {
+            if let Some(&dep_idx) = name_to_idx.get(dep_name.as_str()) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+
+    let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut join_set: JoinSet<(usize, Result<bool, PipelineError>)> = JoinSet::new();
+    let mut completed: HashSet<usize> = HashSet::new();
+    let mut skipped: HashSet<usize> = HashSet::new();
+    let mut any_failure = false;
+
+    loop {
+        // Spawn ready steps
+        while let Some(idx) = ready.pop() {
+            if skipped.contains(&idx) {
+                completed.insert(idx);
+                continue;
+            }
+
+            if is_cancelled(&state.pool, pipeline_id).await? {
+                skip_remaining_steps(&state.pool, pipeline_id).await?;
+                return Ok(false);
+            }
+
+            let step = &steps[idx];
+
+            // Check per-step condition
+            let condition = step_condition_from_row(step);
+            if !super::definition::step_matches(condition.as_ref(), &pipeline.trigger_type, branch)
+            {
+                tracing::info!(
+                    step = %step.name,
+                    trigger = %pipeline.trigger_type,
+                    %branch,
+                    "step skipped (condition not matched)"
+                );
+                sqlx::query!(
+                    "UPDATE pipeline_steps SET status = 'skipped' WHERE id = $1",
+                    step.id
+                )
+                .execute(&state.pool)
+                .await?;
+                completed.insert(idx);
+                // Release dependents even for skipped steps (they still "completed")
+                for &dep_idx in &dependents[idx] {
+                    in_degree[dep_idx] -= 1;
+                    if in_degree[dep_idx] == 0 {
+                        ready.push(dep_idx);
+                    }
+                }
+                continue;
+            }
+
+            // Spawn execution in JoinSet
+            let state = state.clone();
+            let sem = semaphore.clone();
+            let namespace = pipeline.namespace.clone();
+            let step_id = step.id;
+            let step_name = step.name.clone();
+            let step_image = step.image.clone();
+            let step_commands = step.commands.clone();
+            let step_deploy_test = step.deploy_test.clone();
+            let step_env = step.environment.clone();
+            let meta_clone = PipelineMeta {
+                git_ref: pipeline.git_ref.clone(),
+                commit_sha: pipeline.commit_sha.clone(),
+                version: pipeline.version.clone(),
+                project_name: pipeline.project_name.clone(),
+                repo_clone_url: pipeline.repo_clone_url.clone(),
+                git_auth_token: pipeline.git_auth_token.clone(),
+                namespace: pipeline.namespace.clone(),
+                trigger_type: pipeline.trigger_type.clone(),
+                namespace_slug: pipeline.namespace_slug.clone(),
+                otlp_token: pipeline.otlp_token.clone(),
+            };
+            let secrets = secrets.to_vec();
+            let registry_secret = registry_secret.map(String::from);
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let step_row = StepRow {
+                    id: step_id,
+                    step_order: 0, // not used in dispatch
+                    name: step_name,
+                    image: step_image,
+                    commands: step_commands,
+                    condition_events: vec![],
+                    condition_branches: vec![],
+                    deploy_test: step_deploy_test,
+                    depends_on: vec![],
+                    environment: step_env,
+                    gate: false,
+                };
+                let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
+                let result = execute_step_dispatch(
+                    &state,
+                    &pods,
+                    pipeline_id,
+                    project_id,
+                    &meta_clone,
+                    &step_row,
+                    registry_secret.as_deref(),
+                    &secrets,
+                )
+                .await;
+                (idx, result)
+            });
+        }
+
+        // Wait for next completion
+        let Some(result) = join_set.join_next().await else {
+            break; // No more tasks
+        };
+
+        let (idx, step_result) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "step task panicked");
+                any_failure = true;
+                continue;
+            }
+        };
+
+        completed.insert(idx);
+
+        let succeeded = match step_result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, step = %steps[idx].name, "step execution error");
+                false
+            }
+        };
+
+        if succeeded {
+            // Release dependents
+            for &dep_idx in &dependents[idx] {
+                in_degree[dep_idx] -= 1;
+                if in_degree[dep_idx] == 0 && !skipped.contains(&dep_idx) {
+                    ready.push(dep_idx);
+                }
+            }
+        } else {
+            any_failure = true;
+            // Mark all transitive dependents as skipped
+            mark_transitive_dependents_skipped(idx, &dependents, &mut skipped, &completed);
+            // Skip those steps in DB
+            for &s_idx in &skipped {
+                if !completed.contains(&s_idx) {
+                    let _ = sqlx::query!(
+                        "UPDATE pipeline_steps SET status = 'skipped' WHERE id = $1 AND status = 'pending'",
+                        steps[s_idx].id
+                    )
+                    .execute(&state.pool)
+                    .await;
+                }
+            }
+        }
+    }
+
+    Ok(!any_failure)
+}
+
+/// Mark all transitive dependents of a failed step as skipped.
+fn mark_transitive_dependents_skipped(
+    failed_idx: usize,
+    dependents: &[Vec<usize>],
+    skipped: &mut std::collections::HashSet<usize>,
+    completed: &std::collections::HashSet<usize>,
+) {
+    let mut stack = vec![failed_idx];
+    while let Some(idx) = stack.pop() {
+        for &dep_idx in &dependents[idx] {
+            if !completed.contains(&dep_idx) && skipped.insert(dep_idx) {
+                stack.push(dep_idx);
+            }
+        }
+    }
+}
+
+/// Extract branch name from git ref.
+fn extract_branch(git_ref: &str) -> &str {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| git_ref.strip_prefix("refs/tags/"))
+        .unwrap_or(git_ref)
+}
+
+/// Dispatch a step to the right executor (deploy-test or regular).
+#[allow(clippy::too_many_arguments)]
+async fn execute_step_dispatch(
+    state: &AppState,
+    pods: &Api<Pod>,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    pipeline: &PipelineMeta,
+    step: &StepRow,
+    registry_secret: Option<&str>,
+    secrets: &[(String, String)],
+) -> Result<bool, PipelineError> {
+    if step.deploy_test.is_some() {
+        execute_deploy_test_step(
+            state,
+            pipeline_id,
+            project_id,
+            pipeline,
+            step,
+            registry_secret,
+            secrets,
+        )
+        .await
+    } else {
+        execute_single_step(
+            state,
+            pods,
+            pipeline_id,
+            project_id,
+            pipeline,
+            step,
+            registry_secret,
+            secrets,
+        )
+        .await
+    }
 }
 
 /// Build a `StepCondition` from a `StepRow`'s stored arrays.
@@ -364,6 +678,7 @@ fn step_condition_from_row(step: &StepRow) -> Option<super::definition::StepCond
 }
 
 /// Execute one pipeline step as a K8s pod. Returns true on success.
+#[allow(clippy::too_many_arguments)]
 async fn execute_single_step(
     state: &AppState,
     pods: &Api<Pod>,
@@ -372,8 +687,17 @@ async fn execute_single_step(
     pipeline: &PipelineMeta,
     step: &StepRow,
     registry_secret: Option<&str>,
+    secrets: &[(String, String)],
 ) -> Result<bool, PipelineError> {
-    let env_vars = build_env_vars(state, pipeline_id, project_id, pipeline, &step.name);
+    let env_vars = build_env_vars_full(
+        state,
+        pipeline_id,
+        project_id,
+        pipeline,
+        &step.name,
+        secrets,
+        step.environment.as_ref(),
+    );
 
     let pod_name = format!("pl-{}-{}", &pipeline_id.to_string()[..8], slug(&step.name));
     let pod_spec = build_pod_spec(&PodSpecParams {
@@ -390,12 +714,24 @@ async fn execute_single_step(
         git_auth_token: &pipeline.git_auth_token,
     });
 
+    let step_svc = format!("pipeline/{}/{}", pipeline.project_name, step.name);
+
     sqlx::query!(
         "UPDATE pipeline_steps SET status = 'running' WHERE id = $1",
         step.id
     )
     .execute(&state.pool)
     .await?;
+
+    emit_pipeline_log(
+        &state.pool,
+        project_id,
+        &step_svc,
+        "info",
+        &format!("Step '{}' started (image: {})", step.name, step.image),
+        Some(serde_json::json!({"pipeline_id": pipeline_id.to_string(), "step": step.name})),
+    )
+    .await;
 
     let start = Instant::now();
     let result = run_step(pods, &pod_name, &pod_spec, state, pipeline_id, &step.name).await;
@@ -411,6 +747,23 @@ async fn execute_single_step(
             )
             .execute(&state.pool)
             .await?;
+
+            let log_level = if exit_code == 0 { "info" } else { "error" };
+            emit_pipeline_log(
+                &state.pool,
+                project_id,
+                &step_svc,
+                log_level,
+                &format!("Step '{}' {status} ({duration_ms}ms)", step.name),
+                Some(serde_json::json!({
+                    "pipeline_id": pipeline_id.to_string(),
+                    "step": step.name,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                })),
+            )
+            .await;
+
             Ok(exit_code == 0)
         }
         Err(e) => {
@@ -422,6 +775,21 @@ async fn execute_single_step(
             )
             .execute(&state.pool)
             .await?;
+
+            emit_pipeline_log(
+                &state.pool,
+                project_id,
+                &step_svc,
+                "error",
+                &format!("Step '{}' failed: {e}", step.name),
+                Some(serde_json::json!({
+                    "pipeline_id": pipeline_id.to_string(),
+                    "step": step.name,
+                    "duration_ms": duration_ms,
+                })),
+            )
+            .await;
+
             Ok(false)
         }
     }
@@ -456,8 +824,27 @@ async fn run_step(
 }
 
 /// Poll pod status until it reaches a terminal phase.
+/// Default step timeout: 15 minutes.
+const DEFAULT_STEP_TIMEOUT_SECS: u64 = 900;
+
 async fn wait_for_pod(pods: &Api<Pod>, pod_name: &str) -> Result<i32, PipelineError> {
+    wait_for_pod_with_timeout(pods, pod_name, DEFAULT_STEP_TIMEOUT_SECS).await
+}
+
+async fn wait_for_pod_with_timeout(
+    pods: &Api<Pod>,
+    pod_name: &str,
+    timeout_secs: u64,
+) -> Result<i32, PipelineError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PipelineError::Other(anyhow::anyhow!(
+                "pod {pod_name} timed out after {timeout_secs}s"
+            )));
+        }
+
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         let pod = match pods.get(pod_name).await {
@@ -481,12 +868,98 @@ async fn wait_for_pod(pods: &Api<Pod>, pod_name: &str) -> Result<i32, PipelineEr
                 let exit_code = extract_exit_code(status).unwrap_or(1);
                 return Ok(exit_code);
             }
-            "Pending" | "Running" => {}
+            "Pending" | "Running" => {
+                // Detect unrecoverable container states while pod phase is still Pending/Running
+                if let Some(reason) = detect_unrecoverable_container(status) {
+                    tracing::warn!(pod = pod_name, %reason, "pod in unrecoverable state");
+                    return Err(PipelineError::Other(anyhow::anyhow!(
+                        "pod {pod_name} failed: {reason}"
+                    )));
+                }
+            }
             other => {
                 tracing::warn!(pod = pod_name, phase = other, "unexpected pod phase");
             }
         }
     }
+}
+
+/// Check container statuses for unrecoverable waiting/error states.
+/// Returns a human-readable reason if the pod will never succeed.
+fn detect_unrecoverable_container(
+    status: &k8s_openapi::api::core::v1::PodStatus,
+) -> Option<String> {
+    let containers = status.container_statuses.as_ref()?;
+    for cs in containers {
+        if let Some(state) = &cs.state {
+            if let Some(waiting) = &state.waiting {
+                let reason = waiting.reason.as_deref().unwrap_or("");
+                match reason {
+                    // Image cannot be pulled — will never recover without intervention
+                    "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" => {
+                        let msg = waiting.message.as_deref().unwrap_or("image pull failed");
+                        return Some(format!("{reason}: {msg}"));
+                    }
+                    "CreateContainerConfigError" => {
+                        let msg = waiting
+                            .message
+                            .as_deref()
+                            .unwrap_or("container config error");
+                        return Some(format!("{reason}: {msg}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Also check restart count — CrashLoopBackOff with 3+ restarts is unlikely to recover
+        if cs.restart_count >= 3 {
+            if let Some(state) = &cs.state {
+                if let Some(waiting) = &state.waiting {
+                    if waiting.reason.as_deref() == Some("CrashLoopBackOff") {
+                        return Some(format!(
+                            "CrashLoopBackOff after {} restarts",
+                            cs.restart_count
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Also check init containers
+    let init_containers = status.init_container_statuses.as_ref()?;
+    for cs in init_containers {
+        if let Some(state) = &cs.state {
+            if let Some(waiting) = &state.waiting {
+                let reason = waiting.reason.as_deref().unwrap_or("");
+                match reason {
+                    "ImagePullBackOff"
+                    | "ErrImagePull"
+                    | "InvalidImageName"
+                    | "CreateContainerConfigError" => {
+                        let msg = waiting
+                            .message
+                            .as_deref()
+                            .unwrap_or("init container failed");
+                        return Some(format!("init container: {reason}: {msg}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if cs.restart_count >= 3 {
+            if let Some(state) = &cs.state {
+                if let Some(waiting) = &state.waiting {
+                    if waiting.reason.as_deref() == Some("CrashLoopBackOff") {
+                        return Some(format!(
+                            "init container CrashLoopBackOff after {} restarts",
+                            cs.restart_count
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract the exit code from the first container's termination state.
@@ -856,27 +1329,201 @@ fn node_registry_url(config: &crate::config::Config) -> Option<&str> {
         .or(config.registry_url.as_deref())
 }
 
+/// Env var names that must not be overridden by project secrets in pipeline pods.
+const RESERVED_PIPELINE_ENV_VARS: &[&str] = &[
+    "PLATFORM_PROJECT_ID",
+    "PLATFORM_PROJECT_NAME",
+    "PIPELINE_ID",
+    "STEP_NAME",
+    "COMMIT_REF",
+    "COMMIT_BRANCH",
+    "COMMIT_SHA",
+    "SHORT_SHA",
+    "IMAGE_TAG",
+    "PROJECT",
+    "VERSION",
+    "REGISTRY",
+    "DOCKER_CONFIG",
+    "PIPELINE_TRIGGER",
+    "GIT_AUTH_TOKEN",
+    "GIT_ASKPASS",
+    "PLATFORM_SECRET_NAMES",
+    "PATH",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_SERVICE_NAME",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+];
+
+fn is_reserved_pipeline_env_var(name: &str) -> bool {
+    RESERVED_PIPELINE_ENV_VARS.contains(&name)
+}
+
+/// Resolve project secrets scoped to pipeline/agent/all for injection into pipeline pods.
+async fn resolve_pipeline_secrets(state: &AppState, project_id: Uuid) -> Vec<(String, String)> {
+    let Some(master_key_hex) = state.config.master_key.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(master_key) = crate::secrets::engine::parse_master_key(master_key_hex) else {
+        return Vec::new();
+    };
+    match crate::secrets::engine::query_scoped_secrets(
+        &state.pool,
+        &master_key,
+        project_id,
+        &["pipeline", "agent", "all"],
+        None,
+    )
+    .await
+    {
+        Ok(secrets) => secrets,
+        Err(e) => {
+            tracing::warn!(error = %e, %project_id, "failed to resolve pipeline secrets");
+            Vec::new()
+        }
+    }
+}
+
+/// Create a short-lived OTLP API token for a pipeline run.
+/// Returns `None` on failure (non-fatal — pipeline runs without telemetry).
+async fn create_pipeline_otlp_token(
+    state: &AppState,
+    project_id: Uuid,
+    pipeline_id: Uuid,
+) -> Option<String> {
+    let owner_id: Uuid = match sqlx::query_scalar!(
+        "SELECT owner_id FROM projects WHERE id = $1 AND is_active = true",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(id)) => id,
+        _ => return None,
+    };
+
+    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+    let name = format!("otlp-pipeline-{}", &pipeline_id.to_string()[..8]);
+    let scopes = vec!["observe:write".to_string()];
+
+    if let Err(e) = sqlx::query(
+        r#"INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
+           VALUES ($1, $2, $3, $4::text[], $5, now() + interval '4 hours')"#,
+    )
+    .bind(owner_id)
+    .bind(&name)
+    .bind(&token_hash)
+    .bind(&scopes)
+    .bind(project_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %e, %pipeline_id, "failed to create pipeline OTLP token");
+        return None;
+    }
+
+    Some(raw_token)
+}
+
+/// Write a pipeline execution event to the observe `log_entries` table.
+/// Best-effort — failures are logged but do not affect pipeline execution.
+async fn emit_pipeline_log(
+    pool: &PgPool,
+    project_id: Uuid,
+    service: &str,
+    level: &str,
+    message: &str,
+    attributes: Option<serde_json::Value>,
+) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO log_entries (project_id, service, level, message, attributes)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(project_id)
+    .bind(service)
+    .bind(level)
+    .bind(message)
+    .bind(attributes)
+    .execute(pool)
+    .await
+    {
+        tracing::debug!(error = %e, "failed to emit pipeline observe log");
+    }
+}
+
+/// Build env vars with secrets and step-level environment merged in.
 #[allow(clippy::too_many_arguments)]
-fn build_env_vars(
+fn build_env_vars_full(
     state: &AppState,
     pipeline_id: Uuid,
     project_id: Uuid,
     meta: &PipelineMeta,
     step_name: &str,
+    secrets: &[(String, String)],
+    step_environment: Option<&serde_json::Value>,
 ) -> Vec<EnvVar> {
-    build_env_vars_core(
+    // 1. Platform vars (lowest priority)
+    let mut vars = build_env_vars_core(
         pipeline_id,
         project_id,
         &meta.project_name,
         &meta.git_ref,
         meta.commit_sha.as_deref(),
         step_name,
-        // REGISTRY env var for Kaniko push — uses the actual platform API URL
-        // (not the node proxy) since Kaniko pushes from inside the pod.
         state.config.registry_url.as_deref(),
         meta.version.as_deref(),
         &meta.trigger_type,
-    )
+    );
+
+    // 2. OTEL env vars (so pipeline steps can emit telemetry)
+    vars.push(env_var(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        &state.config.platform_api_url,
+    ));
+    vars.push(env_var(
+        "OTEL_SERVICE_NAME",
+        &format!("{}/{step_name}", meta.project_name),
+    ));
+    vars.push(env_var(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        &format!("platform.project_id={project_id}"),
+    ));
+    if let Some(ref token) = meta.otlp_token {
+        vars.push(env_var(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            &format!("Authorization=Bearer {token}"),
+        ));
+    }
+
+    // 3. Project secrets (skip reserved names)
+    let mut secret_names = Vec::new();
+    for (key, val) in secrets {
+        if !is_reserved_pipeline_env_var(key) {
+            vars.push(env_var(key, val));
+            secret_names.push(key.as_str());
+        }
+    }
+    if !secret_names.is_empty() {
+        vars.push(env_var("PLATFORM_SECRET_NAMES", &secret_names.join(",")));
+    }
+
+    // 4. Step-level environment (highest priority — can override secrets)
+    if let Some(env_json) = step_environment
+        && let Some(map) = env_json.as_object()
+    {
+        let existing_pairs: Vec<(String, String)> = vars
+            .iter()
+            .filter_map(|ev| Some((ev.name.clone(), ev.value.as_ref()?.clone())))
+            .collect();
+        for (key, val) in map {
+            if let Some(v) = val.as_str() {
+                let expanded = super::definition::expand_step_env(v, &existing_pairs);
+                vars.push(env_var(key, &expanded));
+            }
+        }
+    }
+
+    vars
 }
 
 /// Core env var builder with no dependency on `AppState`.
@@ -977,6 +1624,7 @@ async fn execute_deploy_test_step(
     pipeline: &PipelineMeta,
     step: &StepRow,
     _registry_secret: Option<&str>,
+    secrets: &[(String, String)],
 ) -> Result<bool, PipelineError> {
     let dt: super::definition::DeployTestDef =
         serde_json::from_value(step.deploy_test.clone().unwrap_or_default()).map_err(|e| {
@@ -984,11 +1632,27 @@ async fn execute_deploy_test_step(
         })?;
 
     // Build env vars for variable expansion
-    let env_pairs: Vec<(String, String)> =
-        build_env_vars(state, pipeline_id, project_id, pipeline, &step.name)
-            .iter()
-            .filter_map(|ev| Some((ev.name.clone(), ev.value.as_ref()?.clone())))
-            .collect();
+    let mut env_pairs: Vec<(String, String)> = build_env_vars_full(
+        state,
+        pipeline_id,
+        project_id,
+        pipeline,
+        &step.name,
+        secrets,
+        step.environment.as_ref(),
+    )
+    .iter()
+    .filter_map(|ev| Some((ev.name.clone(), ev.value.as_ref()?.clone())))
+    .collect();
+
+    // Override REGISTRY with the node-visible URL for test_image expansion.
+    // The default REGISTRY points to the push URL (e.g. host.docker.internal:55251)
+    // but containerd on Kind nodes needs the DaemonSet proxy URL (e.g. localhost:48773).
+    if let Some(node_reg) = node_registry_url(&state.config) {
+        if let Some(pair) = env_pairs.iter_mut().find(|(k, _)| k == "REGISTRY") {
+            pair.1 = node_reg.to_string();
+        }
+    }
 
     // Expand env vars in test_image
     let test_image = super::definition::expand_step_env(&dt.test_image, &env_pairs);
@@ -1034,12 +1698,8 @@ async fn execute_deploy_test_step(
     .await;
 
     // 3. Read + render deploy manifests from project repo
-    let manifests_path = dt.manifests.as_deref().unwrap_or("deploy/production.yaml");
-    let branch = pipeline
-        .git_ref
-        .strip_prefix("refs/heads/")
-        .or_else(|| pipeline.git_ref.strip_prefix("refs/tags/"))
-        .unwrap_or(&pipeline.git_ref);
+    let manifests_path = dt.manifests.as_deref().unwrap_or("deploy/");
+    let branch = extract_branch(&pipeline.git_ref);
 
     // Get repo path from DB
     let repo_path: Option<String> =
@@ -1053,14 +1713,25 @@ async fn execute_deploy_test_step(
     let repo_path = repo_path
         .ok_or_else(|| PipelineError::Other(anyhow::anyhow!("project repo_path not found")))?;
 
-    let manifest_content =
+    // If path ends with `/`, read all YAML files from the directory;
+    // otherwise read a single file (backward compat).
+    let manifest_content = if manifests_path.ends_with('/') {
+        super::trigger::read_dir_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
+            .await
+            .ok_or_else(|| {
+                PipelineError::InvalidDefinition(format!(
+                    "deploy manifests directory '{manifests_path}' not found or empty at ref '{branch}'"
+                ))
+            })?
+    } else {
         super::trigger::read_file_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
             .await
             .ok_or_else(|| {
                 PipelineError::InvalidDefinition(format!(
                     "deploy manifest '{manifests_path}' not found at ref '{branch}'"
                 ))
-            })?;
+            })?
+    };
 
     // Determine app image ref (use node registry URL for containerd pulls)
     let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
@@ -1118,13 +1789,15 @@ async fn execute_deploy_test_step(
         env_var("APP_HOST", &format!("{}-app", pipeline.project_name)),
         env_var("APP_PORT", "8080"),
     ];
-    // Add standard pipeline env vars
-    test_env.extend(build_env_vars(
+    // Add standard pipeline env vars (including secrets + step env)
+    test_env.extend(build_env_vars_full(
         state,
         pipeline_id,
         project_id,
         pipeline,
         &step.name,
+        secrets,
+        step.environment.as_ref(),
     ));
 
     let test_commands = if dt.commands.is_empty() {
@@ -2178,6 +2851,9 @@ mod tests {
             condition_events: vec![],
             condition_branches: vec![],
             deploy_test: None,
+            depends_on: vec![],
+            environment: None,
+            gate: false,
         };
         assert!(step_condition_from_row(&row).is_none());
     }
@@ -2193,6 +2869,9 @@ mod tests {
             condition_events: vec!["mr".into()],
             condition_branches: vec![],
             deploy_test: None,
+            depends_on: vec![],
+            environment: None,
+            gate: false,
         };
         let cond = step_condition_from_row(&row).unwrap();
         assert_eq!(cond.events, vec!["mr"]);
@@ -2871,5 +3550,40 @@ mod tests {
         assert_eq!(sc.allow_privilege_escalation, Some(false));
         let caps = sc.capabilities.as_ref().unwrap();
         assert_eq!(caps.drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
+    }
+
+    // -- reserved pipeline env vars --
+
+    #[test]
+    fn reserved_pipeline_env_vars_blocks_known() {
+        assert!(is_reserved_pipeline_env_var("PIPELINE_ID"));
+        assert!(is_reserved_pipeline_env_var("COMMIT_SHA"));
+        assert!(is_reserved_pipeline_env_var("PATH"));
+        assert!(is_reserved_pipeline_env_var("PLATFORM_SECRET_NAMES"));
+    }
+
+    #[test]
+    fn reserved_pipeline_env_vars_allows_custom() {
+        assert!(!is_reserved_pipeline_env_var("DATABASE_URL"));
+        assert!(!is_reserved_pipeline_env_var("MY_SECRET"));
+        assert!(!is_reserved_pipeline_env_var("API_KEY"));
+    }
+
+    // -- extract_branch --
+
+    #[test]
+    fn extract_branch_from_refs_heads() {
+        assert_eq!(extract_branch("refs/heads/main"), "main");
+        assert_eq!(extract_branch("refs/heads/feature/login"), "feature/login");
+    }
+
+    #[test]
+    fn extract_branch_from_refs_tags() {
+        assert_eq!(extract_branch("refs/tags/v1.0"), "v1.0");
+    }
+
+    #[test]
+    fn extract_branch_bare_ref() {
+        assert_eq!(extract_branch("main"), "main");
     }
 }

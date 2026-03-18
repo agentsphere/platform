@@ -91,6 +91,9 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         health_check_interval_secs: 15,
         self_observe_level: "warn".into(),
         session_idle_timeout_secs: 1800,
+        preview_proxy_url: None,
+        pipeline_max_parallel: 4,
+        mcp_servers_tarball: "/tmp/mcp-servers.tar.gz".into(),
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");

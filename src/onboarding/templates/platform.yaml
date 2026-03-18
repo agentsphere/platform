@@ -1,0 +1,45 @@
+pipeline:
+  on:
+    push:
+      branches: ["main"]
+    mr:
+      actions: [opened, synchronized]
+
+  steps:
+    - name: build-app
+      image: gcr.io/kaniko-project/executor:debug
+      commands:
+        - /kaniko/executor
+          --context=dir:///workspace
+          --dockerfile=Dockerfile
+          --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA
+          --insecure
+          --insecure-registry=$REGISTRY
+          --cache=true
+          --cache-repo=$REGISTRY/$PROJECT/cache
+
+    - name: build-test
+      image: gcr.io/kaniko-project/executor:debug
+      only:
+        events: [mr]
+      commands:
+        - /kaniko/executor
+          --context=dir:///workspace
+          --dockerfile=Dockerfile.test
+          --destination=$REGISTRY/$PROJECT/test:$COMMIT_SHA
+          --insecure
+          --insecure-registry=$REGISTRY
+          --cache=true
+
+    - name: test
+      depends_on: [build-app, build-test]
+      only:
+        events: [mr]
+      deploy_test:
+        test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
+        manifests: deploy/
+        readiness_path: /healthz
+        readiness_timeout: 120
+
+  dev_image:
+    dockerfile: Dockerfile.dev

@@ -136,6 +136,8 @@ pub enum ProgressKind {
     Text,
     IframeAvailable,
     IframeRemoved,
+    SecretRequest,
+    ProgressUpdate,
     /// Forward-compatible catch-all for unknown event kinds from agent-runner.
     #[serde(other)]
     Unknown,
@@ -308,6 +310,14 @@ mod tests {
         let event: ProgressEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.kind, ProgressKind::ToolCall);
         assert!(event.metadata.is_some());
+    }
+
+    #[test]
+    fn progress_kind_progress_update_roundtrip() {
+        let json = serde_json::to_string(&ProgressKind::ProgressUpdate).unwrap();
+        assert_eq!(json, r#""progress_update""#);
+        let back: ProgressKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProgressKind::ProgressUpdate);
     }
 
     #[test]

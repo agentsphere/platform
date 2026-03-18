@@ -49,6 +49,9 @@ mod registry;
 // Workspaces
 mod workspace;
 
+// Onboarding
+mod onboarding;
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -146,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         cli_sessions: agent::claude_cli::CliSessionManager::new(cfg.max_cli_subprocesses),
         health: Arc::new(std::sync::RwLock::new(health::HealthSnapshot::default())),
         task_registry: Arc::new(health::TaskRegistry::new()),
+        cli_auth_manager: Arc::new(onboarding::claude_auth::CliAuthManager::new()),
     };
 
     // Set configurable permission cache TTL
@@ -156,6 +160,24 @@ async fn main() -> anyhow::Result<()> {
         store::bootstrap::BootstrapResult::Skipped => {}
         store::bootstrap::BootstrapResult::DevAdmin => {
             tracing::info!("dev mode: admin user created with default credentials");
+            // Auto-create demo project + trigger pipeline in background
+            let demo_state = state.clone();
+            tokio::spawn(async move {
+                // Small delay so background tasks (executor, reconciler) start first
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if let Ok(Some(admin_id)) =
+                    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE name = 'admin'")
+                        .fetch_optional(&demo_state.pool)
+                        .await
+                {
+                    if let Err(e) =
+                        onboarding::demo_project::create_and_trigger_demo(&demo_state, admin_id)
+                            .await
+                    {
+                        tracing::warn!(error = %e, "auto demo project creation failed");
+                    }
+                }
+            });
         }
         store::bootstrap::BootstrapResult::SetupToken(token) => {
             tracing::warn!("=======================================================");
@@ -170,6 +192,11 @@ async fn main() -> anyhow::Result<()> {
     // Seed registry images from OCI layout tarballs (idempotent)
     if let Err(e) = registry::seed::seed_all(&pool, &state.minio, &cfg.seed_images_path).await {
         tracing::warn!(error = %e, "registry image seeding failed");
+    }
+
+    // Seed global commands from .md files (idempotent)
+    if let Err(e) = store::commands_seed::seed_commands(&pool, &cfg.seed_commands_path).await {
+        tracing::warn!(error = %e, "command seeding failed");
     }
 
     let (shutdown_tx, observe_channels) = spawn_background_tasks(&state, &pool);

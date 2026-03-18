@@ -61,11 +61,49 @@ async fn download_agent_runner(
     Ok((StatusCode::OK, headers, data).into_response())
 }
 
+/// `GET /api/downloads/mcp-servers`
+///
+/// Serves a pre-built tarball of the MCP servers directory (`mcp/`).
+/// Agent pods extract this at startup so they always get the latest MCP tools
+/// without rebuilding the Docker image.
+#[tracing::instrument(skip(state, _auth), err)]
+async fn download_mcp_servers(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Response, ApiError> {
+    let tarball_path = &state.config.mcp_servers_tarball;
+
+    let data = tokio::fs::read(tarball_path).await.map_err(|e| {
+        ApiError::Internal(anyhow::anyhow!(
+            "MCP servers tarball not found at {}: {e}",
+            tarball_path.display()
+        ))
+    })?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/gzip"));
+    headers.insert(
+        "content-disposition",
+        HeaderValue::from_static("attachment; filename=\"mcp-servers.tar.gz\""),
+    );
+    headers.insert(
+        "cache-control",
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+
+    Ok((StatusCode::OK, headers, data).into_response())
+}
+
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/api/downloads/agent-runner",
-        axum::routing::get(download_agent_runner),
-    )
+    Router::new()
+        .route(
+            "/api/downloads/agent-runner",
+            axum::routing::get(download_agent_runner),
+        )
+        .route(
+            "/api/downloads/mcp-servers",
+            axum::routing::get(download_mcp_servers),
+        )
 }
 
 #[cfg(test)]

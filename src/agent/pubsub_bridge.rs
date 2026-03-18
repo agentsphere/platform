@@ -110,7 +110,15 @@ async fn run_persistence_subscriber(
     channel: String,
     session_id: Uuid,
 ) -> Result<(), anyhow::Error> {
-    while let Ok(msg) = rx.recv().await {
+    loop {
+        let msg = match rx.recv().await {
+            Ok(msg) => msg,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(%session_id, skipped = n, "persistence subscriber lagged, continuing");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
         let payload: String = match msg.value.convert() {
             Ok(s) => s,
             Err(_) => continue,

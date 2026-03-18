@@ -1,5 +1,24 @@
-Test Report: PASS
+Test Report: FAIL
 ========================================================================
-Total: 1364  Passed: 1364  Failed: 0  Errors: 0
+Total: 140  Passed: 139  Failed: 1  Errors: 0
 
-All tests passed.
+Failed Tests:
+========================================================================
+
+────────────────────────────────────────────────────────────────────────
+FAIL: agent::claude_code::pod::tests::resource_limits_set  (0.011s)
+  in: platform
+
+  thread 'agent::claude_code::pod::tests::resource_limits_set' (26819197) panicked at src/agent/claude_code/pod.rs:1410:9:
+  assertion `left == right` failed
+    left: Quantity("2")
+   right: Quantity("500m")
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  running 1 test
+  test agent::claude_code::pod::tests::resource_limits_set ... FAILED
+
+  failures:
+
+      agent::claude_code::pod::tests::resource_limits_set
+
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1416 filtered out; finished in 0.00s

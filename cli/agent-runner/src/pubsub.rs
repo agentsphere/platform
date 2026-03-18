@@ -22,6 +22,7 @@ pub enum PubSubKind {
     Error,
     Completed,
     WaitingForInput,
+    ProgressUpdate,
 }
 
 /// Event published by agent-runner to `session:{id}:events`.
@@ -111,17 +112,29 @@ fn convert_assistant(a: &AssistantMessage) -> Option<PubSubEvent> {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tool_calls.push(name.to_owned());
+                let summary = extract_tool_summary(name, block.get("input"));
+                tool_calls.push((name.to_owned(), summary));
             }
             _ => {}
         }
     }
 
     if !tool_calls.is_empty() {
+        let names: Vec<&str> = tool_calls.iter().map(|(n, _)| n.as_str()).collect();
+        let tools_meta: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .map(|(name, summary)| {
+                let mut obj = serde_json::json!({"name": name});
+                if let Some(s) = summary {
+                    obj["summary"] = serde_json::Value::String(s.clone());
+                }
+                obj
+            })
+            .collect();
         Some(PubSubEvent {
             kind: PubSubKind::ToolCall,
-            message: tool_calls.join(", "),
-            metadata: None,
+            message: names.join(", "),
+            metadata: Some(serde_json::json!({"tools": tools_meta})),
         })
     } else if !text_parts.is_empty() {
         Some(PubSubEvent {
@@ -144,18 +157,78 @@ fn convert_user(u: &UserMessage) -> Option<PubSubEvent> {
                 .get("tool_use_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            results.push(tool_id.to_owned());
+            let preview = extract_result_preview(block);
+            results.push((tool_id.to_owned(), preview));
         }
     }
 
     if results.is_empty() {
         None
     } else {
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        let results_meta: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(id, preview)| {
+                let mut obj = serde_json::json!({"tool_use_id": id});
+                if let Some(p) = preview {
+                    obj["preview"] = serde_json::Value::String(p.clone());
+                }
+                obj
+            })
+            .collect();
         Some(PubSubEvent {
             kind: PubSubKind::ToolResult,
-            message: format!("Tool results: {}", results.join(", ")),
-            metadata: None,
+            message: format!("Tool results: {}", ids.join(", ")),
+            metadata: Some(serde_json::json!({"results": results_meta})),
         })
+    }
+}
+
+/// Extract a short summary from tool input based on tool name.
+fn extract_tool_summary(tool_name: &str, input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let raw = match tool_name {
+        "Read" | "Write" => input.get("file_path").and_then(|v| v.as_str()),
+        "Edit" => input.get("file_path").and_then(|v| v.as_str()),
+        "Bash" => input.get("command").and_then(|v| v.as_str()),
+        "Grep" => input.get("pattern").and_then(|v| v.as_str()),
+        "Glob" => input.get("pattern").and_then(|v| v.as_str()),
+        "Agent" => input.get("prompt").and_then(|v| v.as_str()),
+        _ => None,
+    }?;
+    Some(truncate(raw, 150))
+}
+
+/// Extract a preview from a tool result content block.
+fn extract_result_preview(block: &serde_json::Value) -> Option<String> {
+    let content = block.get("content")?;
+    let text = if let Some(s) = content.as_str() {
+        s.to_owned()
+    } else if let Some(arr) = content.as_array() {
+        // Content can be an array of blocks; take first text block
+        arr.iter()
+            .find_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_owned())
+                } else {
+                    None
+                }
+            })?
+    } else {
+        return None;
+    };
+    Some(truncate(&text, 200))
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -413,6 +486,18 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "completed");
         assert_eq!(json["metadata"]["total_cost_usd"], 0.05);
+    }
+
+    #[test]
+    fn pubsub_event_serialize_progress_update() {
+        let event = PubSubEvent {
+            kind: PubSubKind::ProgressUpdate,
+            message: "## Status: working\n## Tasks\n- [x] Done".into(),
+            metadata: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "progress_update");
+        assert!(json["message"].as_str().unwrap().contains("Status: working"));
     }
 
     #[test]
@@ -685,7 +770,7 @@ mod tests {
         let msg = CliMessage::Assistant(AssistantMessage {
             message: AssistantContent {
                 content: vec![
-                    serde_json::json!({"type": "tool_use", "name": "Read", "id": "t1", "input": {}}),
+                    serde_json::json!({"type": "tool_use", "name": "Read", "id": "t1", "input": {"file_path": "/workspace/main.rs"}}),
                 ],
                 model: None,
                 usage: None,
@@ -695,6 +780,12 @@ mod tests {
         let event = cli_message_to_event(&msg).unwrap();
         assert_eq!(event.kind, PubSubKind::ToolCall);
         assert!(event.message.contains("Read"));
+        // Enriched metadata
+        let meta = event.metadata.unwrap();
+        let tools = meta["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "Read");
+        assert_eq!(tools[0]["summary"], "/workspace/main.rs");
     }
 
     #[test]
@@ -709,6 +800,12 @@ mod tests {
         });
         let event = cli_message_to_event(&msg).unwrap();
         assert_eq!(event.kind, PubSubKind::ToolResult);
+        // Enriched metadata
+        let meta = event.metadata.unwrap();
+        let results = meta["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert_eq!(results[0]["preview"], "file contents");
     }
 
     #[test]
@@ -800,8 +897,8 @@ mod tests {
         let msg = CliMessage::Assistant(AssistantMessage {
             message: AssistantContent {
                 content: vec![
-                    serde_json::json!({"type": "tool_use", "name": "Read", "id": "t1", "input": {}}),
-                    serde_json::json!({"type": "tool_use", "name": "Write", "id": "t2", "input": {}}),
+                    serde_json::json!({"type": "tool_use", "name": "Read", "id": "t1", "input": {"file_path": "/a.rs"}}),
+                    serde_json::json!({"type": "tool_use", "name": "Write", "id": "t2", "input": {"file_path": "/b.rs"}}),
                 ],
                 model: None,
                 usage: None,
@@ -812,6 +909,9 @@ mod tests {
         assert_eq!(event.kind, PubSubKind::ToolCall);
         assert!(event.message.contains("Read"));
         assert!(event.message.contains("Write"));
+        let meta = event.metadata.unwrap();
+        let tools = meta["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]
@@ -865,6 +965,11 @@ mod tests {
         assert_eq!(event.kind, PubSubKind::ToolResult);
         assert!(event.message.contains("t1"));
         assert!(event.message.contains("t2"));
+        let meta = event.metadata.unwrap();
+        let results = meta["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["preview"], "ok");
+        assert_eq!(results[1]["preview"], "done");
     }
 
     #[test]
@@ -1024,6 +1129,92 @@ mod tests {
         let event = cli_message_to_event(&msg).unwrap();
         assert_eq!(event.kind, PubSubKind::Text);
         assert_eq!(event.message, "Hello world");
+    }
+
+    // -- extract_tool_summary tests --
+
+    #[test]
+    fn extract_summary_read_file_path() {
+        let input = serde_json::json!({"file_path": "/workspace/src/main.rs"});
+        let result = extract_tool_summary("Read", Some(&input));
+        assert_eq!(result.as_deref(), Some("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn extract_summary_bash_command() {
+        let input = serde_json::json!({"command": "npm install"});
+        let result = extract_tool_summary("Bash", Some(&input));
+        assert_eq!(result.as_deref(), Some("npm install"));
+    }
+
+    #[test]
+    fn extract_summary_grep_pattern() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let result = extract_tool_summary("Grep", Some(&input));
+        assert_eq!(result.as_deref(), Some("fn main"));
+    }
+
+    #[test]
+    fn extract_summary_unknown_tool() {
+        let input = serde_json::json!({"foo": "bar"});
+        let result = extract_tool_summary("UnknownTool", Some(&input));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_summary_no_input() {
+        let result = extract_tool_summary("Read", None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_summary_truncates_long_input() {
+        let long_path = format!("/workspace/{}", "a".repeat(200));
+        let input = serde_json::json!({"file_path": long_path});
+        let result = extract_tool_summary("Read", Some(&input)).unwrap();
+        assert!(result.len() <= 153); // 150 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_result_preview_string_content() {
+        let block = serde_json::json!({"type": "tool_result", "tool_use_id": "t1", "content": "hello world"});
+        let result = extract_result_preview(&block);
+        assert_eq!(result.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn extract_result_preview_array_content() {
+        let block = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "t1",
+            "content": [{"type": "text", "text": "result data"}]
+        });
+        let result = extract_result_preview(&block);
+        assert_eq!(result.as_deref(), Some("result data"));
+    }
+
+    #[test]
+    fn extract_result_preview_no_content() {
+        let block = serde_json::json!({"type": "tool_result", "tool_use_id": "t1"});
+        let result = extract_result_preview(&block);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let result = truncate("hello world", 5);
+        assert_eq!(result, "hello...");
     }
 
     // -- Ignored integration tests (require real Valkey) --

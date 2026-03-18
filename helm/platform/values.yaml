@@ -1,0 +1,171 @@
+# =============================================================================
+# AgentSphere Platform — Default Helm Values
+# =============================================================================
+# Override per environment with values-small.yaml, values-medium.yaml, etc.
+# See Chart.yaml for subchart dependency versions.
+
+# -- Platform application configuration
+platform:
+  image:
+    repository: ghcr.io/agentsphere/platform
+    tag: latest
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+  replicaCount: 1
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "500m"
+    limits:
+      memory: "512Mi"
+      cpu: "1"
+
+  # -- Environment configuration (maps to PLATFORM_* env vars)
+  env:
+    devMode: false
+    secureCookies: false
+    trustProxy: true
+    permissionCacheTtl: 300
+    logLevel: "info"
+    selfObserveLevel: "warn"
+    pipelineMaxParallel: 4
+    maxCliSubprocesses: 10
+    sessionIdleTimeout: 1800
+    healthCheckInterval: 15
+    claudeCliVersion: "stable"
+
+  # -- SSH server configuration
+  ssh:
+    enabled: false
+    port: 2222
+
+  # -- WebAuthn / Passkeys configuration
+  # Set rpId and rpOrigin to match your domain in production
+  webauthn:
+    rpId: ""
+    rpOrigin: ""
+    rpName: "Platform"
+
+  # -- SMTP configuration (optional, enables email notifications)
+  smtp:
+    host: ""
+    port: 587
+    from: "platform@localhost"
+    username: ""
+    password: ""
+
+  # -- Container registry configuration
+  registry:
+    url: ""
+    nodeUrl: ""
+
+  # -- Admin password (dev mode only — leave empty for production setup token flow)
+  adminPassword: ""
+
+  # -- Additional pod annotations
+  podAnnotations: {}
+
+  # -- Additional pod labels
+  podLabels: {}
+
+  # -- Node selector
+  nodeSelector: {}
+
+  # -- Tolerations
+  tolerations: []
+
+  # -- Affinity
+  affinity: {}
+
+# -- Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: platform.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: platform-tls
+  #    hosts:
+  #      - platform.example.com
+
+# -- Persistence configuration for /data volume
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  existingClaim: ""
+
+# -- Service account
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# =============================================================================
+# Subchart: PostgreSQL (Bitnami)
+# =============================================================================
+postgresql:
+  enabled: true
+  auth:
+    username: platform
+    password: ""
+    database: platform
+    existingSecret: ""
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# =============================================================================
+# Subchart: Valkey (Bitnami)
+# =============================================================================
+valkey:
+  enabled: true
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+# =============================================================================
+# Subchart: MinIO (Bitnami)
+# =============================================================================
+minio:
+  enabled: true
+  auth:
+    rootUser: platform
+    rootPassword: ""
+  defaultBuckets: "platform"
+  persistence:
+    enabled: true
+    size: 20Gi
+
+# =============================================================================
+# External services (used when subcharts are disabled)
+# =============================================================================
+externalDatabase:
+  # -- Full PostgreSQL connection URL
+  # Example: postgres://user:pass@host:5432/dbname
+  url: ""
+
+externalValkey:
+  # -- Full Valkey/Redis connection URL
+  # Example: redis://host:6379
+  url: ""
+
+externalMinio:
+  # -- MinIO/S3 endpoint URL
+  # Example: https://minio.example.com:9000
+  endpoint: ""
+  accessKey: ""
+  secretKey: ""

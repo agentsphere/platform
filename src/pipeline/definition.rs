@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,9 @@ pub struct StepDef {
     /// When present, `image` and `commands` are ignored.
     #[serde(default)]
     pub deploy_test: Option<DeployTestDef>,
+    /// Quality gate: marks this step as a quality gate (UI/semantic only).
+    #[serde(default)]
+    pub gate: bool,
 }
 
 /// Per-step condition controlling when a step runs.
@@ -168,6 +171,8 @@ fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
         }
     }
 
+    validate_dag(&def.steps)?;
+
     if let Some(dev) = &def.dev_image {
         if dev.dockerfile.is_empty() {
             return Err(PipelineError::InvalidDefinition(
@@ -192,6 +197,96 @@ fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DAG validation
+// ---------------------------------------------------------------------------
+
+/// Validate that `depends_on` references are valid and the graph is acyclic.
+fn validate_dag(steps: &[StepDef]) -> Result<(), PipelineError> {
+    let names: HashSet<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+    for step in steps {
+        for dep in &step.depends_on {
+            if !names.contains(dep.as_str()) {
+                return Err(PipelineError::InvalidDefinition(format!(
+                    "step '{}': depends_on references unknown step '{dep}'",
+                    step.name,
+                )));
+            }
+            if dep == &step.name {
+                return Err(PipelineError::InvalidDefinition(format!(
+                    "step '{}': depends_on cannot reference itself",
+                    step.name,
+                )));
+            }
+        }
+    }
+
+    // Cycle detection via Kahn's algorithm
+    if topological_layers(steps).is_none() {
+        return Err(PipelineError::InvalidDefinition(
+            "pipeline dependency graph contains a cycle".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Compute parallel execution layers via topological sort.
+///
+/// Returns `None` if the graph has a cycle. Otherwise returns groups of step
+/// indices that can run in parallel: layer 0 has no deps, layer N depends only
+/// on layers < N.
+pub fn topological_layers(steps: &[StepDef]) -> Option<Vec<Vec<usize>>> {
+    let name_to_idx: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+
+    let n = steps.len();
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, step) in steps.iter().enumerate() {
+        for dep_name in &step.depends_on {
+            if let Some(&dep_idx) = name_to_idx.get(dep_name.as_str()) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> = in_degree
+        .iter()
+        .enumerate()
+        .filter(|&(_, &deg)| deg == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut layers = Vec::new();
+    let mut processed = 0usize;
+
+    while !queue.is_empty() {
+        let layer: Vec<usize> = queue.drain(..).collect();
+        for &idx in &layer {
+            processed += 1;
+            for &dep_idx in &dependents[idx] {
+                in_degree[dep_idx] -= 1;
+                if in_degree[dep_idx] == 0 {
+                    queue.push_back(dep_idx);
+                }
+            }
+        }
+        layers.push(layer);
+    }
+
+    if processed == n {
+        Some(layers)
+    } else {
+        None // cycle detected
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,5 +1274,217 @@ pipeline:
         let env = vec![("REGISTRY".into(), "localhost:5000".into())];
         let result = expand_step_env("$REGISTRY/$UNKNOWN", &env);
         assert_eq!(result, "localhost:5000/$UNKNOWN");
+    }
+
+    // -- gate field parsing --
+
+    #[test]
+    fn parse_gate_default_false() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+";
+        let def = parse(yaml).unwrap();
+        assert!(!def.steps[0].gate);
+    }
+
+    #[test]
+    fn parse_gate_true() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: e2e
+      deploy_test:
+        test_image: registry/test:v1
+      gate: true
+";
+        let def = parse(yaml).unwrap();
+        assert!(def.steps[0].gate);
+    }
+
+    // -- DAG validation --
+
+    #[test]
+    fn validate_dag_unknown_dep_rejected() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+      depends_on: [nonexistent]
+";
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("unknown step")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_self_dep_rejected() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+      depends_on: [build]
+";
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("cannot reference itself")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_cycle_detected() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: a
+      image: alpine
+      depends_on: [b]
+    - name: b
+      image: alpine
+      depends_on: [a]
+";
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("cycle")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_valid_chain() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: lint
+      image: alpine
+    - name: test
+      image: alpine
+      depends_on: [lint]
+    - name: build
+      image: alpine
+      depends_on: [test]
+";
+        parse(yaml).unwrap(); // should not error
+    }
+
+    // -- topological_layers --
+
+    #[test]
+    fn topological_layers_no_deps() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: a
+      image: alpine
+    - name: b
+      image: alpine
+    - name: c
+      image: alpine
+";
+        let def = parse(yaml).unwrap();
+        let layers = topological_layers(&def.steps).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 3);
+    }
+
+    #[test]
+    fn topological_layers_diamond() {
+        // A → B, A → C, B → D, C → D
+        let yaml = r"
+pipeline:
+  steps:
+    - name: a
+      image: alpine
+    - name: b
+      image: alpine
+      depends_on: [a]
+    - name: c
+      image: alpine
+      depends_on: [a]
+    - name: d
+      image: alpine
+      depends_on: [b, c]
+";
+        let def = parse(yaml).unwrap();
+        let layers = topological_layers(&def.steps).unwrap();
+        assert_eq!(layers.len(), 3);
+        // Layer 0: a
+        assert_eq!(layers[0], vec![0]);
+        // Layer 1: b, c (parallel)
+        let mut l1 = layers[1].clone();
+        l1.sort();
+        assert_eq!(l1, vec![1, 2]);
+        // Layer 2: d
+        assert_eq!(layers[2], vec![3]);
+    }
+
+    #[test]
+    fn topological_layers_single_step() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: only
+      image: alpine
+";
+        let def = parse(yaml).unwrap();
+        let layers = topological_layers(&def.steps).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0], vec![0]);
+    }
+
+    #[test]
+    fn topological_layers_linear_chain() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: a
+      image: alpine
+    - name: b
+      image: alpine
+      depends_on: [a]
+    - name: c
+      image: alpine
+      depends_on: [b]
+";
+        let def = parse(yaml).unwrap();
+        let layers = topological_layers(&def.steps).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![0]);
+        assert_eq!(layers[1], vec![1]);
+        assert_eq!(layers[2], vec![2]);
+    }
+
+    #[test]
+    fn topological_layers_cycle_returns_none() {
+        let steps = vec![
+            StepDef {
+                name: "a".into(),
+                image: "alpine".into(),
+                depends_on: vec!["b".into()],
+                commands: vec![],
+                environment: HashMap::new(),
+                only: None,
+                deploy_test: None,
+                gate: false,
+            },
+            StepDef {
+                name: "b".into(),
+                image: "alpine".into(),
+                depends_on: vec!["a".into()],
+                commands: vec![],
+                environment: HashMap::new(),
+                only: None,
+                deploy_test: None,
+                gate: false,
+            },
+        ];
+        assert!(topological_layers(&steps).is_none());
     }
 }

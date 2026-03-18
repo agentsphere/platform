@@ -14,6 +14,16 @@ interface Props {
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'thinking';
   content: string;
+  kind?: string; // original event kind for grouping
+  toolMeta?: { name: string; summary?: string }[]; // tool call metadata
+  resultMeta?: { tool_use_id: string; preview?: string }[]; // tool result metadata
+}
+
+// Grouped messages for display
+interface MessageGroup {
+  type: 'message' | 'tool_group';
+  messages?: ChatMessage[]; // For 'message' type (single item)
+  tools?: { name: string; summary?: string; resultPreview?: string }[]; // For 'tool_group'
 }
 
 type PanelStatus = 'idle' | 'creating' | 'connecting' | 'waiting' | 'ready' | 'working' | 'completed' | 'failed' | 'stopped';
@@ -26,11 +36,13 @@ function normalizeKind(kind: string | undefined): ProgressEvent['kind'] {
     completed: 'Completed', waiting_for_input: 'WaitingForInput',
     secret_request: 'SecretRequest',
     iframe_available: 'IframeAvailable', iframe_removed: 'IframeRemoved',
+    progress_update: 'ProgressUpdate',
     Text: 'Text', Thinking: 'Thinking', ToolCall: 'ToolCall',
     ToolResult: 'ToolResult', Milestone: 'Milestone', Error: 'Error',
     Completed: 'Completed', WaitingForInput: 'WaitingForInput',
     SecretRequest: 'SecretRequest',
     IframeAvailable: 'IframeAvailable', IframeRemoved: 'IframeRemoved',
+    ProgressUpdate: 'ProgressUpdate',
   };
   return map[kind] || 'Text';
 }
@@ -55,12 +67,109 @@ const STATUS_LABELS: Record<PanelStatus, string> = {
   stopped: 'Session stopped',
 };
 
+/** Messages that should not break a tool group when they appear between tool calls. */
+function isNoiseMessage(msg: ChatMessage): boolean {
+  if (msg.role === 'system' && /^Session started\b/.test(msg.content)) return true;
+  return false;
+}
+
+/** Group consecutive tool_call/tool_result messages into collapsed groups. */
+function groupMessages(msgs: ChatMessage[]): MessageGroup[] {
+  const groups: MessageGroup[] = [];
+  let toolBuf: ChatMessage[] = [];
+
+  function flushTools() {
+    if (toolBuf.length === 0) return;
+    const tools: MessageGroup['tools'] = [];
+    for (const m of toolBuf) {
+      if (m.kind === 'ToolCall' && m.toolMeta) {
+        for (const t of m.toolMeta) {
+          tools.push({ name: t.name, summary: t.summary });
+        }
+      } else if (m.kind === 'ToolResult' && m.resultMeta) {
+        // Match results to existing tools by position if possible
+        for (const r of m.resultMeta) {
+          const existing = tools.find(t => !t.resultPreview);
+          if (existing) {
+            existing.resultPreview = r.preview;
+          }
+        }
+      }
+    }
+    if (tools.length > 0) {
+      groups.push({ type: 'tool_group', tools });
+    }
+    toolBuf = [];
+  }
+
+  for (const msg of msgs) {
+    if (msg.kind === 'ToolCall' || msg.kind === 'ToolResult') {
+      toolBuf.push(msg);
+    } else if (toolBuf.length > 0 && isNoiseMessage(msg)) {
+      toolBuf.push(msg);
+    } else {
+      flushTools();
+      groups.push({ type: 'message', messages: [msg] });
+    }
+  }
+  flushTools();
+  return groups;
+}
+
+/** Render simple markdown: headings, checkboxes, bold, lists */
+function SimpleMarkdown({ content }: { content: string }) {
+  const lines = content.split('\n');
+  const elements: any[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('## ')) {
+      elements.push(<div key={i} style="font-weight:600;margin:0.5rem 0 0.25rem;font-size:13px;color:var(--text-primary)">{line.slice(3)}</div>);
+    } else if (line.startsWith('# ')) {
+      elements.push(<div key={i} style="font-weight:700;margin:0.5rem 0 0.25rem;font-size:14px;color:var(--text-primary)">{line.slice(2)}</div>);
+    } else if (/^- \[x\] /.test(line)) {
+      elements.push(<div key={i} style="font-size:12px;padding:0.1rem 0;color:var(--text-secondary)"><span style="color:var(--success)">&#x2705;</span> <s>{line.slice(6)}</s></div>);
+    } else if (/^- \[ \] /.test(line)) {
+      elements.push(<div key={i} style="font-size:12px;padding:0.1rem 0;color:var(--text-primary)"><span style="opacity:0.4">&#x2B1C;</span> {line.slice(6)}</div>);
+    } else if (/^- \S/.test(line)) {
+      // Detect the "current" marker with a spinner emoji
+      const isActive = /^- 🔄/.test(line);
+      elements.push(<div key={i} style={`font-size:12px;padding:0.1rem 0;color:${isActive ? 'var(--accent)' : 'var(--text-secondary)'}`}>&bull; {line.slice(2)}</div>);
+    } else if (line.trim() === '') {
+      elements.push(<div key={i} style="height:0.25rem" />);
+    } else {
+      elements.push(<div key={i} style="font-size:12px;color:var(--text-secondary);padding:0.1rem 0">{line}</div>);
+    }
+  }
+  return <>{elements}</>;
+}
+
+function ToolGroupRow({ tools, expanded, onToggle }: { tools: NonNullable<MessageGroup['tools']>; expanded: boolean; onToggle: () => void }) {
+  return (
+    <div class="tool-group" onClick={onToggle}>
+      {expanded ? (
+        <div class="tool-group-expanded">
+          {tools.map((t, i) => (
+            <div key={i} class="tool-group-item">
+              <span class="tool-group-name">{t.name}</span>
+              {t.summary && <span class="tool-group-summary-text">{t.summary}</span>}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <span class="tool-group-collapsed">&#x2504; {tools.length} tool call{tools.length !== 1 ? 's' : ''} &#x2504;</span>
+      )}
+    </div>
+  );
+}
+
 export function AgentChatPanel({ projectId, open, onClose }: Props) {
   const [status, setStatus] = useState<PanelStatus>('idle');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [secretRequest, setSecretRequest] = useState<SecretRequestMeta | null>(null);
+  const [latestProgress, setLatestProgress] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
   const messagesEnd = useRef<HTMLDivElement>(null);
   const sseRef = useRef<EventSourceClient | null>(null);
   const streamBuf = useRef('');
@@ -109,21 +218,29 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
     ).then(data => {
       if (data.messages && data.messages.length > 0) {
         const mapped: ChatMessage[] = [];
+        let lastProgress: string | null = null;
         for (const m of data.messages) {
           const kind = normalizeKind(m.metadata?.kind as string);
+          if (kind === 'ProgressUpdate') {
+            lastProgress = m.content;
+            continue;
+          }
           if (m.role === 'user' || kind === 'Text' && m.role === 'user') {
             mapped.push({ role: 'user', content: m.content });
           } else if (kind === 'Text') {
             mapped.push({ role: 'assistant', content: m.content });
           } else if (kind === 'Thinking') {
             mapped.push({ role: 'thinking', content: m.content });
-          } else if (kind === 'ToolCall' || kind === 'ToolResult') {
-            mapped.push({ role: 'system', content: m.content });
+          } else if (kind === 'ToolCall') {
+            mapped.push({ role: 'system', content: m.content, kind: 'ToolCall', toolMeta: m.metadata?.tools });
+          } else if (kind === 'ToolResult') {
+            mapped.push({ role: 'system', content: m.content, kind: 'ToolResult', resultMeta: m.metadata?.results });
           } else if (kind === 'Milestone') {
             mapped.push({ role: 'system', content: m.content });
           }
         }
         setMessages(mapped);
+        if (lastProgress) setLatestProgress(lastProgress);
       }
       if (data.status === 'completed') setStatus('completed');
       else if (data.status === 'failed') setStatus('failed');
@@ -172,12 +289,18 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
             break;
           }
           case 'ToolCall': {
-            setMessages(prev => [...prev, { role: 'system', content: `Running: ${message}...` }]);
+            const toolMeta = metadata?.tools as { name: string; summary?: string }[] | undefined;
+            setMessages(prev => [...prev, { role: 'system', content: `Running: ${message}...`, kind: 'ToolCall', toolMeta }]);
             break;
           }
           case 'ToolResult': {
             const isError = metadata?.is_error;
-            setMessages(prev => [...prev, { role: 'system', content: isError ? `Error: ${message}` : message }]);
+            const resultMeta = metadata?.results as { tool_use_id: string; preview?: string }[] | undefined;
+            setMessages(prev => [...prev, { role: 'system', content: isError ? `Error: ${message}` : message, kind: 'ToolResult', resultMeta }]);
+            break;
+          }
+          case 'ProgressUpdate': {
+            setLatestProgress(message);
             break;
           }
           case 'Milestone': {
@@ -303,8 +426,19 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
     setSessionId(null);
     setMessages([]);
     streamBuf.current = '';
+    setLatestProgress(null);
+    setExpandedGroups(new Set());
     // Auto-create a new session immediately
     autoCreateSession();
+  }
+
+  function toggleGroup(idx: number) {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
   }
 
   const inputDisabled = status === 'creating' || status === 'connecting' || status === 'waiting' || status === 'working';
@@ -313,10 +447,12 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
 
   if (!open) return null;
 
+  const grouped = groupMessages(messages);
+
   return (
     <>
       <div class="agent-chat-overlay" onClick={onClose} />
-      <div class="agent-chat-panel">
+      <div class={`agent-chat-panel ${latestProgress ? 'agent-chat-panel-with-progress' : ''}`}>
         <div class="agent-chat-panel-header">
           <div class="flex gap-sm" style="align-items:center">
             <span style="font-weight:600">Agent</span>
@@ -341,27 +477,51 @@ export function AgentChatPanel({ projectId, open, onClose }: Props) {
           <div class="agent-chat-status">{statusLabel}</div>
         )}
 
-        <div class="agent-chat-messages">
-          {messages.length === 0 && (status === 'idle' || status === 'creating' || status === 'connecting' || status === 'waiting') && (
-            <div style="text-align:center;padding:2rem;color:var(--text-muted)">
-              <p style="margin-bottom:0.5rem">{status === 'idle' ? 'Starting agent...' : 'Agent is starting...'}</p>
-              <p class="text-xs">The agent will have access to this project's code and can make changes.</p>
-            </div>
-          )}
-          {messages.map((msg, i) => (
-            <div key={i} style={msgStyle(msg.role)}>
-              <div style="font-weight:600;margin-bottom:0.15rem;font-size:0.8rem;color:var(--text-muted)">
-                {msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Agent' : msg.role === 'thinking' ? 'Thinking...' : ''}
+        <div class="agent-chat-body">
+          <div class="agent-chat-messages">
+            {messages.length === 0 && (status === 'idle' || status === 'creating' || status === 'connecting' || status === 'waiting') && (
+              <div style="text-align:center;padding:2rem;color:var(--text-muted)">
+                <p style="margin-bottom:0.5rem">{status === 'idle' ? 'Starting agent...' : 'Agent is starting...'}</p>
+                <p class="text-xs">The agent will have access to this project's code and can make changes.</p>
               </div>
-              <div style={msg.role === 'thinking' ? 'white-space:pre-wrap;font-style:italic;opacity:0.7;font-size:13px' : 'white-space:pre-wrap;font-size:13px'}>{msg.content}</div>
-            </div>
-          ))}
-          {status === 'working' && (
-            <div style="padding:0.5rem 1rem;color:var(--text-muted)">
-              <span class="typing-indicator">&#9679; &#9679; &#9679;</span>
+            )}
+            {grouped.map((group, gi) => {
+              if (group.type === 'tool_group' && group.tools) {
+                return (
+                  <ToolGroupRow
+                    key={`tg-${gi}`}
+                    tools={group.tools}
+                    expanded={expandedGroups.has(gi)}
+                    onToggle={() => toggleGroup(gi)}
+                  />
+                );
+              }
+              const msg = group.messages![0];
+              return (
+                <div key={gi} style={msgStyle(msg.role)}>
+                  <div style="font-weight:600;margin-bottom:0.15rem;font-size:0.8rem;color:var(--text-muted)">
+                    {msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Agent' : msg.role === 'thinking' ? 'Thinking...' : ''}
+                  </div>
+                  <div style={msg.role === 'thinking' ? 'white-space:pre-wrap;font-style:italic;opacity:0.7;font-size:13px' : 'white-space:pre-wrap;font-size:13px'}>{msg.content}</div>
+                </div>
+              );
+            })}
+            {status === 'working' && (
+              <div style="padding:0.5rem 1rem;color:var(--text-muted)">
+                <span class="typing-indicator">&#9679; &#9679; &#9679;</span>
+              </div>
+            )}
+            <div ref={messagesEnd} />
+          </div>
+
+          {latestProgress && (
+            <div class="agent-chat-progress">
+              <div class="agent-chat-progress-header">Progress</div>
+              <div class="agent-chat-progress-content">
+                <SimpleMarkdown content={latestProgress} />
+              </div>
             </div>
           )}
-          <div ref={messagesEnd} />
         </div>
 
         {!isTerminal && (

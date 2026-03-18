@@ -460,6 +460,7 @@ pub(crate) fn build_env(opts: &CliSpawnOptions) -> Vec<(String, String)> {
         "PLATFORM_API_TOKEN",
         "PLATFORM_API_URL",
         "PROJECT_ID",
+        "SESSION_ID",
         "BRANCH",
         "GIT_ASKPASS",
         "GIT_CONFIG_COUNT",

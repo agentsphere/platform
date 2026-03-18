@@ -227,6 +227,7 @@ export PLATFORM_VALKEY_AGENT_HOST="valkey.${SVC_NS}.svc.cluster.local:6379"
 export PLATFORM_PREVIEW_PROXY_URL="http://${NODE_IP}:${PREVIEW_PROXY_PORT}"
 export PLATFORM_SEED_IMAGES_PATH="/tmp/platform-e2e/${WORKTREE}/seed-images"
 export PLATFORM_AGENT_RUNNER_DIR="${RUNNER_DIR}"
+export PLATFORM_MCP_SERVERS_TARBALL="/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz"
 export CLAUDE_CLI_PATH="${PROJECT_DIR}/tests/fixtures/mock-claude-cli.sh"
 
 # Copy mock CLIs to shared mount so they're accessible inside Kind pods

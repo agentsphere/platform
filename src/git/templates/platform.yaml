@@ -6,15 +6,28 @@ pipeline:
       actions: [opened, synchronized]
 
   steps:
-    - name: build
+    # --- Layer 0: these 2 steps have no depends_on → run in PARALLEL ---
+    - name: build-app
       image: gcr.io/kaniko-project/executor:debug
       commands:
-        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA --insecure --cache=true
+        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA --insecure --insecure-registry=$REGISTRY --cache=true
 
     - name: build-test
       image: gcr.io/kaniko-project/executor:debug
       commands:
-        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile.test --destination=$REGISTRY/$PROJECT/test:$COMMIT_SHA --insecure
+        - /kaniko/executor --context=dir:///workspace --dockerfile=/workspace/Dockerfile.test --destination=$REGISTRY/$PROJECT/test:$COMMIT_SHA --insecure --insecure-registry=$REGISTRY
+      only:
+        events: [mr]
+
+    # --- Layer 1: waits for both builds, then deploys + tests ---
+    - name: e2e
+      depends_on: [build-app, build-test]
+      gate: true
+      deploy_test:
+        test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
+        manifests: deploy/
+        readiness_path: /healthz
+        readiness_timeout: 120
       only:
         events: [mr]
 

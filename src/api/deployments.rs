@@ -133,6 +133,11 @@ pub fn router() -> Router<AppState> {
             "/api/projects/{id}/deployments/{env}/history",
             get(list_history),
         )
+        // Deploy preview iframes
+        .route(
+            "/api/projects/{id}/deploy-preview/iframes",
+            get(list_deploy_iframes),
+        )
         // Preview deployment routes
         .route("/api/projects/{id}/previews", get(list_previews))
         .route(
@@ -546,6 +551,96 @@ async fn list_history(
         .collect();
 
     Ok(Json(ListResponse { items, total }))
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview iframes
+// ---------------------------------------------------------------------------
+
+/// Response type for deploy iframe panels (same shape as session iframes).
+#[derive(Debug, Serialize)]
+struct DeployIframePanel {
+    service_name: String,
+    port: i32,
+    port_name: String,
+    preview_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployIframeQuery {
+    #[serde(default = "default_deploy_env")]
+    env: String,
+}
+
+fn default_deploy_env() -> String {
+    "production".into()
+}
+
+/// List iframe panels for a project's deploy namespace.
+/// Discovers K8s Services labeled `platform.io/component=iframe-preview`.
+#[tracing::instrument(skip(state, auth), fields(%id), err)]
+async fn list_deploy_iframes(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<DeployIframeQuery>,
+) -> Result<Json<Vec<DeployIframePanel>>, ApiError> {
+    require_project_read(&state, &auth, id).await?;
+
+    let project = sqlx::query!(
+        r#"SELECT namespace_slug FROM projects WHERE id = $1 AND is_active = true"#,
+        id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project".into()))?;
+
+    let slug = &project.namespace_slug;
+    if slug.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    let namespace = crate::deployer::reconciler::target_namespace(&state.config, slug, &query.env);
+
+    if !crate::api::preview::validate_namespace_format(&namespace) {
+        return Ok(Json(vec![]));
+    }
+
+    let svc_api: kube::Api<k8s_openapi::api::core::v1::Service> =
+        kube::Api::namespaced(state.kube.clone(), &namespace);
+    let lp = kube::api::ListParams::default().labels("platform.io/component=iframe-preview");
+
+    let svcs = match svc_api.list(&lp).await {
+        Ok(list) => list,
+        Err(kube::Error::Api(resp)) if resp.code == 404 => {
+            // Namespace doesn't exist yet — no iframes
+            return Ok(Json(vec![]));
+        }
+        Err(e) => return Err(ApiError::Internal(e.into())),
+    };
+
+    let panels: Vec<DeployIframePanel> = svcs
+        .items
+        .iter()
+        .flat_map(|svc| {
+            let spec = svc.spec.as_ref();
+            let ports = spec.and_then(|s| s.ports.as_ref());
+            let name = svc.metadata.name.clone().unwrap_or_default();
+            let project_id = id;
+            ports
+                .into_iter()
+                .flatten()
+                .filter(|p| p.name.as_deref() == Some("iframe"))
+                .map(move |p| DeployIframePanel {
+                    service_name: name.clone(),
+                    port: p.port,
+                    port_name: "iframe".into(),
+                    preview_url: format!("/deploy-preview/{project_id}/{name}/"),
+                })
+        })
+        .collect();
+
+    Ok(Json(panels))
 }
 
 // ---------------------------------------------------------------------------

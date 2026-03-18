@@ -4,6 +4,7 @@ mod control;
 mod error;
 mod mcp;
 mod messages;
+mod progress_watcher;
 mod pubsub;
 mod render;
 mod repl;
@@ -12,6 +13,8 @@ mod transport;
 
 #[cfg(test)]
 mod llm_tests;
+
+use std::io::Write;
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -190,12 +193,53 @@ fn resolve_pubsub() -> anyhow::Result<Option<PubSubConfig>> {
 }
 
 // ---------------------------------------------------------------------------
+// Write project secrets to .env.dev so the agent can source them for app dev
+// ---------------------------------------------------------------------------
+
+fn write_secrets_env_file() {
+    let names = match std::env::var("PLATFORM_SECRET_NAMES") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+
+    let path = std::path::Path::new("/workspace/.env.dev");
+    let mut file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[warn] could not create {}: {e}", path.display());
+            return;
+        }
+    };
+
+    let mut count = 0;
+    for name in names.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if let Ok(val) = std::env::var(name) {
+            // Shell-safe quoting: single quotes, escape embedded single quotes
+            let escaped = val.replace('\'', "'\\''");
+            let _ = writeln!(file, "{name}='{escaped}'");
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        eprintln!("[info] wrote {count} secret(s) to {}", path.display());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // 0. Write project secrets to .env.dev (before anything else)
+    write_secrets_env_file();
 
     // 1. Resolve auth (may be None if user relies on config-dir OAuth)
     let auth = resolve_auth().ok();
@@ -323,8 +367,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 10. Run per-turn spawn REPL (opts are cloned per turn)
+    // 10. Spawn progress file watcher (pub/sub mode only)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let _progress_handle = if let Some(ref ps_config) = pubsub_config {
+        // Create a second pub/sub client for the watcher (separate connection)
+        match PubSubClient::connect(&ps_config.url, &ps_config.session_id).await {
+            Ok(watcher_client) => {
+                Some(progress_watcher::spawn(watcher_client, shutdown_rx))
+            }
+            Err(e) => {
+                eprintln!("[warn] progress watcher pub/sub connect failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 11. Run per-turn spawn REPL (opts are cloned per turn)
     repl::run(opts, pubsub, initial_prompt, stdin_rx, cli.one_shot).await?;
+
+    // Signal progress watcher to shut down
+    let _ = shutdown_tx.send(true);
 
     // config_dir is dropped here (auto-cleanup)
     Ok(())

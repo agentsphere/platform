@@ -41,16 +41,16 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: "{{ project_name }}"
+  name: "{{ project_name }}-app"
 spec:
   replicas: {{ values.replicas | default(1) }}
   selector:
     matchLabels:
-      app: "{{ project_name }}"
+      app: "{{ project_name }}-app"
   template:
     metadata:
       labels:
-        app: "{{ project_name }}"
+        app: "{{ project_name }}-app"
     spec:
       imagePullSecrets:
         - name: platform-registry-pull
@@ -62,10 +62,6 @@ spec:
           env:
             - name: DATABASE_URL
               value: "postgresql://app:{{ values.db_password | default('changeme') }}@{{ project_name }}-db:5432/app"
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "{{ platform_api_url }}"
-            - name: OTEL_SERVICE_NAME
-              value: "{{ project_name }}"
           readinessProbe:
             httpGet:
               path: /healthz
@@ -82,10 +78,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: "{{ project_name }}"
+  name: "{{ project_name }}-app"
 spec:
   selector:
-    app: "{{ project_name }}"
+    app: "{{ project_name }}-app"
   ports:
-    - port: 80
+    - port: 8080
       targetPort: 8080

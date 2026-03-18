@@ -559,7 +559,12 @@ async fn llm_mcp_config_written() {
     use crate::mcp::{generate_mcp_config, write_mcp_config};
 
     let dir = tempfile::TempDir::new().expect("failed to create temp dir");
-    let config = generate_mcp_config("http://platform.test:8080", "test-token");
+    let config = generate_mcp_config(&crate::mcp::McpContext {
+        platform_api_url: "http://platform.test:8080",
+        platform_api_token: "test-token",
+        session_id: "test-session",
+        project_id: "test-project",
+    });
     let path = write_mcp_config(dir.path(), &config).expect("failed to write MCP config");
 
     assert!(path.exists(), "MCP config file should exist");

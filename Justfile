@@ -258,6 +258,13 @@ cli-test-llm:
 cli-cov:
     cargo llvm-cov --manifest-path cli/agent-runner/Cargo.toml --bin agent-runner
 
+# Build MCP servers tarball (fast — no Docker, no cross-compile)
+mcp-tarball dir="/tmp/platform-e2e/main":
+    @mkdir -p {{ dir }}
+    tar -czf {{ dir }}/mcp-servers.tar.gz -C mcp \
+      servers lib package.json package-lock.json node_modules
+    @echo "MCP tarball: {{ dir }}/mcp-servers.tar.gz"
+
 docker tag="platform:dev":
     docker build -f docker/Dockerfile -t {{ tag }} .
 

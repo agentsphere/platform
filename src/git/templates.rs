@@ -7,6 +7,10 @@ const DEPLOY_PRODUCTION: &str = include_str!("templates/deploy/production.yaml")
 const CLAUDE_MD: &str = include_str!("templates/CLAUDE.md");
 const README_TEMPLATE: &str = include_str!("templates/README.md");
 const DEV_COMMAND: &str = include_str!("templates/.claude/commands/dev.md");
+const REQUIREMENTS_TEST: &str = include_str!("templates/requirements-test.txt");
+const TEST_CONFTEST: &str = include_str!("templates/tests-e2e/conftest.py");
+const TEST_HEALTHZ: &str = include_str!("templates/tests-e2e/test_healthz.py");
+const TEST_API: &str = include_str!("templates/tests-e2e/test_api.py");
 
 /// A file to be committed as part of the project template.
 pub struct TemplateFile {
@@ -51,6 +55,22 @@ pub fn project_template_files(project_name: &str) -> Vec<TemplateFile> {
             path: ".claude/commands/dev.md",
             content: DEV_COMMAND.to_owned(),
         },
+        TemplateFile {
+            path: "requirements-test.txt",
+            content: REQUIREMENTS_TEST.to_owned(),
+        },
+        TemplateFile {
+            path: "tests-e2e/conftest.py",
+            content: TEST_CONFTEST.to_owned(),
+        },
+        TemplateFile {
+            path: "tests-e2e/test_healthz.py",
+            content: TEST_HEALTHZ.to_owned(),
+        },
+        TemplateFile {
+            path: "tests-e2e/test_api.py",
+            content: TEST_API.to_owned(),
+        },
     ]
 }
 
@@ -61,7 +81,7 @@ mod tests {
     #[test]
     fn template_files_count() {
         let files = project_template_files("test-project");
-        assert_eq!(files.len(), 8);
+        assert_eq!(files.len(), 12);
     }
 
     #[test]
@@ -84,6 +104,10 @@ mod tests {
         assert!(paths.contains(&"CLAUDE.md"));
         assert!(paths.contains(&"README.md"));
         assert!(paths.contains(&".claude/commands/dev.md"));
+        assert!(paths.contains(&"requirements-test.txt"));
+        assert!(paths.contains(&"tests-e2e/conftest.py"));
+        assert!(paths.contains(&"tests-e2e/test_healthz.py"));
+        assert!(paths.contains(&"tests-e2e/test_api.py"));
     }
 
     #[test]
@@ -214,5 +238,60 @@ mod tests {
         let files = project_template_files("test");
         let f = files.iter().find(|f| f.path == "CLAUDE.md").unwrap();
         assert!(f.content.contains("base: './'"));
+    }
+
+    #[test]
+    fn template_has_conftest_with_timeout() {
+        let files = project_template_files("test");
+        let f = files
+            .iter()
+            .find(|f| f.path == "tests-e2e/conftest.py")
+            .unwrap();
+        assert!(f.content.contains("timeout=3.0"));
+        assert!(f.content.contains("APP_HOST"));
+        assert!(f.content.contains("APP_PORT"));
+    }
+
+    #[test]
+    fn template_has_healthz_test() {
+        let files = project_template_files("test");
+        let f = files
+            .iter()
+            .find(|f| f.path == "tests-e2e/test_healthz.py")
+            .unwrap();
+        assert!(f.content.contains("/healthz"));
+        assert!(f.content.contains("status"));
+    }
+
+    #[test]
+    fn template_has_requirements_test() {
+        let files = project_template_files("test");
+        let f = files
+            .iter()
+            .find(|f| f.path == "requirements-test.txt")
+            .unwrap();
+        assert!(f.content.contains("pytest-timeout"));
+        assert!(f.content.contains("httpx"));
+    }
+
+    #[test]
+    fn template_deploy_uses_app_suffix() {
+        let files = project_template_files("test");
+        let f = files
+            .iter()
+            .find(|f| f.path == "deploy/production.yaml")
+            .unwrap();
+        assert!(f.content.contains("project_name }}-app"));
+        // Service port should be 8080 (matching APP_PORT)
+        assert!(f.content.contains("port: 8080\n      targetPort: 8080"));
+    }
+
+    #[test]
+    fn template_dockerfile_test_uses_tests_e2e() {
+        let files = project_template_files("test");
+        let f = files.iter().find(|f| f.path == "Dockerfile.test").unwrap();
+        assert!(f.content.contains("tests-e2e/"));
+        assert!(f.content.contains("--timeout=10"));
+        assert!(f.content.contains("-x"));
     }
 }

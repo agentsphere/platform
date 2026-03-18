@@ -1022,20 +1022,13 @@ fn build_test_oci_tarball(config_json: &[u8], layer_data: &[u8]) -> (Vec<u8>, St
 async fn seed_image_imports_blobs_and_manifest(pool: PgPool) {
     let (state, _token) = test_state(pool.clone()).await;
 
-    // Create a project and registry repo
-    let _project_id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = 'platform-runner'")
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .expect("platform-runner project should exist after bootstrap");
-
+    // Look up system repo (auto-created by seed, project_id = NULL)
     let repo_id: uuid::Uuid =
         sqlx::query_scalar("SELECT id FROM registry_repositories WHERE name = 'platform-runner'")
             .fetch_optional(&pool)
             .await
             .unwrap()
-            .expect("platform-runner repo should exist after bootstrap");
+            .expect("platform-runner repo should exist after seed");
 
     // Build test tarball
     let config_json = br#"{"architecture":"amd64","os":"linux"}"#;
@@ -1108,12 +1101,13 @@ async fn seed_image_imports_blobs_and_manifest(pool: PgPool) {
 async fn seed_image_is_idempotent(pool: PgPool) {
     let (state, _token) = test_state(pool.clone()).await;
 
+    // System repo auto-created by seed (project_id = NULL)
     let repo_id: uuid::Uuid =
         sqlx::query_scalar("SELECT id FROM registry_repositories WHERE name = 'platform-runner'")
             .fetch_optional(&pool)
             .await
             .unwrap()
-            .expect("platform-runner repo should exist");
+            .expect("platform-runner repo should exist after seed");
 
     let config_json = br#"{"architecture":"amd64","os":"linux"}"#;
     let layer_data = b"idempotent seed test layer";
@@ -1158,7 +1152,7 @@ async fn seed_image_is_idempotent(pool: PgPool) {
 async fn seed_all_scans_directory(pool: PgPool) {
     let (state, _token) = test_state(pool.clone()).await;
 
-    // Verify platform-runner repo exists (from bootstrap)
+    // Verify platform-runner repo exists (auto-created by seed)
     let repo_exists: bool = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM registry_repositories WHERE name = 'platform-runner')",
     )
@@ -1167,7 +1161,7 @@ async fn seed_all_scans_directory(pool: PgPool) {
     .unwrap();
     assert!(
         repo_exists,
-        "platform-runner repo should exist from bootstrap"
+        "platform-runner repo should exist from seed auto-create"
     );
 
     // Build a tarball named platform-runner.tar in a temp dir

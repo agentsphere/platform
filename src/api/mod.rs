@@ -11,6 +11,7 @@ pub mod helpers;
 pub mod issues;
 pub mod merge_requests;
 pub mod notifications;
+pub mod onboarding;
 pub mod passkeys;
 pub mod pipelines;
 pub mod preview;
@@ -50,6 +51,7 @@ pub fn router() -> Router<AppState> {
         .merge(branch_protection::router())
         .merge(releases::router())
         .merge(dashboard::router())
+        .merge(onboarding::router())
         .merge(setup::router())
         .merge(cli_auth::router())
         .merge(commands::router())

@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use std::time::Instant;
 
+use crate::agent::provider::{ProgressEvent, ProgressKind};
+use crate::agent::pubsub_bridge;
 use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
@@ -159,7 +161,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/projects/{id}/secrets/{name}",
-            axum::routing::delete(delete_project_secret),
+            get(read_project_secret).delete(delete_project_secret),
         )
         .route(
             "/api/projects/{id}/secret-requests",
@@ -273,6 +275,40 @@ async fn list_project_secrets(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // environment reserved for future env-aware resolution
+struct ReadSecretParams {
+    scope: Option<String>,
+    environment: Option<String>,
+}
+
+/// Read (decrypt) a single project secret by name.
+/// Requires `secret:read`. Agents use this to retrieve secrets at runtime.
+#[tracing::instrument(skip(state), fields(%id, %name), err)]
+async fn read_project_secret(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, name)): Path<(Uuid, String)>,
+    Query(params): Query<ReadSecretParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_secret_read(&state, &auth, id).await?;
+
+    let master_key = get_master_key(&state)?;
+    let requested_scope = params.scope.as_deref().unwrap_or("agent");
+
+    let value = engine::resolve_secret(&state.pool, &master_key, id, &name, requested_scope)
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, %id, %name, "secret resolution failed");
+            ApiError::NotFound("secret".into())
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "name": name,
+        "value": value,
+    })))
+}
+
 #[tracing::instrument(skip(state), fields(%id, %name), err)]
 async fn delete_project_secret(
     State(state): State<AppState>,
@@ -320,7 +356,10 @@ async fn create_secret_request(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateSecretRequestBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_secret_write(&state, &auth, id).await?;
+    // Agents only have secret:read — requesting a secret is not the same as
+    // writing one.  The actual value is written by complete_secret_request
+    // which correctly requires secret:write (called by the human user).
+    require_secret_read(&state, &auth, id).await?;
 
     validation::check_name(&body.name)?;
     let desc = body.description.as_deref().unwrap_or("");
@@ -378,13 +417,31 @@ async fn create_secret_request(
     };
 
     let req_name = req.name.clone();
+    let req_description = req.description.clone();
+    let req_environments = req.environments.clone();
     let req_session_id = req.session_id;
+    let req_id = req.id;
     {
         let mut map = state
             .secret_requests
             .write()
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("secret_requests lock poisoned")))?;
         map.insert(req.id, req);
+    }
+
+    // Publish SSE event so the UI shows the secret-request modal
+    let event = ProgressEvent {
+        kind: ProgressKind::SecretRequest,
+        message: format!("Secret requested: {req_name}"),
+        metadata: Some(serde_json::json!({
+            "request_id": req_id,
+            "name": req_name,
+            "prompt": req_description,
+            "environments": req_environments,
+        })),
+    };
+    if let Err(e) = pubsub_bridge::publish_event(&state.valkey, req_session_id, &event).await {
+        tracing::warn!(error = %e, %req_session_id, "failed to publish SecretRequest SSE event");
     }
 
     write_audit(

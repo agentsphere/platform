@@ -10,7 +10,35 @@ This project runs on the Platform DevOps system.
 - `Dockerfile.dev` — Dev/agent image build (customise agent environment)
 - `deploy/production.yaml` — K8s deployment manifests (minijinja templates)
 - `requirements.txt` — Python dependencies
-- `requirements-test.txt` — Test dependencies
+- `requirements-test.txt` — Test dependencies (pytest-timeout, httpx)
+- `tests-e2e/` — E2E test stubs (healthz + root smoke tests with 3s timeout)
+
+## Progress Tracking
+
+IMPORTANT: Maintain a progress file at `.platform/progress.md` throughout your session.
+Update it after completing each task, when starting a new task, and when hitting blockers.
+This file is displayed to the user in real-time.
+
+Format:
+```
+## Status: working
+
+## Tasks
+- [x] Completed task
+- [ ] Current task
+- [ ] Upcoming task
+
+## Current
+Brief description of what you're doing now.
+
+## Findings
+- Notable discoveries or decisions
+
+## Blockers
+- Issues preventing progress (or "None")
+```
+
+Update this file frequently — it's the user's primary view of your work.
 
 ## Development Workflow
 
@@ -104,7 +132,13 @@ kubectl rollout status deployment/postgres --timeout=60s
 
 ### 2. Create Tests First
 
-Write tests BEFORE implementing features:
+Write tests BEFORE implementing features.
+
+**IMPORTANT — test timeouts:** The CI test runner (`Dockerfile.test`) enforces a 10-second per-test timeout via `pytest-timeout`. Always:
+- Include `pytest-timeout` in `requirements-test.txt` (already there by default)
+- Use short HTTP timeouts: `httpx.Client(timeout=3.0)` or `requests.get(url, timeout=3)`
+- Never use bare `requests.get(url)` or `httpx.get(url)` without an explicit timeout
+- The starter tests in `tests-e2e/` already have correct timeouts — extend them, don't replace
 
 ```bash
 # Install app dependencies first
@@ -114,10 +148,10 @@ pip install -r requirements-test.txt
 # Unit tests — run locally in the pod, no K8s needed
 python -m pytest tests/unit/ -v
 
-# API tests — test against locally running app
+# E2E tests — test against locally running app
 DATABASE_URL=postgresql://app:password@postgres:5432/app uvicorn app.main:app --host 0.0.0.0 --port 8080 &
 sleep 2
-python -m pytest tests/ -v
+python -m pytest tests-e2e/ -v
 ```
 
 ### 3. Verify Test Setup
@@ -125,7 +159,7 @@ python -m pytest tests/ -v
 Run the tests and confirm they fail for the right reason (missing feature, not broken setup):
 
 ```bash
-python -m pytest tests/ -v --tb=short
+python -m pytest tests-e2e/ -v --tb=short
 ```
 
 ### 4. Plan Implementation
@@ -147,8 +181,8 @@ Run tests in this order — fix failures before moving to the next level:
 # Level 1: Unit tests (fast, no I/O)
 python -m pytest tests/unit/ -v
 
-# Level 2: Local API tests (app running in pod)
-python -m pytest tests/ -v
+# Level 2: E2E tests (app running in pod)
+python -m pytest tests-e2e/ -v
 
 # Level 3: Build app image (requires $REGISTRY env var — skip if not set)
 # Use kaniko to build directly in the pod (no Docker daemon needed)
@@ -226,20 +260,75 @@ steps:
 
 Both `events` and `branches` AND together. Valid events: `push`, `mr`, `tag`, `api`. Empty list = match all. Steps without `only:` always run.
 
+### Step Dependencies (DAG Execution)
+
+Steps can declare `depends_on` to form a DAG. Steps without dependencies run in parallel (layer 0). Steps with dependencies wait until all named dependencies complete before starting.
+
+```yaml
+steps:
+  # Layer 0 — these run in PARALLEL (no depends_on)
+  - name: build-app
+    image: gcr.io/kaniko-project/executor:debug
+    commands: [...]
+
+  - name: build-test
+    image: gcr.io/kaniko-project/executor:debug
+    commands: [...]
+
+  # Layer 1 — waits for both builds to complete
+  - name: e2e
+    depends_on: [build-app, build-test]
+    gate: true
+    deploy_test:
+      test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
+```
+
+Rules:
+- If **no** step has `depends_on`, all steps run sequentially (backward compatible)
+- If **any** step has `depends_on`, the pipeline runs as a DAG
+- If a step fails, all its transitive dependents are skipped
+- `depends_on` names must reference existing step names (validated on parse)
+- Cycles are rejected
+
+### Quality Gates
+
+Steps marked `gate: true` are quality gates — they appear with a gate badge in the UI. Currently this is a semantic annotation; any step failure (gate or not) still fails the pipeline.
+
+### Step-Level Environment
+
+Steps can declare environment variables via `environment:`. These merge with platform vars and project secrets (step env has highest priority). Use `$VAR` to reference secrets or platform vars:
+
+```yaml
+  - name: lint
+    image: node:22
+    commands: [npm run lint]
+    environment:
+      NODE_ENV: test
+      API_KEY: $MY_SECRET
+```
+
+### Pipeline Secrets
+
+Project secrets with scope `pipeline`, `agent`, or `all` are automatically injected as environment variables into all pipeline step pods. The `PLATFORM_SECRET_NAMES` env var lists injected secret names. Reserved platform env vars (e.g. `PIPELINE_ID`, `COMMIT_SHA`, `REGISTRY`) cannot be overridden by secrets.
+
 ### Deploy-Test Steps (advanced, do not add unless explicitly requested)
 
 The platform supports `deploy_test:` steps that deploy the built app to a temporary K8s namespace and run integration tests. This is an advanced feature — do NOT add it to `.platform.yaml` unless explicitly asked. The default pipeline (build + build-test) is sufficient for most projects.
 
 ```yaml
   - name: e2e
+    depends_on: [build-app, build-test]
+    gate: true
     deploy_test:
       test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
-      manifests: deploy/production.yaml   # default
-      readiness_path: /healthz            # default
-      readiness_timeout: 120              # seconds, default
+      manifests: deploy/              # reads ALL .yaml files from this directory
+      readiness_path: /healthz        # default
+      readiness_timeout: 120          # seconds, default
     only:
       events: [mr]
 ```
+
+`manifests` defaults to `deploy/` (a directory). All `.yaml`/`.yml` files in that directory are rendered with minijinja and applied to the test namespace. You can also specify a single file path (e.g. `deploy/production.yaml`) for backward compatibility.
 
 ## Build Verification
 
@@ -333,11 +422,12 @@ app/              # application source code
   models.py       # data models
   routes.py       # API routes
 static/           # frontend assets (HTML/JS/CSS)
-tests/            # API / integration tests
+tests-e2e/        # E2E tests (run against deployed app via APP_HOST / APP_PORT)
+  conftest.py     # shared fixtures: base_url, client (3s httpx timeout)
   test_healthz.py # health check smoke test
-  test_api.py     # endpoint tests (uses APP_HOST / APP_PORT env vars)
+  test_api.py     # root endpoint smoke test
 requirements.txt      # app dependencies
-requirements-test.txt # test dependencies
+requirements-test.txt # test dependencies (pytest-timeout, httpx)
 ```
 
 Adjust file names and layout when using a different language or framework.

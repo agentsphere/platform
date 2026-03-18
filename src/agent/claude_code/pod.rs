@@ -407,12 +407,18 @@ fn build_env_vars(
     }
     // Project secrets (scope=agent/all) as extra env vars.
     // Skip reserved names to prevent privilege escalation (e.g. overriding PLATFORM_API_TOKEN).
+    let mut secret_names = Vec::new();
     for (name, value) in params.extra_env_vars {
         if is_reserved_env_var(name) {
             tracing::warn!(%name, "skipping reserved env var from project secrets");
             continue;
         }
         vars.push(env_var(name, value));
+        secret_names.push(name.as_str());
+    }
+    // Tell agent-runner which env vars are project secrets so it can write .env.dev
+    if !secret_names.is_empty() {
+        vars.push(env_var("PLATFORM_SECRET_NAMES", &secret_names.join(",")));
     }
     vars
 }
@@ -424,13 +430,16 @@ fn build_env_vars(
 #[allow(clippy::uninlined_format_args)]
 fn build_setup_tools_script(claude_cli_version: &str) -> String {
     let agent_runner = setup_agent_runner_script();
+    let mcp_servers = setup_mcp_servers_script();
     let claude_cli = setup_claude_cli_script(claude_cli_version);
     let kubectl = setup_kubectl_script();
     let kaniko = setup_kaniko_script();
     let kubeconfig = setup_kubeconfig_script();
+    let commands_sync = setup_commands_sync_script();
     format!(
         "set -eu\nBIN_DIR=/workspace/.platform/bin\nmkdir -p \"$BIN_DIR\"\n\
-         {agent_runner}\n{claude_cli}\n{kubectl}\n{kaniko}\n{kubeconfig}\n\
+         {agent_runner}\n{mcp_servers}\n{claude_cli}\n{kubectl}\n{kaniko}\n{kubeconfig}\n\
+         {commands_sync}\n\
          echo \"[setup] Auto-setup complete\""
     )
 }
@@ -475,6 +484,54 @@ if [ "$DOWNLOADED" = "0" ] && [ ! -x "$BIN_DIR/agent-runner" ]; then
   else
     echo '[setup] ERROR: need curl or node to download agent-runner' >&2
     exit 1
+  fi
+fi"#
+}
+
+fn setup_mcp_servers_script() -> &'static str {
+    r#"# 1b. Setup MCP servers: download tarball from platform API, fallback to baked-in
+# Write to workspace volume (UID 1000 writable), not /usr/local/lib/mcp (root-owned).
+MCP_DIR=/workspace/.platform/mcp
+MCP_DOWNLOADED=0
+mkdir -p "$MCP_DIR"
+if [ -n "$PLATFORM_API_URL" ] && [ -n "$PLATFORM_API_TOKEN" ]; then
+  echo "[setup] Downloading MCP servers from platform..."
+  if command -v curl >/dev/null 2>&1; then
+    if curl -sf -H "Authorization: Bearer $PLATFORM_API_TOKEN" \
+      "${PLATFORM_API_URL}/api/downloads/mcp-servers" \
+      -o /tmp/mcp-servers.tar.gz; then
+      tar -xzf /tmp/mcp-servers.tar.gz -C "$MCP_DIR"
+      rm -f /tmp/mcp-servers.tar.gz
+      echo "[setup] MCP servers downloaded and extracted"
+      MCP_DOWNLOADED=1
+    else
+      echo "[setup] MCP servers download failed, trying fallback..."
+    fi
+  elif command -v node >/dev/null 2>&1; then
+    if node -e "
+      const fs = require('fs');
+      const url = process.env.PLATFORM_API_URL + '/api/downloads/mcp-servers';
+      fetch(url, {headers:{'Authorization':'Bearer '+process.env.PLATFORM_API_TOKEN}})
+        .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.arrayBuffer(); })
+        .then(b => fs.writeFileSync('/tmp/mcp-servers.tar.gz', Buffer.from(b)))
+        .catch(e => { console.error(e); process.exit(1); });
+    "; then
+      tar -xzf /tmp/mcp-servers.tar.gz -C "$MCP_DIR"
+      rm -f /tmp/mcp-servers.tar.gz
+      echo "[setup] MCP servers downloaded via node and extracted"
+      MCP_DOWNLOADED=1
+    else
+      echo "[setup] MCP servers download via node failed, trying fallback..."
+    fi
+  fi
+fi
+if [ "$MCP_DOWNLOADED" = "0" ]; then
+  # Copy baked-in MCP servers to the workspace so the path is consistent
+  if [ -d /usr/local/lib/mcp/servers ]; then
+    cp -r /usr/local/lib/mcp/* "$MCP_DIR/"
+    echo "[setup] Copied baked-in MCP servers to $MCP_DIR"
+  else
+    echo "[setup] WARNING: no MCP servers available"
   fi
 fi"#
 }
@@ -573,6 +630,37 @@ else
 fi"#
 }
 
+fn setup_commands_sync_script() -> &'static str {
+    r#"# 6. Sync platform commands to .claude/commands/
+CMD_DIR=/workspace/.claude/commands
+mkdir -p "$CMD_DIR"
+if [ -n "${PLATFORM_API_URL:-}" ] && [ -n "${PLATFORM_API_TOKEN:-}" ] && [ -n "${PROJECT_ID:-}" ]; then
+  echo "[setup] Syncing platform commands..."
+  CMDS_JSON=$(curl -sf -H "Authorization: Bearer $PLATFORM_API_TOKEN" \
+    "${PLATFORM_API_URL}/api/commands/resolved?project_id=${PROJECT_ID}" 2>/dev/null || echo "[]")
+  if [ "$CMDS_JSON" != "[]" ] && command -v node >/dev/null 2>&1; then
+    node -e "
+      const cmds = JSON.parse(process.argv[1]);
+      const fs = require('fs');
+      const path = require('path');
+      let written = 0;
+      for (const cmd of cmds) {
+        const fp = path.join('$CMD_DIR', cmd.name + '.md');
+        if (!fs.existsSync(fp)) {
+          fs.writeFileSync(fp, cmd.prompt_template);
+          written++;
+        }
+      }
+      console.log('[setup] Wrote ' + written + '/' + cmds.length + ' platform commands');
+    " "$CMDS_JSON"
+  else
+    echo "[setup] No platform commands to sync (or node unavailable)"
+  fi
+else
+  echo "[setup] Skipping command sync (missing env vars)"
+fi"#
+}
+
 /// Build the setup-tools init container that downloads agent-runner from the
 /// platform server, installs Claude CLI, and sets up kubectl.
 ///
@@ -592,11 +680,17 @@ fn build_setup_tools_container(
         image_pull_policy: Some(pull_policy.to_owned()),
         command: Some(vec!["sh".into(), "-c".into()]),
         args: Some(vec![setup_script]),
-        env: Some(vec![
-            env_var("PLATFORM_API_TOKEN", params.agent_api_token),
-            env_var("PLATFORM_API_URL", params.platform_api_url),
-            env_var("CLAUDE_CLI_VERSION", params.claude_cli_version),
-        ]),
+        env: Some({
+            let mut env = vec![
+                env_var("PLATFORM_API_TOKEN", params.agent_api_token),
+                env_var("PLATFORM_API_URL", params.platform_api_url),
+                env_var("CLAUDE_CLI_VERSION", params.claude_cli_version),
+            ];
+            if let Some(pid) = params.session.project_id {
+                env.push(env_var("PROJECT_ID", &pid.to_string()));
+            }
+            env
+        }),
         working_dir: Some("/workspace".into()),
         volume_mounts: Some(vec![workspace_mount()]),
         security_context: Some(container_security()),
@@ -759,12 +853,12 @@ fn build_main_container(
         security_context: Some(main_container_security()),
         resources: Some(ResourceRequirements {
             requests: Some(BTreeMap::from([
-                ("cpu".into(), Quantity("200m".into())),
-                ("memory".into(), Quantity("256Mi".into())),
+                ("cpu".into(), Quantity("500m".into())),
+                ("memory".into(), Quantity("1Gi".into())),
             ])),
             limits: Some(BTreeMap::from([
-                ("cpu".into(), Quantity("500m".into())),
-                ("memory".into(), Quantity("512Mi".into())),
+                ("cpu".into(), Quantity("2".into())),
+                ("memory".into(), Quantity("4Gi".into())),
             ])),
             ..Default::default()
         }),

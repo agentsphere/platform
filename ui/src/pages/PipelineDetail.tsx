@@ -79,7 +79,15 @@ export function PipelineDetail({ id: projectId, pipelineId }: Props) {
             {(pipeline.steps || []).map(s => (
               <tr key={s.id}>
                 <td class="text-muted">{s.step_order}</td>
-                <td>{s.name}</td>
+                <td>
+                  {s.name}
+                  {s.gate && <span class="badge badge-info ml-xs" title="Quality Gate">Gate</span>}
+                  {s.depends_on && s.depends_on.length > 0 && (
+                    <span class="text-xs text-muted ml-xs" title={`Depends on: ${s.depends_on.join(', ')}`}>
+                      ({s.depends_on.join(', ')})
+                    </span>
+                  )}
+                </td>
                 <td class="mono text-xs">{s.image}</td>
                 <td><Badge status={s.status} /> {s.exit_code != null && <span class="text-xs text-muted">exit {s.exit_code}</span>}</td>
                 <td class="text-sm">{s.duration_ms != null ? duration(s.duration_ms) : '—'}</td>

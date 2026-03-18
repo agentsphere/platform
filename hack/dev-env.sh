@@ -159,6 +159,8 @@ PLATFORM_PREVIEW_PROXY_URL=http://${NODE_IP}:${PREVIEW_PROXY_PORT}
 WEBAUTHN_RP_ID=localhost
 WEBAUTHN_RP_ORIGIN=http://localhost:${BACKEND_PORT}
 WEBAUTHN_RP_NAME=Platform
+
+PLATFORM_SEED_COMMANDS_PATH=/Users/steven/newKid/business/agentsphere/repos/platform/seed-commands
 EOF
 
 # ── Summary ──────────────────────────────────────────────────────────────

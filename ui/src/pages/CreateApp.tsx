@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
+import { useAuth } from '../lib/auth';
 import { api } from '../lib/api';
 import { createSse, type EventSourceClient } from '../lib/sse';
 import { AgentBar, type AgentInfo, getAgentColor } from '../components/AgentBar';
@@ -8,6 +9,83 @@ interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'thinking';
   content: string;
   sessionId?: string;
+  kind?: string;
+  toolMeta?: { name: string; summary?: string }[];
+  resultMeta?: { tool_use_id: string; preview?: string }[];
+}
+
+interface MessageGroup {
+  type: 'message' | 'tool_group';
+  messages?: ChatMessage[];
+  tools?: { name: string; summary?: string; resultPreview?: string }[];
+  sessionId?: string;
+}
+
+function isNoiseMessage(msg: ChatMessage): boolean {
+  if (msg.role === 'system' && /^Session started\b/.test(msg.content)) return true;
+  return false;
+}
+
+function groupMessages(msgs: ChatMessage[]): MessageGroup[] {
+  const groups: MessageGroup[] = [];
+  let toolBuf: ChatMessage[] = [];
+
+  function flushTools() {
+    if (toolBuf.length === 0) return;
+    const tools: NonNullable<MessageGroup['tools']> = [];
+    for (const m of toolBuf) {
+      if (m.kind === 'tool_call' && m.toolMeta) {
+        for (const t of m.toolMeta) tools.push({ name: t.name, summary: t.summary });
+      } else if (m.kind === 'tool_result' && m.resultMeta) {
+        for (const r of m.resultMeta) {
+          const existing = tools.find(t => !t.resultPreview);
+          if (existing) existing.resultPreview = r.preview;
+        }
+      }
+    }
+    if (tools.length > 0) {
+      groups.push({ type: 'tool_group', tools, sessionId: toolBuf[0].sessionId });
+    }
+    toolBuf = [];
+  }
+
+  for (const msg of msgs) {
+    if (msg.kind === 'tool_call' || msg.kind === 'tool_result') {
+      toolBuf.push(msg);
+    } else if (toolBuf.length > 0 && isNoiseMessage(msg)) {
+      toolBuf.push(msg);
+    } else {
+      flushTools();
+      groups.push({ type: 'message', messages: [msg] });
+    }
+  }
+  flushTools();
+  return groups;
+}
+
+function SimpleMarkdown({ content }: { content: string }) {
+  const lines = content.split('\n');
+  const elements: any[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('## ')) {
+      elements.push(<div key={i} style="font-weight:600;margin:0.5rem 0 0.25rem;font-size:13px;color:var(--text-primary)">{line.slice(3)}</div>);
+    } else if (line.startsWith('# ')) {
+      elements.push(<div key={i} style="font-weight:700;margin:0.5rem 0 0.25rem;font-size:14px;color:var(--text-primary)">{line.slice(2)}</div>);
+    } else if (/^- \[x\] /.test(line)) {
+      elements.push(<div key={i} style="font-size:12px;padding:0.1rem 0;color:var(--text-secondary)"><span style="color:var(--success)">&#x2705;</span> <s>{line.slice(6)}</s></div>);
+    } else if (/^- \[ \] /.test(line)) {
+      elements.push(<div key={i} style="font-size:12px;padding:0.1rem 0;color:var(--text-primary)"><span style="opacity:0.4">&#x2B1C;</span> {line.slice(6)}</div>);
+    } else if (/^- \S/.test(line)) {
+      const isActive = /^- /.test(line);
+      elements.push(<div key={i} style="font-size:12px;padding:0.1rem 0;color:var(--text-secondary)">&bull; {line.slice(2)}</div>);
+    } else if (line.trim() === '') {
+      elements.push(<div key={i} style="height:0.25rem" />);
+    } else {
+      elements.push(<div key={i} style="font-size:12px;color:var(--text-secondary);padding:0.1rem 0">{line}</div>);
+    }
+  }
+  return <>{elements}</>;
 }
 
 interface SessionInfo {
@@ -24,6 +102,7 @@ interface ProgressEvent {
 }
 
 export function CreateApp() {
+  const { user } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [session, setSession] = useState<SessionInfo | null>(null);
@@ -32,10 +111,14 @@ export function CreateApp() {
   const [streaming, setStreaming] = useState(false);
   const [agents, setAgents] = useState<Map<string, AgentInfo>>(new Map());
   const [replyTarget, setReplyTarget] = useState<string | null>(null);
+  const [latestProgress, setLatestProgress] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
+  const [showHero, setShowHero] = useState(true);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const sseRef = useRef<EventSourceClient | null>(null);
   // Per-agent stream buffers keyed by session_id
   const streamBufs = useRef<Map<string, string>>(new Map());
+  const autoSubmitted = useRef(false);
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -45,6 +128,22 @@ export function CreateApp() {
   // Cleanup SSE on unmount
   useEffect(() => {
     return () => { sseRef.current?.close(); };
+  }, []);
+
+  // Check for prompt query param (from Dashboard hero)
+  useEffect(() => {
+    if (autoSubmitted.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const prompt = params.get('prompt');
+    if (prompt) {
+      autoSubmitted.current = true;
+      setShowHero(false);
+      setInput(prompt);
+      // Auto-submit after a tick
+      setTimeout(() => {
+        submitPrompt(prompt);
+      }, 0);
+    }
   }, []);
 
   function getStreamBuf(sessionId: string): string {
@@ -171,15 +270,19 @@ export function CreateApp() {
             break;
           }
           case 'tool_call': {
-            setMessages(prev => [...prev, { role: 'system', content: `Setting up: ${data.message}...`, sessionId: sid }]);
+            const toolMeta = data.metadata?.tools as { name: string; summary?: string }[] | undefined;
+            setMessages(prev => [...prev, { role: 'system', content: `Setting up: ${data.message}...`, sessionId: sid, kind: 'tool_call', toolMeta }]);
             break;
           }
           case 'tool_result': {
             const isError = data.metadata?.is_error;
+            const resultMeta = data.metadata?.results as { tool_use_id: string; preview?: string }[] | undefined;
             setMessages(prev => [...prev, {
               role: 'system',
               content: isError ? `Error: ${data.message}` : data.message,
               sessionId: sid,
+              kind: 'tool_result',
+              resultMeta,
             }]);
             if (data.metadata?.tool_name === 'create_project' && !isError && data.metadata?.result) {
               try {
@@ -201,6 +304,10 @@ export function CreateApp() {
             setMessages(prev => [...prev, { role: 'system', content: `Error: ${data.message}`, sessionId: sid }]);
             break;
           }
+          case 'progress_update': {
+            setLatestProgress(data.message);
+            break;
+          }
           default:
             break;
         }
@@ -209,12 +316,9 @@ export function CreateApp() {
     sseRef.current = sse;
   }
 
-  async function handleSubmit(e: Event) {
-    e.preventDefault();
-    if (!input.trim()) return;
-
-    const userMsg = input.trim();
-    setInput('');
+  async function submitPrompt(prompt: string) {
+    if (!prompt.trim()) return;
+    const userMsg = prompt.trim();
 
     if (!session) {
       setLoading(true);
@@ -235,7 +339,6 @@ export function CreateApp() {
         setLoading(false);
       }
     } else {
-      // Send to reply target or parent
       const targetId = replyTarget || session.id;
       setMessages(prev => [...prev, { role: 'user', content: userMsg, sessionId: targetId }]);
       setStreamBuf(targetId, '');
@@ -248,6 +351,21 @@ export function CreateApp() {
         setStreaming(false);
       }
     }
+  }
+
+  async function handleSubmit(e: Event) {
+    e.preventDefault();
+    if (!input.trim()) return;
+    const userMsg = input.trim();
+    setInput('');
+    setShowHero(false);
+    submitPrompt(userMsg);
+  }
+
+  function handleHeroSubmit(prompt: string) {
+    setShowHero(false);
+    setInput('');
+    submitPrompt(prompt);
   }
 
   function handleMessageClick(msg: ChatMessage) {
@@ -263,6 +381,71 @@ export function CreateApp() {
     ? getAgentColorForSession(replyTarget, session.id)
     : '';
 
+  const grouped = groupMessages(messages);
+
+  function toggleGroup(idx: number) {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  }
+
+  const displayName = user?.display_name || user?.name || 'there';
+  const heroTemplates = [
+    { label: 'REST API + Postgres', prompt: 'Create a REST API with Postgres database, auth, and CRUD endpoints' },
+    { label: 'Static Site', prompt: 'Create a static website with Markdown content' },
+    { label: 'Full-Stack App', prompt: 'Create a full-stack web app with React frontend and API backend' },
+  ];
+
+  // Hero entry state — before chat begins
+  if (showHero && !session && messages.length === 0) {
+    return (
+      <div style="position:relative;min-height:calc(100vh - 6rem)">
+        <div class="aurora-bg">
+          <div class="aurora-blob-3" />
+        </div>
+        <div class="hero-container">
+          <h1 class="hero-greeting">Hey {displayName}, what will you build?</h1>
+
+          <form onSubmit={handleSubmit} style="width:100%;max-width:560px;display:flex;gap:0.5rem">
+            <input
+              type="text"
+              class="hero-chat-input"
+              placeholder="Describe your app idea..."
+              value={input}
+              onInput={(e) => setInput((e.target as HTMLInputElement).value)}
+              autoFocus
+            />
+            <button type="submit" class="btn btn-primary" style="border-radius:12px;padding:0.9rem 1.5rem" disabled={!input.trim()}>
+              Create
+            </button>
+          </form>
+
+          <div class="hero-options">
+            <div class="hero-option-card" onClick={() => handleHeroSubmit('Import my existing repository from GitHub')}>
+              <div class="hero-option-title">Import from GitHub</div>
+              <div class="hero-option-desc">Bring an existing repo to the platform</div>
+            </div>
+            <div class="hero-option-card" onClick={() => {/* expand templates below */}}>
+              <div class="hero-option-title">Start from Template</div>
+              <div class="hero-option-desc">Pick a starter to get going fast</div>
+            </div>
+          </div>
+
+          <div class="hero-templates">
+            {heroTemplates.map(t => (
+              <button key={t.label} class="hero-template-chip" onClick={() => handleHeroSubmit(t.prompt)}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style="display:flex;flex-direction:column;height:calc(100vh - 4rem)">
       <div style="padding:1rem 0;border-bottom:1px solid var(--border)">
@@ -272,55 +455,84 @@ export function CreateApp() {
         </p>
       </div>
 
-      {/* Messages area */}
-      <div style="flex:1;overflow-y:auto;padding:1rem 0">
-        {messages.length === 0 && (
-          <div style="text-align:center;padding:3rem;color:var(--text-muted)">
-            <p style="font-size:1.1rem;margin-bottom:0.5rem">What would you like to build?</p>
-            <p class="text-sm">Examples: "A REST API with auth and a Postgres database", "A static blog with markdown", "A microservice in Go"</p>
-          </div>
-        )}
-        {messages.map((msg, i) => {
-          const isClickable = msg.role !== 'user' && !!msg.sessionId && !!session;
-          const agentColor = msg.sessionId && session
-            ? getAgentColorForSession(msg.sessionId, session.id)
-            : undefined;
+      {/* Main content area: chat + optional progress sidebar */}
+      <div class="create-app-body">
+        {/* Messages area */}
+        <div style="flex:1;overflow-y:auto;padding:1rem 0">
+          {grouped.map((group, gi) => {
+            if (group.type === 'tool_group' && group.tools) {
+              const agentColor = group.sessionId && session
+                ? getAgentColorForSession(group.sessionId, session.id)
+                : undefined;
+              return (
+                <div key={`tg-${gi}`} class="tool-group" style={agentColor ? { 'border-left-color': agentColor } : {}} onClick={() => toggleGroup(gi)}>
+                  {expandedGroups.has(gi) ? (
+                    <div class="tool-group-expanded">
+                      {group.tools.map((t, i) => (
+                        <div key={i} class="tool-group-item">
+                          <span class="tool-group-name">{t.name}</span>
+                          {t.summary && <span class="tool-group-summary-text">{t.summary}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <span class="tool-group-collapsed">&#x2504; {group.tools.length} tool call{group.tools.length !== 1 ? 's' : ''} &#x2504;</span>
+                  )}
+                </div>
+              );
+            }
+            const msg = group.messages![0];
+            const isClickable = msg.role !== 'user' && !!msg.sessionId && !!session;
+            const agentColor = msg.sessionId && session
+              ? getAgentColorForSession(msg.sessionId, session.id)
+              : undefined;
 
-          return (
-            <div
-              key={i}
-              style={msgStyle(msg.role, agentColor)}
-              class={isClickable ? 'chat-msg-clickable' : ''}
-              onClick={() => handleMessageClick(msg)}
-            >
-              <div class="chat-agent-name" style={agentColor ? `color: ${agentColor}` : ''}>
-                {msg.role === 'user'
-                  ? (msg.sessionId && session && msg.sessionId !== session.id
-                    ? `You → ${getAgentLabel(msg.sessionId, session.id)}`
-                    : 'You')
-                  : msg.role === 'thinking'
-                    ? `${msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'Agent'} thinking...`
-                    : msg.role === 'system'
-                      ? (msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'System')
-                      : (msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'Agent')}
+            return (
+              <div
+                key={gi}
+                style={msgStyle(msg.role, agentColor)}
+                class={isClickable ? 'chat-msg-clickable' : ''}
+                onClick={() => handleMessageClick(msg)}
+              >
+                <div class="chat-agent-name" style={agentColor ? `color: ${agentColor}` : ''}>
+                  {msg.role === 'user'
+                    ? (msg.sessionId && session && msg.sessionId !== session.id
+                      ? `You -> ${getAgentLabel(msg.sessionId, session.id)}`
+                      : 'You')
+                    : msg.role === 'thinking'
+                      ? `${msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'Agent'} thinking...`
+                      : msg.role === 'system'
+                        ? (msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'System')
+                        : (msg.sessionId && session ? getAgentLabel(msg.sessionId, session.id) : 'Agent')}
+                </div>
+                <div style={msg.role === 'thinking' ? 'white-space:pre-wrap;font-style:italic;opacity:0.7' : 'white-space:pre-wrap'}>
+                  {msg.content}
+                </div>
               </div>
-              <div style={msg.role === 'thinking' ? 'white-space:pre-wrap;font-style:italic;opacity:0.7' : 'white-space:pre-wrap'}>
-                {msg.content}
-              </div>
+            );
+          })}
+          {streaming && (
+            <div style="padding:0.5rem 1rem;color:var(--text-muted)">
+              <span class="typing-indicator">&#9679; &#9679; &#9679;</span>
             </div>
-          );
-        })}
-        {streaming && (
-          <div style="padding:0.5rem 1rem;color:var(--text-muted)">
-            <span class="typing-indicator">&#9679; &#9679; &#9679;</span>
+          )}
+          {loading && (
+            <div style="padding:0.5rem 1rem;color:var(--text-muted);font-style:italic">
+              Creating session...
+            </div>
+          )}
+          <div ref={messagesEnd} />
+        </div>
+
+        {/* Progress sidebar */}
+        {latestProgress && (
+          <div class="create-app-progress">
+            <div class="agent-chat-progress-header">Progress</div>
+            <div class="agent-chat-progress-content">
+              <SimpleMarkdown content={latestProgress} />
+            </div>
           </div>
         )}
-        {loading && (
-          <div style="padding:0.5rem 1rem;color:var(--text-muted);font-style:italic">
-            Creating session...
-          </div>
-        )}
-        <div ref={messagesEnd} />
       </div>
 
       {/* Agent bar */}

@@ -37,3 +37,6 @@ pub mod registry;
 
 // Workspaces
 pub mod workspace;
+
+// Onboarding
+pub mod onboarding;

@@ -85,9 +85,31 @@ else
   echo "${RUNNER_CURRENT_CHECKSUM}" > "${RUNNER_CHECKSUM_FILE}"
 fi
 
+# ── MCP servers tarball ────────────────────────────────────────────────
+MCP_TARBALL="/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz"
+MCP_CHECKSUM_FILE="/tmp/platform-e2e/${WORKTREE}/.mcp-checksum"
+echo "  MCP servers tarball (→ ${MCP_TARBALL}):"
+MCP_CURRENT_CHECKSUM=$(
+  { find "${PROJECT_DIR}/mcp/servers" "${PROJECT_DIR}/mcp/lib" -type f -exec shasum -a 256 {} +
+    shasum -a 256 "${PROJECT_DIR}/mcp/package.json" "${PROJECT_DIR}/mcp/package-lock.json"
+  } | sort | shasum -a 256 | awk '{print $1}'
+)
+
+if [[ "$FORCE" == "false" && -f "${MCP_TARBALL}" && -f "${MCP_CHECKSUM_FILE}" && \
+      "$(cat "${MCP_CHECKSUM_FILE}")" == "${MCP_CURRENT_CHECKSUM}" ]]; then
+  echo "    cached"
+else
+  echo "    building..."
+  tar -czf "${MCP_TARBALL}" -C "${PROJECT_DIR}/mcp" \
+    servers lib package.json package-lock.json node_modules
+  echo "${MCP_CURRENT_CHECKSUM}" > "${MCP_CHECKSUM_FILE}"
+fi
+
 echo ""
 echo "==> Done"
 echo "  Seed images: ${SEED_DIR}/"
 ls -lh "${SEED_DIR}"/*.tar 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'
 echo "  Agent-runner: ${RUNNER_DIR}/"
 ls -lh "${RUNNER_DIR}/arm64" "${RUNNER_DIR}/amd64" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'
+echo "  MCP tarball: ${MCP_TARBALL}"
+ls -lh "${MCP_TARBALL}" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'

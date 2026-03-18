@@ -1,0 +1,57 @@
+===============================================================================
+  AgentSphere Platform has been deployed!
+===============================================================================
+
+{{- if .Values.ingress.enabled }}
+
+  Access the platform at:
+  {{- range .Values.ingress.hosts }}
+  {{- if $.Values.ingress.tls }}
+    https://{{ .host }}
+  {{- else }}
+    http://{{ .host }}
+  {{- end }}
+  {{- end }}
+
+{{- else }}
+
+  The platform is available via NodePort service. Get the URL with:
+
+    export NODE_PORT=$(kubectl get svc {{ include "platform.fullname" . }}-nodeport \
+      -n {{ .Release.Namespace }} -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}')
+    export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    echo "http://${NODE_IP}:${NODE_PORT}"
+
+  Or use port-forwarding:
+
+    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "platform.fullname" . }} 8080:8080
+    echo "http://localhost:8080"
+
+{{- end }}
+
+{{- if .Values.platform.env.devMode }}
+
+  DEV MODE is enabled. Default admin credentials: admin / admin
+  WARNING: Do not use dev mode in production!
+
+{{- else }}
+
+  FIRST-TIME SETUP:
+
+  1. Retrieve the one-time setup token from the pod logs:
+
+     kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "platform.fullname" . }} | grep "SETUP TOKEN"
+
+  2. Open the platform URL and navigate to /setup
+
+  3. Enter the setup token to create your first admin user.
+
+  NOTE: The setup token expires after 1 hour. If you miss it, delete
+  the pod to trigger a fresh bootstrap with a new token.
+
+{{- end }}
+
+{{- if .Values.platform.ssh.enabled }}
+
+  SSH Git access is enabled on port {{ .Values.platform.ssh.port }}.
+{{- end }}

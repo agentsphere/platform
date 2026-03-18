@@ -354,6 +354,86 @@ pub async fn scale(
     Ok(())
 }
 
+/// Inject `envFrom: [{secretRef: {name: ...}}]` into all workload containers
+/// in the rendered YAML, so that deployed pods automatically receive env vars
+/// from a K8s Secret (e.g. OTEL config, deploy-scoped secrets).
+///
+/// Processes `Deployment`, `StatefulSet`, `DaemonSet`, `Job` (pod template) and
+/// `CronJob` (job template → pod template). Non-workload kinds are passed through
+/// unchanged. Idempotent: skips containers that already reference the secret.
+pub fn inject_env_from_secret(
+    manifests_yaml: &str,
+    secret_name: &str,
+) -> Result<String, DeployerError> {
+    let docs = renderer::split_yaml_documents(manifests_yaml);
+    let mut output_docs = Vec::with_capacity(docs.len());
+
+    for doc_str in &docs {
+        let mut doc: serde_json::Value = serde_yaml::from_str(doc_str)
+            .map_err(|e| DeployerError::InvalidManifest(e.to_string()))?;
+
+        let kind = doc["kind"].as_str().unwrap_or_default();
+        match kind {
+            "Deployment" | "StatefulSet" | "DaemonSet" | "Job" => {
+                inject_env_from_to_pod_spec(&mut doc, "/spec/template/spec", secret_name);
+            }
+            "CronJob" => {
+                inject_env_from_to_pod_spec(
+                    &mut doc,
+                    "/spec/jobTemplate/spec/template/spec",
+                    secret_name,
+                );
+            }
+            _ => { /* non-workload kind — pass through */ }
+        }
+
+        let yaml_str = serde_yaml::to_string(&doc)
+            .map_err(|e| DeployerError::InvalidManifest(e.to_string()))?;
+        output_docs.push(yaml_str);
+    }
+
+    Ok(output_docs.join("---\n"))
+}
+
+/// Inject `envFrom` into all `containers` and `initContainers` under the given
+/// JSON pointer to a pod spec.
+fn inject_env_from_to_pod_spec(
+    doc: &mut serde_json::Value,
+    pod_spec_path: &str,
+    secret_name: &str,
+) {
+    if let Some(spec) = doc.pointer_mut(pod_spec_path) {
+        for field in &["containers", "initContainers"] {
+            if let Some(containers) = spec.get_mut(*field).and_then(|v| v.as_array_mut()) {
+                for container in containers.iter_mut() {
+                    inject_env_from_to_container(container, secret_name);
+                }
+            }
+        }
+    }
+}
+
+/// Inject a single `envFrom` secretRef entry into a container, unless it already
+/// references the same secret name.
+fn inject_env_from_to_container(container: &mut serde_json::Value, secret_name: &str) {
+    let entry = serde_json::json!({"secretRef": {"name": secret_name}});
+
+    if let Some(env_from) = container.get_mut("envFrom").and_then(|v| v.as_array_mut()) {
+        // Idempotent: check if this secretRef already exists
+        let already = env_from.iter().any(|e| {
+            e.get("secretRef")
+                .and_then(|sr| sr.get("name"))
+                .and_then(|n| n.as_str())
+                == Some(secret_name)
+        });
+        if !already {
+            env_from.push(entry);
+        }
+    } else {
+        container["envFrom"] = serde_json::json!([entry]);
+    }
+}
+
 /// Find the first Deployment resource name from a list of applied resources.
 pub fn find_deployment_name(applied: &[AppliedResource]) -> Option<&str> {
     applied
@@ -844,5 +924,208 @@ mod tests {
         );
 
         assert!(!has_prune_disabled(&obj));
+    }
+
+    // --- inject_env_from_secret tests ---
+
+    #[test]
+    fn inject_env_from_single_deployment() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env_from = &doc["spec"]["template"]["spec"]["containers"][0]["envFrom"];
+        assert_eq!(env_from[0]["secretRef"]["name"], "myapp-secrets");
+    }
+
+    #[test]
+    fn inject_env_from_multi_doc_only_workloads() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-svc
+spec:
+  ports:
+    - port: 80";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let docs: Vec<&str> = result.split("---\n").collect();
+        assert_eq!(docs.len(), 2);
+
+        let deploy: serde_json::Value = serde_yaml::from_str(docs[0]).unwrap();
+        assert!(
+            deploy["spec"]["template"]["spec"]["containers"][0]["envFrom"][0]["secretRef"]["name"]
+                .as_str()
+                .is_some()
+        );
+
+        let svc: serde_json::Value = serde_yaml::from_str(docs[1]).unwrap();
+        assert!(
+            svc["spec"]["template"].is_null()
+                || svc
+                    .pointer("/spec/template/spec/containers/0/envFrom")
+                    .is_none()
+        );
+    }
+
+    #[test]
+    fn inject_env_from_idempotent() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          envFrom:
+            - secretRef:
+                name: myapp-secrets";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env_from = doc["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(env_from.len(), 1, "should not duplicate existing secretRef");
+    }
+
+    #[test]
+    fn inject_env_from_appends_to_existing_different_secret() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          envFrom:
+            - secretRef:
+                name: other-secret";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env_from = doc["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(env_from.len(), 2);
+        assert_eq!(env_from[0]["secretRef"]["name"], "other-secret");
+        assert_eq!(env_from[1]["secretRef"]["name"], "myapp-secrets");
+    }
+
+    #[test]
+    fn inject_env_from_service_only_unchanged() {
+        let yaml = "\
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+spec:
+  ports:
+    - port: 80";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        assert!(doc.pointer("/spec/template").is_none());
+    }
+
+    #[test]
+    fn inject_env_from_init_containers() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init
+          image: busybox
+      containers:
+        - name: app
+          image: myapp:latest";
+
+        let result = inject_env_from_secret(yaml, "myapp-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let init_env = &doc["spec"]["template"]["spec"]["initContainers"][0]["envFrom"];
+        assert_eq!(init_env[0]["secretRef"]["name"], "myapp-secrets");
+        let app_env = &doc["spec"]["template"]["spec"]["containers"][0]["envFrom"];
+        assert_eq!(app_env[0]["secretRef"]["name"], "myapp-secrets");
+    }
+
+    #[test]
+    fn inject_env_from_statefulset() {
+        let yaml = "\
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mydb
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:16";
+
+        let result = inject_env_from_secret(yaml, "db-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        assert_eq!(
+            doc["spec"]["template"]["spec"]["containers"][0]["envFrom"][0]["secretRef"]["name"],
+            "db-secrets"
+        );
+    }
+
+    #[test]
+    fn inject_env_from_cronjob() {
+        let yaml = "\
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: backup:latest";
+
+        let result = inject_env_from_secret(yaml, "backup-secrets").unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env_from =
+            &doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["envFrom"];
+        assert_eq!(env_from[0]["secretRef"]["name"], "backup-secrets");
     }
 }

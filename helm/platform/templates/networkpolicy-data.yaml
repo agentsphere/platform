@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "platform.fullname" . }}-data-stores
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  # Apply to all pods in this namespace that are NOT the platform pod itself
+  # (i.e., PostgreSQL, Valkey, MinIO subchart pods)
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: NotIn
+        values:
+          - {{ include "platform.name" . }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only allow traffic from pods in this namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}

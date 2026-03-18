@@ -1,0 +1,24 @@
+{{- if not .Values.ingress.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "platform.fullname" . }}-nodeport
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.platform.ssh.enabled }}
+    - name: ssh
+      port: {{ .Values.platform.ssh.port }}
+      targetPort: ssh
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "platform.selectorLabels" . | nindent 4 }}
+{{- end }}

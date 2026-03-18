@@ -1,0 +1,52 @@
+# =============================================================================
+# Small deployment — single node, minimal resources
+# Usage: helm install platform ./helm/platform -f helm/platform/values-small.yaml
+# =============================================================================
+
+platform:
+  replicaCount: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+  env:
+    pipelineMaxParallel: 2
+    maxCliSubprocesses: 5
+
+postgresql:
+  primary:
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+    persistence:
+      size: 5Gi
+
+valkey:
+  master:
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+      limits:
+        memory: "128Mi"
+        cpu: "250m"
+    persistence:
+      size: 1Gi
+
+minio:
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+  persistence:
+    size: 10Gi

@@ -15,47 +15,61 @@ fi
 # Generate MCP config based on agent role
 # ---------------------------------------------------------------------------
 ROLE="${AGENT_ROLE:-dev}"
-MCP_DIR="/usr/local/lib/mcp/servers"
+# Prefer workspace-downloaded MCP (init container), fallback to baked-in
+if [ -d /workspace/.platform/mcp/servers ]; then
+  MCP_DIR="/workspace/.platform/mcp/servers"
+else
+  MCP_DIR="/usr/local/lib/mcp/servers"
+fi
+
+# Helper: build a single MCP server entry with platform env vars injected
+mcp_server() {
+  local name="$1"
+  cat <<SEOF
+"$name":{"command":"node","args":["$MCP_DIR/$name.js"],"env":{"PLATFORM_API_URL":"${PLATFORM_API_URL:-}","PLATFORM_API_TOKEN":"${PLATFORM_API_TOKEN:-}","SESSION_ID":"${SESSION_ID:-}","PROJECT_ID":"${PROJECT_ID:-}"}}
+SEOF
+}
 
 # Core server is always included
-MCP_JSON='{"mcpServers":{"platform-core":{"command":"node","args":["'"$MCP_DIR"'/platform-core.js"]}'
+MCP_JSON='{"mcpServers":{'
+MCP_JSON+="$(mcp_server platform-core)"
 
 case "$ROLE" in
   dev)
-    MCP_JSON+=',"platform-pipeline":{"command":"node","args":["'"$MCP_DIR"'/platform-pipeline.js"]}'
-    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
+    MCP_JSON+=",$(mcp_server platform-pipeline)"
+    MCP_JSON+=",$(mcp_server platform-issues)"
     ;;
   ops)
-    MCP_JSON+=',"platform-pipeline":{"command":"node","args":["'"$MCP_DIR"'/platform-pipeline.js"]}'
-    MCP_JSON+=',"platform-deploy":{"command":"node","args":["'"$MCP_DIR"'/platform-deploy.js"]}'
-    MCP_JSON+=',"platform-observe":{"command":"node","args":["'"$MCP_DIR"'/platform-observe.js"]}'
+    MCP_JSON+=",$(mcp_server platform-pipeline)"
+    MCP_JSON+=",$(mcp_server platform-deploy)"
+    MCP_JSON+=",$(mcp_server platform-observe)"
     ;;
   admin)
     for s in platform-pipeline platform-issues platform-deploy platform-observe platform-admin; do
-      MCP_JSON+=',"'"$s"'":{"command":"node","args":["'"$MCP_DIR"'/'"$s"'.js"]}'
+      MCP_JSON+=",$(mcp_server "$s")"
     done
     ;;
   ui)
-    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
+    MCP_JSON+=",$(mcp_server platform-issues)"
     ;;
   test)
-    MCP_JSON+=',"platform-pipeline":{"command":"node","args":["'"$MCP_DIR"'/platform-pipeline.js"]}'
-    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
-    MCP_JSON+=',"platform-observe":{"command":"node","args":["'"$MCP_DIR"'/platform-observe.js"]}'
+    MCP_JSON+=",$(mcp_server platform-pipeline)"
+    MCP_JSON+=",$(mcp_server platform-issues)"
+    MCP_JSON+=",$(mcp_server platform-observe)"
     ;;
   review)
-    MCP_JSON+=',"platform-issues":{"command":"node","args":["'"$MCP_DIR"'/platform-issues.js"]}'
+    MCP_JSON+=",$(mcp_server platform-issues)"
     ;;
   manager|create-app)
     for s in platform-pipeline platform-issues platform-deploy platform-observe platform-admin; do
-      MCP_JSON+=',"'"$s"'":{"command":"node","args":["'"$MCP_DIR"'/'"$s"'.js"]}'
+      MCP_JSON+=",$(mcp_server "$s")"
     done
     ;;
 esac
 
 # Add browser MCP server when browser sidecar is enabled
 if [ "${BROWSER_ENABLED:-}" = "true" ]; then
-    MCP_JSON+=',"platform-browser":{"command":"node","args":["'"$MCP_DIR"'/platform-browser.js"]}'
+    MCP_JSON+=",$(mcp_server platform-browser)"
 fi
 
 MCP_JSON+='}}'
@@ -77,12 +91,8 @@ ENVEOF
 # ---------------------------------------------------------------------------
 # Run Claude Code with MCP config, streaming JSON output
 # ---------------------------------------------------------------------------
-# MCP servers are generated above but currently disabled due to a Claude CLI
-# compatibility issue where --mcp-config causes the process to hang
-# indefinitely during MCP server startup. The coding agent works fine with
-# built-in tools (Bash, Edit, Read, Write).  Re-enable when the issue is
-# resolved by uncommenting --mcp-config below.
-claude --print --output-format stream-json --verbose --dangerously-skip-permissions "$@"
+claude --print --output-format stream-json --verbose --dangerously-skip-permissions \
+  --mcp-config /tmp/mcp-config.json "$@"
 EXIT_CODE=$?
 
 # ---------------------------------------------------------------------------
