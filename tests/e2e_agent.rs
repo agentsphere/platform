@@ -1,7 +1,5 @@
 mod e2e_helpers;
 
-use std::fmt::Write;
-
 use axum::http::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -511,74 +509,34 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
     }
 
     let session_id_str = body["id"].as_str().unwrap();
-    let session_id: Uuid = session_id_str.parse().unwrap();
+    let _session_id: Uuid = session_id_str.parse().unwrap();
 
-    // 4. Wait for pod to complete (mock CLI exits immediately after 3 NDJSON lines)
-    let pod_name = body["pod_name"]
-        .as_str()
-        .expect("session response should have pod_name");
-    // Pod is now in the session namespace, not the project dev namespace
-    let namespace: Option<String> =
-        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let namespace = namespace.expect("session_namespace should be set");
-
-    let phase = e2e_helpers::wait_for_pod(&state.kube, &namespace, pod_name, 120).await;
-    eprintln!("pod {pod_name} finished with phase: {phase}");
-
-    // Capture container logs for debugging
-    if phase == "Failed" {
-        for container in &["git-clone", "setup-tools", "claude"] {
-            let logs =
-                e2e_helpers::pod_logs_container(&state.kube, &namespace, pod_name, container).await;
-            eprintln!("pod {pod_name} [{container}] logs:\n{logs}");
-        }
-    } else {
-        let logs = e2e_helpers::pod_logs(&state.kube, &namespace, pod_name).await;
-        eprintln!("pod {pod_name} logs:\n{logs}");
-    }
-
-    assert_eq!(phase, "Succeeded", "pod should succeed with mock CLI");
-
-    // 5. Run the reaper once to transition session to completed/failed
-    //    (the reaper is not started as a background task in test_router)
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    platform::agent::service::run_reaper_once(&state).await;
-
-    // 6. Poll session status — should be completed (mock CLI exits with success)
-    let final_status =
-        e2e_helpers::poll_session_status(&pool, session_id, &["completed", "failed"], 30).await;
-    eprintln!("session final status: {final_status}");
-    assert_eq!(
-        final_status, "completed",
-        "session should be completed after successful pod"
-    );
-
-    // 7. Get session detail — verify messages were persisted via pub/sub
-    let (detail_status, detail) = e2e_helpers::get_json(
+    // 4. Poll for pubsub messages to arrive (agent-runner is multi-turn, pod won't
+    //    self-terminate — we wait for messages then stop the session)
+    let detail = e2e_helpers::poll_session_messages(
         &app,
         &admin_token,
-        &format!("/api/projects/{project_id}/sessions/{session_id_str}"),
+        project_id,
+        session_id_str,
+        3,  // expect at least 3 messages: milestone, text, waiting_for_input
+        120,
     )
     .await;
-    assert_eq!(detail_status, StatusCode::OK);
 
     let messages = detail["messages"].as_array().unwrap();
 
     // Mock CLI emits 3 NDJSON lines → agent-runner converts to pub/sub events:
-    //   system  → PubSubKind::Milestone  (role: "milestone")
-    //   assistant (text) → PubSubKind::Text (role: "text")
-    //   result (success) → PubSubKind::Completed (role: "completed")
+    //   system  → Milestone  (role: "milestone")
+    //   assistant (text) → Text (role: "text")
+    //   result (success) → WaitingForInput (role: "waiting_for_input")
+    // Plus a 4th WaitingForInput from the REPL loop.
     let roles: Vec<&str> = messages.iter().filter_map(|m| m["role"].as_str()).collect();
     eprintln!("message roles: {roles:?}");
 
-    assert_eq!(
-        messages.len(),
-        3,
-        "mock CLI emits 3 NDJSON lines → 3 persisted messages, got: {roles:?}"
+    assert!(
+        messages.len() >= 3,
+        "expected at least 3 persisted messages, got {}: {roles:?}",
+        messages.len()
     );
 
     assert_eq!(
@@ -590,8 +548,8 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
         "second event should be text (assistant response)"
     );
     assert_eq!(
-        roles[2], "completed",
-        "third event should be completed (result)"
+        roles[2], "waiting_for_input",
+        "third event should be waiting_for_input (turn completed)"
     );
 
     // Verify milestone message content (from convert_system)
@@ -605,12 +563,8 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
     let text_content = messages[1]["content"].as_str().unwrap_or("");
     assert!(!text_content.is_empty(), "text message should have content");
 
-    // Verify completed message
-    let completed_content = messages[2]["content"].as_str().unwrap_or("");
-    assert!(
-        !completed_content.is_empty(),
-        "completed message should have content"
-    );
+    // 5. Stop the session (agent-runner is multi-turn, pod won't self-terminate)
+    e2e_helpers::stop_session(&app, &admin_token, project_id, session_id_str).await;
 }
 
 /// Test 9: Agent pod can clone via init container and push from main container.
@@ -691,53 +645,26 @@ async fn e2e_agent_git_clone_push(pool: PgPool) {
     }
 
     let session_id_str = body["id"].as_str().unwrap();
-    let session_id: Uuid = session_id_str.parse().unwrap();
-    let pod_name = body["pod_name"]
-        .as_str()
-        .expect("session response should have pod_name");
+    let _session_id: Uuid = session_id_str.parse().unwrap();
 
-    // 5. Get session namespace for pod lookups (pods now use per-session namespaces)
-    let namespace: Option<String> =
-        sqlx::query_scalar("SELECT session_namespace FROM agent_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let namespace = namespace.expect("session_namespace should be set");
+    // 5. Poll for pubsub messages (agent-runner is multi-turn, pod won't self-terminate).
+    //    The mock git CLI pushes first, then emits NDJSON, so by the time messages arrive
+    //    the git push is already complete.
+    let _detail = e2e_helpers::poll_session_messages(
+        &app,
+        &admin_token,
+        project_id,
+        session_id_str,
+        3,  // system init + assistant text + result
+        180,
+    )
+    .await;
 
-    // 6. Wait for pod to complete (clone + commit + push + NDJSON)
-    //    Keep the git mock in place until the pod finishes — the pod reads
-    //    the script from the hostPath mount at execution time, not at creation.
-    let phase = e2e_helpers::wait_for_pod(&state.kube, &namespace, pod_name, 180).await;
-    eprintln!("pod {pod_name} finished with phase: {phase}");
-
-    // Restore original mock CLI after pod completes
+    // Restore original mock CLI after messages confirm mock has run
     std::fs::rename(&backup_path, &cli_path).expect("restore original mock CLI");
 
-    // On failure, dump all container logs for debugging
-    if phase != "Succeeded" {
-        let mut all_logs = String::new();
-        for container in &["git-clone", "setup-tools", "claude"] {
-            let logs =
-                e2e_helpers::pod_logs_container(&state.kube, &namespace, pod_name, container).await;
-            write!(all_logs, "\n=== {container} ===\n{logs}\n").unwrap();
-        }
-        panic!(
-            "pod should succeed with mock-claude-cli-git.sh, got phase: {phase}\n\
-             Pod logs:{all_logs}"
-        );
-    }
-
-    // 7. Run reaper to transition session to completed
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    platform::agent::service::run_reaper_once(&state).await;
-
-    let final_status =
-        e2e_helpers::poll_session_status(&pool, session_id, &["completed", "failed"], 30).await;
-    assert_eq!(
-        final_status, "completed",
-        "session should be completed after successful pod"
-    );
+    // Stop the session (pod won't self-terminate in multi-turn mode)
+    e2e_helpers::stop_session(&app, &admin_token, project_id, session_id_str).await;
 
     // 8. Verify push: bare repo should have one more commit on main
     let final_log = e2e_helpers::git_cmd(

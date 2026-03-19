@@ -856,6 +856,51 @@ pub async fn poll_session_status(
     }
 }
 
+/// Poll session detail until the expected number of messages arrive.
+///
+/// Returns the session detail JSON. Panics on timeout.
+pub async fn poll_session_messages(
+    app: &axum::Router,
+    token: &str,
+    project_id: Uuid,
+    session_id: &str,
+    expected_count: usize,
+    timeout_secs: u64,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let url = format!("/api/projects/{project_id}/sessions/{session_id}");
+    loop {
+        let (status, detail) = get_json(app, token, &url).await;
+        if status == axum::http::StatusCode::OK {
+            if let Some(messages) = detail["messages"].as_array() {
+                if messages.len() >= expected_count {
+                    return detail;
+                }
+            }
+        }
+        assert!(
+            start.elapsed().as_secs() <= timeout_secs,
+            "session {session_id} did not reach {expected_count} messages within {timeout_secs}s"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Stop a session via the API (POST /api/projects/{id}/sessions/{sid}/stop).
+pub async fn stop_session(
+    app: &axum::Router,
+    token: &str,
+    project_id: Uuid,
+    session_id: &str,
+) {
+    let url = format!("/api/projects/{project_id}/sessions/{session_id}/stop");
+    let (status, _) = post_json(app, token, &url, serde_json::json!({})).await;
+    assert!(
+        status == axum::http::StatusCode::OK || status == axum::http::StatusCode::NO_CONTENT,
+        "stop session failed with {status}"
+    );
+}
+
 /// Start a real TCP server for agent E2E tests (with git routes for repo clone).
 ///
 /// Binds to `PLATFORM_LISTEN_PORT` (set by `test-in-cluster.sh`) so that the

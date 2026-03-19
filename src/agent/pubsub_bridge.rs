@@ -136,7 +136,7 @@ async fn run_persistence_subscriber(
         let kind_str = serde_json::to_string(&event.kind).unwrap_or_default();
         // Remove surrounding quotes from the JSON string
         let kind_str = kind_str.trim_matches('"');
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO agent_messages (session_id, role, content, metadata)
              VALUES ($1, $2, $3, $4)",
         )
@@ -145,7 +145,10 @@ async fn run_persistence_subscriber(
         .bind(&event.message)
         .bind(&event.metadata)
         .execute(&pool)
-        .await;
+        .await
+        {
+            tracing::warn!(error = %e, %session_id, role = kind_str, "failed to persist agent message");
+        }
 
         // Exit on terminal events
         if matches!(
