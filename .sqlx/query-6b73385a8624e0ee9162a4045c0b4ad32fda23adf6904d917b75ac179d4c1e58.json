@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, project_id, workspace_id, name, description,\n                   persistent_session, created_at, updated_at\n            FROM platform_commands\n            WHERE (workspace_id = $1 AND project_id IS NULL)\n               OR (project_id IS NULL AND workspace_id IS NULL)\n            ORDER BY workspace_id IS NULL ASC, name ASC\n            LIMIT $2 OFFSET $3\n            ",
+  "query": "SELECT id, project_id, workspace_id, name, description,\n               persistent_session, created_at, updated_at\n        FROM platform_commands\n        WHERE (workspace_id = $1 AND project_id IS NULL)\n           OR (project_id IS NULL AND workspace_id IS NULL)\n        ORDER BY workspace_id IS NULL ASC, name ASC\n        LIMIT $2 OFFSET $3",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       false
     ]
   },
-  "hash": "0a4d26106dc97b99908ed8f1fb2427d97b8c367f907c50c919ced925eaefe32c"
+  "hash": "6b73385a8624e0ee9162a4045c0b4ad32fda23adf6904d917b75ac179d4c1e58"
 }

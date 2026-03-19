@@ -12,6 +12,7 @@ pub enum OrgType {
 }
 
 impl OrgType {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Solo => "solo",
@@ -148,7 +149,7 @@ async fn upsert_setting(
 }
 
 /// Read the effective pipeline concurrency from `platform_settings` with env fallback.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(dead_code, clippy::cast_possible_truncation)]
 pub async fn effective_pipeline_concurrency(pool: &PgPool, env_default: usize) -> usize {
     let val = get_setting(pool, "preset_config").await.ok().flatten();
     val.and_then(|v| v.get("pipeline_concurrency")?.as_u64())

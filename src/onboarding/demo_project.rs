@@ -186,7 +186,7 @@ pub async fn create_demo_project(
 }
 
 /// Sync `deploy/` directory from project repo to ops repo.
-/// Returns the ops_repo_id if successful.
+/// Returns the `ops_repo_id` if successful.
 async fn sync_demo_deploy(
     state: &AppState,
     project_id: Uuid,
@@ -320,14 +320,12 @@ This is a great first feature to try building with an agent session.",
             "Add product reviews",
             "open",
             vec!["enhancement"],
-            r#"Let customers leave reviews on products:
-
-- Star rating (1-5) + review text
-- Display average rating on product cards
-- Review list on product detail page
-- Database migration to add a `reviews` table
-
-This demonstrates schema evolution and the migration workflow."#,
+            "Let customers leave reviews on products:\n\n\
+- Star rating (1-5) + review text\n\
+- Display average rating on product cards\n\
+- Review list on product detail page\n\
+- Database migration to add a `reviews` table\n\n\
+This demonstrates schema evolution and the migration workflow.",
         ),
         (
             "Set up monitoring alerts",

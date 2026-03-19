@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as \"count!: i64\" FROM platform_commands\n        WHERE project_id = $1\n           OR (workspace_id = $2 AND project_id IS NULL)\n           OR (project_id IS NULL AND workspace_id IS NULL)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8cc4988b25077e928a119e874a92b6ee17afc8640607a3a05b1963e57ff4de0b"
+}

@@ -131,7 +131,7 @@ async fn require_workspace_member(
     Ok(())
 }
 
-/// Look up a project's workspace_id.
+/// Look up a project's `workspace_id`.
 async fn project_workspace_id(
     pool: &sqlx::PgPool,
     project_id: Uuid,
@@ -237,7 +237,7 @@ async fn create_command(
     ))
 }
 
-/// `GET /api/commands` — List commands (global, or project+workspace+global when project_id set).
+/// `GET /api/commands` — List commands (global, or project+workspace+global when `project_id` set).
 #[tracing::instrument(skip(state), fields(user_id = %auth.user_id), err)]
 async fn list_commands(
     State(state): State<AppState>,
@@ -249,146 +249,158 @@ async fn list_commands(
 
     let (items, total) = if let Some(pid) = params.project_id {
         super::helpers::require_project_read(&state, &auth, pid).await?;
-
-        // Look up project's workspace_id to include workspace commands
         let wid = project_workspace_id(&state.pool, pid).await?;
-
-        let total = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) as "count!: i64" FROM platform_commands
-            WHERE project_id = $1
-               OR (workspace_id = $2 AND project_id IS NULL)
-               OR (project_id IS NULL AND workspace_id IS NULL)
-            "#,
-            pid,
-            wid,
-        )
-        .fetch_one(&state.pool)
-        .await?;
-
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, project_id, workspace_id, name, description,
-                   persistent_session, created_at, updated_at
-            FROM platform_commands
-            WHERE project_id = $1
-               OR (workspace_id = $2 AND project_id IS NULL)
-               OR (project_id IS NULL AND workspace_id IS NULL)
-            ORDER BY
-                CASE WHEN project_id IS NOT NULL THEN 0
-                     WHEN workspace_id IS NOT NULL THEN 1
-                     ELSE 2 END ASC,
-                name ASC
-            LIMIT $3 OFFSET $4
-            "#,
-            pid,
-            wid,
-            limit,
-            offset,
-        )
-        .fetch_all(&state.pool)
-        .await?;
-
-        let items = rows
-            .into_iter()
-            .map(|r| CommandResponse {
-                id: r.id,
-                project_id: r.project_id,
-                workspace_id: r.workspace_id,
-                name: r.name,
-                description: r.description,
-                persistent_session: r.persistent_session,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
-            .collect();
-        (items, total)
+        list_commands_for_project(&state.pool, pid, wid, limit, offset).await?
     } else if let Some(wid) = params.workspace_id {
         require_workspace_member(&state, &auth, wid).await?;
-
-        let total = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) as "count!: i64" FROM platform_commands
-            WHERE (workspace_id = $1 AND project_id IS NULL)
-               OR (project_id IS NULL AND workspace_id IS NULL)
-            "#,
-            wid,
-        )
-        .fetch_one(&state.pool)
-        .await?;
-
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, project_id, workspace_id, name, description,
-                   persistent_session, created_at, updated_at
-            FROM platform_commands
-            WHERE (workspace_id = $1 AND project_id IS NULL)
-               OR (project_id IS NULL AND workspace_id IS NULL)
-            ORDER BY workspace_id IS NULL ASC, name ASC
-            LIMIT $2 OFFSET $3
-            "#,
-            wid,
-            limit,
-            offset,
-        )
-        .fetch_all(&state.pool)
-        .await?;
-
-        let items = rows
-            .into_iter()
-            .map(|r| CommandResponse {
-                id: r.id,
-                project_id: r.project_id,
-                workspace_id: r.workspace_id,
-                name: r.name,
-                description: r.description,
-                persistent_session: r.persistent_session,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
-            .collect();
-        (items, total)
+        list_commands_for_workspace(&state.pool, wid, limit, offset).await?
     } else {
-        // Global commands only
-        let total = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) as "count!: i64" FROM platform_commands
-            WHERE project_id IS NULL AND workspace_id IS NULL"#,
-        )
-        .fetch_one(&state.pool)
-        .await?;
-
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, project_id, workspace_id, name, description,
-                   persistent_session, created_at, updated_at
-            FROM platform_commands
-            WHERE project_id IS NULL AND workspace_id IS NULL
-            ORDER BY name ASC
-            LIMIT $1 OFFSET $2
-            "#,
-            limit,
-            offset,
-        )
-        .fetch_all(&state.pool)
-        .await?;
-
-        let items = rows
-            .into_iter()
-            .map(|r| CommandResponse {
-                id: r.id,
-                project_id: r.project_id,
-                workspace_id: r.workspace_id,
-                name: r.name,
-                description: r.description,
-                persistent_session: r.persistent_session,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
-            .collect();
-        (items, total)
+        list_global_commands(&state.pool, limit, offset).await?
     };
 
     Ok(Json(ListResponse { items, total }))
+}
+
+async fn list_commands_for_project(
+    pool: &sqlx::PgPool,
+    pid: Uuid,
+    wid: Option<Uuid>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<CommandResponse>, i64), ApiError> {
+    let total = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count!: i64" FROM platform_commands
+        WHERE project_id = $1
+           OR (workspace_id = $2 AND project_id IS NULL)
+           OR (project_id IS NULL AND workspace_id IS NULL)"#,
+        pid,
+        wid,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let rows = sqlx::query!(
+        r#"SELECT id, project_id, workspace_id, name, description,
+               persistent_session, created_at, updated_at
+        FROM platform_commands
+        WHERE project_id = $1
+           OR (workspace_id = $2 AND project_id IS NULL)
+           OR (project_id IS NULL AND workspace_id IS NULL)
+        ORDER BY
+            CASE WHEN project_id IS NOT NULL THEN 0
+                 WHEN workspace_id IS NOT NULL THEN 1
+                 ELSE 2 END ASC,
+            name ASC
+        LIMIT $3 OFFSET $4"#,
+        pid,
+        wid,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| CommandResponse {
+            id: r.id,
+            project_id: r.project_id,
+            workspace_id: r.workspace_id,
+            name: r.name,
+            description: r.description,
+            persistent_session: r.persistent_session,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect();
+    Ok((items, total))
+}
+
+async fn list_commands_for_workspace(
+    pool: &sqlx::PgPool,
+    wid: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<CommandResponse>, i64), ApiError> {
+    let total = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count!: i64" FROM platform_commands
+        WHERE (workspace_id = $1 AND project_id IS NULL)
+           OR (project_id IS NULL AND workspace_id IS NULL)"#,
+        wid,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let rows = sqlx::query!(
+        r#"SELECT id, project_id, workspace_id, name, description,
+               persistent_session, created_at, updated_at
+        FROM platform_commands
+        WHERE (workspace_id = $1 AND project_id IS NULL)
+           OR (project_id IS NULL AND workspace_id IS NULL)
+        ORDER BY workspace_id IS NULL ASC, name ASC
+        LIMIT $2 OFFSET $3"#,
+        wid,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| CommandResponse {
+            id: r.id,
+            project_id: r.project_id,
+            workspace_id: r.workspace_id,
+            name: r.name,
+            description: r.description,
+            persistent_session: r.persistent_session,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect();
+    Ok((items, total))
+}
+
+async fn list_global_commands(
+    pool: &sqlx::PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<CommandResponse>, i64), ApiError> {
+    let total = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count!: i64" FROM platform_commands
+        WHERE project_id IS NULL AND workspace_id IS NULL"#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let rows = sqlx::query!(
+        r#"SELECT id, project_id, workspace_id, name, description,
+               persistent_session, created_at, updated_at
+        FROM platform_commands
+        WHERE project_id IS NULL AND workspace_id IS NULL
+        ORDER BY name ASC
+        LIMIT $1 OFFSET $2"#,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| CommandResponse {
+            id: r.id,
+            project_id: r.project_id,
+            workspace_id: r.workspace_id,
+            name: r.name,
+            description: r.description,
+            persistent_session: r.persistent_session,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect();
+    Ok((items, total))
 }
 
 /// `GET /api/commands/{id}` — Get a single command.

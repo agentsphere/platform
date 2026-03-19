@@ -588,10 +588,7 @@ mod tests {
             Some("http://172.18.0.2:31500"),
             None,
         );
-        assert_eq!(
-            url,
-            "http://172.18.0.2:31500/preview-abc12345.my-ns.8000/"
-        );
+        assert_eq!(url, "http://172.18.0.2:31500/preview-abc12345.my-ns.8000/");
     }
 
     #[test]

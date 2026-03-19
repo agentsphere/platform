@@ -200,7 +200,17 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     // Clean up git auth token
     cleanup_git_auth_token(state, &git_token.1).await;
 
-    // Finalize pipeline
+    finalize_pipeline(state, pipeline_id, project_id, all_succeeded, &pipeline_svc).await
+}
+
+/// Finalize a pipeline run: update status, trigger post-run actions, fire webhooks.
+async fn finalize_pipeline(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    all_succeeded: bool,
+    pipeline_svc: &str,
+) -> Result<(), PipelineError> {
     let final_status = if all_succeeded { "success" } else { "failure" };
     sqlx::query!(
         "UPDATE pipelines SET status = $2, finished_at = now() WHERE id = $1",
@@ -213,7 +223,6 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     if all_succeeded {
         detect_and_write_deployment(state, pipeline_id, project_id).await;
         detect_and_publish_dev_image(state, pipeline_id, project_id).await;
-        // Try auto-merge for any open MRs with auto_merge enabled
         crate::api::merge_requests::try_auto_merge(state, project_id).await;
     }
 
@@ -223,7 +232,7 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     emit_pipeline_log(
         &state.pool,
         project_id,
-        &pipeline_svc,
+        pipeline_svc,
         log_level,
         &format!("Pipeline {final_status}"),
         Some(serde_json::json!({"pipeline_id": pipeline_id.to_string(), "status": final_status})),
@@ -890,73 +899,50 @@ fn detect_unrecoverable_container(
     status: &k8s_openapi::api::core::v1::PodStatus,
 ) -> Option<String> {
     let containers = status.container_statuses.as_ref()?;
-    for cs in containers {
-        if let Some(state) = &cs.state {
-            if let Some(waiting) = &state.waiting {
-                let reason = waiting.reason.as_deref().unwrap_or("");
-                match reason {
-                    // Image cannot be pulled — will never recover without intervention
-                    "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" => {
-                        let msg = waiting.message.as_deref().unwrap_or("image pull failed");
-                        return Some(format!("{reason}: {msg}"));
-                    }
-                    "CreateContainerConfigError" => {
-                        let msg = waiting
-                            .message
-                            .as_deref()
-                            .unwrap_or("container config error");
-                        return Some(format!("{reason}: {msg}"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Also check restart count — CrashLoopBackOff with 3+ restarts is unlikely to recover
-        if cs.restart_count >= 3 {
-            if let Some(state) = &cs.state {
-                if let Some(waiting) = &state.waiting {
-                    if waiting.reason.as_deref() == Some("CrashLoopBackOff") {
-                        return Some(format!(
-                            "CrashLoopBackOff after {} restarts",
-                            cs.restart_count
-                        ));
-                    }
-                }
-            }
-        }
+    if let Some(reason) = check_container_statuses(containers, "") {
+        return Some(reason);
     }
-    // Also check init containers
     let init_containers = status.init_container_statuses.as_ref()?;
-    for cs in init_containers {
-        if let Some(state) = &cs.state {
-            if let Some(waiting) = &state.waiting {
-                let reason = waiting.reason.as_deref().unwrap_or("");
-                match reason {
-                    "ImagePullBackOff"
-                    | "ErrImagePull"
-                    | "InvalidImageName"
-                    | "CreateContainerConfigError" => {
-                        let msg = waiting
-                            .message
-                            .as_deref()
-                            .unwrap_or("init container failed");
-                        return Some(format!("init container: {reason}: {msg}"));
-                    }
-                    _ => {}
+    check_container_statuses(init_containers, "init container ")
+}
+
+/// Check a list of container statuses for unrecoverable states.
+fn check_container_statuses(
+    statuses: &[k8s_openapi::api::core::v1::ContainerStatus],
+    prefix: &str,
+) -> Option<String> {
+    for cs in statuses {
+        if let Some(state) = &cs.state
+            && let Some(waiting) = &state.waiting
+        {
+            let reason = waiting.reason.as_deref().unwrap_or("");
+            match reason {
+                "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" => {
+                    let msg = waiting.message.as_deref().unwrap_or("image pull failed");
+                    return Some(format!("{prefix}{reason}: {msg}"));
                 }
+                "CreateContainerConfigError" => {
+                    let msg = waiting
+                        .message
+                        .as_deref()
+                        .unwrap_or("container config error");
+                    return Some(format!("{prefix}{reason}: {msg}"));
+                }
+                _ => {}
             }
         }
-        if cs.restart_count >= 3 {
-            if let Some(state) = &cs.state {
-                if let Some(waiting) = &state.waiting {
-                    if waiting.reason.as_deref() == Some("CrashLoopBackOff") {
-                        return Some(format!(
-                            "init container CrashLoopBackOff after {} restarts",
-                            cs.restart_count
-                        ));
-                    }
-                }
-            }
+        if cs.restart_count >= 3
+            && cs
+                .state
+                .as_ref()
+                .and_then(|s| s.waiting.as_ref())
+                .and_then(|w| w.reason.as_deref())
+                == Some("CrashLoopBackOff")
+        {
+            return Some(format!(
+                "{prefix}CrashLoopBackOff after {} restarts",
+                cs.restart_count
+            ));
         }
     }
     None
@@ -1407,8 +1393,8 @@ async fn create_pipeline_otlp_token(
     let scopes = vec!["observe:write".to_string()];
 
     if let Err(e) = sqlx::query(
-        r#"INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
-           VALUES ($1, $2, $3, $4::text[], $5, now() + interval '4 hours')"#,
+        "INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
+           VALUES ($1, $2, $3, $4::text[], $5, now() + interval '4 hours')",
     )
     .bind(owner_id)
     .bind(&name)
@@ -1648,10 +1634,10 @@ async fn execute_deploy_test_step(
     // Override REGISTRY with the node-visible URL for test_image expansion.
     // The default REGISTRY points to the push URL (e.g. host.docker.internal:55251)
     // but containerd on Kind nodes needs the DaemonSet proxy URL (e.g. localhost:48773).
-    if let Some(node_reg) = node_registry_url(&state.config) {
-        if let Some(pair) = env_pairs.iter_mut().find(|(k, _)| k == "REGISTRY") {
-            pair.1 = node_reg.to_string();
-        }
+    if let Some(node_reg) = node_registry_url(&state.config)
+        && let Some(pair) = env_pairs.iter_mut().find(|(k, _)| k == "REGISTRY")
+    {
+        pair.1 = node_reg.to_string();
     }
 
     // Expand env vars in test_image

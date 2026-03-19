@@ -169,13 +169,11 @@ async fn main() -> anyhow::Result<()> {
                     sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE name = 'admin'")
                         .fetch_optional(&demo_state.pool)
                         .await
-                {
-                    if let Err(e) =
+                    && let Err(e) =
                         onboarding::demo_project::create_and_trigger_demo(&demo_state, admin_id)
                             .await
-                    {
-                        tracing::warn!(error = %e, "auto demo project creation failed");
-                    }
+                {
+                    tracing::warn!(error = %e, "auto demo project creation failed");
                 }
             });
         }

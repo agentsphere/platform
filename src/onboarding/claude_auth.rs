@@ -15,6 +15,7 @@ use uuid::Uuid;
 /// State of a Claude CLI auth session (returned to frontend).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum AuthSessionState {
     /// Process starting, extracting URL from stdout.
     Starting,
@@ -29,6 +30,7 @@ pub enum AuthSessionState {
 }
 
 /// An active CLI auth session (owns process handle — not Clone).
+#[allow(dead_code)]
 struct AuthSession {
     state: AuthSessionState,
     stdin: Option<ChildStdin>,
@@ -249,6 +251,7 @@ impl CliAuthManager {
     }
 
     /// Evict sessions older than 5 minutes.
+    #[allow(dead_code)]
     pub async fn evict_stale(&self) {
         let mut sessions = self.sessions.lock().await;
         let threshold = std::time::Duration::from_secs(300);
@@ -440,7 +443,7 @@ async fn run_cli_validation(
 
         // Check the result line
         if v.get("type").and_then(|t| t.as_str()) == Some("result") {
-            if v.get("is_error").and_then(|e| e.as_bool()) == Some(false) {
+            if v.get("is_error").and_then(serde_json::Value::as_bool) == Some(false) {
                 return Ok(true);
             }
             // is_error: true — auth likely failed
@@ -721,7 +724,8 @@ mod tests {
 
     #[test]
     fn find_oauth_token_extracts_token() {
-        let text = "Your OAuth token (valid for 1 year):\nsk-ant-oat01-FAKE_TEST_TOKEN_aabbccdd1122334455";
+        let text =
+            "Your OAuth token (valid for 1 year):\nsk-ant-oat01-FAKE_TEST_TOKEN_aabbccdd1122334455";
         let token = find_oauth_token(text).unwrap();
         assert!(token.starts_with("sk-ant-oat01-"));
     }
@@ -845,8 +849,7 @@ echo "Store this token securely."
         let config_dir = tmp.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
 
-        let mut child =
-            spawn_claude_setup_token(mock_cli.to_str().unwrap(), &config_dir).unwrap();
+        let mut child = spawn_claude_setup_token(mock_cli.to_str().unwrap(), &config_dir).unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut reader = BufReader::new(stdout);
 
@@ -874,8 +877,7 @@ echo "Store this token securely."
         let config_dir = tmp.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
 
-        let mut child =
-            spawn_claude_setup_token(mock_cli.to_str().unwrap(), &config_dir).unwrap();
+        let mut child = spawn_claude_setup_token(mock_cli.to_str().unwrap(), &config_dir).unwrap();
 
         let stdout = child.stdout.take().unwrap();
         let mut stdin = child.stdin.take().unwrap();
@@ -905,10 +907,7 @@ echo "Store this token securely."
         });
 
         // Phase 3: Write auth code to stdin (same as send_code does)
-        stdin
-            .write_all(b"test-auth-code-12345\r")
-            .await
-            .unwrap();
+        stdin.write_all(b"test-auth-code-12345\r").await.unwrap();
         stdin.flush().await.unwrap();
 
         // Phase 4: Wait for token

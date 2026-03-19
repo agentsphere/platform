@@ -571,7 +571,7 @@ async fn verify_oauth_token(
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "oauth token validation failed");
-            ApiError::Internal(e.into())
+            ApiError::Internal(e)
         })?;
 
     if valid {

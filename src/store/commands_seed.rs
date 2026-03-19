@@ -41,13 +41,13 @@ pub async fn seed_commands(pool: &PgPool, seed_path: &Path) -> Result<(), anyhow
         // Insert as global command (workspace_id=NULL, project_id=NULL).
         // ON CONFLICT DO NOTHING: never overwrite admin edits.
         sqlx::query(
-            r#"INSERT INTO platform_commands (workspace_id, project_id, name, description, prompt_template, persistent_session)
+            "INSERT INTO platform_commands (workspace_id, project_id, name, description, prompt_template, persistent_session)
                VALUES (NULL, NULL, $1, $2, $3, $4)
                ON CONFLICT (
                    COALESCE(workspace_id, '00000000-0000-0000-0000-000000000000'::uuid),
                    COALESCE(project_id,   '00000000-0000-0000-0000-000000000000'::uuid),
                    name
-               ) DO NOTHING"#,
+               ) DO NOTHING",
         )
         .bind(&name)
         .bind(&description)
@@ -65,19 +65,19 @@ pub async fn seed_commands(pool: &PgPool, seed_path: &Path) -> Result<(), anyhow
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct Meta {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    persistent_session: bool,
+}
+
 /// Read optional metadata from a sibling `.json` file.
 fn read_metadata(md_path: &Path) -> (String, bool) {
     let json_path = md_path.with_extension("json");
     if !json_path.exists() {
         return (String::new(), false);
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        persistent_session: bool,
     }
 
     match std::fs::read_to_string(&json_path) {
