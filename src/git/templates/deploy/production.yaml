@@ -85,3 +85,10 @@ spec:
   ports:
     - port: 8080
       targetPort: 8080
+# --- Canary deployment (uncomment for progressive delivery) ---
+# To enable canary deployments, split this into separate files:
+#   deploy/deployment-stable.yaml  — uses {{ stable_image | default(image_ref) }}
+#   deploy/deployment-canary.yaml  — uses {{ canary_image | default(image_ref) }}
+#   deploy/service-stable.yaml     — selects variant: stable
+#   deploy/service-canary.yaml     — selects variant: canary
+# Then update .platform.yaml with deploy.specs[].type: canary

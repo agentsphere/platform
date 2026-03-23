@@ -430,6 +430,8 @@ async fn run_cli_validation(
         tracing::warn!(stderr = %preview, "claude validation stderr");
     }
 
+    let mut saw_init = false;
+
     for line in stdout.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -441,14 +443,36 @@ async fn run_cli_validation(
             return Ok(false);
         }
 
+        // The CLI emits a {"type":"system","subtype":"init"} message after
+        // successful authentication.  If we see it, the token is valid even
+        // if the subsequent prompt execution fails (rate-limit, network, etc.).
+        if v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+        {
+            saw_init = true;
+        }
+
         // Check the result line
         if v.get("type").and_then(|t| t.as_str()) == Some("result") {
             if v.get("is_error").and_then(serde_json::Value::as_bool) == Some(false) {
                 return Ok(true);
             }
-            // is_error: true — auth likely failed
+            // is_error but we already authenticated (init appeared) — the
+            // prompt failed for a non-auth reason (rate-limit, network, etc.).
+            if saw_init {
+                tracing::warn!(
+                    "CLI result has is_error=true but init was seen — treating as valid auth"
+                );
+                return Ok(true);
+            }
             return Ok(false);
         }
+    }
+
+    // No result line but init appeared — token authenticated successfully
+    if saw_init {
+        tracing::info!("no result line but init was seen — treating as valid auth");
+        return Ok(true);
     }
 
     // No clear signal — treat as failure

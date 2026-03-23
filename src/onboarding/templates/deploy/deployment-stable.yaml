@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ project_name }}-app-stable
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ project_name }}-app
+      variant: stable
+  template:
+    metadata:
+      labels:
+        app: {{ project_name }}-app
+        variant: stable
+    spec:
+      imagePullSecrets:
+        - name: platform-registry-pull
+      containers:
+        - name: app
+          image: {{ stable_image | default(image_ref) }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://app:changeme@{{ project_name }}-db:5432/app"
+            - name: CACHE_URL
+              value: "redis://{{ project_name }}-cache:6379"
+            - name: APP_VERSION
+              value: stable
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

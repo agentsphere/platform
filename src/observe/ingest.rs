@@ -61,9 +61,9 @@ pub fn create_channels() -> (
 
 /// Check that the authenticated user has `ObserveWrite` permission for every
 /// `project_id` present in the OTLP payload. Returns an error if:
-/// - Any resource has no `platform.project_id` attribute → 400
-/// - Any `platform.project_id` is not a valid UUID → 400
-/// - The user lacks `ObserveWrite` for any project → 404 (avoids leaking existence)
+/// - Any resource has no `platform.project_id` attribute -> 400
+/// - Any `platform.project_id` is not a valid UUID -> 400
+/// - The user lacks `ObserveWrite` for any project -> 404 (avoids leaking existence)
 ///
 /// Deduplicates permission lookups within the request (many spans share the same project).
 async fn check_otlp_project_auth(
@@ -330,6 +330,12 @@ async fn build_log_record(
         })
         .unwrap_or_default();
 
+    let source = if env.session_id.is_some() {
+        "session".into()
+    } else {
+        "external".into()
+    };
+
     LogEntryRecord {
         timestamp,
         trace_id: env.trace_id,
@@ -339,6 +345,7 @@ async fn build_log_record(
         user_id: env.user_id,
         service: env.service,
         level,
+        source,
         message,
         attributes: json_opt(&log.attributes),
     }
@@ -546,6 +553,7 @@ async fn drain_and_publish_logs(
                 timestamp: log.timestamp,
                 service: log.service.clone(),
                 level: log.level.clone(),
+                source: log.source.clone(),
                 message: log.message.clone(),
                 trace_id: log.trace_id.clone(),
             };
@@ -609,7 +617,7 @@ mod tests {
     use crate::observe::proto;
     use uuid::Uuid;
 
-    // ── number_point_to_record ──────────────────────────────────────
+    // -- number_point_to_record ----------------------------------------
 
     fn empty_envelope() -> correlation::CorrelationEnvelope {
         correlation::CorrelationEnvelope {
@@ -661,7 +669,7 @@ mod tests {
         assert!(number_point_to_record(&dp, "x", "gauge", None, &env).is_none());
     }
 
-    // ── json_opt ────────────────────────────────────────────────────
+    // -- json_opt -------------------------------------------------------
 
     #[test]
     fn json_opt_non_empty_returns_some() {
@@ -681,7 +689,7 @@ mod tests {
         assert!(json_opt(&[]).is_none());
     }
 
-    // ── events_to_json ──────────────────────────────────────────────
+    // -- events_to_json -------------------------------------------------
 
     #[test]
     fn events_to_json_empty_returns_none() {
@@ -719,7 +727,7 @@ mod tests {
         assert_eq!(json.as_array().unwrap().len(), 2);
     }
 
-    // ── build_metric_records coverage (metric data type branches) ───
+    // -- build_metric_records coverage (metric data type branches) ------
 
     #[tokio::test]
     async fn build_metric_records_gauge() {
@@ -736,7 +744,7 @@ mod tests {
         assert_eq!(rec.metric_type, "gauge");
     }
 
-    // ── number_point_to_record edge cases ────────────────────────────
+    // -- number_point_to_record edge cases --------------------------------
 
     #[test]
     fn number_point_counter_type() {
@@ -835,7 +843,7 @@ mod tests {
         assert_eq!(rec.project_id, Some(Uuid::nil()));
     }
 
-    // ── json_opt edge cases ──────────────────────────────────────────
+    // -- json_opt edge cases ---------------------------------------------
 
     #[test]
     fn json_opt_multiple_attrs() {
@@ -858,7 +866,7 @@ mod tests {
         assert_eq!(result["b"], 2);
     }
 
-    // ── events_to_json edge cases ────────────────────────────────────
+    // -- events_to_json edge cases ----------------------------------------
 
     #[test]
     fn events_to_json_with_attributes() {
@@ -878,7 +886,7 @@ mod tests {
         assert!(event["attributes"].is_object());
     }
 
-    // ── extract_project_ids (removed — validation merged into check_otlp_project_auth) ──
+    // -- extract_project_ids (removed -- validation merged into check_otlp_project_auth) --
     // UUID presence/format validation is now tested via integration tests:
     // - otlp_ingest_missing_project_id_returns_400
     // - otlp_ingest_invalid_project_id_uuid_returns_400

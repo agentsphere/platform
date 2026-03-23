@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use ts_rs::TS;
@@ -663,13 +664,22 @@ pub async fn evaluate_alerts_loop(state: AppState, mut shutdown: tokio::sync::wa
                 break;
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                match evaluate_all(&state, &mut alert_states).await {
-                    Ok(()) => state.task_registry.heartbeat("alert_evaluator"),
-                    Err(e) => {
-                        state.task_registry.report_error("alert_evaluator", &e.to_string());
-                        tracing::error!(error = %e, "alert evaluation cycle failed");
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "alert_evaluator",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    match evaluate_all(&state, &mut alert_states).await {
+                        Ok(()) => state.task_registry.heartbeat("alert_evaluator"),
+                        Err(e) => {
+                            state.task_registry.report_error("alert_evaluator", &e.to_string());
+                            tracing::error!(error = %e, "alert evaluation cycle failed");
+                        }
                     }
-                }
+                }.instrument(span).await;
             }
         }
     }
@@ -828,7 +838,7 @@ async fn handle_alert_state(
     }
 }
 
-fn check_condition(condition: &str, threshold: Option<f64>, value: Option<f64>) -> bool {
+pub fn check_condition(condition: &str, threshold: Option<f64>, value: Option<f64>) -> bool {
     match condition {
         "absent" => value.is_none(),
         "gt" => value.is_some_and(|v| threshold.is_some_and(|t| v > t)),

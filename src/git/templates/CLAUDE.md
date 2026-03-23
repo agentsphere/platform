@@ -474,3 +474,37 @@ The platform provides a live preview iframe in the session view. To use it:
 5. Hot Module Replacement (HMR) works automatically — the platform proxies WebSocket connections.
 
 6. **Additional preview ports**: To expose more UIs (monorepo), create K8s Services in the session namespace with label `platform.io/component: iframe-preview` and a port named `iframe`. They will be auto-discovered.
+
+## Progressive Delivery
+
+The platform supports progressive delivery strategies:
+
+### Feature Flags
+
+Define flags in `.platform.yaml`:
+```yaml
+flags:
+  - key: my_feature
+    default_value: false
+```
+
+Evaluate in your app via `POST /api/flags/evaluate`:
+```json
+{"project_id": "...", "keys": ["my_feature"], "user_id": "optional"}
+```
+
+### Canary Deployments
+
+Split deployments into stable/canary variants:
+1. Create `deploy/deployment-stable.yaml` and `deploy/deployment-canary.yaml`
+2. Add `Dockerfile.canary` for the canary image
+3. Configure `.platform.yaml` with `deploy.specs[].type: canary`
+
+Traffic is shifted automatically: 10% → 25% → 50% → 100%.
+
+### Staging Promotion
+
+When `deploy.enable_staging: true`:
+- Pipeline commits to `staging` branch first
+- Promote to production: `POST /api/projects/{id}/promote-staging`
+- Check status: `GET /api/projects/{id}/staging-status`

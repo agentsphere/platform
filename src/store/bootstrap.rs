@@ -259,6 +259,12 @@ const SYSTEM_PERMISSIONS: &[PermDef] = &[
         action: "push",
         description: "Push images to project registry",
     },
+    PermDef {
+        name: "flag:manage",
+        resource: "flag",
+        action: "manage",
+        description: "Manage feature flags",
+    },
 ];
 
 /// Result of the bootstrap process.

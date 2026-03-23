@@ -5,6 +5,7 @@ use kube::Api;
 use kube::api::{AttachParams, DeleteParams, LogParams, PostParams};
 use sqlx::PgPool;
 use tokio::io::AsyncWriteExt;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::secrets::user_keys;
@@ -154,19 +155,13 @@ pub async fn create_session(
     let (repo_clone_url, project_agent_image) =
         get_project_repo_info(&state.pool, project_id, platform_api_url).await?;
 
-    // 4. Resolve auth: CLI subscription credentials > user API key > global platform secret
-    let cli_oauth_token = resolve_cli_oauth_token(state, user_id).await;
-    let user_api_key = if cli_oauth_token.is_some() {
-        None // CLI OAuth takes priority; skip API key lookup
-    } else {
-        match resolve_user_api_key(state, user_id).await {
-            Some(key) => Some(key),
-            None => resolve_global_api_key(state).await,
-        }
-    };
+    // 4. Resolve auth via user's active LLM provider setting
+    let (cli_oauth_token, user_api_key, provider_extra_env, _model_override) =
+        resolve_active_llm_provider(state, user_id).await;
 
-    // 4b. Query project secrets scoped to agent/all
-    let extra_env_vars = resolve_agent_secrets(state, project_id).await;
+    // 4b. Query project secrets scoped to agent/all + merge provider env
+    let mut extra_env_vars = resolve_agent_secrets(state, project_id).await;
+    extra_env_vars.extend(provider_extra_env);
 
     // 4c. Create registry pull secret if registry is configured
     // Use registry_node_url (DaemonSet proxy) for image refs that containerd pulls;
@@ -570,20 +565,29 @@ pub async fn run_reaper(state: AppState, mut shutdown: tokio::sync::watch::Recei
                 break;
             }
             () = tokio::time::sleep(Duration::from_secs(30)) => {
-                match reap_terminated_sessions(&state).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        state.task_registry.report_error("agent_reaper", &e.to_string());
-                        tracing::error!(error = %e, "error reaping agent sessions");
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "agent_reaper",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    match reap_terminated_sessions(&state).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            state.task_registry.report_error("agent_reaper", &e.to_string());
+                            tracing::error!(error = %e, "error reaping agent sessions");
+                        }
                     }
-                }
-                match reap_idle_sessions(&state).await {
-                    Ok(()) => state.task_registry.heartbeat("agent_reaper"),
-                    Err(e) => {
-                        state.task_registry.report_error("agent_reaper", &e.to_string());
-                        tracing::error!(error = %e, "error reaping idle agent sessions");
+                    match reap_idle_sessions(&state).await {
+                        Ok(()) => state.task_registry.heartbeat("agent_reaper"),
+                        Err(e) => {
+                            state.task_registry.report_error("agent_reaper", &e.to_string());
+                            tracing::error!(error = %e, "error reaping idle agent sessions");
+                        }
                     }
-                }
+                }.instrument(span).await;
             }
         }
     }
@@ -930,20 +934,13 @@ pub async fn create_global_session(
 ) -> Result<AgentSession, AgentError> {
     let _ = get_provider(provider_name)?;
 
-    // Resolve auth: CLI OAuth token > user API key > global platform secret
-    let cli_oauth_token = resolve_cli_oauth_token(state, user_id).await;
-    let user_api_key = if cli_oauth_token.is_some() {
-        None
-    } else {
-        match resolve_user_api_key(state, user_id).await {
-            Some(key) => Some(key),
-            None => resolve_global_api_key(state).await,
-        }
-    };
+    // Resolve auth via user's active LLM provider setting
+    let (cli_oauth_token, user_api_key, provider_extra_env, model_override) =
+        resolve_active_llm_provider(state, user_id).await;
 
     if cli_oauth_token.is_none() && user_api_key.is_none() {
         return Err(AgentError::ConfigurationRequired(
-            "No Anthropic API key configured. Set your key in Settings > Provider Keys, or ask an admin to set a global ANTHROPIC_API_KEY secret.".into(),
+            "No LLM provider configured. Set your key in Settings > Provider Keys, configure a custom provider, or ask an admin to set a global ANTHROPIC_API_KEY secret.".into(),
         ));
     }
 
@@ -994,6 +991,8 @@ pub async fn create_global_session(
         let prompt_owned = prompt.to_owned();
         let oauth = cli_oauth_token.clone();
         let api_key = user_api_key.clone();
+        let extra = provider_extra_env;
+        let model = model_override;
         tokio::spawn(async move {
             let result = super::create_app::run_create_app_loop(
                 &state_clone,
@@ -1001,6 +1000,8 @@ pub async fn create_global_session(
                 prompt_owned,
                 oauth,
                 api_key,
+                extra,
+                model,
             )
             .await;
 
@@ -1188,6 +1189,112 @@ pub(crate) async fn resolve_global_api_key(state: &AppState) -> Option<String> {
     }
 }
 
+/// Unified auth resolution using the user's `active_llm_provider` setting.
+///
+/// Returns `(oauth_token, api_key, extra_env, model)` based on the active provider:
+/// - `auto`: legacy priority (OAuth → API key → global)
+/// - `oauth`: CLI OAuth token only
+/// - `api_key`: Anthropic API key only
+/// - `custom:{id}`: decrypt custom config, split `ANTHROPIC_API_KEY` out of `env_vars`
+/// - `global`: platform shared key
+pub(crate) async fn resolve_active_llm_provider(
+    state: &AppState,
+    user_id: Uuid,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<(String, String)>,
+    Option<String>,
+) {
+    use crate::secrets::llm_providers;
+
+    let active = llm_providers::get_active_provider(&state.pool, user_id)
+        .await
+        .unwrap_or_else(|_| "auto".into());
+
+    match active.as_str() {
+        "oauth" => {
+            let oauth = resolve_cli_oauth_token(state, user_id).await;
+            (oauth, None, Vec::new(), None)
+        }
+        "api_key" => {
+            let key = resolve_user_api_key(state, user_id).await;
+            (None, key, Vec::new(), None)
+        }
+        "global" => {
+            let key = resolve_global_api_key(state).await;
+            (None, key, Vec::new(), None)
+        }
+        v if v.starts_with("custom:") => {
+            let config_id = v
+                .strip_prefix("custom:")
+                .and_then(|s| Uuid::parse_str(s).ok());
+
+            if let Some(cid) = config_id
+                && let Some(master_key_hex) = state.config.master_key.as_deref()
+                && let Ok(master_key) = crate::secrets::engine::parse_master_key(master_key_hex)
+            {
+                match llm_providers::get_config(&state.pool, &master_key, cid, user_id).await {
+                    Ok(Some(config)) if config.validation_status == "valid" => {
+                        let (api_key, extra_env) = super::llm_validate::build_provider_extra_env(
+                            &config.provider_type,
+                            &config.env_vars,
+                        );
+                        return (None, api_key, extra_env, config.model);
+                    }
+                    Ok(Some(_)) => {
+                        tracing::warn!(
+                            %user_id,
+                            config_id = %cid,
+                            "custom provider not validated, falling back to auto"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            %user_id,
+                            config_id = %cid,
+                            "custom provider config not found, falling back to auto"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            %user_id,
+                            "failed to decrypt custom provider config"
+                        );
+                    }
+                }
+            }
+            // Fallback to auto on any error
+            resolve_auto(state, user_id).await
+        }
+        // "auto" and any unknown value
+        _ => resolve_auto(state, user_id).await,
+    }
+}
+
+/// Legacy auto-resolution: OAuth → API key → global.
+async fn resolve_auto(
+    state: &AppState,
+    user_id: Uuid,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<(String, String)>,
+    Option<String>,
+) {
+    let oauth = resolve_cli_oauth_token(state, user_id).await;
+    let api_key = if oauth.is_some() {
+        None
+    } else {
+        match resolve_user_api_key(state, user_id).await {
+            Some(key) => Some(key),
+            None => resolve_global_api_key(state).await,
+        }
+    };
+    (oauth, api_key, Vec::new(), None)
+}
+
 /// Send a message to a CLI subprocess session.
 ///
 /// Queues the message in `pending_messages`. If the tool loop is not busy,
@@ -1223,15 +1330,18 @@ async fn send_cli_message(
     if !handle.is_busy() {
         let state_clone = state.clone();
         let handle_clone = handle.clone();
-        let oauth = resolve_cli_oauth_token(state, handle.user_id).await;
-        let api_key = if oauth.is_some() {
-            None
-        } else {
-            resolve_user_api_key(state, handle.user_id).await
-        };
+        let (oauth, api_key, extra, model) =
+            resolve_active_llm_provider(state, handle.user_id).await;
         tokio::spawn(async move {
-            super::create_app::run_pending_messages(&state_clone, handle_clone, oauth, api_key)
-                .await;
+            super::create_app::run_pending_messages(
+                &state_clone,
+                handle_clone,
+                oauth,
+                api_key,
+                extra,
+                model,
+            )
+            .await;
         });
     }
     // If busy, the tool loop will drain pending_messages after the current round

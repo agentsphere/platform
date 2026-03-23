@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
+use tracing::Instrument;
 
 use crate::store::AppState;
 
@@ -18,13 +19,22 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<()>) {
                 break;
             }
             _ = interval.tick() => {
-                match collect_garbage(&state).await {
-                    Ok(()) => state.task_registry.heartbeat("registry_gc"),
-                    Err(e) => {
-                        state.task_registry.report_error("registry_gc", &e.to_string());
-                        tracing::error!(error = %e, "registry GC failed");
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "registry_gc",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    match collect_garbage(&state).await {
+                        Ok(()) => state.task_registry.heartbeat("registry_gc"),
+                        Err(e) => {
+                            state.task_registry.report_error("registry_gc", &e.to_string());
+                            tracing::error!(error = %e, "registry GC failed");
+                        }
                     }
-                }
+                }.instrument(span).await;
             }
         }
     }

@@ -31,6 +31,16 @@ pub struct WizardRequest {
     pub provider_key: Option<String>,
     /// CLI credential token — for manual OAuth token paste (stored in `cli_credentials`).
     pub cli_token: Option<CliTokenInput>,
+    /// Custom LLM provider (Bedrock, Vertex, Azure Foundry, or custom endpoint).
+    pub custom_provider: Option<CustomProviderInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CustomProviderInput {
+    pub provider_type: String,
+    pub env_vars: std::collections::HashMap<String, String>,
+    pub model: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +192,11 @@ async fn complete_wizard(
     // Save CLI token if provided (manual OAuth token paste)
     if let Some(ref cli_token) = body.cli_token {
         save_cli_token(&state, auth.user_id, cli_token).await?;
+    }
+
+    // Save custom provider if provided (Bedrock, Vertex, Azure Foundry, custom endpoint)
+    if let Some(ref custom) = body.custom_provider {
+        save_custom_provider(&state, auth.user_id, custom).await?;
     }
 
     // Create team workspace for startup/tech_org
@@ -384,6 +399,44 @@ async fn save_cli_token(
     )
     .await
     .map_err(ApiError::Internal)?;
+
+    Ok(())
+}
+
+/// Save a custom LLM provider config and set it as the user's active provider.
+async fn save_custom_provider(
+    state: &AppState,
+    user_id: Uuid,
+    input: &CustomProviderInput,
+) -> Result<(), ApiError> {
+    let hex_str = state
+        .config
+        .master_key
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("master key not configured".into()))?;
+
+    let master_key =
+        crate::secrets::engine::parse_master_key(hex_str).map_err(ApiError::Internal)?;
+
+    let label = input.label.as_deref().unwrap_or("");
+
+    let config_id = crate::secrets::llm_providers::create_config(
+        &state.pool,
+        &master_key,
+        user_id,
+        &input.provider_type,
+        label,
+        &input.env_vars,
+        input.model.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // Set as active provider (untested — user should validate via the Settings page)
+    let active_value = format!("custom:{config_id}");
+    crate::secrets::llm_providers::set_active_provider(&state.pool, user_id, &active_value)
+        .await
+        .map_err(ApiError::Internal)?;
 
     Ok(())
 }

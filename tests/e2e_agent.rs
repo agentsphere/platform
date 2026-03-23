@@ -518,7 +518,7 @@ async fn e2e_agent_session_pubsub_flow(pool: PgPool) {
         &admin_token,
         project_id,
         session_id_str,
-        3,  // expect at least 3 messages: milestone, text, waiting_for_input
+        3, // expect at least 3 messages: milestone, text, waiting_for_input
         120,
     )
     .await;
@@ -655,7 +655,7 @@ async fn e2e_agent_git_clone_push(pool: PgPool) {
         &admin_token,
         project_id,
         session_id_str,
-        3,  // system init + assistant text + result
+        3, // system init + assistant text + result
         180,
     )
     .await;

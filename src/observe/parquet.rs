@@ -7,6 +7,8 @@ use parquet::arrow::ArrowWriter;
 use sqlx::Row;
 use uuid::Uuid;
 
+use tracing::Instrument;
+
 use crate::store::AppState;
 
 use super::error::ObserveError;
@@ -27,25 +29,34 @@ pub async fn rotation_loop(state: AppState, mut shutdown: tokio::sync::watch::Re
                 break;
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(900)) => {
-                let mut had_error = false;
-                if let Err(e) = rotate_logs(&state).await {
-                    state.task_registry.report_error("parquet_rotation", &e.to_string());
-                    tracing::error!(error = %e, "log rotation failed");
-                    had_error = true;
-                }
-                if let Err(e) = rotate_spans(&state).await {
-                    state.task_registry.report_error("parquet_rotation", &e.to_string());
-                    tracing::error!(error = %e, "span rotation failed");
-                    had_error = true;
-                }
-                if let Err(e) = rotate_metrics(&state).await {
-                    state.task_registry.report_error("parquet_rotation", &e.to_string());
-                    tracing::error!(error = %e, "metric rotation failed");
-                    had_error = true;
-                }
-                if !had_error {
-                    state.task_registry.heartbeat("parquet_rotation");
-                }
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "parquet_rotation",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    let mut had_error = false;
+                    if let Err(e) = rotate_logs(&state).await {
+                        state.task_registry.report_error("parquet_rotation", &e.to_string());
+                        tracing::error!(error = %e, "log rotation failed");
+                        had_error = true;
+                    }
+                    if let Err(e) = rotate_spans(&state).await {
+                        state.task_registry.report_error("parquet_rotation", &e.to_string());
+                        tracing::error!(error = %e, "span rotation failed");
+                        had_error = true;
+                    }
+                    if let Err(e) = rotate_metrics(&state).await {
+                        state.task_registry.report_error("parquet_rotation", &e.to_string());
+                        tracing::error!(error = %e, "metric rotation failed");
+                        had_error = true;
+                    }
+                    if !had_error {
+                        state.task_registry.heartbeat("parquet_rotation");
+                    }
+                }.instrument(span).await;
             }
         }
     }

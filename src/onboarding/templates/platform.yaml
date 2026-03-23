@@ -7,39 +7,77 @@ pipeline:
 
   steps:
     - name: build-app
-      image: gcr.io/kaniko-project/executor:debug
-      commands:
-        - /kaniko/executor
-          --context=dir:///workspace
-          --dockerfile=Dockerfile
-          --destination=$REGISTRY/$PROJECT/app:$COMMIT_SHA
-          --insecure
-          --insecure-registry=$REGISTRY
-          --cache=true
-          --cache-repo=$REGISTRY/$PROJECT/cache
+      type: imagebuild
+      imageName: app
+      dockerfile: Dockerfile
+
+    - name: build-canary
+      type: imagebuild
+      imageName: canary
+      dockerfile: Dockerfile.canary
+
+    - name: build-dev
+      type: imagebuild
+      imageName: dev
+      dockerfile: Dockerfile.dev
 
     - name: build-test
-      image: gcr.io/kaniko-project/executor:debug
+      type: imagebuild
+      imageName: test
+      dockerfile: Dockerfile.test
       only:
         events: [mr]
-      commands:
-        - /kaniko/executor
-          --context=dir:///workspace
-          --dockerfile=Dockerfile.test
-          --destination=$REGISTRY/$PROJECT/test:$COMMIT_SHA
-          --insecure
-          --insecure-registry=$REGISTRY
-          --cache=true
 
-    - name: test
+    - name: e2e
       depends_on: [build-app, build-test]
       only:
         events: [mr]
       deploy_test:
         test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
-        manifests: deploy/
-        readiness_path: /healthz
+        manifests: testinfra/
         readiness_timeout: 120
+        wait_for_services: [platform-demo-app, platform-demo-db]
 
-  dev_image:
-    dockerfile: Dockerfile.dev
+    - name: sync-ops-repo
+      type: gitops_sync
+      depends_on: [build-app, build-canary]
+      only:
+        events: [push]
+        branches: ["main"]
+      gitops:
+        copy: ["deploy/", ".platform.yaml"]
+
+    - name: watch-deploy
+      type: deploy_watch
+      depends_on: [sync-ops-repo]
+      only:
+        events: [push]
+        branches: ["main"]
+      deploy_watch:
+        environment: staging
+        timeout: 300
+
+flags:
+  - key: new_checkout_flow
+    default_value: false
+    description: "Enable the new checkout experience"
+  - key: dark_mode
+    default_value: false
+    description: "Enable dark mode theme"
+
+deploy:
+  variables:
+    staging: deploy/variables_staging.yaml
+    production: deploy/variables_prod.yaml
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: platform-demo-app-stable
+        canary_service: platform-demo-app-canary
+        steps: [10, 25, 50, 100]
+        interval: 120
+        progress_gates:
+          - metric: error_rate
+            condition: lt
+            threshold: 0.05

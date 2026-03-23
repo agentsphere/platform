@@ -303,55 +303,55 @@ async fn reconciler_optimistic_lock(pool: PgPool) {
         .await;
 }
 
-/// Preview cleanup removes expired previews.
+/// Preview cleanup deactivates expired preview deploy_targets.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn preview_expired_cleanup(pool: PgPool) {
     let (state, admin_token) = e2e_helpers::e2e_state(pool.clone()).await;
     let app = e2e_helpers::test_router(state.clone());
-    let token = admin_token.clone();
 
-    let project_id = e2e_helpers::create_project(&app, &token, "preview-expire", "private").await;
+    let project_id =
+        e2e_helpers::create_project(&app, &admin_token, "preview-expire", "private").await;
 
-    // Insert an already-expired preview
+    // Insert an already-expired preview deploy target
     sqlx::query(
-        r"INSERT INTO preview_deployments
-           (project_id, branch, branch_slug, image_ref, desired_status, current_status, ttl_hours, expires_at)
-           VALUES ($1, 'feature/old', 'feature-old', 'nginx:old', 'active', 'pending', 1,
-                   now() - interval '1 hour')",
+        r"INSERT INTO deploy_targets
+           (project_id, name, environment, branch, branch_slug, ttl_hours, expires_at, is_active)
+           VALUES ($1, 'preview-feature-old', 'preview', 'feature/old', 'feature-old', 1,
+                   now() - interval '1 hour', true)",
     )
     .bind(project_id)
     .execute(&state.pool)
     .await
     .unwrap();
 
-    // Spawn the preview reconciler (which handles TTL cleanup)
+    // Spawn the reconciler (which handles preview TTL cleanup)
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let preview_state = state.clone();
+    let recon_state = state.clone();
     let handle = tokio::spawn(async move {
-        platform::deployer::preview::run(preview_state, shutdown_rx).await;
+        platform::deployer::reconciler::run(recon_state, shutdown_rx).await;
     });
 
-    // Wait for one cleanup cycle (preview reconciler runs every 30s)
-    tokio::time::sleep(Duration::from_secs(35)).await;
+    // Wait for one cleanup cycle (reconciler runs every 10s)
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
-    // Shut down preview reconciler
+    // Shut down reconciler
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 
-    // Expired preview should now be stopped
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT desired_status FROM preview_deployments WHERE project_id = $1 AND branch_slug = 'feature-old'",
+    // Expired preview should now be deactivated
+    let is_active: Option<bool> = sqlx::query_scalar(
+        "SELECT is_active FROM deploy_targets WHERE project_id = $1 AND branch_slug = 'feature-old'",
     )
     .bind(project_id)
     .fetch_optional(&state.pool)
     .await
     .unwrap();
 
-    if let Some((desired,)) = row {
-        assert_eq!(
-            desired, "stopped",
-            "expired preview should have desired_status=stopped"
+    if let Some(active) = is_active {
+        assert!(
+            !active,
+            "expired preview target should be deactivated (is_active=false)"
         );
     }
     // If row is None, it was cleaned up entirely — also acceptable

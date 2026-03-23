@@ -9,10 +9,23 @@ use super::error::PipelineError;
 // ---------------------------------------------------------------------------
 
 /// Top-level `.platform.yaml` structure.
+///
+/// Supports both old form (`pipeline:` only) and new form with optional
+/// top-level `flags:` and `deploy:` sections.
 #[derive(Debug, Deserialize)]
-pub struct PipelineFile {
+pub struct PlatformFile {
     pub pipeline: PipelineDefinition,
+    /// Top-level feature flags — per project, not per app.
+    #[serde(default)]
+    pub flags: Vec<FlagDef>,
+    /// Deploy configuration with specs for canary/AB/rolling.
+    #[serde(default)]
+    pub deploy: Option<DeployConfig>,
 }
+
+/// Backward-compatible alias — used by existing code that refers to `PipelineFile`.
+#[allow(dead_code)]
+pub type PipelineFile = PlatformFile;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // artifacts consumed via serde for future use
@@ -32,10 +45,141 @@ pub struct DevImageConfig {
     pub dockerfile: String,
 }
 
+// ---------------------------------------------------------------------------
+// Feature flag definition (top-level in .platform.yaml)
+// ---------------------------------------------------------------------------
+
+/// A feature flag definition in `.platform.yaml`. Pipeline registers these with
+/// defaults on each build. Users toggle via UI/API.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FlagDef {
+    pub key: String,
+    pub default_value: serde_json::Value,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Deploy configuration
+// ---------------------------------------------------------------------------
+
+/// Top-level `deploy:` section of `.platform.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeployConfig {
+    /// Opt-in staging environment. Default: false.
+    /// NOTE: prefer the `include_staging` project DB setting over this field.
+    /// This field is kept for backwards compatibility but `gitops_sync` reads
+    /// the DB setting, not this value.
+    #[serde(default)]
+    pub enable_staging: bool,
+    /// Per-environment variable files from the code repo (paths relative to repo root).
+    /// These are merged into the ops repo values during `gitops_sync`.
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
+    /// Array of deployment specs (canary, `ab_test`, rolling).
+    #[serde(default)]
+    pub specs: Vec<DeploySpec>,
+}
+
+/// A single deployment spec within `deploy.specs[]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeploySpec {
+    pub name: String,
+    #[serde(rename = "type", default = "default_deploy_type")]
+    pub deploy_type: String,
+    /// Canary-specific config.
+    #[serde(default)]
+    pub canary: Option<CanaryConfig>,
+    /// A/B test-specific config.
+    #[serde(default)]
+    pub ab_test: Option<AbTestConfig>,
+    /// Whether this spec also deploys to staging (when `enable_staging=true`).
+    #[serde(default)]
+    pub include_staging: bool,
+}
+
+fn default_deploy_type() -> String {
+    "rolling".into()
+}
+
+/// Canary deployment configuration within a deploy spec.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CanaryConfig {
+    pub stable_service: String,
+    pub canary_service: String,
+    pub steps: Vec<u32>,
+    #[serde(default = "default_canary_interval")]
+    pub interval: u32,
+    #[serde(default = "default_canary_min_requests")]
+    pub min_requests: u64,
+    #[serde(default = "default_canary_max_failures")]
+    pub max_failures: u32,
+    #[serde(default)]
+    pub progress_gates: Vec<MetricGateConfig>,
+    #[serde(default)]
+    pub rollback_triggers: Vec<MetricGateConfig>,
+}
+
+fn default_canary_interval() -> u32 {
+    120
+}
+fn default_canary_min_requests() -> u64 {
+    100
+}
+fn default_canary_max_failures() -> u32 {
+    3
+}
+
+/// Metric gate in canary config for progress/rollback.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricGateConfig {
+    pub metric: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub condition: String,
+    pub threshold: f64,
+}
+
+/// A/B test configuration within a deploy spec.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AbTestConfig {
+    pub control_service: String,
+    pub treatment_service: String,
+    #[serde(rename = "match")]
+    pub match_rule: AbTestMatchConfig,
+    pub success_metric: String,
+    pub success_condition: String,
+    #[serde(default = "default_ab_duration")]
+    pub duration: u64,
+    #[serde(default = "default_ab_min_samples")]
+    pub min_samples: u64,
+}
+
+fn default_ab_duration() -> u64 {
+    86400
+}
+fn default_ab_min_samples() -> u64 {
+    1000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AbTestMatchConfig {
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // fields consumed via serde + executor
 pub struct StepDef {
     pub name: String,
+    /// Explicit step type. When set, the platform generates the execution plan:
+    /// - `imagebuild` — kaniko image build (platform manages registry/push creds)
+    /// - `gitops_sync` — copy files to ops repo and publish `OpsRepoUpdated`
+    /// - `deploy_watch` — poll `deploy_releases` until terminal phase
+    ///
+    /// When absent, falls back to legacy behavior (raw commands or `deploy_test`).
+    #[serde(rename = "type", default)]
+    pub step_type: Option<String>,
     #[serde(default)]
     pub image: String,
     #[serde(default)]
@@ -51,9 +195,80 @@ pub struct StepDef {
     /// When present, `image` and `commands` are ignored.
     #[serde(default)]
     pub deploy_test: Option<DeployTestDef>,
+    /// Image build config (when `type: imagebuild`).
+    #[serde(default, rename = "imageName")]
+    pub image_name: Option<String>,
+    /// Dockerfile path for imagebuild steps (default: Dockerfile).
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// Secret names to inject as kaniko build-arg (imagebuild only).
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// `GitOps` sync config (when type is `gitops_sync`).
+    #[serde(default)]
+    pub gitops: Option<GitopsSyncDef>,
+    /// Deploy watch config (when type is `deploy_watch`).
+    #[serde(default)]
+    pub deploy_watch: Option<DeployWatchDef>,
     /// Quality gate: marks this step as a quality gate (UI/semantic only).
     #[serde(default)]
     pub gate: bool,
+}
+
+/// Configuration for a `gitops_sync` step.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GitopsSyncDef {
+    /// Files/directories to copy from code repo to ops repo.
+    #[serde(default)]
+    pub copy: Vec<String>,
+}
+
+/// Configuration for a `deploy_watch` step.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DeployWatchDef {
+    /// Which environment to watch (e.g. "staging", "production").
+    pub environment: String,
+    /// Timeout in seconds (default: 300).
+    #[serde(default = "default_deploy_watch_timeout")]
+    pub timeout: u64,
+}
+
+fn default_deploy_watch_timeout() -> u64 {
+    300
+}
+
+/// Resolved step kind used by the executor to dispatch execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepKind {
+    /// Raw command execution in a container (legacy).
+    Command,
+    /// Platform-managed kaniko image build.
+    ImageBuild,
+    /// Deploy app to test namespace and run test image.
+    DeployTest,
+    /// Copy files to ops repo and publish `OpsRepoUpdated`.
+    GitopsSync,
+    /// Poll `deploy_releases` until terminal phase.
+    DeployWatch,
+}
+
+impl StepDef {
+    /// Determine the execution kind for this step.
+    pub fn kind(&self) -> StepKind {
+        match self.step_type.as_deref() {
+            Some("imagebuild") => StepKind::ImageBuild,
+            Some("gitops_sync") => StepKind::GitopsSync,
+            Some("deploy_watch") => StepKind::DeployWatch,
+            _ if self.deploy_test.is_some() => StepKind::DeployTest,
+            _ => StepKind::Command,
+        }
+    }
+
+    /// Whether this step executes inside the executor process (no K8s pod).
+    #[allow(dead_code)]
+    pub fn is_in_process(&self) -> bool {
+        matches!(self.kind(), StepKind::GitopsSync | StepKind::DeployWatch)
+    }
 }
 
 /// Per-step condition controlling when a step runs.
@@ -87,11 +302,16 @@ pub struct DeployTestDef {
     #[serde(default)]
     pub manifests: Option<String>,
     /// Readiness path to poll before running tests (default: `/healthz`).
+    /// Deprecated: prefer `wait_for_services` which uses K8s readiness probes.
     #[serde(default = "default_readiness_path")]
     pub readiness_path: String,
     /// Timeout in seconds for app to become ready (default: 120).
     #[serde(default = "default_readiness_timeout")]
     pub readiness_timeout: u32,
+    /// Wait for these K8s services to be ready (via K8s readiness probes).
+    /// When set, replaces readiness_path-based polling.
+    #[serde(default)]
+    pub wait_for_services: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,11 +351,21 @@ pub struct TagTrigger {
 
 /// Parse a `.platform.yaml` file contents into a validated `PipelineDefinition`.
 pub fn parse(yaml: &str) -> Result<PipelineDefinition, PipelineError> {
-    let file: PipelineFile =
+    let file = parse_platform_file(yaml)?;
+    Ok(file.pipeline)
+}
+
+/// Parse a `.platform.yaml` into the full `PlatformFile` (pipeline + flags + deploy).
+pub fn parse_platform_file(yaml: &str) -> Result<PlatformFile, PipelineError> {
+    let file: PlatformFile =
         serde_yaml::from_str(yaml).map_err(|e| PipelineError::InvalidDefinition(e.to_string()))?;
 
     validate(&file.pipeline)?;
-    Ok(file.pipeline)
+    validate_flags(&file.flags)?;
+    if let Some(ref deploy) = file.deploy {
+        validate_deploy_config(deploy)?;
+    }
+    Ok(file)
 }
 
 fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
@@ -151,21 +381,53 @@ fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
                 "step {i} is missing a name"
             )));
         }
-        // deploy_test steps don't need image/commands
-        if let Some(ref dt) = step.deploy_test {
-            if !step.commands.is_empty() {
-                return Err(PipelineError::InvalidDefinition(format!(
-                    "step '{}': deploy_test and commands are mutually exclusive",
-                    step.name,
-                )));
+
+        match step.kind() {
+            StepKind::ImageBuild => {
+                if step.image_name.as_ref().is_none_or(String::is_empty) {
+                    return Err(PipelineError::InvalidDefinition(format!(
+                        "step '{}': type=imagebuild requires imageName",
+                        step.name,
+                    )));
+                }
             }
-            validate_deploy_test(&step.name, dt)?;
-        } else if step.image.is_empty() {
-            return Err(PipelineError::InvalidDefinition(format!(
-                "step '{}' is missing an image",
-                step.name
-            )));
+            StepKind::DeployTest => {
+                let dt = step.deploy_test.as_ref().unwrap();
+                if !step.commands.is_empty() {
+                    return Err(PipelineError::InvalidDefinition(format!(
+                        "step '{}': deploy_test and commands are mutually exclusive",
+                        step.name,
+                    )));
+                }
+                validate_deploy_test(&step.name, dt)?;
+            }
+            StepKind::GitopsSync => {
+                if step.gitops.as_ref().is_none_or(|g| g.copy.is_empty()) {
+                    return Err(PipelineError::InvalidDefinition(format!(
+                        "step '{}': type=gitops_sync requires gitops.copy with at least one entry",
+                        step.name,
+                    )));
+                }
+            }
+            StepKind::DeployWatch => {
+                if step.deploy_watch.is_none() {
+                    return Err(PipelineError::InvalidDefinition(format!(
+                        "step '{}': type=deploy_watch requires deploy_watch config",
+                        step.name,
+                    )));
+                }
+            }
+            StepKind::Command => {
+                // Legacy: raw command step needs an image
+                if step.image.is_empty() {
+                    return Err(PipelineError::InvalidDefinition(format!(
+                        "step '{}' is missing an image",
+                        step.name
+                    )));
+                }
+            }
         }
+
         if let Some(ref cond) = step.only {
             validate_step_condition(&step.name, cond)?;
         }
@@ -414,6 +676,190 @@ fn validate_deploy_test(step_name: &str, dt: &DeployTestDef) -> Result<(), Pipel
     if dt.readiness_timeout == 0 || dt.readiness_timeout > 600 {
         return Err(PipelineError::InvalidDefinition(format!(
             "step '{step_name}': deploy_test.readiness_timeout must be 1-600"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate feature flag definitions.
+fn validate_flags(flags: &[FlagDef]) -> Result<(), PipelineError> {
+    let mut seen = std::collections::HashSet::new();
+    for flag in flags {
+        if flag.key.is_empty() || flag.key.len() > 255 {
+            return Err(PipelineError::InvalidDefinition(
+                "flag key must be 1-255 characters".into(),
+            ));
+        }
+        if !flag
+            .key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "flag key '{}': only alphanumeric, underscore, hyphen, and dot allowed",
+                flag.key
+            )));
+        }
+        if !seen.insert(&flag.key) {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "duplicate flag key '{}'",
+                flag.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate deploy config.
+fn validate_deploy_config(deploy: &DeployConfig) -> Result<(), PipelineError> {
+    let mut seen_names = std::collections::HashSet::new();
+    for spec in &deploy.specs {
+        if spec.name.is_empty() || spec.name.len() > 255 {
+            return Err(PipelineError::InvalidDefinition(
+                "deploy spec name must be 1-255 characters".into(),
+            ));
+        }
+        if !seen_names.insert(&spec.name) {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "duplicate deploy spec name '{}'",
+                spec.name
+            )));
+        }
+        match spec.deploy_type.as_str() {
+            "rolling" => {}
+            "canary" => {
+                let canary = spec.canary.as_ref().ok_or_else(|| {
+                    PipelineError::InvalidDefinition(format!(
+                        "deploy spec '{}': type 'canary' requires canary config",
+                        spec.name
+                    ))
+                })?;
+                validate_canary_config(&spec.name, canary)?;
+            }
+            "ab_test" => {
+                let ab = spec.ab_test.as_ref().ok_or_else(|| {
+                    PipelineError::InvalidDefinition(format!(
+                        "deploy spec '{}': type 'ab_test' requires ab_test config",
+                        spec.name
+                    ))
+                })?;
+                validate_ab_test_config(&spec.name, ab)?;
+            }
+            other => {
+                return Err(PipelineError::InvalidDefinition(format!(
+                    "deploy spec '{}': unknown type '{other}' (allowed: rolling, canary, ab_test)",
+                    spec.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate canary-specific config.
+fn validate_canary_config(spec_name: &str, c: &CanaryConfig) -> Result<(), PipelineError> {
+    if c.stable_service.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': canary.stable_service must not be empty"
+        )));
+    }
+    if c.canary_service.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': canary.canary_service must not be empty"
+        )));
+    }
+    if c.steps.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': canary.steps must not be empty"
+        )));
+    }
+    // Steps must be ascending
+    for window in c.steps.windows(2) {
+        if window[0] >= window[1] {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "deploy spec '{spec_name}': canary.steps must be strictly ascending"
+            )));
+        }
+    }
+    // Last step must be 100
+    if *c.steps.last().unwrap() != 100 {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': canary.steps must end with 100"
+        )));
+    }
+    // All steps must be 1-100
+    for &step in &c.steps {
+        if step == 0 || step > 100 {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "deploy spec '{spec_name}': canary step values must be 1-100"
+            )));
+        }
+    }
+    if c.interval == 0 {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': canary.interval must be > 0"
+        )));
+    }
+    for gate in &c.progress_gates {
+        validate_metric_gate(spec_name, "progress_gate", gate)?;
+    }
+    for trigger in &c.rollback_triggers {
+        validate_metric_gate(spec_name, "rollback_trigger", trigger)?;
+    }
+    Ok(())
+}
+
+/// Validate A/B test config.
+fn validate_ab_test_config(spec_name: &str, ab: &AbTestConfig) -> Result<(), PipelineError> {
+    if ab.control_service.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': ab_test.control_service must not be empty"
+        )));
+    }
+    if ab.treatment_service.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': ab_test.treatment_service must not be empty"
+        )));
+    }
+    if ab.success_metric.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': ab_test.success_metric must not be empty"
+        )));
+    }
+    let valid_conditions = ["gt", "lt", "eq"];
+    if !valid_conditions.contains(&ab.success_condition.as_str()) {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': ab_test.success_condition must be gt, lt, or eq"
+        )));
+    }
+    if ab.duration == 0 {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': ab_test.duration must be > 0"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a metric gate definition.
+fn validate_metric_gate(
+    spec_name: &str,
+    gate_kind: &str,
+    gate: &MetricGateConfig,
+) -> Result<(), PipelineError> {
+    if gate.metric.is_empty() {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': {gate_kind} metric must not be empty"
+        )));
+    }
+    if gate.metric == "custom" && gate.name.as_ref().is_none_or(String::is_empty) {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': custom {gate_kind} requires a 'name' field"
+        )));
+    }
+    let valid_conditions = ["gt", "lt", "eq"];
+    if !valid_conditions.contains(&gate.condition.as_str()) {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "deploy spec '{spec_name}': {gate_kind} condition must be gt, lt, or eq"
         )));
     }
     Ok(())
@@ -1473,6 +1919,12 @@ pipeline:
                 only: None,
                 deploy_test: None,
                 gate: false,
+                step_type: None,
+                image_name: None,
+                dockerfile: None,
+                secrets: vec![],
+                gitops: None,
+                deploy_watch: None,
             },
             StepDef {
                 name: "b".into(),
@@ -1483,8 +1935,703 @@ pipeline:
                 only: None,
                 deploy_test: None,
                 gate: false,
+                step_type: None,
+                image_name: None,
+                dockerfile: None,
+                secrets: vec![],
+                gitops: None,
+                deploy_watch: None,
             },
         ];
         assert!(topological_layers(&steps).is_none());
+    }
+
+    // -- PlatformFile (flags + deploy) parsing --
+
+    #[test]
+    fn parse_platform_file_with_flags() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+flags:
+  - key: new_checkout_flow
+    default_value: false
+    description: "New checkout UI flow"
+  - key: dark_mode_v2
+    default_value: false
+"#;
+        let file = parse_platform_file(yaml).unwrap();
+        assert_eq!(file.flags.len(), 2);
+        assert_eq!(file.flags[0].key, "new_checkout_flow");
+        assert_eq!(file.flags[0].default_value, serde_json::json!(false));
+        assert_eq!(
+            file.flags[0].description.as_deref(),
+            Some("New checkout UI flow")
+        );
+        assert_eq!(file.flags[1].key, "dark_mode_v2");
+    }
+
+    #[test]
+    fn parse_platform_file_no_flags() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+";
+        let file = parse_platform_file(yaml).unwrap();
+        assert!(file.flags.is_empty());
+        assert!(file.deploy.is_none());
+    }
+
+    #[test]
+    fn parse_deploy_canary_config() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  enable_staging: false
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: api-stable
+        canary_service: api-canary
+        steps: [5, 20, 50, 80, 100]
+        interval: 120
+        min_requests: 100
+        progress_gates:
+          - metric: error_rate
+            condition: lt
+            threshold: 0.05
+        rollback_triggers:
+          - metric: error_rate
+            condition: gt
+            threshold: 0.50
+"#;
+        let file = parse_platform_file(yaml).unwrap();
+        let deploy = file.deploy.unwrap();
+        assert!(!deploy.enable_staging);
+        assert_eq!(deploy.specs.len(), 1);
+        let spec = &deploy.specs[0];
+        assert_eq!(spec.name, "api");
+        assert_eq!(spec.deploy_type, "canary");
+        let canary = spec.canary.as_ref().unwrap();
+        assert_eq!(canary.steps, vec![5, 20, 50, 80, 100]);
+        assert_eq!(canary.progress_gates.len(), 1);
+        assert_eq!(canary.rollback_triggers.len(), 1);
+    }
+
+    #[test]
+    fn parse_deploy_ab_test_config() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: checkout-experiment
+      type: ab_test
+      ab_test:
+        control_service: checkout-control
+        treatment_service: checkout-treatment
+        match:
+          headers:
+            x-experiment: treatment
+        success_metric: custom/conversion_rate
+        success_condition: gt
+        duration: 86400
+        min_samples: 1000
+"#;
+        let file = parse_platform_file(yaml).unwrap();
+        let spec = &file.deploy.unwrap().specs[0];
+        assert_eq!(spec.deploy_type, "ab_test");
+        let ab = spec.ab_test.as_ref().unwrap();
+        assert_eq!(ab.control_service, "checkout-control");
+        assert_eq!(ab.treatment_service, "checkout-treatment");
+        assert_eq!(
+            ab.match_rule.headers.get("x-experiment"),
+            Some(&"treatment".to_string())
+        );
+        assert_eq!(ab.success_metric, "custom/conversion_rate");
+        assert_eq!(ab.duration, 86400);
+    }
+
+    #[test]
+    fn parse_deploy_rolling_spec() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: rolling
+";
+        let file = parse_platform_file(yaml).unwrap();
+        let spec = &file.deploy.unwrap().specs[0];
+        assert_eq!(spec.deploy_type, "rolling");
+        assert!(spec.canary.is_none());
+        assert!(spec.ab_test.is_none());
+    }
+
+    #[test]
+    fn validate_canary_steps_ascending() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: s
+        canary_service: c
+        steps: [50, 20, 100]
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("ascending")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_canary_steps_must_end_at_100() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: s
+        canary_service: c
+        steps: [10, 50]
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("end with 100")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_canary_requires_config() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: canary
+";
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("requires canary config")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_ab_test_requires_config() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: exp
+      type: ab_test
+";
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("requires ab_test config")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_unknown_deploy_type() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: blue_green
+";
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("unknown type")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_duplicate_spec_names() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: rolling
+    - name: api
+      type: rolling
+";
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("duplicate deploy spec")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flag_key_invalid_chars() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+flags:
+  - key: "has spaces"
+    default_value: false
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("alphanumeric")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_duplicate_flag_keys() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+flags:
+  - key: my_flag
+    default_value: false
+  - key: my_flag
+    default_value: true
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("duplicate flag")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_custom_metric_gate_requires_name() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: s
+        canary_service: c
+        steps: [100]
+        progress_gates:
+          - metric: custom
+            condition: lt
+            threshold: 0.05
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("custom") && msg.contains("name")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_wait_for_services() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: e2e
+      deploy_test:
+        test_image: registry/test:v1
+        manifests: testinfra/
+        wait_for_services: [api, postgres]
+"#;
+        let def = parse(yaml).unwrap();
+        let dt = def.steps[0].deploy_test.as_ref().unwrap();
+        assert_eq!(dt.wait_for_services, vec!["api", "postgres"]);
+    }
+
+    #[test]
+    fn parse_full_platform_yaml() {
+        let yaml = r#"
+pipeline:
+  on:
+    push:
+      branches: ["main"]
+    mr:
+      actions: [opened, synchronized]
+  steps:
+    - name: build-app
+      image: gcr.io/kaniko-project/executor:debug
+      commands:
+        - /kaniko/executor --context=. --dockerfile=Dockerfile
+    - name: build-test
+      image: gcr.io/kaniko-project/executor:debug
+      commands:
+        - /kaniko/executor --context=. --dockerfile=Dockerfile.test
+      only:
+        events: [mr]
+    - name: e2e
+      depends_on: [build-app, build-test]
+      gate: true
+      deploy_test:
+        test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
+        manifests: testinfra/
+        wait_for_services: [api, postgres]
+      only:
+        events: [mr]
+  dev_image:
+    dockerfile: Dockerfile.dev
+
+flags:
+  - key: new_checkout_flow
+    default_value: false
+    description: "New checkout UI flow"
+  - key: dark_mode_v2
+    default_value: false
+
+deploy:
+  enable_staging: false
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: api-stable
+        canary_service: api-canary
+        steps: [5, 20, 50, 80, 100]
+        interval: 120
+        min_requests: 100
+        progress_gates:
+          - metric: error_rate
+            condition: lt
+            threshold: 0.05
+          - metric: latency_p95
+            condition: lt
+            threshold: 500
+          - metric: custom
+            name: checkout_failures
+            condition: lt
+            threshold: 0.02
+        rollback_triggers:
+          - metric: error_rate
+            condition: gt
+            threshold: 0.50
+"#;
+        let file = parse_platform_file(yaml).unwrap();
+        assert_eq!(file.pipeline.steps.len(), 3);
+        assert_eq!(file.flags.len(), 2);
+        let deploy = file.deploy.unwrap();
+        assert!(!deploy.enable_staging);
+        assert_eq!(deploy.specs.len(), 1);
+        let canary = deploy.specs[0].canary.as_ref().unwrap();
+        assert_eq!(canary.progress_gates.len(), 3);
+        assert_eq!(canary.rollback_triggers.len(), 1);
+        assert_eq!(canary.progress_gates[2].metric, "custom");
+        assert_eq!(
+            canary.progress_gates[2].name.as_deref(),
+            Some("checkout_failures")
+        );
+    }
+
+    // -- New step type parsing --
+
+    #[test]
+    fn parse_imagebuild_step() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build-app
+      type: imagebuild
+      imageName: app
+      dockerfile: Dockerfile
+      secrets:
+        - MY_SECRET
+"#;
+        let def = parse(yaml).unwrap();
+        let step = &def.steps[0];
+        assert_eq!(step.step_type.as_deref(), Some("imagebuild"));
+        assert_eq!(step.image_name.as_deref(), Some("app"));
+        assert_eq!(step.dockerfile.as_deref(), Some("Dockerfile"));
+        assert_eq!(step.secrets, vec!["MY_SECRET"]);
+        assert_eq!(step.kind(), StepKind::ImageBuild);
+    }
+
+    #[test]
+    fn imagebuild_missing_image_name_rejected() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build-app
+      type: imagebuild
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("imageName")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_gitops_sync_step() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: sync
+      type: gitops_sync
+      gitops:
+        copy: ["deploy/", ".platform.yaml"]
+"#;
+        let def = parse(yaml).unwrap();
+        let step = &def.steps[0];
+        assert_eq!(step.kind(), StepKind::GitopsSync);
+        let gitops = step.gitops.as_ref().unwrap();
+        assert_eq!(gitops.copy, vec!["deploy/", ".platform.yaml"]);
+    }
+
+    #[test]
+    fn gitops_sync_missing_copy_rejected() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: sync
+      type: gitops_sync
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("gitops.copy")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_deploy_watch_step() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: watch
+      type: deploy_watch
+      deploy_watch:
+        environment: staging
+        timeout: 600
+"#;
+        let def = parse(yaml).unwrap();
+        let step = &def.steps[0];
+        assert_eq!(step.kind(), StepKind::DeployWatch);
+        let dw = step.deploy_watch.as_ref().unwrap();
+        assert_eq!(dw.environment, "staging");
+        assert_eq!(dw.timeout, 600);
+    }
+
+    #[test]
+    fn deploy_watch_missing_config_rejected() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: watch
+      type: deploy_watch
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("deploy_watch")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_watch_default_timeout() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: watch
+      type: deploy_watch
+      deploy_watch:
+        environment: production
+"#;
+        let def = parse(yaml).unwrap();
+        let dw = def.steps[0].deploy_watch.as_ref().unwrap();
+        assert_eq!(dw.timeout, 300);
+    }
+
+    #[test]
+    fn step_kind_infers_correctly() {
+        // deploy_test inferred from field, not type
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: e2e
+      deploy_test:
+        test_image: my-image:latest
+        manifests: testinfra/
+"#;
+        let def = parse(yaml).unwrap();
+        assert_eq!(def.steps[0].kind(), StepKind::DeployTest);
+
+        // command step (no type, has image)
+        let yaml2 = r"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+      commands: ['echo hi']
+";
+        let def2 = parse(yaml2).unwrap();
+        assert_eq!(def2.steps[0].kind(), StepKind::Command);
+    }
+
+    #[test]
+    fn parse_deploy_variables() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+deploy:
+  variables:
+    staging: deploy/variables_staging.yaml
+    production: deploy/variables_prod.yaml
+  specs: []
+"#;
+        let pf = parse_platform_file(yaml).unwrap();
+        let deploy = pf.deploy.unwrap();
+        assert_eq!(
+            deploy.variables.get("staging").unwrap(),
+            "deploy/variables_staging.yaml"
+        );
+        assert_eq!(
+            deploy.variables.get("production").unwrap(),
+            "deploy/variables_prod.yaml"
+        );
+    }
+
+    #[test]
+    fn parse_full_demo_platform_yaml() {
+        let yaml = r#"
+pipeline:
+  on:
+    push:
+      branches: ["main"]
+    mr:
+      actions: [opened, synchronized]
+  steps:
+    - name: build-app
+      type: imagebuild
+      imageName: app
+      dockerfile: Dockerfile
+    - name: build-canary
+      type: imagebuild
+      imageName: canary
+      dockerfile: Dockerfile.canary
+    - name: build-dev
+      type: imagebuild
+      imageName: dev
+      dockerfile: Dockerfile.dev
+    - name: build-test
+      type: imagebuild
+      imageName: test
+      dockerfile: Dockerfile.test
+      only:
+        events: [mr]
+    - name: e2e
+      depends_on: [build-app, build-test]
+      only:
+        events: [mr]
+      deploy_test:
+        test_image: registry/test:sha
+        manifests: testinfra/
+        readiness_timeout: 120
+        wait_for_services: [app, db]
+    - name: sync-ops-repo
+      type: gitops_sync
+      depends_on: [build-app, build-canary]
+      only:
+        events: [push]
+        branches: ["main"]
+      gitops:
+        copy: ["deploy/", ".platform.yaml"]
+    - name: watch-deploy
+      type: deploy_watch
+      depends_on: [sync-ops-repo]
+      only:
+        events: [push]
+        branches: ["main"]
+      deploy_watch:
+        environment: staging
+        timeout: 300
+flags:
+  - key: new_checkout_flow
+    default_value: false
+  - key: dark_mode
+    default_value: false
+deploy:
+  variables:
+    staging: deploy/variables_staging.yaml
+    production: deploy/variables_prod.yaml
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: app-stable
+        canary_service: app-canary
+        steps: [10, 25, 50, 100]
+        interval: 120
+        progress_gates:
+          - metric: error_rate
+            condition: lt
+            threshold: 0.05
+"#;
+        let pf = parse_platform_file(yaml).unwrap();
+        assert_eq!(pf.pipeline.steps.len(), 7);
+        assert_eq!(pf.flags.len(), 2);
+        assert!(pf.deploy.is_some());
+
+        // Verify step kinds
+        let kinds: Vec<StepKind> = pf.pipeline.steps.iter().map(|s| s.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                StepKind::ImageBuild,
+                StepKind::ImageBuild,
+                StepKind::ImageBuild,
+                StepKind::ImageBuild,
+                StepKind::DeployTest,
+                StepKind::GitopsSync,
+                StepKind::DeployWatch,
+            ]
+        );
     }
 }

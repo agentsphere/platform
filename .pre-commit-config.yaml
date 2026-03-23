@@ -19,6 +19,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: inject-mermaid
+        name: inject mermaid diagrams
+        language: script
+        entry: hack/inject-mermaid.sh
+        files: '(docs/arc42/.*\.md|docs/arc42/diagrams/.*\.mmd)$'
+        pass_filenames: false
+
       - id: rust-fmt
         name: rustfmt
         language: system

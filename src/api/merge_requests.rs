@@ -1413,6 +1413,7 @@ pub async fn try_auto_merge(state: &AppState, project_id: Uuid) {
             token_scopes: None,
             boundary_project_id: None,
             boundary_workspace_id: None,
+            session_id: None,
         };
 
         match do_merge(state, &auth, project_id, mr.number, method).await {
@@ -1494,7 +1495,7 @@ async fn run_post_merge_side_effects(
     source_branch: &str,
     target_branch: &str,
     merge_method: &str,
-    head_sha: Option<&str>,
+    _head_sha: Option<&str>,
     repo_path: &std::path::Path,
 ) {
     write_audit(
@@ -1530,21 +1531,42 @@ async fn run_post_merge_side_effects(
 
     crate::deployer::preview::stop_preview_for_branch(&state.pool, project_id, source_branch).await;
 
-    // Post-merge deploy (background, best-effort)
-    let deploy_state = state.clone();
-    let source_head_sha = head_sha.unwrap_or_default().to_string();
-    let target_branch = target_branch.to_string();
-    let deploy_repo_path = repo_path.to_path_buf();
-    tokio::spawn(async move {
-        post_merge_deploy(
-            &deploy_state,
-            project_id,
-            &target_branch,
-            &deploy_repo_path,
-            &source_head_sha,
-        )
-        .await;
-    });
+    // Trigger push pipeline on the target branch (background, best-effort).
+    // do_merge() writes directly to the bare repo via worktree, bypassing the
+    // git HTTP endpoint, so post-receive hooks never fire. This explicit call
+    // ensures a push-triggered pipeline runs on main after every merge.
+    {
+        let trigger_state = state.clone();
+        let trigger_repo = repo_path.to_path_buf();
+        let trigger_branch = target_branch.to_string();
+        let trigger_user = auth.user_id;
+        tokio::spawn(async move {
+            let merge_sha = get_branch_head_sha(&trigger_repo, &trigger_branch).await;
+            let params = crate::pipeline::trigger::PushTriggerParams {
+                project_id,
+                user_id: trigger_user,
+                repo_path: trigger_repo,
+                branch: trigger_branch,
+                commit_sha: merge_sha,
+            };
+            match crate::pipeline::trigger::on_push(&trigger_state.pool, &params).await {
+                Ok(Some(pipeline_id)) => {
+                    crate::pipeline::trigger::notify_executor(&trigger_state, pipeline_id).await;
+                    tracing::info!(%project_id, %pipeline_id, "post-merge push pipeline triggered");
+                }
+                Ok(None) => {
+                    tracing::debug!(%project_id, "no push pipeline matched after merge");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, %project_id, "post-merge push pipeline trigger failed");
+                }
+            }
+        });
+    }
+
+    // NOTE: post_merge_deploy is no longer called here. The push pipeline's
+    // gitops_sync step now handles ops repo updates and deploy release creation.
+    // The on_push trigger (above) fires the push pipeline which includes gitops_sync.
 }
 
 fn spawn_mr_pipeline_trigger(
@@ -1591,6 +1613,7 @@ fn spawn_mr_pipeline_trigger(
 ///
 /// The `source_head_sha` is the MR's head commit — the exact commit that was built
 /// and tested by the CI pipeline. The image was tagged with this full SHA by Kaniko.
+#[allow(clippy::too_many_lines, dead_code)]
 async fn post_merge_deploy(
     state: &AppState,
     project_id: Uuid,
@@ -1651,26 +1674,40 @@ async fn post_merge_deploy(
 
     let ops_repo_id = ops_repo.as_ref().map(|o| o.id);
 
-    // Create or update the production deployment row so the reconciler picks it up
-    if let Err(e) = sqlx::query!(
-        r#"INSERT INTO deployments (project_id, environment, image_ref, ops_repo_id,
-                                    desired_status, current_status)
-           VALUES ($1, 'production', $2, $3, 'active', 'pending')
-           ON CONFLICT (project_id, environment)
-           DO UPDATE SET image_ref = $2,
-                         ops_repo_id = COALESCE($3, deployments.ops_repo_id),
-                         desired_status = 'active',
-                         current_status = 'pending'"#,
-        project_id,
-        image_ref,
-        ops_repo_id,
-    )
-    .execute(&state.pool)
+    // Upsert deploy target + create release so the reconciler picks it up
+    if let Err(e) = async {
+        // Ensure deploy target exists
+        let target_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO deploy_targets (project_id, name, environment, ops_repo_id)
+             VALUES ($1, 'production', 'production', $2)
+             ON CONFLICT (project_id, environment, branch_slug) DO UPDATE SET
+                 ops_repo_id = COALESCE(deploy_targets.ops_repo_id, $2)
+             RETURNING id",
+        )
+        .bind(project_id)
+        .bind(ops_repo_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+        // Create release
+        sqlx::query(
+            "INSERT INTO deploy_releases (target_id, project_id, image_ref, strategy)
+             SELECT $1, $2, $3, dt.default_strategy
+             FROM deploy_targets dt WHERE dt.id = $1",
+        )
+        .bind(target_id)
+        .bind(project_id)
+        .bind(&image_ref)
+        .execute(&state.pool)
+        .await?;
+
+        Ok::<(), sqlx::Error>(())
+    }
     .await
     {
-        tracing::warn!(error = %e, "post-merge deployment upsert failed");
+        tracing::warn!(error = %e, "post-merge release creation failed");
     } else {
-        tracing::info!(%project_id, %image_ref, "production deployment created/updated (post-merge)");
+        tracing::info!(%project_id, %image_ref, "release created (post-merge)");
     }
 
     // Sync deploy/ to ops repo + commit values

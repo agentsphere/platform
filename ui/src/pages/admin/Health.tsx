@@ -73,6 +73,57 @@ function formatUptime(seconds: number): string {
   return `${mins}m`;
 }
 
+function SystemLogs() {
+  const [logs, setLogs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.get('/api/observe/logs?source=system&range=1h&limit=30')
+      .then((r: any) => setLogs(r.items || []))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  return (
+    <>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+        <h3>Recent System Logs</h3>
+        <a href="/observe/logs?source=system" class="text-sm">View All →</a>
+      </div>
+      <div class="table-container mb-md">
+        {loading ? (
+          <div class="text-muted text-sm" style="padding:1rem">Loading...</div>
+        ) : logs.length === 0 ? (
+          <div class="text-muted text-sm" style="padding:1rem">No recent system logs</div>
+        ) : (
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Level</th>
+                <th>Task</th>
+                <th>Message</th>
+                <th>Trace</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map((entry: any) => (
+                <tr key={entry.id}>
+                  <td class="mono text-xs">{new Date(entry.timestamp).toLocaleTimeString()}</td>
+                  <td><span style={{color: entry.level === 'error' ? 'var(--danger)' : entry.level === 'warn' ? 'var(--warning)' : undefined}}>{entry.level}</span></td>
+                  <td class="text-xs">{entry.attributes?.task_name || '-'}</td>
+                  <td style={{maxWidth:400, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{entry.message}</td>
+                  <td>{entry.trace_id ? <a href={`/observe/logs?trace_id=${entry.trace_id}`} class="text-xs">{entry.trace_id.slice(0, 8)}</a> : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function Health() {
   const [data, setData] = useState<HealthSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -202,6 +253,9 @@ export function Health() {
           </tbody>
         </table>
       </div>
+
+      {/* Recent System Logs */}
+      <SystemLogs />
 
       {/* Pod failures */}
       <h3 style="margin-bottom:0.5rem">Pod Failures (24h)</h3>

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# test-in-cluster.sh — Run integration/E2E tests against ephemeral Kind services
+# test-in-cluster.sh — Run integration/E2E tests against ephemeral cluster services
 #
 # Creates isolated namespaces (platform-test-{id}-*), deploys PG + Valkey + MinIO
 # as NodePort services, deploys a DaemonSet registry proxy, then connects
-# directly to the Kind node IP (OrbStack makes it routable from macOS).
+# directly to the cluster node IP (OrbStack makes it routable from macOS).
 # Runs tests natively with cargo nextest.
 #
 # Usage:
@@ -26,7 +26,7 @@ TEST_FILTER="*_integration"
 TEST_TYPE="integration"   # "integration", "e2e", or "total"
 TEST_THREADS=""
 FILTER_EXPR=""
-KIND_CLUSTER="platform"
+
 
 # Coverage options
 COVERAGE_MODE=false
@@ -67,17 +67,6 @@ SVC_NS="${NS_PREFIX}-services"
 PIPELINE_NS="${NS_PREFIX}-pipelines"
 AGENT_NS="${NS_PREFIX}-agents"
 
-# Node IP for direct NodePort access (OrbStack makes Kind node IP-routable)
-NODE_IP=""
-
-# ── Detect host address ──────────────────────────────────────────────────
-if [[ "$(uname)" == "Darwin" ]]; then
-  PLATFORM_HOST="host.docker.internal"
-else
-  PLATFORM_HOST=$(docker network inspect kind \
-    -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "172.18.0.1")
-fi
-
 # ── Cleanup on exit ───────────────────────────────────────────────────────
 cleanup() {
   echo ""
@@ -98,47 +87,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Pre-flight checks ────────────────────────────────────────────────────
+# ── Pre-flight checks / cluster detection ───────────────────────────────
 echo "==> Pre-flight checks"
+source "${SCRIPT_DIR}/cluster-info.sh"
 
-if ! command -v kind &>/dev/null; then
-  echo "ERROR: 'kind' not found. Install: https://kind.sigs.k8s.io/"
-  exit 1
-fi
-
-if ! kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER}$"; then
-  echo "ERROR: Kind cluster '${KIND_CLUSTER}' not found. Run: just cluster-up"
-  exit 1
-fi
-
-export KUBECONFIG="${HOME}/.kube/kind-${KIND_CLUSTER}"
-if [[ ! -f "$KUBECONFIG" ]]; then
-  echo "ERROR: Kubeconfig not found at ${KUBECONFIG}"
-  exit 1
-fi
-
-echo "  Kind cluster: ${KIND_CLUSTER}"
-echo "  NS prefix:    ${NS_PREFIX}"
-echo "  Test type:    ${TEST_TYPE}"
-echo "  Test filter:  ${TEST_FILTER}"
-
-# ── Get node IP (OrbStack makes Kind node directly routable) ────────────
-NODE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER}-control-plane")
-if [[ -z "$NODE_IP" ]]; then
-  echo "ERROR: Could not determine node IP for ${KIND_CLUSTER}-control-plane"
-  exit 1
-fi
-echo "  Node IP:       ${NODE_IP}"
+echo "  Cluster:   ${NODE_CONTAINER}"
+echo "  NS prefix: ${NS_PREFIX}"
+echo "  Test type: ${TEST_TYPE}"
+echo "  Test filter: ${TEST_FILTER}"
+echo "  Node IP:   ${NODE_IP}"
 
 # ── Find free ports (backend + registry only — PG/Valkey/MinIO use NodePort) ──
 find_free_port() {
   python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()"
-}
-
-# Find a free port inside the Kind node (for hostPort bindings like registry proxy)
-find_free_node_port() {
-  docker exec "${KIND_CLUSTER}-control-plane" \
-    python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()"
 }
 
 BACKEND_PORT=$(find_free_port)
@@ -172,7 +133,7 @@ echo "  Valkey:        ${NODE_IP}:${VALKEY_PORT}"
 echo "  MinIO:         ${NODE_IP}:${MINIO_PORT}"
 echo "  Preview proxy: ${NODE_IP}:${PREVIEW_PROXY_PORT}"
 
-# Wait for NodePort connectivity (direct to Kind node — no port-forward)
+# Wait for NodePort connectivity (direct to cluster node — no port-forward)
 echo -n "  Waiting for NodePort connectivity"
 for i in $(seq 1 30); do
   if nc -z "$NODE_IP" "$PG_PORT" 2>/dev/null && \
@@ -232,7 +193,7 @@ export PLATFORM_AGENT_RUNNER_DIR="${RUNNER_DIR}"
 export PLATFORM_MCP_SERVERS_TARBALL="/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz"
 export CLAUDE_CLI_PATH="${PROJECT_DIR}/tests/fixtures/mock-claude-cli.sh"
 
-# Copy mock CLIs to shared mount so they're accessible inside Kind pods
+# Copy mock CLIs to shared mount so they're accessible inside cluster pods
 cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli.sh" "/tmp/platform-e2e/mock-claude-cli.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli.sh"
 cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli-git.sh" "/tmp/platform-e2e/mock-claude-cli-git.sh"

@@ -26,6 +26,7 @@ pub enum Permission {
     WorkspaceAdmin,
     RegistryPull,
     RegistryPush,
+    FlagManage,
 }
 
 impl Permission {
@@ -52,6 +53,7 @@ impl Permission {
             Self::WorkspaceAdmin => "workspace:admin",
             Self::RegistryPull => "registry:pull",
             Self::RegistryPush => "registry:push",
+            Self::FlagManage => "flag:manage",
         }
     }
 }
@@ -88,6 +90,7 @@ impl FromStr for Permission {
             "workspace:admin" => Ok(Self::WorkspaceAdmin),
             "registry:pull" => Ok(Self::RegistryPull),
             "registry:push" => Ok(Self::RegistryPush),
+            "flag:manage" => Ok(Self::FlagManage),
             other => anyhow::bail!("unknown permission: {other}"),
         }
     }
@@ -132,6 +135,7 @@ mod tests {
         Permission::WorkspaceAdmin,
         Permission::RegistryPull,
         Permission::RegistryPush,
+        Permission::FlagManage,
     ];
 
     #[test]
@@ -145,7 +149,7 @@ mod tests {
 
     #[test]
     fn all_permissions_counted() {
-        assert_eq!(ALL_PERMISSIONS.len(), 21);
+        assert_eq!(ALL_PERMISSIONS.len(), 22);
     }
 
     #[test]

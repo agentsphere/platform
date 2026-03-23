@@ -33,9 +33,13 @@ pub struct LogSearchParams {
     pub trace_id: Option<String>,
     pub level: Option<String>,
     pub service: Option<String>,
+    pub source: Option<String>,
+    pub task_name: Option<String>,
     pub q: Option<String>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+    /// Relative time range like "1h", "6h", "24h", "7d". Converted to `from`.
+    pub range: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -51,6 +55,7 @@ pub struct LogEntryResponse {
     pub session_id: Option<Uuid>,
     pub service: String,
     pub level: String,
+    pub source: String,
     pub message: String,
     pub attributes: Option<serde_json::Value>,
 }
@@ -177,6 +182,7 @@ pub struct LiveTailParams {
     pub project_id: Option<Uuid>,
     pub level: Option<String>,
     pub service: Option<String>,
+    pub source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +202,7 @@ pub fn router() -> Router<AppState> {
             "/api/observe/sessions/{session_id}/timeline",
             get(session_timeline),
         )
+        .route("/api/projects/{project_id}/logs", get(project_logs))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +293,48 @@ async fn search_logs(
     auth: AuthUser,
     Query(params): Query<LogSearchParams>,
 ) -> Result<Json<ListResponse<LogEntryResponse>>, ApiError> {
-    require_observe_read(&state, &auth, params.project_id).await?;
+    search_logs_inner(&state, &auth, params).await
+}
+
+#[tracing::instrument(skip(state), err)]
+async fn project_logs(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(project_id): Path<Uuid>,
+    Query(mut params): Query<LogSearchParams>,
+) -> Result<Json<ListResponse<LogEntryResponse>>, ApiError> {
+    require_project_read(&state, &auth, project_id).await?;
+    params.project_id = Some(project_id);
+    search_logs_inner(&state, &auth, params).await
+}
+
+/// Resolve a relative time range string (e.g. "1h", "7d") to an absolute `from` timestamp.
+fn resolve_range(
+    explicit_from: Option<DateTime<Utc>>,
+    range: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    explicit_from.or_else(|| {
+        range.and_then(|r| {
+            let secs = match r {
+                "1h" => 3600,
+                "6h" => 21600,
+                "12h" => 43200,
+                "24h" | "1d" => 86400,
+                "7d" => 604_800,
+                "30d" => 2_592_000,
+                _ => return None,
+            };
+            Some(Utc::now() - chrono::Duration::seconds(secs))
+        })
+    })
+}
+
+async fn search_logs_inner(
+    state: &AppState,
+    auth: &AuthUser,
+    params: LogSearchParams,
+) -> Result<Json<ListResponse<LogEntryResponse>>, ApiError> {
+    require_observe_read(state, auth, params.project_id).await?;
 
     if let Some(ref q) = params.q {
         validation::check_length("q", q, 1, 1000)?;
@@ -295,6 +343,7 @@ async fn search_logs(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
     let search_pattern = params.q.as_deref().map(|s| format!("%{s}%"));
+    let from = resolve_range(params.from, params.range.as_deref());
 
     let total: i64 = sqlx::query_scalar(
         r"
@@ -308,6 +357,8 @@ async fn search_logs(
           AND ($6::text IS NULL OR message ILIKE $6)
           AND ($7::timestamptz IS NULL OR timestamp >= $7)
           AND ($8::timestamptz IS NULL OR timestamp <= $8)
+          AND ($9::text IS NULL OR source = $9)
+          AND ($10::text IS NULL OR attributes->>'task_name' = $10)
         ",
     )
     .bind(params.project_id)
@@ -316,15 +367,17 @@ async fn search_logs(
     .bind(params.level.as_deref())
     .bind(params.service.as_deref())
     .bind(search_pattern.as_deref())
-    .bind(params.from)
+    .bind(from)
     .bind(params.to)
+    .bind(params.source.as_deref())
+    .bind(params.task_name.as_deref())
     .fetch_one(&state.pool)
     .await?;
 
     let rows = sqlx::query(
         r"
         SELECT id, timestamp, trace_id, span_id, project_id, session_id,
-               service, level, message, attributes
+               service, level, source, message, attributes
         FROM log_entries
         WHERE ($1::uuid IS NULL OR project_id = $1)
           AND ($2::uuid IS NULL OR session_id = $2)
@@ -334,8 +387,10 @@ async fn search_logs(
           AND ($6::text IS NULL OR message ILIKE $6)
           AND ($7::timestamptz IS NULL OR timestamp >= $7)
           AND ($8::timestamptz IS NULL OR timestamp <= $8)
+          AND ($9::text IS NULL OR source = $9)
+          AND ($10::text IS NULL OR attributes->>'task_name' = $10)
         ORDER BY timestamp DESC
-        LIMIT $9 OFFSET $10
+        LIMIT $11 OFFSET $12
         ",
     )
     .bind(params.project_id)
@@ -344,8 +399,10 @@ async fn search_logs(
     .bind(params.level.as_deref())
     .bind(params.service.as_deref())
     .bind(search_pattern.as_deref())
-    .bind(params.from)
+    .bind(from)
     .bind(params.to)
+    .bind(params.source.as_deref())
+    .bind(params.task_name.as_deref())
     .bind(limit)
     .bind(offset)
     .fetch_all(&state.pool)
@@ -362,6 +419,7 @@ async fn search_logs(
             session_id: r.get("session_id"),
             service: r.get("service"),
             level: r.get("level"),
+            source: r.get("source"),
             message: r.get("message"),
             attributes: r.get("attributes"),
         })
@@ -534,21 +592,7 @@ async fn query_metrics(
 
     let limit = params.limit.unwrap_or(1000).min(10_000);
 
-    // Support relative time range (e.g. "1h", "6h", "24h", "7d")
-    let from = params.from.or_else(|| {
-        params.range.as_deref().and_then(|r| {
-            let secs = match r {
-                "1h" => 3600,
-                "6h" => 21600,
-                "12h" => 43200,
-                "24h" | "1d" => 86400,
-                "7d" => 604_800,
-                "30d" => 2_592_000,
-                _ => return None,
-            };
-            Some(Utc::now() - chrono::Duration::seconds(secs))
-        })
-    });
+    let from = resolve_range(params.from, params.range.as_deref());
 
     let rows = sqlx::query(
         r"
@@ -768,7 +812,7 @@ async fn live_tail_sse(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// Check if a live tail message matches optional level/service filters.
+/// Check if a live tail message matches optional level/service/source filters.
 fn should_forward(text: &str, params: &LiveTailParams) -> bool {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
         return true;
@@ -786,6 +830,12 @@ fn should_forward(text: &str, params: &LiveTailParams) -> bool {
         return false;
     }
 
+    if let Some(ref source) = params.source
+        && msg.get("source").and_then(|v| v.as_str()) != Some(source)
+    {
+        return false;
+    }
+
     true
 }
 
@@ -798,6 +848,20 @@ mod tests {
             project_id: None,
             level: level.map(String::from),
             service: service.map(String::from),
+            source: None,
+        }
+    }
+
+    fn params_with_source(
+        level: Option<&str>,
+        service: Option<&str>,
+        source: Option<&str>,
+    ) -> LiveTailParams {
+        LiveTailParams {
+            project_id: None,
+            level: level.map(String::from),
+            service: service.map(String::from),
+            source: source.map(String::from),
         }
     }
 
@@ -844,6 +908,37 @@ mod tests {
         assert!(!should_forward(r#"{"level":"info","service":"api"}"#, &p));
         assert!(!should_forward(
             r#"{"level":"error","service":"worker"}"#,
+            &p
+        ));
+    }
+
+    #[test]
+    fn should_forward_source_match() {
+        let p = params_with_source(None, None, Some("session"));
+        assert!(should_forward(
+            r#"{"level":"info","service":"api","source":"session"}"#,
+            &p
+        ));
+    }
+
+    #[test]
+    fn should_forward_source_mismatch() {
+        let p = params_with_source(None, None, Some("session"));
+        assert!(!should_forward(
+            r#"{"level":"info","service":"api","source":"external"}"#,
+            &p
+        ));
+    }
+
+    #[test]
+    fn should_forward_source_combined() {
+        let p = params_with_source(Some("error"), None, Some("system"));
+        assert!(should_forward(
+            r#"{"level":"error","service":"api","source":"system"}"#,
+            &p
+        ));
+        assert!(!should_forward(
+            r#"{"level":"error","service":"api","source":"external"}"#,
             &p
         ));
     }

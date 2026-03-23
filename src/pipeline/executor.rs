@@ -10,6 +10,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::Api;
 use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
 use sqlx::PgPool;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::auth::token;
@@ -36,19 +37,37 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 break;
             }
             _ = interval.tick() => {
-                match poll_pending(&state).await {
-                    Ok(()) => state.task_registry.heartbeat("pipeline_executor"),
-                    Err(e) => {
-                        state.task_registry.report_error("pipeline_executor", &e.to_string());
-                        tracing::error!(error = %e, "error polling pending pipelines");
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "pipeline_executor",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    match poll_pending(&state).await {
+                        Ok(()) => state.task_registry.heartbeat("pipeline_executor"),
+                        Err(e) => {
+                            state.task_registry.report_error("pipeline_executor", &e.to_string());
+                            tracing::error!(error = %e, "error polling pending pipelines");
+                        }
                     }
-                }
+                }.instrument(span).await;
             }
             () = state.pipeline_notify.notified() => {
-                // Immediate poll on notification
-                if let Err(e) = poll_pending(&state).await {
-                    tracing::error!(error = %e, "error polling pending pipelines (notified)");
-                }
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "pipeline_executor",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    // Immediate poll on notification
+                    if let Err(e) = poll_pending(&state).await {
+                        tracing::error!(error = %e, "error polling pending pipelines (notified)");
+                    }
+                }.instrument(span).await;
                 // Reset interval to avoid immediate double-poll
                 interval.reset();
             }
@@ -87,6 +106,7 @@ async fn poll_pending(state: &AppState) -> Result<(), PipelineError> {
 // ---------------------------------------------------------------------------
 
 /// Execute a single pipeline: run each step as a K8s pod sequentially.
+#[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(state), fields(%pipeline_id), err)]
 async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), PipelineError> {
     // Claim the pipeline by setting status to running
@@ -221,8 +241,10 @@ async fn finalize_pipeline(
     .await?;
 
     if all_succeeded {
-        detect_and_write_deployment(state, pipeline_id, project_id).await;
-        detect_and_publish_dev_image(state, pipeline_id, project_id).await;
+        // NOTE: detect_and_write_deployment() and detect_and_publish_dev_image()
+        // are no longer called here. GitOps handoff and dev image publication are
+        // now explicit pipeline steps (gitops_sync and imagebuild).
+        // Only auto-merge remains as a finalize-time side effect.
         crate::api::merge_requests::try_auto_merge(state, project_id).await;
     }
 
@@ -244,6 +266,7 @@ async fn finalize_pipeline(
 }
 
 /// Parameters extracted from pipeline + project join query.
+#[derive(Debug)]
 struct PipelineMeta {
     git_ref: String,
     commit_sha: Option<String>,
@@ -264,6 +287,7 @@ struct PipelineMeta {
 
 /// A pipeline step row loaded from the database.
 #[allow(dead_code)] // `gate` stored for API response; read via DB query in pipelines.rs
+#[derive(sqlx::FromRow)]
 struct StepRow {
     id: Uuid,
     step_order: i32,
@@ -276,6 +300,8 @@ struct StepRow {
     depends_on: Vec<String>,
     environment: Option<serde_json::Value>,
     gate: bool,
+    step_type: String,
+    step_config: Option<serde_json::Value>,
 }
 
 /// Ensure the project's dev namespace (and network policy) exist before running pods.
@@ -312,18 +338,16 @@ async fn run_all_steps(
     pipeline: &PipelineMeta,
     registry_secret: Option<&str>,
 ) -> Result<bool, PipelineError> {
-    let steps = sqlx::query_as!(
-        StepRow,
-        r#"
-        SELECT id, step_order, name, image, commands,
+    let steps = sqlx::query_as::<_, StepRow>(
+        "SELECT id, step_order, name, image, commands,
                condition_events, condition_branches,
-               deploy_test, depends_on, environment, gate
+               deploy_test, depends_on, environment, gate,
+               step_type, step_config
         FROM pipeline_steps
         WHERE pipeline_id = $1
-        ORDER BY step_order ASC
-        "#,
-        pipeline_id,
+        ORDER BY step_order ASC",
     )
+    .bind(pipeline_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -512,6 +536,8 @@ async fn run_steps_dag(
             let step_commands = step.commands.clone();
             let step_deploy_test = step.deploy_test.clone();
             let step_env = step.environment.clone();
+            let step_type = step.step_type.clone();
+            let step_config = step.step_config.clone();
             let meta_clone = PipelineMeta {
                 git_ref: pipeline.git_ref.clone(),
                 commit_sha: pipeline.commit_sha.clone(),
@@ -541,6 +567,8 @@ async fn run_steps_dag(
                     depends_on: vec![],
                     environment: step_env,
                     gate: false,
+                    step_type,
+                    step_config,
                 };
                 let pods: Api<Pod> = Api::namespaced(state.kube.clone(), &namespace);
                 let result = execute_step_dispatch(
@@ -636,7 +664,7 @@ fn extract_branch(git_ref: &str) -> &str {
         .unwrap_or(git_ref)
 }
 
-/// Dispatch a step to the right executor (deploy-test or regular).
+/// Dispatch a step to the right executor based on `step_type`.
 #[allow(clippy::too_many_arguments)]
 async fn execute_step_dispatch(
     state: &AppState,
@@ -648,29 +676,76 @@ async fn execute_step_dispatch(
     registry_secret: Option<&str>,
     secrets: &[(String, String)],
 ) -> Result<bool, PipelineError> {
-    if step.deploy_test.is_some() {
-        execute_deploy_test_step(
-            state,
-            pipeline_id,
-            project_id,
-            pipeline,
-            step,
-            registry_secret,
-            secrets,
-        )
-        .await
-    } else {
-        execute_single_step(
-            state,
-            pods,
-            pipeline_id,
-            project_id,
-            pipeline,
-            step,
-            registry_secret,
-            secrets,
-        )
-        .await
+    match step.step_type.as_str() {
+        "deploy_test" => {
+            execute_deploy_test_step(
+                state,
+                pipeline_id,
+                project_id,
+                pipeline,
+                step,
+                registry_secret,
+                secrets,
+            )
+            .await
+        }
+        "imagebuild" => {
+            // imagebuild steps: inject secrets as --build-arg into the kaniko command
+            let mut build_secrets = secrets.to_vec();
+            if let Some(ref config) = step.step_config
+                && let Some(secret_names) = config.get("secrets").and_then(|v| v.as_array())
+            {
+                for sn in secret_names {
+                    if let Some(name) = sn.as_str()
+                        && let Some((_, val)) = secrets.iter().find(|(k, _)| k == name)
+                    {
+                        build_secrets.push((format!("BUILD_ARG_{name}"), val.clone()));
+                    }
+                }
+            }
+            execute_single_step(
+                state,
+                pods,
+                pipeline_id,
+                project_id,
+                pipeline,
+                step,
+                registry_secret,
+                &build_secrets,
+            )
+            .await
+        }
+        "gitops_sync" => {
+            execute_gitops_sync_step(state, pipeline_id, project_id, pipeline, step).await
+        }
+        "deploy_watch" => execute_deploy_watch_step(state, pipeline_id, project_id, step).await,
+        _ => {
+            // Legacy command step or deploy_test inferred from field
+            if step.deploy_test.is_some() {
+                execute_deploy_test_step(
+                    state,
+                    pipeline_id,
+                    project_id,
+                    pipeline,
+                    step,
+                    registry_secret,
+                    secrets,
+                )
+                .await
+            } else {
+                execute_single_step(
+                    state,
+                    pods,
+                    pipeline_id,
+                    project_id,
+                    pipeline,
+                    step,
+                    registry_secret,
+                    secrets,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -823,8 +898,8 @@ async fn run_step(
     // Wait for pod to finish
     let exit_code = wait_for_pod(pods, pod_name).await?;
 
-    // Capture logs to MinIO
-    capture_logs(pods, pod_name, state, pipeline_id, step_name).await;
+    // Capture logs to MinIO + emit to platform logs on failure
+    capture_logs(pods, pod_name, state, pipeline_id, step_name, exit_code).await;
 
     // Clean up pod
     let _ = pods.delete(pod_name, &DeleteParams::default()).await;
@@ -968,14 +1043,25 @@ async fn capture_logs(
     state: &AppState,
     pipeline_id: Uuid,
     step_name: &str,
+    exit_code: i32,
 ) {
-    // Capture init container (clone) logs for debugging
+    let failed = exit_code != 0;
+
+    // Capture init container (clone) logs
     let init_log_params = LogParams {
         container: Some("clone".into()),
         ..Default::default()
     };
     match pods.logs(pod_name, &init_log_params).await {
         Ok(logs) => {
+            if failed {
+                let truncated: String = logs.chars().take(2000).collect();
+                tracing::warn!(
+                    pod = pod_name,
+                    step = step_name,
+                    "clone container logs (step failed):\n{truncated}"
+                );
+            }
             let path = format!("logs/pipelines/{pipeline_id}/{step_name}-clone.log");
             if let Err(e) = state.minio.write(&path, logs.into_bytes()).await {
                 tracing::error!(error = %e, %path, "failed to write clone logs to MinIO");
@@ -994,6 +1080,15 @@ async fn capture_logs(
 
     match pods.logs(pod_name, &log_params).await {
         Ok(logs) => {
+            if failed {
+                let truncated: String = logs.chars().take(2000).collect();
+                tracing::error!(
+                    pod = pod_name,
+                    step = step_name,
+                    exit_code,
+                    "step container logs (FAILED):\n{truncated}"
+                );
+            }
             let path = format!("logs/pipelines/{pipeline_id}/{step_name}.log");
             if let Err(e) = state.minio.write(&path, logs.into_bytes()).await {
                 tracing::error!(error = %e, %path, "failed to write logs to MinIO");
@@ -1683,6 +1778,9 @@ async fn execute_deploy_test_step(
     )
     .await;
 
+    // 2b. Inject project secrets (scope: test/all) + OTEL tokens into test namespace
+    inject_test_namespace_secrets(state, project_id, &pipeline.project_name, &ns_name).await;
+
     // 3. Read + render deploy manifests from project repo
     let manifests_path = dt.manifests.as_deref().unwrap_or("deploy/");
     let branch = extract_branch(&pipeline.git_ref);
@@ -1726,11 +1824,15 @@ async fn execute_deploy_test_step(
 
     // Render manifests with test environment
     let vars = crate::deployer::renderer::RenderVars {
-        image_ref: app_image_ref,
+        image_ref: app_image_ref.clone(),
         project_name: pipeline.project_name.clone(),
         environment: "test".into(),
         values: serde_json::json!({}),
         platform_api_url: state.config.platform_api_url.clone(),
+        stable_image: None,
+        canary_image: None,
+        commit_sha: pipeline.commit_sha.clone(),
+        app_image: Some(app_image_ref),
     };
     let rendered = crate::deployer::renderer::render(&manifest_content, &vars)
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -1755,6 +1857,29 @@ async fn execute_deploy_test_step(
     if let Err(e) = wait_for_deployment_ready(&state.kube, &ns_name, dt.readiness_timeout).await {
         tracing::error!(error = %e, %ns_name, "app deployment did not become ready");
         // Capture app logs for debugging
+        capture_deployment_logs(state, &ns_name, pipeline_id, &step.name).await;
+        let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
+        sqlx::query!(
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            step.id,
+            duration_ms,
+        )
+        .execute(&state.pool)
+        .await?;
+        return Ok(false);
+    }
+
+    // 5b. Wait for services to have ready endpoints (if specified)
+    if !dt.wait_for_services.is_empty()
+        && let Err(e) = wait_for_services_ready(
+            &state.kube,
+            &ns_name,
+            &dt.wait_for_services,
+            dt.readiness_timeout,
+        )
+        .await
+    {
+        tracing::error!(error = %e, %ns_name, "services did not become ready");
         capture_deployment_logs(state, &ns_name, pipeline_id, &step.name).await;
         let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
         sqlx::query!(
@@ -1886,9 +2011,53 @@ async fn wait_for_deployment_ready(
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.into());
+    let mut last_log = std::time::Instant::now();
 
     loop {
         if tokio::time::Instant::now() >= deadline {
+            // Log final state of all deployments before failing
+            if let Ok(dl) = deployments.list(&ListParams::default()).await {
+                for d in &dl.items {
+                    let name = d.metadata.name.as_deref().unwrap_or("?");
+                    let ready = d
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.ready_replicas)
+                        .unwrap_or(0);
+                    let desired = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+                    tracing::error!(
+                        %namespace, deploy = name, ready, desired,
+                        "deployment not ready at timeout"
+                    );
+                }
+            }
+            // Also log pod statuses
+            let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+            if let Ok(pl) = pods.list(&ListParams::default()).await {
+                for p in &pl.items {
+                    let pname = p.metadata.name.as_deref().unwrap_or("?");
+                    let phase = p
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.phase.as_deref())
+                        .unwrap_or("?");
+                    let conditions = p
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_ref())
+                        .map(|cs| {
+                            cs.iter()
+                                .map(|c| format!("{}={}", c.type_, c.status))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    tracing::error!(
+                        %namespace, pod = pname, phase, conditions,
+                        "pod state at timeout"
+                    );
+                }
+            }
             return Err(PipelineError::Other(anyhow::anyhow!(
                 "deployment in {namespace} did not become ready within {timeout_secs}s"
             )));
@@ -1900,6 +2069,23 @@ async fn wait_for_deployment_ready(
             if deploy_list.items.is_empty() {
                 continue;
             }
+            // Log progress every 15s
+            if last_log.elapsed().as_secs() >= 15 {
+                for d in &deploy_list.items {
+                    let name = d.metadata.name.as_deref().unwrap_or("?");
+                    let ready = d
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.ready_replicas)
+                        .unwrap_or(0);
+                    let desired = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+                    tracing::info!(
+                        %namespace, deploy = name, ready, desired,
+                        "waiting for deployment readiness"
+                    );
+                }
+                last_log = std::time::Instant::now();
+            }
             let all_ready = deploy_list.items.iter().all(|d| {
                 d.status
                     .as_ref()
@@ -1910,6 +2096,53 @@ async fn wait_for_deployment_ready(
             if all_ready {
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Wait for K8s services to have at least one ready endpoint.
+/// Polls every 3s until all services are ready or timeout.
+async fn wait_for_services_ready(
+    kube: &kube::Client,
+    namespace: &str,
+    service_names: &[String],
+    timeout_secs: u32,
+) -> Result<(), PipelineError> {
+    use k8s_openapi::api::core::v1::Endpoints;
+
+    let endpoints: Api<Endpoints> = Api::namespaced(kube.clone(), namespace);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.into());
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PipelineError::Other(anyhow::anyhow!(
+                "services {service_names:?} in {namespace} did not become ready within {timeout_secs}s"
+            )));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let mut all_ready = true;
+        for svc_name in service_names {
+            if let Ok(ep) = endpoints.get(svc_name).await {
+                let has_ready = ep.subsets.as_ref().is_some_and(|subsets| {
+                    subsets
+                        .iter()
+                        .any(|s| s.addresses.as_ref().is_some_and(|addrs| !addrs.is_empty()))
+                });
+                if !has_ready {
+                    all_ready = false;
+                    break;
+                }
+            } else {
+                all_ready = false;
+                break;
+            }
+        }
+
+        if all_ready {
+            return Ok(());
         }
     }
 }
@@ -1937,6 +2170,431 @@ async fn capture_deployment_logs(
                 tracing::warn!(error = %e, %path, "failed to write app logs");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-process step executors (no K8s pod)
+// ---------------------------------------------------------------------------
+
+/// Execute a `gitops_sync` step: copy files to ops repo, commit values, publish event.
+#[tracing::instrument(skip(state, step), fields(%pipeline_id, %project_id), err)]
+async fn execute_gitops_sync_step(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    pipeline: &PipelineMeta,
+    step: &StepRow,
+) -> Result<bool, PipelineError> {
+    // Mark step as running
+    sqlx::query("UPDATE pipeline_steps SET status = 'running', started_at = now() WHERE id = $1")
+        .bind(step.id)
+        .execute(&state.pool)
+        .await?;
+
+    let start = std::time::Instant::now();
+
+    let result = execute_gitops_sync_inner(state, pipeline_id, project_id, pipeline, step).await;
+
+    let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let (status, exit_code) = match &result {
+        Ok(true) => ("success", 0i32),
+        Ok(false) | Err(_) => ("failure", 1i32),
+    };
+
+    sqlx::query(
+        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4 WHERE id = $1",
+    )
+    .bind(step.id)
+    .bind(status)
+    .bind(exit_code)
+    .bind(duration_ms)
+    .execute(&state.pool)
+    .await?;
+
+    result
+}
+
+/// Inner logic for `gitops_sync` — separated for cleaner error handling.
+#[allow(clippy::too_many_lines)]
+async fn execute_gitops_sync_inner(
+    state: &AppState,
+    _pipeline_id: Uuid,
+    project_id: Uuid,
+    pipeline: &PipelineMeta,
+    step: &StepRow,
+) -> Result<bool, PipelineError> {
+    use sqlx::Row as _;
+
+    // Read project info (use dynamic query — include_staging is a new column)
+    let project = sqlx::query(
+        "SELECT name, repo_path, include_staging FROM projects WHERE id = $1 AND is_active = true",
+    )
+    .bind(project_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| PipelineError::Other(anyhow::anyhow!("project not found")))?;
+    let project_name: String = project.get("name");
+    let project_repo_path: Option<String> = project.get("repo_path");
+    let include_staging: bool = project.get("include_staging");
+
+    // Look up ops repo
+    let ops_repo = sqlx::query("SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1")
+        .bind(project_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| PipelineError::Other(anyhow::anyhow!("no ops repo for project")))?;
+    let ops_repo_id: Uuid = ops_repo.get("id");
+    let ops_repo_path: String = ops_repo.get("repo_path");
+    let ops_repo_branch: String = ops_repo.get("branch");
+
+    let sha = pipeline.commit_sha.as_deref().unwrap_or("HEAD");
+
+    // Read .platform.yaml from project repo
+    let repo_path = project_repo_path
+        .as_deref()
+        .ok_or_else(|| PipelineError::Other(anyhow::anyhow!("project has no repo_path")))?;
+    let platform_yaml = crate::deployer::ops_repo::read_file_at_ref(
+        std::path::Path::new(repo_path),
+        sha,
+        ".platform.yaml",
+    )
+    .await
+    .ok();
+
+    let platform_file: Option<super::definition::PlatformFile> = platform_yaml
+        .as_ref()
+        .and_then(|y| serde_yaml::from_str(y).ok());
+
+    // Determine target branch from project setting (not platform.yaml)
+    let (target_branch, environment) = if include_staging {
+        ("staging", "staging")
+    } else {
+        (ops_repo_branch.as_str(), "production")
+    };
+
+    let ops_path = std::path::PathBuf::from(&ops_repo_path);
+
+    // 1. Copy files from code repo → ops repo
+    if let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
+        std::path::Path::new(repo_path),
+        &ops_path,
+        &ops_repo_branch,
+        sha,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to sync deploy/ to ops repo");
+    }
+
+    // 2. Write platform.yaml to ops repo root
+    if let Some(ref yaml_content) = platform_yaml
+        && let Err(e) = crate::deployer::ops_repo::write_file_to_repo(
+            &ops_path,
+            &ops_repo_branch,
+            "platform.yaml",
+            yaml_content,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to write platform.yaml to ops repo");
+    }
+
+    // 3. Build values (image refs + user variables)
+    let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
+    let tag = sha;
+    let image_ref = format!("{registry}/{project_name}/app:{tag}");
+
+    // Check if any build step was for canary
+    let step_config = step.step_config.as_ref();
+    let _ = step_config; // gitops config from step (copy list, etc.)
+
+    let has_canary = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pipeline_steps WHERE pipeline_id = (SELECT id FROM pipelines WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1) AND name ILIKE '%canary%' AND status = 'success'",
+    )
+    .bind(project_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0) > 0;
+
+    let canary_image_ref = format!("{registry}/{project_name}/canary:{tag}");
+
+    let mut values = serde_json::json!({
+        "image_ref": image_ref,
+        "project_name": project_name,
+        "environment": environment,
+    });
+    if has_canary {
+        values["canary_image_ref"] = serde_json::Value::String(canary_image_ref);
+    }
+
+    // 3b. Merge per-environment variables from code repo (deploy/variables_{env}.yaml)
+    let var_path = platform_file
+        .as_ref()
+        .and_then(|pf| pf.deploy.as_ref())
+        .and_then(|d| d.variables.get(environment));
+    if let Some(var_path) = var_path
+        && let Ok(var_content) = crate::deployer::ops_repo::read_file_at_ref(
+            std::path::Path::new(repo_path),
+            sha,
+            var_path,
+        )
+        .await
+    {
+        match serde_yaml::from_str::<serde_json::Value>(&var_content) {
+            Ok(user_vars) => {
+                if let Some(obj) = user_vars.as_object() {
+                    for (k, v) in obj {
+                        values[k] = v.clone();
+                    }
+                }
+                tracing::info!(%environment, %var_path, "merged user variables into deploy values");
+            }
+            Err(e) => tracing::warn!(error = %e, %var_path, "failed to parse variables file"),
+        }
+    }
+
+    // 4. Commit values to ops repo
+    let ops_commit_sha = match crate::deployer::ops_repo::commit_values(
+        &ops_path,
+        target_branch,
+        environment,
+        &values,
+    )
+    .await
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            tracing::error!(error = %e, %project_id, "failed to commit values to ops repo");
+            return Ok(false);
+        }
+    };
+
+    // 5. Publish OpsRepoUpdated event
+    let event = crate::store::eventbus::PlatformEvent::OpsRepoUpdated {
+        project_id,
+        ops_repo_id,
+        environment: environment.into(),
+        commit_sha: ops_commit_sha,
+        image_ref: image_ref.clone(),
+    };
+    if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
+        tracing::error!(error = %e, %project_id, "failed to publish OpsRepoUpdated event");
+    }
+
+    // 6. Register feature flags from platform.yaml
+    if let Some(ref pf) = platform_file
+        && !pf.flags.is_empty()
+    {
+        let flag_defs: Vec<(String, serde_json::Value)> = pf
+            .flags
+            .iter()
+            .map(|f| (f.key.clone(), f.default_value.clone()))
+            .collect();
+        let flag_event = crate::store::eventbus::PlatformEvent::FlagsRegistered {
+            project_id,
+            flags: flag_defs,
+        };
+        let _ = crate::store::eventbus::publish(&state.valkey, &flag_event).await;
+    }
+
+    tracing::info!(%project_id, %image_ref, %environment, "gitops_sync step completed");
+    Ok(true)
+}
+
+/// Execute a `deploy_watch` step: poll `deploy_releases` until terminal phase.
+#[tracing::instrument(skip(state, step), fields(%pipeline_id, %project_id), err)]
+async fn execute_deploy_watch_step(
+    state: &AppState,
+    pipeline_id: Uuid,
+    project_id: Uuid,
+    step: &StepRow,
+) -> Result<bool, PipelineError> {
+    // Mark step as running
+    sqlx::query("UPDATE pipeline_steps SET status = 'running', started_at = now() WHERE id = $1")
+        .bind(step.id)
+        .execute(&state.pool)
+        .await?;
+
+    let start = std::time::Instant::now();
+
+    // Parse config
+    let (environment, timeout_secs) = if let Some(ref config) = step.step_config {
+        let env = config
+            .get("environment")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("staging");
+        let timeout = config
+            .get("timeout")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(300);
+        (env.to_string(), timeout)
+    } else {
+        ("staging".into(), 300u64)
+    };
+
+    // Poll deploy_releases until terminal
+    let success = loop {
+        if start.elapsed().as_secs() > timeout_secs {
+            tracing::warn!(%project_id, %environment, "deploy_watch timed out");
+            break false;
+        }
+
+        let phase = sqlx::query_scalar::<_, String>(
+            "SELECT dr.phase FROM deploy_releases dr \
+             JOIN deploy_targets dt ON dr.target_id = dt.id \
+             WHERE dr.project_id = $1 AND dt.environment = $2 \
+             ORDER BY dr.created_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(&environment)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+        match phase.as_deref() {
+            Some("completed") => {
+                tracing::info!(%project_id, %environment, "deploy_watch: release completed");
+                break true;
+            }
+            Some("failed" | "rolled_back" | "cancelled") => {
+                tracing::warn!(%project_id, %environment, phase = ?phase, "deploy_watch: release failed");
+                break false;
+            }
+            _ => {
+                // Still pending/progressing/holding/promoting — keep polling
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
+
+    let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let (status, exit_code) = if success {
+        ("success", 0i32)
+    } else {
+        ("failure", 1i32)
+    };
+
+    sqlx::query(
+        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4 WHERE id = $1",
+    )
+    .bind(step.id)
+    .bind(status)
+    .bind(exit_code)
+    .bind(duration_ms)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(success)
+}
+
+// ---------------------------------------------------------------------------
+// Test namespace secret injection
+// ---------------------------------------------------------------------------
+
+/// Inject project secrets and OTEL tokens into a deploy-test namespace.
+/// Creates a K8s Secret with test-scoped secrets + OTEL env vars.
+async fn inject_test_namespace_secrets(
+    state: &AppState,
+    project_id: Uuid,
+    project_name: &str,
+    namespace: &str,
+) {
+    use sqlx::Row as _;
+
+    let mut env_data: BTreeMap<String, String> = BTreeMap::new();
+
+    // Query test-scoped secrets
+    if let Some(ref master_key_str) = state.config.master_key
+        && let Ok(mk) = crate::secrets::engine::parse_master_key(master_key_str)
+    {
+        let rows = sqlx::query(
+            "SELECT name, encrypted_value FROM secrets
+                 WHERE project_id = $1 AND scope IN ('test', 'all')
+                   AND environment IS NULL",
+        )
+        .bind(project_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &rows {
+            let name: String = row.get("name");
+            let encrypted: Vec<u8> = row.get("encrypted_value");
+            match crate::secrets::engine::decrypt(&encrypted, &mk) {
+                Ok(val) => {
+                    if let Ok(s) = String::from_utf8(val) {
+                        env_data.insert(name, s);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to decrypt test secret");
+                }
+            }
+        }
+    }
+
+    // Inject OTEL env vars
+    env_data.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+        state.config.platform_api_url.clone(),
+    );
+    env_data.insert("OTEL_SERVICE_NAME".into(), project_name.to_string());
+    env_data.insert(
+        "OTEL_RESOURCE_ATTRIBUTES".into(),
+        format!("platform.project_id={project_id}"),
+    );
+
+    // Create scoped OTEL + API tokens for the test namespace
+    if let Ok((otel_token, api_token)) =
+        crate::deployer::reconciler::ensure_scoped_tokens(state, project_id, "test").await
+    {
+        env_data.insert(
+            "OTEL_EXPORTER_OTLP_HEADERS".into(),
+            format!("Authorization=Bearer {otel_token}"),
+        );
+        env_data.insert("PLATFORM_API_TOKEN".into(), api_token);
+    }
+
+    env_data.insert(
+        "PLATFORM_API_URL".into(),
+        state.config.platform_api_url.clone(),
+    );
+    env_data.insert("PLATFORM_PROJECT_ID".into(), project_id.to_string());
+
+    if env_data.is_empty() {
+        return;
+    }
+
+    // Create K8s Secret
+    let secret_name = format!("{namespace}-test-secrets");
+    let secret_data: BTreeMap<String, k8s_openapi::ByteString> = env_data
+        .into_iter()
+        .map(|(k, v)| (k, k8s_openapi::ByteString(v.into_bytes())))
+        .collect();
+
+    let secret = k8s_openapi::api::core::v1::Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(secret_name.clone()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        data: Some(secret_data),
+        ..Default::default()
+    };
+
+    let secrets_api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
+    match secrets_api
+        .patch(
+            &secret_name,
+            &kube::api::PatchParams::apply("platform-pipeline"),
+            &kube::api::Patch::Apply(secret),
+        )
+        .await
+    {
+        Ok(_) => tracing::info!(%namespace, "test namespace secrets injected"),
+        Err(e) => tracing::warn!(error = %e, %namespace, "failed to inject test secrets"),
     }
 }
 
@@ -1993,11 +2651,26 @@ async fn mark_pipeline_failed(pool: &PgPool, pipeline_id: Uuid) -> Result<(), Pi
 }
 
 // ---------------------------------------------------------------------------
-// Deployment handoff
+// Deployment handoff (removed — now handled by explicit gitops_sync step)
 // ---------------------------------------------------------------------------
+// detect_and_write_deployment, gitops_handoff, write_file_to_ops_repo,
+// detect_and_publish_dev_image, upsert_preview_deployment removed.
+// Preview deployments for non-main branches are still handled by the
+// reconciler when an OpsRepoUpdated event arrives for a preview environment.
 
-/// If any step used a kaniko-like image, publish an `ImageBuilt` event (for production)
-/// or directly upsert a preview deployment (for non-main branches).
+// NOTE: The functions below were part of the old "magic" finalize flow.
+// They have been replaced by:
+//   - `type: imagebuild` steps for dev image publication
+//   - `type: gitops_sync` steps for ops repo handoff
+// The old functions are preserved in git history (commit before this change).
+
+// (end of removed deployment handoff section)
+
+// detect_and_write_deployment, gitops_handoff, write_file_to_ops_repo,
+// detect_and_publish_dev_image, upsert_preview_deployment — no longer called
+// from finalize_pipeline. Replaced by explicit gitops_sync and imagebuild steps.
+// Kept temporarily for reference; will be removed in cleanup pass.
+#[allow(dead_code)]
 async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, project_id: Uuid) {
     let dev_step_name = super::trigger::DEV_IMAGE_STEP_NAME;
     let image_steps = sqlx::query!(
@@ -2034,15 +2707,23 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
         return;
     };
 
-    let project_name = sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten();
+    // Project info (name + repo_path)
+    let project = sqlx::query!(
+        "SELECT name, repo_path FROM projects WHERE id = $1 AND is_active = true",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(project) = project else {
+        return;
+    };
 
     // Use node_registry_url for image refs (containerd pulls from this URL)
     let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
-    let name = project_name.as_deref().unwrap_or("unknown");
+    let name = &project.name;
     let tag = pipeline_meta.commit_sha.as_deref().unwrap_or("latest");
     let image_ref = format!("{registry}/{name}/app:{tag}");
 
@@ -2054,23 +2735,8 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
 
     let is_main = matches!(branch, "main" | "master");
 
-    if is_main {
-        // Publish ImageBuilt event — the event bus handler will commit to
-        // the ops repo and trigger deployment.
-        let event = crate::store::eventbus::PlatformEvent::ImageBuilt {
-            project_id,
-            environment: "production".into(),
-            image_ref: image_ref.clone(),
-            pipeline_id,
-            triggered_by: pipeline_meta.triggered_by,
-        };
-        if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
-            tracing::error!(error = %e, %project_id, "failed to publish ImageBuilt event");
-        }
-
-        tracing::info!(%project_id, %image_ref, "ImageBuilt event published from pipeline");
-    } else {
-        // Preview deployments bypass the event bus (no ops repo)
+    if !is_main {
+        // Preview deployments bypass the ops repo
         if let Err(e) = upsert_preview_deployment(
             state,
             pipeline_id,
@@ -2083,11 +2749,168 @@ async fn detect_and_write_deployment(state: &AppState, pipeline_id: Uuid, projec
         {
             tracing::error!(error = %e, %project_id, %branch, "failed to upsert preview deployment");
         }
+        return;
+    }
+
+    // --- GitOps flow for main branch ---
+    let step_names: Vec<String> = image_steps.iter().map(|s| s.name.clone()).collect();
+    gitops_handoff(
+        state,
+        project_id,
+        &project.name,
+        project.repo_path.as_deref(),
+        pipeline_meta.commit_sha.as_deref(),
+        &step_names,
+        &image_ref,
+        tag,
+    )
+    .await;
+}
+
+/// `GitOps` hand-off: sync `deploy/`, write values + `platform.yaml` to ops repo,
+/// then publish `OpsRepoUpdated`.
+#[allow(clippy::too_many_arguments, dead_code)]
+async fn gitops_handoff(
+    state: &AppState,
+    project_id: Uuid,
+    project_name: &str,
+    project_repo_path: Option<&str>,
+    commit_sha: Option<&str>,
+    step_names: &[String],
+    image_ref: &str,
+    tag: &str,
+) {
+    // Look up ops repo for this project
+    let ops_repo = sqlx::query!(
+        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(ops_repo) = ops_repo else {
+        tracing::warn!(%project_id, "no ops repo found, skipping deployment hand-off");
+        return;
+    };
+
+    // Read .platform.yaml from project repo at this commit
+    let sha = commit_sha.unwrap_or("HEAD");
+    let platform_yaml = if let Some(repo_path) = project_repo_path {
+        crate::deployer::ops_repo::read_file_at_ref(
+            std::path::Path::new(repo_path),
+            sha,
+            ".platform.yaml",
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+
+    // Parse for deploy config (enable_staging, etc.)
+    let platform_file: Option<crate::pipeline::definition::PlatformFile> = platform_yaml
+        .as_ref()
+        .and_then(|y| serde_yaml::from_str(y).ok());
+
+    let enable_staging = platform_file
+        .as_ref()
+        .and_then(|pf| pf.deploy.as_ref())
+        .is_some_and(|d| d.enable_staging);
+
+    // Check for canary image step
+    let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
+    let has_canary_step = step_names
+        .iter()
+        .any(|s| s.to_lowercase().contains("canary"));
+    let canary_image_ref = format!("{registry}/{project_name}/canary:{tag}");
+
+    let ops_path = std::path::PathBuf::from(&ops_repo.repo_path);
+
+    // 1. Sync deploy/ from project repo to ops repo
+    if let Some(repo_path) = project_repo_path
+        && let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
+            std::path::Path::new(repo_path),
+            &ops_path,
+            &ops_repo.branch,
+            sha,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to sync deploy/ to ops repo");
+    }
+
+    // 2. Write platform.yaml to ops repo root
+    if let Some(ref yaml_content) = platform_yaml {
+        write_file_to_ops_repo(&ops_path, &ops_repo.branch, "platform.yaml", yaml_content).await;
+    }
+
+    // 3. Determine target branch and environment
+    let (target_branch, environment) = if enable_staging {
+        ("staging", "staging")
+    } else {
+        (ops_repo.branch.as_str(), "production")
+    };
+
+    // 4. Build values and commit to ops repo
+    let mut values = serde_json::json!({
+        "image_ref": image_ref,
+        "project_name": project_name,
+        "environment": environment,
+    });
+    if has_canary_step {
+        values["canary_image_ref"] = serde_json::Value::String(canary_image_ref);
+    }
+
+    let ops_commit_sha = match crate::deployer::ops_repo::commit_values(
+        &ops_path,
+        target_branch,
+        environment,
+        &values,
+    )
+    .await
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            tracing::error!(error = %e, %project_id, "failed to commit values to ops repo");
+            return;
+        }
+    };
+
+    // 5. Publish OpsRepoUpdated event
+    let event = crate::store::eventbus::PlatformEvent::OpsRepoUpdated {
+        project_id,
+        ops_repo_id: ops_repo.id,
+        environment: environment.into(),
+        commit_sha: ops_commit_sha,
+        image_ref: image_ref.to_owned(),
+    };
+    if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
+        tracing::error!(error = %e, %project_id, "failed to publish OpsRepoUpdated event");
+    }
+
+    tracing::info!(%project_id, %image_ref, %environment, "deployment handed off to ops repo");
+}
+
+/// Best-effort write of a single file to the ops repo.
+#[allow(dead_code)]
+async fn write_file_to_ops_repo(
+    ops_path: &std::path::Path,
+    branch: &str,
+    file_path: &str,
+    content: &str,
+) {
+    if let Err(e) =
+        crate::deployer::ops_repo::write_file_to_repo(ops_path, branch, file_path, content).await
+    {
+        tracing::warn!(error = %e, %file_path, "failed to write file to ops repo");
     }
 }
 
 /// If a `build-dev-image` step succeeded, publish a `DevImageBuilt` event so
 /// the project's `agent_image` is updated.
+#[allow(dead_code)]
 #[tracing::instrument(skip(state), fields(%pipeline_id, %project_id))]
 async fn detect_and_publish_dev_image(state: &AppState, pipeline_id: Uuid, project_id: Uuid) {
     let dev_step_name = super::trigger::DEV_IMAGE_STEP_NAME;
@@ -2137,6 +2960,7 @@ async fn detect_and_publish_dev_image(state: &AppState, pipeline_id: Uuid, proje
 }
 
 /// Create or update a preview deployment for a non-main branch.
+#[allow(dead_code)]
 #[tracing::instrument(skip(state), fields(%pipeline_id, %project_id, %branch), err)]
 async fn upsert_preview_deployment(
     state: &AppState,
@@ -2148,24 +2972,31 @@ async fn upsert_preview_deployment(
 ) -> Result<(), anyhow::Error> {
     let branch_slug = crate::pipeline::slugify_branch(branch);
 
-    sqlx::query!(
-        r#"INSERT INTO preview_deployments
-            (project_id, branch, branch_slug, image_ref, pipeline_id, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (project_id, branch_slug) DO UPDATE SET
-            image_ref = EXCLUDED.image_ref,
-            pipeline_id = EXCLUDED.pipeline_id,
-            desired_status = 'active',
-            current_status = 'pending',
-            expires_at = now() + (preview_deployments.ttl_hours || ' hours')::interval,
-            updated_at = now()"#,
-        project_id,
-        branch,
-        branch_slug,
-        image_ref,
-        pipeline_id,
-        triggered_by,
+    // Upsert preview deploy target + create release
+    let target_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO deploy_targets (project_id, name, environment, branch, branch_slug, ttl_hours, expires_at, created_by)
+         VALUES ($1, $2, 'preview', $3, $4, 24, now() + interval '24 hours', $5)
+         ON CONFLICT (project_id, environment, branch_slug) DO UPDATE SET
+             expires_at = now() + interval '24 hours',
+             is_active = true
+         RETURNING id",
     )
+    .bind(project_id)
+    .bind(format!("preview-{branch_slug}"))
+    .bind(branch)
+    .bind(&branch_slug)
+    .bind(triggered_by)
+    .fetch_one(&state.pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO deploy_releases (target_id, project_id, image_ref, pipeline_id, strategy)
+         VALUES ($1, $2, $3, $4, 'rolling')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .bind(image_ref)
+    .bind(pipeline_id)
     .execute(&state.pool)
     .await?;
 
@@ -2176,6 +3007,9 @@ async fn upsert_preview_deployment(
         image = %image_ref,
         "preview deployment upserted"
     );
+
+    // Wake reconciler to process the preview release
+    state.deploy_notify.notify_one();
 
     // Fire webhook for preview event
     crate::api::webhooks::fire_webhooks(
@@ -2840,6 +3674,8 @@ mod tests {
             depends_on: vec![],
             environment: None,
             gate: false,
+            step_type: "command".into(),
+            step_config: None,
         };
         assert!(step_condition_from_row(&row).is_none());
     }
@@ -2858,6 +3694,8 @@ mod tests {
             depends_on: vec![],
             environment: None,
             gate: false,
+            step_type: "command".into(),
+            step_config: None,
         };
         let cond = step_condition_from_row(&row).unwrap();
         assert_eq!(cond.events, vec!["mr"]);

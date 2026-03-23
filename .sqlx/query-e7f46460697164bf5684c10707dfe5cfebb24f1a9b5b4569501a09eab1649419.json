@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE llm_provider_configs\n        SET validation_status = $2, last_validated_at = now(), updated_at = now()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e7f46460697164bf5684c10707dfe5cfebb24f1a9b5b4569501a09eab1649419"
+}

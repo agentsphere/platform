@@ -42,13 +42,15 @@ pub enum LoopOutcome {
 /// - `handle.cancelled` is set → stopped
 /// - `MAX_TOOL_ROUNDS` reached → safety limit
 #[allow(clippy::too_many_lines)]
-#[tracing::instrument(skip(state, handle, initial_prompt, oauth_token, anthropic_api_key), fields(session_id = %handle.session_id), err)]
+#[tracing::instrument(skip(state, handle, initial_prompt, oauth_token, anthropic_api_key, extra_env, model_override), fields(session_id = %handle.session_id), err)]
 pub async fn run_create_app_loop(
     state: &AppState,
     handle: Arc<CliSessionHandle>,
     initial_prompt: String,
     oauth_token: Option<String>,
     anthropic_api_key: Option<String>,
+    extra_env: Vec<(String, String)>,
+    model_override: Option<String>,
 ) -> Result<LoopOutcome, AgentError> {
     handle.busy.store(true, Ordering::Relaxed);
     let session_id = handle.session_id;
@@ -95,6 +97,8 @@ pub async fn run_create_app_loop(
             oauth_token: oauth_token.clone(),
             anthropic_api_key: anthropic_api_key.clone(),
             max_turns: Some(1),
+            extra_env: extra_env.clone(),
+            model_override: model_override.clone(),
         };
 
         let (response, result_msg) = match cli_invoke::invoke_cli(params, &state.valkey).await {
@@ -213,6 +217,8 @@ pub async fn run_pending_messages(
     handle: Arc<CliSessionHandle>,
     oauth_token: Option<String>,
     anthropic_api_key: Option<String>,
+    extra_env: Vec<(String, String)>,
+    model_override: Option<String>,
 ) {
     let pending = drain_pending(&handle).await;
     if pending.is_empty() {
@@ -220,7 +226,17 @@ pub async fn run_pending_messages(
     }
 
     let session_id = handle.session_id;
-    match run_create_app_loop(state, handle, pending, oauth_token, anthropic_api_key).await {
+    match run_create_app_loop(
+        state,
+        handle,
+        pending,
+        oauth_token,
+        anthropic_api_key,
+        extra_env,
+        model_override,
+    )
+    .await
+    {
         Ok(LoopOutcome::Completed | LoopOutcome::Cancelled) => {
             let _ = sqlx::query(
                 "UPDATE agent_sessions SET status = 'completed', finished_at = now() \

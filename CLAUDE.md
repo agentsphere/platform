@@ -15,8 +15,8 @@ just deny           # cargo deny check
 just check          # fmt + lint + deny
 just test           # cargo nextest run (all tests)
 just test-unit      # cargo nextest run --lib (unit only, no DB)
-just test-integration  # integration tests (ephemeral Kind services)
-just test-e2e       # E2E tests (ephemeral Kind services, run-ignored)
+just test-integration  # integration tests (ephemeral cluster services)
+just test-e2e       # E2E tests (ephemeral cluster services, run-ignored)
 just test-all       # unit + integration + e2e (all except LLM)
 just test-doc       # cargo test --doc
 just ui             # build Preact SPA (esbuild)
@@ -32,8 +32,8 @@ just cov-unit       # unit test coverage → coverage-unit.lcov
 just cov-integration # integration coverage → coverage-integration.lcov
 just cov-e2e        # E2E coverage → coverage-e2e.lcov
 just cov-all        # all tiers combined → coverage-all.lcov
-just cov-total      # ★ combined report: unit + integration + E2E (needs Kind + DB)
-just cov-diff       # diff coverage on changed lines vs main (unit+int+E2E, needs Kind)
+just cov-total      # ★ combined report: unit + integration + E2E (needs cluster + DB)
+just cov-diff       # diff coverage on changed lines vs main (unit+int+E2E, needs cluster)
 just cov-diff-check # diff coverage strict: fail if changed lines < 100% covered
 just cov-html       # unit coverage as HTML report
 just cov-summary    # quick terminal summary (unit + integration)
@@ -610,7 +610,7 @@ just ci-full          # fmt + lint + deny + test-unit + test-integration + test-
 If `just ci-full` is too slow for iterative development, run at minimum:
 ```bash
 just test-unit        # fast (~1s), run after every code change
-just test-integration # after API/DB/auth changes (~2.5 min, requires Kind cluster)
+just test-integration # after API/DB/auth changes (~2.5 min, requires dev cluster)
 just test-e2e         # after multi-step workflow changes (~2.5 min)
 ```
 
@@ -618,7 +618,7 @@ just test-e2e         # after multi-step workflow changes (~2.5 min)
 
 ### MANDATORY: Read test report after in-cluster tests
 
-`just test-integration`, `just test-e2e`, and `just cov-total` run tests inside the Kind cluster via `hack/test-in-cluster.sh`. Each run has a unique `RUN_ID` (8-char hex) and writes a JUnit-based test report to **`test-report-{RUN_ID}.txt`** in the project root. **Always read the matching `test-report-*.txt` file after any in-cluster test run** to check the pass/fail summary and identify any failures — do not rely solely on the exit code or terminal tail output. The RUN_ID is printed early in the test output (look for `platform-test-{RUN_ID}` namespace lines).
+`just test-integration`, `just test-e2e`, and `just cov-total` run tests inside the dev cluster via `hack/test-in-cluster.sh`. Each run has a unique `RUN_ID` (8-char hex) and writes a JUnit-based test report to **`test-report-{RUN_ID}.txt`** in the project root. **Always read the matching `test-report-*.txt` file after any in-cluster test run** to check the pass/fail summary and identify any failures — do not rely solely on the exit code or terminal tail output. The RUN_ID is printed early in the test output (look for `platform-test-{RUN_ID}` namespace lines).
 
 ### Test Tier Boundary: Endpoint Scope vs User Journey
 
@@ -702,7 +702,7 @@ state.pipeline_notify.notify_one();  // wake executor after trigger
 
 **Use dynamic queries in test files** — `sqlx::query()` not `sqlx::query!()` in `tests/`.
 
-**Git repos under `/tmp/platform-e2e/`** — shared mount between host and Kind node.
+**Git repos under `/tmp/platform-e2e/`** — shared mount between host and cluster node.
 
 **Mock CLI for integration tests** — `test_state_with_cli(pool, true)` sets `CLAUDE_CLI_PATH` to `tests/fixtures/mock-claude-cli.sh` and enables `cli_spawn_enabled`. The mock script exits instantly with canned NDJSON.
 

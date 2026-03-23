@@ -393,6 +393,8 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
         )}
       </div>
 
+      <SessionLogs sessionId={sessionId!} />
+
       {secretRequest && projectId && (
         <SecretRequestModal
           open={!!secretRequest}
@@ -409,6 +411,46 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
           }}
           onClose={() => setSecretRequest(null)}
         />
+      )}
+    </div>
+  );
+}
+
+function SessionLogs({ sessionId }: { sessionId: string }) {
+  const [logs, setLogs] = useState<any[]>([]);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    api.get(`/api/observe/logs?session_id=${sessionId}&range=24h&limit=50`)
+      .then((r: any) => setLogs(r.items || []))
+      .catch(() => {});
+  }, [sessionId, open]);
+
+  return (
+    <div class="card" style="margin-top:1rem">
+      <div style="cursor:pointer;padding:0.75rem 1rem;display:flex;justify-content:space-between;align-items:center"
+        onClick={() => setOpen(!open)}>
+        <strong>Platform Logs</strong>
+        <span>{open ? '\u25B2' : '\u25BC'}</span>
+      </div>
+      {open && (
+        <div style="padding:0 1rem 0.75rem">
+          {logs.length === 0 ? (
+            <div class="text-muted text-sm">No platform logs found for this session</div>
+          ) : (
+            <div class="log-list">
+              {logs.map((entry: any) => (
+                <div key={entry.id} class="log-entry" style="padding:0.25rem 0">
+                  <span class="mono text-xs" style="margin-right:0.5rem">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                  <span class="text-xs" style="margin-right:0.5rem;opacity:0.6">{entry.source}</span>
+                  <span class="text-xs" style="margin-right:0.5rem">{entry.level}</span>
+                  <span class="text-sm">{entry.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

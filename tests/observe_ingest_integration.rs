@@ -578,90 +578,145 @@ async fn otlp_ingest_deduplicates_project_auth(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — Phase 5B: OTLP token auto-creation
+// Tests — Phase 5B: Scoped token auto-creation
 // ---------------------------------------------------------------------------
 
-/// `ensure_otlp_token` creates a project-scoped API token with observe:write scope.
+/// `ensure_scoped_tokens` creates project-scoped API tokens (otel + api).
 #[sqlx::test(migrations = "./migrations")]
-async fn ensure_otlp_token_creates_scoped_token(pool: PgPool) {
+async fn ensure_scoped_tokens_creates_both_tokens(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
 
     let app = helpers::test_router(state.clone());
     let project_id =
-        helpers::create_project(&app, &admin_token, "otlp-token-proj", "private").await;
+        helpers::create_project(&app, &admin_token, "scoped-token-proj", "private").await;
 
-    // Call ensure_otlp_token directly
-    let raw_token = platform::deployer::reconciler::ensure_otlp_token(&state, project_id)
-        .await
-        .expect("ensure_otlp_token should succeed");
+    // Call ensure_scoped_tokens directly
+    let (otel_token, api_token) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "prod")
+            .await
+            .expect("ensure_scoped_tokens should succeed");
 
-    // Verify the token was created
+    // Verify both tokens were created
     assert!(
-        raw_token.starts_with("plat_api_"),
-        "token should have platform prefix"
+        otel_token.starts_with("plat_api_"),
+        "otel token should have platform prefix"
+    );
+    assert!(
+        api_token.starts_with("plat_api_"),
+        "api token should have platform prefix"
+    );
+    assert_ne!(otel_token, api_token, "tokens should be distinct");
+
+    // Verify OTEL token DB entry: project_id, scopes
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-prod-{proj8}");
+    let otel_row: (Vec<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT scopes, project_id FROM api_tokens WHERE name = $1 LIMIT 1")
+            .bind(&otel_name)
+            .fetch_one(&pool)
+            .await
+            .expect("otel token row should exist");
+
+    assert!(
+        otel_row.0.contains(&"observe:write".to_string()),
+        "otel token should have observe:write scope, got: {:?}",
+        otel_row.0
+    );
+    assert_eq!(
+        otel_row.1,
+        Some(project_id),
+        "otel token should be scoped to project"
     );
 
-    // Verify DB entry: project_id, scopes, expiry
-    let row: (Vec<String>, Option<Uuid>) = sqlx::query_as(
-        "SELECT scopes, project_id FROM api_tokens WHERE name LIKE 'otlp-auto-%' ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("token row should exist");
+    // Verify API token DB entry: project_id, scopes
+    let api_name = format!("api-prod-{proj8}");
+    let api_row: (Vec<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT scopes, project_id FROM api_tokens WHERE name = $1 LIMIT 1")
+            .bind(&api_name)
+            .fetch_one(&pool)
+            .await
+            .expect("api token row should exist");
 
     assert!(
-        row.0.contains(&"observe:write".to_string()),
-        "token should have observe:write scope, got: {:?}",
-        row.0
+        api_row.0.contains(&"project:read".to_string()),
+        "api token should have project:read scope, got: {:?}",
+        api_row.0
     );
-    assert_eq!(row.1, Some(project_id), "token should be scoped to project");
+    assert_eq!(
+        api_row.1,
+        Some(project_id),
+        "api token should be scoped to project"
+    );
 }
 
-/// `ensure_otlp_token` rotates (replaces) existing tokens.
+/// `ensure_scoped_tokens` rotates (replaces) existing tokens.
 #[sqlx::test(migrations = "./migrations")]
-async fn ensure_otlp_token_rotates_existing(pool: PgPool) {
+async fn ensure_scoped_tokens_rotates_existing(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
 
     let app = helpers::test_router(state.clone());
     let project_id =
-        helpers::create_project(&app, &admin_token, "otlp-rotate-proj", "private").await;
+        helpers::create_project(&app, &admin_token, "scoped-rotate-proj", "private").await;
 
-    // Create first token
-    let token1 = platform::deployer::reconciler::ensure_otlp_token(&state, project_id)
-        .await
-        .expect("first ensure_otlp_token");
+    // Create first pair
+    let (otel1, api1) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging")
+            .await
+            .expect("first ensure_scoped_tokens");
 
-    // Create second token (should replace the first)
-    let token2 = platform::deployer::reconciler::ensure_otlp_token(&state, project_id)
-        .await
-        .expect("second ensure_otlp_token");
+    // Create second pair (should replace the first)
+    let (otel2, api2) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging")
+            .await
+            .expect("second ensure_scoped_tokens");
 
     // Tokens should be different (new raw token each time)
-    assert_ne!(token1, token2, "rotated tokens should differ");
+    assert_ne!(otel1, otel2, "rotated otel tokens should differ");
+    assert_ne!(api1, api2, "rotated api tokens should differ");
 
-    // Only one token should remain for this project
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM api_tokens WHERE project_id = $1 AND scopes @> ARRAY['observe:write']",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count.0, 1, "old token should be deleted after rotation");
+    // Only one otel token should remain for this scope
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-staging-{proj8}");
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE project_id = $1 AND name = $2")
+            .bind(project_id)
+            .bind(&otel_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, 1,
+        "old otel token should be deleted after rotation"
+    );
+
+    // Only one api token should remain for this scope
+    let api_name = format!("api-staging-{proj8}");
+    let count2: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE project_id = $1 AND name = $2")
+            .bind(project_id)
+            .bind(&api_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count2.0, 1,
+        "old api token should be deleted after rotation"
+    );
 }
 
-/// `ensure_otlp_token` returns an error for a nonexistent project.
+/// `ensure_scoped_tokens` returns an error for a nonexistent project.
 #[sqlx::test(migrations = "./migrations")]
-async fn ensure_otlp_token_nonexistent_project_returns_error(pool: PgPool) {
+async fn ensure_scoped_tokens_nonexistent_project_returns_error(pool: PgPool) {
     let (state, _admin_token) = test_state(pool).await;
 
     let fake_project_id = uuid::Uuid::new_v4();
-    let result = platform::deployer::reconciler::ensure_otlp_token(&state, fake_project_id).await;
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, fake_project_id, "prod").await;
 
     assert!(result.is_err(), "should fail for nonexistent project");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("project not found"),
-        "error should mention 'project not found', got: {err_msg}"
+        err_msg.contains("project") && err_msg.contains("not found"),
+        "error should mention project not found, got: {err_msg}"
     );
 }

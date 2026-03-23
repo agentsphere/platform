@@ -48,6 +48,7 @@ async fn insert_test_log(pool: &PgPool, service: &str, level: &str, message: &st
         user_id: None,
         service: service.into(),
         level: level.into(),
+        source: "external".into(),
         message: message.into(),
         attributes: None,
     };
@@ -608,6 +609,7 @@ async fn rotate_logs_archives_old_data(pool: PgPool) {
         user_id: None,
         service: "rotate-svc".into(),
         level: "info".into(),
+        source: "external".into(),
         message: "old log for rotation".into(),
         attributes: None,
     };
@@ -973,6 +975,7 @@ async fn search_logs_time_range(pool: PgPool) {
         user_id: None,
         service: svc.clone(),
         level: "info".into(),
+        source: "external".into(),
         message: "recent log".into(),
         attributes: None,
     };
@@ -1031,6 +1034,7 @@ async fn search_logs_by_trace_id(pool: PgPool) {
         user_id: None,
         service: "trace-log-svc".into(),
         level: "info".into(),
+        source: "external".into(),
         message: "log with trace".into(),
         attributes: None,
     };
@@ -1102,6 +1106,7 @@ async fn search_logs_by_project_id(pool: PgPool) {
         user_id: None,
         service: "proj-log-svc".into(),
         level: "warn".into(),
+        source: "external".into(),
         message: "project-scoped log".into(),
         attributes: None,
     };
@@ -1977,6 +1982,7 @@ async fn search_logs_with_attributes(pool: PgPool) {
         user_id: None,
         service: svc.clone(),
         level: "info".into(),
+        source: "external".into(),
         message: "log with attrs".into(),
         attributes: Some(serde_json::json!({"request_id": "abc-123", "duration_ms": 42})),
     };
@@ -2017,6 +2023,7 @@ async fn search_logs_by_session_id(pool: PgPool) {
         user_id: None,
         service: "sess-log-svc".into(),
         level: "info".into(),
+        source: "external".into(),
         message: "session-scoped log".into(),
         attributes: None,
     };

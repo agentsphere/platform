@@ -116,7 +116,9 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
             platform::health::HealthSnapshot::default(),
         )),
         task_registry: std::sync::Arc::new(platform::health::TaskRegistry::new()),
-        cli_auth_manager: std::sync::Arc::new(platform::onboarding::claude_auth::CliAuthManager::new()),
+        cli_auth_manager: std::sync::Arc::new(
+            platform::onboarding::claude_auth::CliAuthManager::new(),
+        ),
     };
 
     (state, setup_token)

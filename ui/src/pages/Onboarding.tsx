@@ -3,7 +3,8 @@ import { api } from '../lib/api';
 
 type OrgType = 'solo' | 'startup' | 'tech_org' | 'exploring';
 type PasskeyPolicy = 'optional' | 'recommended' | 'mandatory';
-type AuthMethod = 'oauth' | 'api_key' | null;
+type AuthMethod = 'oauth' | 'api_key' | 'custom' | null;
+type CustomProviderType = 'bedrock' | 'vertex' | 'azure_foundry' | 'custom_endpoint' | null;
 
 interface WizardResponse {
   success: boolean;
@@ -33,6 +34,12 @@ export function Onboarding() {
   const [tokenVerifying, setTokenVerifying] = useState(false);
   const [tokenValid, setTokenValid] = useState<boolean | null>(null);
   const [tokenError, setTokenError] = useState<string | null>(null);
+
+  // Custom provider state
+  const [customProvider, setCustomProvider] = useState<CustomProviderType>(null);
+  const [customEnvVars, setCustomEnvVars] = useState<Record<string, string>>({});
+  const [customModel, setCustomModel] = useState('');
+  const [customLabel, setCustomLabel] = useState('');
 
   // OAuth CLI flow state
   const [cliStarting, setCliStarting] = useState(false);
@@ -177,6 +184,15 @@ export function Onboarding() {
       if (authMethod === 'api_key' && apiKey.trim()) {
         body.provider_key = apiKey;
       }
+      // If custom provider was configured, include it
+      if (authMethod === 'custom' && customProvider) {
+        body.custom_provider = {
+          provider_type: customProvider,
+          env_vars: customEnvVars,
+          model: customModel || undefined,
+          label: customLabel || undefined,
+        };
+      }
       // OAuth token or code flow — tokens are already stored server-side by
       // verify-token or /code endpoints, no need to send again.
 
@@ -315,6 +331,18 @@ export function Onboarding() {
                 </div>
                 <div style="font-size:12px;color:var(--text-muted)">
                   Billed separately through the Anthropic API. Pay per token used.
+                </div>
+              </div>
+
+              <div
+                class={`auth-option-card${authMethod === 'custom' ? ' selected' : ''}`}
+                onClick={() => setAuthMethod('custom')}
+              >
+                <div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:0.25rem">
+                  Custom Provider
+                </div>
+                <div style="font-size:12px;color:var(--text-muted)">
+                  AWS Bedrock, Vertex AI, Azure Foundry, or any Claude CLI-compatible endpoint.
                 </div>
               </div>
             </div>
@@ -480,6 +508,141 @@ export function Onboarding() {
                     </p>
                   )}
                 </div>
+              </div>
+            )}
+
+            {/* Custom Provider flow */}
+            {authMethod === 'custom' && (
+              <div class="auth-input-area">
+                {/* Sub-option cards */}
+                {!customProvider && (
+                  <div class="auth-option-grid" style="grid-template-columns:repeat(2,1fr)">
+                    {([
+                      ['bedrock', 'AWS Bedrock'] as const,
+                      ['vertex', 'Vertex AI'] as const,
+                      ['azure_foundry', 'Azure Foundry'] as const,
+                      ['custom_endpoint', 'Custom Endpoint'] as const,
+                    ]).map(([type, title]) => (
+                      <div
+                        key={type}
+                        class="auth-option-card"
+                        onClick={() => {
+                          setCustomProvider(type);
+                          setCustomEnvVars({});
+                        }}
+                      >
+                        <div style="font-size:13px;font-weight:600;color:var(--text-primary)">{title}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Provider-specific env var fields */}
+                {customProvider && (
+                  <div>
+                    <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem">
+                      <button class="btn btn-ghost btn-xs" onClick={() => setCustomProvider(null)}>
+                        ← Back
+                      </button>
+                      <span style="font-size:13px;font-weight:600;color:var(--text-primary)">
+                        {customProvider === 'bedrock' && 'AWS Bedrock'}
+                        {customProvider === 'vertex' && 'Vertex AI'}
+                        {customProvider === 'azure_foundry' && 'Azure Foundry'}
+                        {customProvider === 'custom_endpoint' && 'Custom Endpoint'}
+                      </span>
+                    </div>
+
+                    {customProvider === 'bedrock' && (
+                      <>
+                        <div class="form-group">
+                          <label>AWS Access Key ID</label>
+                          <input class="input" placeholder="AKIA..."
+                            value={customEnvVars['AWS_ACCESS_KEY_ID'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, AWS_ACCESS_KEY_ID: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                        <div class="form-group">
+                          <label>AWS Secret Access Key</label>
+                          <input class="input" type="password" placeholder="..."
+                            value={customEnvVars['AWS_SECRET_ACCESS_KEY'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, AWS_SECRET_ACCESS_KEY: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                        <div class="form-group">
+                          <label>AWS Region (optional)</label>
+                          <input class="input" placeholder="us-east-1"
+                            value={customEnvVars['AWS_REGION'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, AWS_REGION: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    {customProvider === 'vertex' && (
+                      <>
+                        <div class="form-group">
+                          <label>Vertex Project ID</label>
+                          <input class="input" placeholder="my-gcp-project"
+                            value={customEnvVars['ANTHROPIC_VERTEX_PROJECT_ID'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, ANTHROPIC_VERTEX_PROJECT_ID: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                        <div class="form-group">
+                          <label>Region (optional, default: global)</label>
+                          <input class="input" placeholder="global"
+                            value={customEnvVars['CLOUD_ML_REGION'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, CLOUD_ML_REGION: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    {customProvider === 'azure_foundry' && (
+                      <div class="form-group">
+                        <label>Foundry API Key</label>
+                        <input class="input" type="password" placeholder="..."
+                          value={customEnvVars['ANTHROPIC_FOUNDRY_API_KEY'] || ''}
+                          onInput={(e) => setCustomEnvVars(v => ({...v, ANTHROPIC_FOUNDRY_API_KEY: (e.target as HTMLInputElement).value}))}
+                        />
+                      </div>
+                    )}
+
+                    {customProvider === 'custom_endpoint' && (
+                      <>
+                        <div class="form-group">
+                          <label>Base URL</label>
+                          <input class="input" placeholder="https://litellm.example.com/v1"
+                            value={customEnvVars['ANTHROPIC_BASE_URL'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, ANTHROPIC_BASE_URL: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                        <div class="form-group">
+                          <label>API Key</label>
+                          <input class="input" type="password" placeholder="sk-..."
+                            value={customEnvVars['ANTHROPIC_API_KEY'] || ''}
+                            onInput={(e) => setCustomEnvVars(v => ({...v, ANTHROPIC_API_KEY: (e.target as HTMLInputElement).value}))}
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    <div class="form-group">
+                      <label>Model (optional)</label>
+                      <input class="input" placeholder="e.g. us.anthropic.claude-sonnet-4-5-20250929-v2:0"
+                        value={customModel}
+                        onInput={(e) => setCustomModel((e.target as HTMLInputElement).value)}
+                      />
+                    </div>
+
+                    <div class="form-group">
+                      <label>Label (optional)</label>
+                      <input class="input" placeholder="My AWS Account"
+                        value={customLabel}
+                        onInput={(e) => setCustomLabel((e.target as HTMLInputElement).value)}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

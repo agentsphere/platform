@@ -426,6 +426,8 @@ async fn llm_invoke_cli_completes() {
         oauth_token: oauth,
         anthropic_api_key: api_key,
         max_turns: Some(1),
+        extra_env: vec![],
+        model_override: None,
     };
 
     let result = tokio::time::timeout(

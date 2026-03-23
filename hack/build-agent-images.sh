@@ -81,7 +81,7 @@ if [[ "$FORCE" == "false" && -f "${RUNNER_DIR}/arm64" && -f "${RUNNER_DIR}/amd64
   echo "    cached"
 else
   echo "    building..."
-  cd "${PROJECT_DIR}" && just cli-cross "${RUNNER_DIR}"
+  cd "${PROJECT_DIR}" && just cli cross "${RUNNER_DIR}"
   echo "${RUNNER_CURRENT_CHECKSUM}" > "${RUNNER_CHECKSUM_FILE}"
 fi
 

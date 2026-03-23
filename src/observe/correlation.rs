@@ -72,6 +72,9 @@ pub async fn resolve_session(
         if envelope.user_id.is_none() {
             envelope.user_id = Some(row.get::<Uuid, _>("user_id"));
         }
+    } else {
+        // Session not found — clear to avoid FK violation on log_entries.session_id
+        envelope.session_id = None;
     }
 
     Ok(())

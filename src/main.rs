@@ -7,6 +7,7 @@ use tokio::signal;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tracing::Instrument;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod audit;
@@ -60,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Platform self-observe: capture warn+ logs into the observe pipeline
     let self_observe_level = observe::tracing_layer::parse_level(
-        &std::env::var("PLATFORM_SELF_OBSERVE_LEVEL").unwrap_or_else(|_| "warn".into()),
+        &std::env::var("PLATFORM_SELF_OBSERVE_LEVEL").unwrap_or_else(|_| "info".into()),
     );
     let (platform_logs_tx, platform_logs_rx) = observe::tracing_layer::create_channel();
     let platform_log_layer =
@@ -237,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::disable())
                 .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
         )
+        .layer(axum::middleware::from_fn(request_tracing_middleware))
         .with_state(state)
         .fallback(ui::static_handler)
         // Default body limit: 10 MB for API endpoints.
@@ -271,6 +273,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn request_tracing_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let span = tracing::info_span!("http_request",
+        http.method = %method,
+        http.path = %path,
+        http.status_code = tracing::field::Empty,
+        user_id = tracing::field::Empty,
+        user_type = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        source = "api",
+    );
+    async {
+        let response = next.run(request).await;
+        tracing::Span::current().record("http.status_code", response.status().as_u16());
+        response
+    }
+    .instrument(span)
+    .await
+}
+
 fn spawn_background_tasks(
     state: &store::AppState,
     pool: &sqlx::PgPool,
@@ -285,7 +311,9 @@ fn spawn_background_tasks(
         state.clone(),
         shutdown_tx.subscribe(),
     ));
-    tokio::spawn(deployer::preview::run(
+    // Preview cleanup merged into reconciler::cleanup_expired_previews()
+    // deployer::preview::run() removed — preview_deployments table dropped.
+    tokio::spawn(deployer::analysis::run(
         state.clone(),
         shutdown_tx.subscribe(),
     ));
@@ -317,31 +345,42 @@ async fn run_session_cleanup(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
     loop {
         interval.tick().await;
-        if let Err(e) = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < now()")
+        let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let span = tracing::info_span!(
+            "task_iteration",
+            task_name = "session_cleanup",
+            trace_id = %iter_trace_id,
+            source = "system",
+        );
+        async {
+            if let Err(e) = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < now()")
+                .execute(&pool)
+                .await
+            {
+                tracing::warn!(error = %e, "expired sessions cleanup failed");
+            }
+            if let Err(e) = sqlx::query(
+                "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < now()",
+            )
             .execute(&pool)
             .await
-        {
-            tracing::warn!(error = %e, "expired sessions cleanup failed");
-        }
-        if let Err(e) = sqlx::query(
-            "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < now()",
-        )
-        .execute(&pool)
-        .await
-        {
-            tracing::warn!(error = %e, "expired tokens cleanup failed");
-        }
-        // Evict stale secret requests (completed/timed-out older than 10 minutes)
-        let evict_threshold = std::time::Duration::from_secs(600);
-        if let Ok(mut map) = secret_requests.write() {
-            let before = map.len();
-            map.retain(|_, r| r.created_at.elapsed() < evict_threshold);
-            let evicted = before - map.len();
-            if evicted > 0 {
-                tracing::debug!(evicted, "evicted stale secret requests");
+            {
+                tracing::warn!(error = %e, "expired tokens cleanup failed");
             }
+            // Evict stale secret requests (completed/timed-out older than 10 minutes)
+            let evict_threshold = std::time::Duration::from_secs(600);
+            if let Ok(mut map) = secret_requests.write() {
+                let before = map.len();
+                map.retain(|_, r| r.created_at.elapsed() < evict_threshold);
+                let evicted = before - map.len();
+                if evicted > 0 {
+                    tracing::debug!(evicted, "evicted stale secret requests");
+                }
+            }
+            tracing::debug!("expired sessions/tokens cleanup complete");
         }
-        tracing::debug!("expired sessions/tokens cleanup complete");
+        .instrument(span)
+        .await;
     }
 }
 

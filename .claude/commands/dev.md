@@ -292,12 +292,12 @@ If agent-facing APIs changed:
 ### Run integration tests
 
 ```bash
-just test-integration   # ~2.5 min, requires Kind cluster
+just test-integration   # ~2.5 min, requires dev cluster
 ```
 
 If E2E tests were added/changed:
 ```bash
-just test-e2e           # ~2.5 min, requires Kind cluster
+just test-e2e           # ~2.5 min, requires dev cluster
 ```
 
 ---

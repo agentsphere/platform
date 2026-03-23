@@ -8,6 +8,7 @@
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
 use kube::runtime::watcher;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::provider::{ProgressEvent, ProgressKind};
@@ -34,10 +35,28 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 event = stream.try_next() => {
                     match event {
                         Ok(Some(watcher::Event::Apply(svc) | watcher::Event::InitApply(svc))) => {
-                            handle_service_event(&state, &svc, ProgressKind::IframeAvailable).await;
+                            let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                            let span = tracing::info_span!(
+                                "task_iteration",
+                                task_name = "preview_watcher",
+                                trace_id = %iter_trace_id,
+                                source = "system",
+                            );
+                            async {
+                                handle_service_event(&state, &svc, ProgressKind::IframeAvailable).await;
+                            }.instrument(span).await;
                         }
                         Ok(Some(watcher::Event::Delete(svc))) => {
-                            handle_service_event(&state, &svc, ProgressKind::IframeRemoved).await;
+                            let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                            let span = tracing::info_span!(
+                                "task_iteration",
+                                task_name = "preview_watcher",
+                                trace_id = %iter_trace_id,
+                                source = "system",
+                            );
+                            async {
+                                handle_service_event(&state, &svc, ProgressKind::IframeRemoved).await;
+                            }.instrument(span).await;
                         }
                         Ok(Some(watcher::Event::Init | watcher::Event::InitDone)) => {
                             // Initial list bookkeeping — no action needed

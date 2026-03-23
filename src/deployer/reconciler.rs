@@ -4,6 +4,8 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Secret;
 use kube::Api;
 use kube::api::PostParams;
+use sqlx::Row;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::store::AppState;
@@ -12,15 +14,13 @@ use super::error::DeployerError;
 use super::{applier, ops_repo, renderer};
 
 /// Fixed name for the registry pull secret created in every project namespace.
-/// The secret is a `kubernetes.io/dockerconfigjson` type with credentials scoped
-/// to the project. All deploy templates can reference this name.
 pub const REGISTRY_PULL_SECRET_NAME: &str = "platform-registry-pull";
 
 // ---------------------------------------------------------------------------
 // Background reconciliation loop
 // ---------------------------------------------------------------------------
 
-/// Background task that polls for pending deployments and reconciles them.
+/// Background task that polls for pending releases and reconciles them.
 pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) {
     tracing::info!("deployer reconciler started");
 
@@ -34,113 +34,138 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 break;
             }
             _ = interval.tick() => {
-                match reconcile(&state).await {
-                    Ok(()) => state.task_registry.heartbeat("deployer_reconciler"),
-                    Err(e) => {
-                        state.task_registry.report_error("deployer_reconciler", &e.to_string());
-                        tracing::error!(error = %e, "error polling pending deployments");
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "deployer_reconciler",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    match reconcile(&state).await {
+                        Ok(()) => state.task_registry.heartbeat("deployer_reconciler"),
+                        Err(e) => {
+                            state.task_registry.report_error("deployer_reconciler", &e.to_string());
+                            tracing::error!(error = %e, "error polling pending releases");
+                        }
                     }
-                }
+                }.instrument(span).await;
             }
             () = state.deploy_notify.notified() => {
-                // Immediate poll on notification from event bus
-                if let Err(e) = reconcile(&state).await {
-                    tracing::error!(error = %e, "error polling pending deployments (notified)");
-                }
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "deployer_reconciler",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    if let Err(e) = reconcile(&state).await {
+                        tracing::error!(error = %e, "error polling pending releases (notified)");
+                    }
+                }.instrument(span).await;
                 interval.reset();
             }
         }
     }
 }
 
-/// Find deployments needing reconciliation and spawn tasks for each.
+/// Find releases needing reconciliation and spawn tasks for each.
 async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
-    let pending = sqlx::query!(
-        r#"
-        SELECT d.id, d.project_id, d.environment, d.ops_repo_id,
-               d.manifest_path, d.image_ref, d.values_override,
-               d.desired_status, d.current_status, d.deployed_by,
-               d.tracked_resources,
-               p.name as "project_name!: String",
-               p.namespace_slug as "namespace_slug!: String"
-        FROM deployments d
-        JOIN projects p ON p.id = d.project_id AND p.is_active = true
-        WHERE (d.desired_status = 'active' AND d.current_status IN ('pending', 'failed'))
-           OR (d.desired_status = 'rollback' AND d.current_status != 'syncing')
-           OR (d.desired_status = 'stopped' AND d.current_status NOT IN ('stopped', 'syncing'))
-        LIMIT 5
-        "#,
+    let pending = sqlx::query(
+        "SELECT r.id, r.target_id, r.project_id, r.image_ref, r.commit_sha,
+                r.strategy, r.phase, r.traffic_weight, r.current_step,
+                r.rollout_config, r.values_override, r.deployed_by,
+                r.tracked_resources, r.pipeline_id,
+                dt.environment, dt.ops_repo_id, dt.manifest_path, dt.branch_slug,
+                p.name as project_name, p.namespace_slug
+         FROM deploy_releases r
+         JOIN deploy_targets dt ON dt.id = r.target_id
+         JOIN projects p ON p.id = r.project_id AND p.is_active = true
+         WHERE r.phase IN ('pending','progressing','holding','promoting','rolling_back')
+         ORDER BY r.created_at ASC
+         LIMIT 10",
     )
     .fetch_all(&state.pool)
     .await?;
 
-    for row in pending {
-        let state = state.clone();
+    for row in &pending {
+        let release_id: Uuid = row.get("id");
         let (tracked, skip_prune) = match serde_json::from_value::<Vec<applier::TrackedResource>>(
-            row.tracked_resources.clone(),
+            row.get("tracked_resources"),
         ) {
             Ok(t) => (t, false),
             Err(e) => {
-                tracing::warn!(
-                    deployment_id = %row.id,
-                    error = %e,
-                    "failed to parse tracked_resources, skipping prune"
-                );
+                tracing::warn!(%release_id, error = %e, "failed to parse tracked_resources");
                 (Vec::new(), true)
             }
         };
-        let deployment = PendingDeployment {
-            id: row.id,
-            project_id: row.project_id,
-            environment: row.environment,
-            ops_repo_id: row.ops_repo_id,
-            manifest_path: row.manifest_path,
-            image_ref: row.image_ref,
-            values_override: row.values_override,
-            desired_status: row.desired_status,
-            deployed_by: row.deployed_by,
-            project_name: row.project_name,
-            namespace_slug: row.namespace_slug,
+
+        let release = PendingRelease {
+            id: release_id,
+            target_id: row.get("target_id"),
+            project_id: row.get("project_id"),
+            image_ref: row.get("image_ref"),
+            commit_sha: row.get("commit_sha"),
+            strategy: row.get("strategy"),
+            phase: row.get("phase"),
+            traffic_weight: row.get("traffic_weight"),
+            current_step: row.get("current_step"),
+            rollout_config: row.get("rollout_config"),
+            values_override: row.get("values_override"),
+            deployed_by: row.get("deployed_by"),
+            pipeline_id: row.get("pipeline_id"),
+            environment: row.get("environment"),
+            ops_repo_id: row.get("ops_repo_id"),
+            manifest_path: row.get("manifest_path"),
+            branch_slug: row.get("branch_slug"),
+            project_name: row.get("project_name"),
+            namespace_slug: row.get("namespace_slug"),
             tracked_resources: tracked,
             skip_prune,
         };
 
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = reconcile_one(&state, &deployment).await {
-                tracing::error!(
-                    error = %e,
-                    deployment_id = %deployment.id,
-                    "reconciliation failed"
-                );
-                mark_failed(
-                    &state,
-                    deployment.id,
-                    deployment.deployed_by,
-                    &e.to_string(),
-                )
-                .await;
+            if let Err(e) = reconcile_one(&state, &release).await {
+                tracing::error!(error = %e, release_id = %release.id, "reconciliation failed");
+                mark_failed(&state, &release, &e.to_string()).await;
             }
         });
     }
+
+    // Cleanup expired preview targets
+    cleanup_expired_previews(state).await;
 
     Ok(())
 }
 
 #[derive(Debug)]
-pub struct PendingDeployment {
+#[allow(dead_code)]
+pub struct PendingRelease {
     pub id: Uuid,
+    pub target_id: Uuid,
     pub project_id: Uuid,
+    pub image_ref: String,
+    pub commit_sha: Option<String>,
+    pub strategy: String,
+    pub phase: String,
+    pub traffic_weight: i32,
+    pub current_step: i32,
+    pub rollout_config: serde_json::Value,
+    pub values_override: Option<serde_json::Value>,
+    pub deployed_by: Option<Uuid>,
+    pub pipeline_id: Option<Uuid>,
+    // From deploy_targets
     pub environment: String,
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
-    pub image_ref: String,
-    pub values_override: Option<serde_json::Value>,
-    pub desired_status: String,
-    pub deployed_by: Option<Uuid>,
+    pub branch_slug: Option<String>,
+    // From projects
     pub project_name: String,
     pub namespace_slug: String,
+    // Parsed
     pub tracked_resources: Vec<applier::TrackedResource>,
-    /// When true, skip orphan pruning (`tracked_resources` failed to parse).
     pub skip_prune: bool,
 }
 
@@ -153,8 +178,6 @@ fn env_suffix(environment: &str) -> &str {
 }
 
 /// Resolve the target K8s namespace for a deployment.
-/// Maps `production` → `{slug}-prod`, `staging` → `{slug}-staging`, etc.
-/// When `config` has a `ns_prefix`, the namespace is prefixed accordingly.
 pub fn target_namespace(
     config: &crate::config::Config,
     namespace_slug: &str,
@@ -164,693 +187,981 @@ pub fn target_namespace(
 }
 
 // ---------------------------------------------------------------------------
-// Single deployment reconciliation
+// Single release reconciliation
 // ---------------------------------------------------------------------------
 
-/// Claim and reconcile a single deployment. Uses optimistic locking to prevent
-/// double-processing.
-async fn reconcile_one(
-    state: &AppState,
-    deployment: &PendingDeployment,
-) -> Result<(), DeployerError> {
-    // Claim with optimistic lock
-    let claimed = sqlx::query_scalar!(
-        r#"
-        UPDATE deployments SET current_status = 'syncing'
-        WHERE id = $1 AND current_status != 'syncing'
-        RETURNING id
-        "#,
-        deployment.id,
+/// Claim and reconcile a single release. Uses optimistic locking.
+async fn reconcile_one(state: &AppState, release: &PendingRelease) -> Result<(), DeployerError> {
+    // Claim with optimistic lock — only process if still in expected phase
+    let claimed = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE deploy_releases SET started_at = COALESCE(started_at, now())
+         WHERE id = $1 AND phase = $2
+         RETURNING id",
     )
+    .bind(release.id)
+    .bind(&release.phase)
     .fetch_optional(&state.pool)
     .await?;
 
     if claimed.is_none() {
-        tracing::debug!(deployment_id = %deployment.id, "deployment already being processed");
+        tracing::debug!(release_id = %release.id, "release phase changed, skipping");
         return Ok(());
     }
 
-    match deployment.desired_status.as_str() {
-        "active" => handle_active(state, deployment).await,
-        "rollback" => handle_rollback(state, deployment).await,
-        "stopped" => handle_stopped(state, deployment).await,
-        other => {
-            tracing::warn!(deployment_id = %deployment.id, desired = other, "unknown desired_status");
-            Ok(())
-        }
+    match release.phase.as_str() {
+        "pending" => handle_pending(state, release).await,
+        "progressing" | "holding" => match release.strategy.as_str() {
+            "rolling" => handle_rolling_progress(state, release),
+            "canary" => handle_canary_progress(state, release).await,
+            "ab_test" => handle_ab_test_progress(state, release).await,
+            _ => {
+                tracing::warn!(release_id = %release.id, strategy = %release.strategy, "unknown strategy");
+                Ok(())
+            }
+        },
+        "promoting" => handle_promoting(state, release).await,
+        "rolling_back" => handle_rolling_back(state, release).await,
+        _ => Ok(()),
     }
 }
 
-/// Deploy the current `image_ref` using ops repo manifests.
-async fn handle_active(
-    state: &AppState,
-    deployment: &PendingDeployment,
-) -> Result<(), DeployerError> {
-    let ns = target_namespace(
-        &state.config,
-        &deployment.namespace_slug,
-        &deployment.environment,
-    );
+// ---------------------------------------------------------------------------
+// Phase handlers
+// ---------------------------------------------------------------------------
 
-    // Ensure the target namespace exists before applying
+/// Pending release — apply manifests, transition to progressing.
+async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<(), DeployerError> {
+    let ns = target_namespace(&state.config, &release.namespace_slug, &release.environment);
+
+    // Ensure namespace, secrets, registry pull secret
     crate::deployer::namespace::ensure_namespace(
         &state.kube,
         &ns,
-        env_suffix(&deployment.environment),
-        &deployment.project_id.to_string(),
+        env_suffix(&release.environment),
+        &release.project_id.to_string(),
     )
     .await?;
 
-    // Inject project secrets as a K8s Secret before applying manifests
-    let secrets_name = inject_project_secrets(state, deployment, &ns).await;
+    let secrets_name = inject_project_secrets(state, release, &ns).await;
+    ensure_registry_pull_secret_for(state, release.project_id, release.id, &ns).await;
 
-    // Ensure a registry pull secret exists so pods can pull images
-    ensure_registry_pull_secret_for(state, deployment.project_id, deployment.id, &ns).await;
-
-    let (rendered, sha) = render_manifests(state, deployment).await?;
-
-    // Inject envFrom into workload containers so pods receive the secret env vars
-    let rendered = if let Some(ref secret_name) = secrets_name {
-        applier::inject_env_from_secret(&rendered, secret_name)?
+    // Render + apply manifests
+    let (rendered, _sha) = render_manifests(state, release).await?;
+    let rendered = if let Some(ref sn) = secrets_name {
+        applier::inject_env_from_secret(&rendered, sn)?
     } else {
         rendered
     };
 
-    // Build new resource inventory before applying
+    // Prune orphans
     let new_tracked = applier::build_tracked_inventory(&rendered, &ns);
-
-    // Prune orphaned resources (removed from manifests since last apply).
-    // Skip if tracked_resources failed to deserialize (R3: avoid accidental mass deletion).
-    if !deployment.skip_prune {
-        let orphans = applier::find_orphans(&deployment.tracked_resources, &new_tracked);
+    if !release.skip_prune {
+        let orphans = applier::find_orphans(&release.tracked_resources, &new_tracked);
         if !orphans.is_empty() {
             let pruned = applier::prune_orphans(&state.kube, &orphans).await?;
             tracing::info!(pruned_count = pruned, "orphaned resources pruned");
         }
     }
 
-    // Apply with tracking labels
     let applied =
-        applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(deployment.id)).await?;
+        applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(release.id)).await?;
+    store_tracked_resources(state, release.id, &new_tracked).await?;
 
-    // Store the new resource inventory
-    store_tracked_resources(state, deployment.id, &new_tracked).await?;
+    // For rolling strategy: wait for health and complete immediately
+    if release.strategy == "rolling" {
+        if let Some(deploy_name) = applier::find_deployment_name(&applied) {
+            applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
+        }
+        transition_phase(state, release, "completed", Some(100), Some("healthy")).await?;
+        record_history(state, release, "promoted", "completed", Some(100)).await;
+        fire_webhook(state, release, "deployed").await;
+    } else {
+        // Canary/AB: transition to progressing with initial weight
+        #[allow(clippy::cast_possible_truncation)]
+        let initial_weight = release
+            .rollout_config
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0) as i32;
 
-    // Wait for health if a Deployment resource was applied
-    if let Some(deploy_name) = applier::find_deployment_name(&applied) {
-        applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
+        // Set initial weight in DB
+        sqlx::query("UPDATE deploy_releases SET traffic_weight = $2 WHERE id = $1")
+            .bind(release.id)
+            .bind(initial_weight)
+            .execute(&state.pool)
+            .await?;
+
+        // Apply gateway resources for traffic splitting
+        apply_gateway_resources(state, release, &ns, initial_weight).await;
+
+        transition_phase(state, release, "progressing", Some(initial_weight), None).await?;
+        record_history(
+            state,
+            release,
+            "step_advanced",
+            "progressing",
+            Some(initial_weight),
+        )
+        .await;
     }
 
-    finalize_success(state, deployment, sha.as_deref(), "deploy").await?;
-    fire_webhook(state, deployment, "deployed").await;
     Ok(())
 }
 
-/// Rollback to the previous successful `image_ref`.
-/// If an ops repo is linked, reverts the last ops repo commit to restore
-/// the previous values file, then re-deploys.
-async fn handle_rollback(
-    state: &AppState,
-    deployment: &PendingDeployment,
+/// Rolling release already progressing — nothing to do, should have completed in pending.
+#[allow(clippy::unnecessary_wraps)]
+fn handle_rolling_progress(
+    _state: &AppState,
+    _release: &PendingRelease,
 ) -> Result<(), DeployerError> {
-    let rollback_image = if let Some(ops_repo_id) = deployment.ops_repo_id {
-        // Ops-repo-centric rollback: revert the last commit
-        let (repo_path, _sha, branch) = ops_repo::sync_repo(&state.pool, ops_repo_id).await?;
+    // Rolling deploys complete in handle_pending. If we're here, it's a no-op.
+    Ok(())
+}
 
-        let new_sha = ops_repo::revert_last_commit(&repo_path, &branch).await?;
-
-        // Read the reverted values to get the old image_ref
-        let reverted = ops_repo::read_values(&repo_path, &branch, &deployment.environment)
-            .await
-            .map_err(|_| DeployerError::NoPreviousDeployment)?;
-
-        let old_image = reverted["image_ref"]
-            .as_str()
-            .ok_or(DeployerError::NoPreviousDeployment)?
-            .to_owned();
-
-        // Update DB to match the reverted ops repo state
-        sqlx::query!(
-            "UPDATE deployments SET image_ref = $2, current_sha = $3 WHERE id = $1",
-            deployment.id,
-            old_image,
-            new_sha,
-        )
-        .execute(&state.pool)
-        .await?;
-
-        old_image
-    } else {
-        // Legacy DB-based rollback: look up previous image from history
-        let prev = sqlx::query_scalar!(
-            r#"
-            SELECT image_ref FROM deployment_history
-            WHERE deployment_id = $1 AND status = 'success' AND action = 'deploy'
-            ORDER BY created_at DESC LIMIT 1 OFFSET 1
-            "#,
-            deployment.id,
-        )
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(DeployerError::NoPreviousDeployment)?;
-
-        sqlx::query!(
-            "UPDATE deployments SET image_ref = $2 WHERE id = $1",
-            deployment.id,
-            prev,
-        )
-        .execute(&state.pool)
-        .await?;
-
-        prev
-    };
-
-    // Create a modified deployment with the rollback image
-    let rollback_deployment = PendingDeployment {
-        image_ref: rollback_image,
-        ..copy_deployment_fields(deployment)
-    };
-
-    let ns = target_namespace(
-        &state.config,
-        &deployment.namespace_slug,
-        &deployment.environment,
-    );
-
-    // Inject project secrets for rollback (same as active deploy)
-    let secrets_name = inject_project_secrets(state, deployment, &ns).await;
-
-    let (rendered, sha) = render_manifests(state, &rollback_deployment).await?;
-
-    // Inject envFrom into workload containers
-    let rendered = if let Some(ref secret_name) = secrets_name {
-        applier::inject_env_from_secret(&rendered, secret_name)?
-    } else {
-        rendered
-    };
-
-    let applied =
-        applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(deployment.id)).await?;
-
-    // Update tracked resources for rollback
-    let new_tracked = applier::build_tracked_inventory(&rendered, &ns);
-    store_tracked_resources(state, deployment.id, &new_tracked).await?;
-
-    if let Some(deploy_name) = applier::find_deployment_name(&applied) {
-        applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
-    }
-
-    // Reset desired_status to active after successful rollback
-    sqlx::query!(
-        "UPDATE deployments SET desired_status = 'active' WHERE id = $1",
-        deployment.id,
+/// Canary release progressing — check analysis verdicts and step forward.
+async fn handle_canary_progress(
+    state: &AppState,
+    release: &PendingRelease,
+) -> Result<(), DeployerError> {
+    // Check latest analysis verdict for current step
+    let verdict = sqlx::query_scalar::<_, String>(
+        "SELECT verdict FROM rollout_analyses
+         WHERE release_id = $1 AND step_index = $2
+         ORDER BY created_at DESC LIMIT 1",
     )
-    .execute(&state.pool)
+    .bind(release.id)
+    .bind(release.current_step)
+    .fetch_optional(&state.pool)
     .await?;
 
-    finalize_success(state, &rollback_deployment, sha.as_deref(), "rollback").await?;
-    fire_webhook(state, deployment, "rolled_back").await;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    match verdict.as_deref() {
+        Some("pass") => {
+            // Advance to next step
+            let steps: Vec<i32> = release
+                .rollout_config
+                .get("steps")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+            let next_step = release.current_step + 1;
+            if usize::try_from(next_step).unwrap_or(usize::MAX) >= steps.len() {
+                // All steps passed — promote
+                transition_phase(state, release, "promoting", Some(100), None).await?;
+                record_history(state, release, "promoted", "promoting", Some(100)).await;
+            } else {
+                let weight = steps.get(next_step as usize).copied().unwrap_or(100);
+                sqlx::query(
+                    "UPDATE deploy_releases SET current_step = $2, traffic_weight = $3 WHERE id = $1",
+                )
+                .bind(release.id)
+                .bind(next_step)
+                .bind(weight)
+                .execute(&state.pool)
+                .await?;
+
+                // Update HTTPRoute with new weight
+                let ns =
+                    target_namespace(&state.config, &release.namespace_slug, &release.environment);
+                apply_gateway_resources(state, release, &ns, weight).await;
+
+                record_history(state, release, "step_advanced", "progressing", Some(weight)).await;
+            }
+        }
+        Some("fail") => {
+            let config = &release.rollout_config;
+            let max_failures: i64 = config
+                .get("max_failures")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(3);
+
+            let fail_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM rollout_analyses
+                 WHERE release_id = $1 AND step_index = $2 AND verdict = 'fail'",
+            )
+            .bind(release.id)
+            .bind(release.current_step)
+            .fetch_one(&state.pool)
+            .await?;
+
+            if fail_count >= max_failures {
+                transition_phase(state, release, "rolling_back", Some(0), Some("unhealthy"))
+                    .await?;
+                record_history(state, release, "rolled_back", "rolling_back", Some(0)).await;
+            } else if release.phase == "progressing" {
+                transition_phase(state, release, "holding", None, Some("degraded")).await?;
+                record_history(state, release, "health_changed", "holding", None).await;
+            }
+        }
+        // Analysis still running or not started yet — wait
+        _ => {}
+    }
+
     Ok(())
 }
 
-/// Stop the deployment by scaling to 0 replicas.
-async fn handle_stopped(
+/// A/B test progressing — similar to canary but with duration-based completion.
+async fn handle_ab_test_progress(
     state: &AppState,
-    deployment: &PendingDeployment,
+    release: &PendingRelease,
 ) -> Result<(), DeployerError> {
-    let ns = target_namespace(
-        &state.config,
-        &deployment.namespace_slug,
-        &deployment.environment,
-    );
-    let deploy_name = format!("{}-{}", deployment.project_name, deployment.environment);
+    let duration_secs: i64 = release
+        .rollout_config
+        .get("duration")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(86400);
 
-    applier::scale(&state.kube, &ns, &deploy_name, 0).await?;
+    // Check if duration has elapsed since started_at
+    let elapsed: Option<bool> = sqlx::query_scalar(
+        "SELECT (now() - started_at) > ($2 || ' seconds')::interval
+         FROM deploy_releases WHERE id = $1 AND started_at IS NOT NULL",
+    )
+    .bind(release.id)
+    .bind(duration_secs)
+    .fetch_optional(&state.pool)
+    .await?;
 
-    finalize_success(state, deployment, None, "stop").await?;
-    fire_webhook(state, deployment, "stopped").await;
+    if elapsed == Some(true) {
+        // Duration complete — move to promoting for manual review
+        transition_phase(state, release, "promoting", Some(100), None).await?;
+        record_history(state, release, "promoted", "promoting", Some(100)).await;
+    }
+
     Ok(())
+}
+
+/// Promoting — re-render manifests with canary as new stable, apply, finalize.
+async fn handle_promoting(state: &AppState, release: &PendingRelease) -> Result<(), DeployerError> {
+    let ns = target_namespace(&state.config, &release.namespace_slug, &release.environment);
+
+    // For canary/AB: route 100% to stable (which now uses the canary image)
+    if release.strategy != "rolling" {
+        apply_gateway_resources(state, release, &ns, 100).await;
+
+        // Re-render manifests with stable_image = canary_image (promotion)
+        // The new stable is the canary image
+        let (rendered, _sha) = render_manifests(state, release).await?;
+        let _ = applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(release.id)).await;
+    }
+
+    transition_phase(state, release, "completed", Some(100), Some("healthy")).await?;
+    record_history(state, release, "promoted", "completed", Some(100)).await;
+    fire_webhook(state, release, "deployed").await;
+
+    let _ = crate::store::eventbus::publish(
+        &state.valkey,
+        &crate::store::eventbus::PlatformEvent::ReleasePromoted {
+            release_id: release.id,
+            project_id: release.project_id,
+            image_ref: release.image_ref.clone(),
+        },
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Rolling back — revert traffic to stable, scale canary down, mark `rolled_back`.
+async fn handle_rolling_back(
+    state: &AppState,
+    release: &PendingRelease,
+) -> Result<(), DeployerError> {
+    let ns = target_namespace(&state.config, &release.namespace_slug, &release.environment);
+
+    // Route 100% traffic to stable (0% canary)
+    if release.strategy != "rolling" {
+        apply_gateway_resources(state, release, &ns, 0).await;
+    }
+
+    transition_phase(state, release, "rolled_back", Some(0), Some("unhealthy")).await?;
+    record_history(state, release, "rolled_back", "rolled_back", Some(0)).await;
+    fire_webhook(state, release, "rolled_back").await;
+
+    let _ = crate::store::eventbus::publish(
+        &state.valkey,
+        &crate::store::eventbus::PlatformEvent::ReleaseRolledBack {
+            release_id: release.id,
+            project_id: release.project_id,
+            reason: "rollback requested".into(),
+        },
+    )
+    .await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gateway API helpers
+// ---------------------------------------------------------------------------
+
+/// Apply Gateway + `HTTPRoute` resources for traffic splitting.
+/// For canary: weighted split between `stable_service` and `canary_service`.
+/// For AB test: header-based routing.
+async fn apply_gateway_resources(
+    state: &AppState,
+    release: &PendingRelease,
+    namespace: &str,
+    canary_weight: i32,
+) {
+    let config = &release.rollout_config;
+    let hostname = config
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .unwrap_or("*");
+    let route_name = format!("{}-traffic", release.project_name);
+
+    match release.strategy.as_str() {
+        "canary" => {
+            let stable_svc = config
+                .get("stable_service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stable");
+            let canary_svc = config
+                .get("canary_service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("canary");
+
+            let cw = canary_weight.unsigned_abs();
+            let sw = 100 - cw;
+
+            // Ensure Gateway exists
+            let gw = super::gateway::build_gateway(namespace);
+            apply_json_to_k8s(state, &gw, namespace).await;
+
+            // Create/update HTTPRoute with weights
+            let route = super::gateway::build_weighted_httproute(
+                &route_name,
+                namespace,
+                hostname,
+                stable_svc,
+                canary_svc,
+                sw,
+                cw,
+            );
+            apply_json_to_k8s(state, &route, namespace).await;
+        }
+        "ab_test" => {
+            let control_svc = config
+                .get("control_service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("control");
+            let treatment_svc = config
+                .get("treatment_service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("treatment");
+
+            // Parse header match rules
+            let headers: std::collections::HashMap<String, String> = config
+                .get("match")
+                .and_then(|m| m.get("headers"))
+                .and_then(|h| serde_json::from_value(h.clone()).ok())
+                .unwrap_or_default();
+
+            let gw = super::gateway::build_gateway(namespace);
+            apply_json_to_k8s(state, &gw, namespace).await;
+
+            let route = super::gateway::build_header_match_httproute(
+                &route_name,
+                namespace,
+                hostname,
+                control_svc,
+                treatment_svc,
+                &headers,
+            );
+            apply_json_to_k8s(state, &route, namespace).await;
+        }
+        _ => {}
+    }
+}
+
+/// Apply a single JSON resource to K8s via server-side apply (serialize to YAML).
+async fn apply_json_to_k8s(state: &AppState, resource: &serde_json::Value, namespace: &str) {
+    let yaml = match serde_yaml::to_string(resource) {
+        Ok(y) => y,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize gateway resource to YAML");
+            return;
+        }
+    };
+    if let Err(e) = applier::apply_with_tracking(&state.kube, &yaml, namespace, None).await {
+        tracing::warn!(error = %e, "failed to apply gateway resource");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preview cleanup (merged from preview.rs)
+// ---------------------------------------------------------------------------
+
+async fn cleanup_expired_previews(state: &AppState) {
+    let expired = sqlx::query(
+        "SELECT dt.id, dt.project_id, dt.branch_slug, p.namespace_slug
+         FROM deploy_targets dt
+         JOIN projects p ON p.id = dt.project_id
+         WHERE dt.environment = 'preview' AND dt.is_active = true
+           AND dt.expires_at IS NOT NULL AND dt.expires_at < now()",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    for row in &expired {
+        let target_id: Uuid = row.get("id");
+        let project_id: Uuid = row.get("project_id");
+        let branch_slug: Option<String> = row.get("branch_slug");
+        let namespace_slug: String = row.get("namespace_slug");
+
+        // Mark target inactive
+        let _ = sqlx::query("UPDATE deploy_targets SET is_active = false WHERE id = $1")
+            .bind(target_id)
+            .execute(&state.pool)
+            .await;
+
+        // Cancel any active releases
+        let _ = sqlx::query(
+            "UPDATE deploy_releases SET phase = 'cancelled'
+             WHERE target_id = $1 AND phase NOT IN ('completed','rolled_back','cancelled','failed')",
+        )
+        .bind(target_id)
+        .execute(&state.pool)
+        .await;
+
+        // Delete K8s namespace
+        let slug = branch_slug.as_deref().unwrap_or("unknown");
+        let ns = target_namespace(&state.config, &namespace_slug, &format!("preview-{slug}"));
+        if let Err(e) = crate::deployer::namespace::delete_namespace(&state.kube, &ns).await {
+            tracing::warn!(error = %e, %target_id, "failed to delete preview namespace");
+        }
+
+        tracing::info!(%project_id, %target_id, "expired preview target cleaned up");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Query deploy-scoped secrets for a project, decrypt, inject OTEL config,
-/// and create/update a K8s Secret in the target namespace. Best-effort.
-///
-/// Returns the secret name when created (so callers can inject `envFrom`),
-/// or `None` when no data was collected.
-#[tracing::instrument(skip(state, deployment), fields(project_id = %deployment.project_id, %namespace))]
+/// Transition a release to a new phase.
+async fn transition_phase(
+    state: &AppState,
+    release: &PendingRelease,
+    new_phase: &str,
+    traffic_weight: Option<i32>,
+    health: Option<&str>,
+) -> Result<(), DeployerError> {
+    sqlx::query(
+        "UPDATE deploy_releases SET
+            phase = $2,
+            traffic_weight = COALESCE($3, traffic_weight),
+            health = COALESCE($4, health),
+            completed_at = CASE WHEN $2 IN ('completed','rolled_back','cancelled','failed') THEN now() ELSE completed_at END
+         WHERE id = $1",
+    )
+    .bind(release.id)
+    .bind(new_phase)
+    .bind(traffic_weight)
+    .bind(health)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Record a release history entry.
+async fn record_history(
+    state: &AppState,
+    release: &PendingRelease,
+    action: &str,
+    phase: &str,
+    traffic_weight: Option<i32>,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO release_history (release_id, target_id, action, phase, traffic_weight, image_ref, actor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(release.id)
+    .bind(release.target_id)
+    .bind(action)
+    .bind(phase)
+    .bind(traffic_weight)
+    .bind(&release.image_ref)
+    .bind(release.deployed_by)
+    .execute(&state.pool)
+    .await;
+}
+
+/// Mark a release as failed.
+pub async fn mark_failed(state: &AppState, release: &PendingRelease, message: &str) {
+    let _ = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'failed', health = 'unhealthy', completed_at = now() WHERE id = $1",
+    )
+    .bind(release.id)
+    .execute(&state.pool)
+    .await;
+
+    let _ = sqlx::query(
+        "INSERT INTO release_history (release_id, target_id, action, phase, image_ref, detail)
+         VALUES ($1, $2, 'failed', 'failed', $3, $4)",
+    )
+    .bind(release.id)
+    .bind(release.target_id)
+    .bind(&release.image_ref)
+    .bind(serde_json::json!({"error": message}))
+    .execute(&state.pool)
+    .await;
+}
+
+/// Query deploy-scoped secrets, decrypt, inject OTEL config, create K8s Secret.
+#[tracing::instrument(skip(state, release), fields(project_id = %release.project_id, %namespace))]
 async fn inject_project_secrets(
     state: &AppState,
-    deployment: &PendingDeployment,
+    release: &PendingRelease,
     namespace: &str,
 ) -> Option<String> {
-    let mut data: BTreeMap<String, String> = BTreeMap::new();
+    let mut env_data: BTreeMap<String, String> = BTreeMap::new();
 
-    // Collect deploy-scoped secrets (requires master key)
-    if let Some(master_key) = state
-        .config
-        .master_key
-        .as_deref()
-        .and_then(|k| crate::secrets::engine::parse_master_key(k).ok())
+    // Query secrets scoped to this environment (staging/prod) or 'all'.
+    // Maps environment name to scope: staging→staging, production→prod.
+    let env_scope = match release.environment.as_str() {
+        "production" => "prod",
+        other => other, // staging→staging, preview→preview
+    };
+    if let Some(ref master_key_str) = state.config.master_key
+        && let Ok(mk) = crate::secrets::engine::parse_master_key(master_key_str)
     {
-        match crate::secrets::engine::query_scoped_secrets(
-            &state.pool,
-            &master_key,
-            deployment.project_id,
-            &["deploy", "all"],
-            Some(&deployment.environment),
+        let rows = sqlx::query(
+            "SELECT name, encrypted_value FROM secrets
+                 WHERE project_id = $1 AND scope IN ($3, 'all')
+                   AND (environment IS NULL OR environment = $2)",
         )
+        .bind(release.project_id)
+        .bind(&release.environment)
+        .bind(env_scope)
+        .fetch_all(&state.pool)
         .await
-        {
-            Ok(secrets) => {
-                for (name, value) in secrets {
-                    data.insert(name, value);
+        .unwrap_or_default();
+
+        for row in &rows {
+            let name: String = row.get("name");
+            let encrypted: Vec<u8> = row.get("encrypted_value");
+            match crate::secrets::engine::decrypt(&encrypted, &mk) {
+                Ok(val) => {
+                    if let Ok(s) = String::from_utf8(val) {
+                        env_data.insert(name, s);
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, project_id = %deployment.project_id, "failed to query deploy secrets");
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to decrypt secret");
+                }
             }
         }
     }
 
-    // Inject OTEL configuration for automatic observability
-    inject_otel_env_vars(state, deployment, &mut data).await;
+    // Inject OTEL env vars
+    inject_otel_env_vars(state, release, &mut env_data).await;
 
-    if data.is_empty() {
+    if env_data.is_empty() {
         return None;
     }
 
-    let secret_name = format!(
-        "{}-{}-secrets",
-        deployment.namespace_slug,
-        env_suffix(&deployment.environment)
-    );
-
-    apply_k8s_secret(state, namespace, &secret_name, deployment.project_id, data).await;
+    let secret_name = format!("{namespace}-{}-secrets", env_suffix(&release.environment));
+    apply_k8s_secret(
+        state,
+        namespace,
+        &secret_name,
+        &release.project_id,
+        &env_data,
+    )
+    .await;
     Some(secret_name)
 }
 
-/// Inject OTEL env vars into the secrets data map for automatic observability.
-#[tracing::instrument(skip(state, data), fields(project_id = %deployment.project_id))]
+/// Inject OTEL environment variables into the secret data.
 async fn inject_otel_env_vars(
     state: &AppState,
-    deployment: &PendingDeployment,
-    data: &mut BTreeMap<String, String>,
+    release: &PendingRelease,
+    env_data: &mut BTreeMap<String, String>,
 ) {
-    data.insert(
+    env_data.insert(
         "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
         state.config.platform_api_url.clone(),
     );
-    data.insert("OTEL_SERVICE_NAME".into(), deployment.project_name.clone());
-    data.insert(
+    env_data.insert("OTEL_SERVICE_NAME".into(), release.project_name.clone());
+    env_data.insert(
         "OTEL_RESOURCE_ATTRIBUTES".into(),
-        format!("platform.project_id={}", deployment.project_id),
+        format!("platform.project_id={}", release.project_id),
     );
 
-    // Auto-create or rotate a scoped OTLP token
-    match ensure_otlp_token(state, deployment.project_id).await {
-        Ok(raw_token) => {
-            data.insert(
-                "OTEL_EXPORTER_OTLP_HEADERS".into(),
-                format!("Authorization=Bearer {raw_token}"),
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                project_id = %deployment.project_id,
-                "failed to create OTLP token, skipping OTEL auth header"
-            );
-        }
+    // Determine scope from environment
+    let scope = if release.environment == "staging" {
+        "staging"
+    } else {
+        "prod"
+    };
+
+    if let Ok((otel_token, api_token)) =
+        ensure_scoped_tokens(state, release.project_id, scope).await
+    {
+        env_data.insert(
+            "OTEL_EXPORTER_OTLP_HEADERS".into(),
+            format!("Authorization=Bearer {otel_token}"),
+        );
+        env_data.insert("PLATFORM_API_TOKEN".into(), api_token);
+        env_data.insert(
+            "PLATFORM_API_URL".into(),
+            state.config.platform_api_url.clone(),
+        );
+        env_data.insert("PLATFORM_PROJECT_ID".into(), release.project_id.to_string());
     }
 }
 
-/// Create or rotate a project-scoped OTLP API token.
-///
-/// - Scope: `["observe:write"]` (minimal — only allows OTLP ingest)
-/// - Project-scoped hard boundary via `project_id`
-/// - 365-day expiry; rotated on each deploy
-///
-/// Uses a transaction with insert-before-delete to avoid any window where
-/// no valid token exists (R3 fix).
-///
-/// Returns the raw token string (never stored in plaintext after this).
-#[tracing::instrument(skip(state), fields(%project_id), err)]
-pub async fn ensure_otlp_token(state: &AppState, project_id: Uuid) -> anyhow::Result<String> {
-    let mut tx = state.pool.begin().await?;
+/// Create/rotate scoped tokens for a project deployment.
+/// Returns (`otel_token`, `api_token`).
+/// Scope determines the token name prefix and namespace:
+///   - "agent" -> agent sessions
+///   - "pipeline" -> pipeline builds
+///   - "staging" -> staging environment
+///   - "prod" -> production environment
+pub async fn ensure_scoped_tokens(
+    state: &AppState,
+    project_id: Uuid,
+    scope: &str,
+) -> Result<(String, String), DeployerError> {
+    let owner = resolve_project_owner(state, project_id).await;
+    let Some((owner_id, _)) = owner else {
+        return Err(DeployerError::Other(anyhow::anyhow!(
+            "project owner not found"
+        )));
+    };
 
-    // Find the project owner to assign the token to
-    let owner_id = sqlx::query_scalar!(
-        "SELECT owner_id FROM projects WHERE id = $1 AND is_active = true",
-        project_id,
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-{scope}-{proj8}");
+    let api_name = format!("api-{scope}-{proj8}");
 
-    // Check for existing token (we need to delete it after inserting the new one)
-    let existing = sqlx::query_scalar!(
-        r#"
-        SELECT id
-        FROM api_tokens
-        WHERE project_id = $1
-          AND scopes @> ARRAY['observe:write']
-          AND (expires_at IS NULL OR expires_at > now())
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-        project_id,
+    // Create OTEL token (observe:write)
+    let otel_token =
+        ensure_single_token(state, owner_id, project_id, &otel_name, &["observe:write"]).await?;
+
+    // Create API token (project:read — for flag evaluation)
+    let api_token =
+        ensure_single_token(state, owner_id, project_id, &api_name, &["project:read"]).await?;
+
+    Ok((otel_token, api_token))
+}
+
+/// Create or rotate a single scoped API token.
+async fn ensure_single_token(
+    state: &AppState,
+    owner_id: Uuid,
+    project_id: Uuid,
+    name: &str,
+    scopes: &[&str],
+) -> Result<String, DeployerError> {
+    // Check existing valid token with matching name
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM api_tokens
+         WHERE project_id = $1 AND name = $2
+           AND (expires_at IS NULL OR expires_at > now())
+         LIMIT 1",
     )
-    .fetch_optional(&mut *tx)
+    .bind(project_id)
+    .bind(name)
+    .fetch_optional(&state.pool)
     .await?;
 
-    // INSERT new token first — ensures a valid token always exists
-    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+    let (raw_token, hash) = crate::auth::token::generate_api_token();
+    let expires = chrono::Utc::now() + chrono::Duration::days(365);
+    let scope_strs: Vec<String> = scopes
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
-    sqlx::query!(
-        r#"
-        INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
-        VALUES ($1, $2, $3, $4, $5, now() + interval '365 days')
-        "#,
-        owner_id,
-        format!("otlp-auto-{project_id}"),
-        token_hash,
-        &["observe:write"] as &[&str],
-        project_id,
+    let mut tx = state.pool.begin().await?;
+
+    // Insert new token first (R3: no token gap)
+    sqlx::query(
+        "INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
+    .bind(owner_id)
+    .bind(name)
+    .bind(&hash)
+    .bind(&scope_strs)
+    .bind(project_id)
+    .bind(expires)
     .execute(&mut *tx)
     .await?;
 
-    // THEN delete the old token to prevent accumulation
-    if let Some(old_id) = existing
-        && let Err(e) = sqlx::query!("DELETE FROM api_tokens WHERE id = $1", old_id)
+    // Delete old token if exists
+    if let Some(old_id) = existing {
+        sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(old_id)
             .execute(&mut *tx)
-            .await
-    {
-        tracing::warn!(error = %e, token_id = %old_id, "failed to delete old OTLP token");
+            .await?;
     }
 
     tx.commit().await?;
 
-    tracing::info!(
-        %project_id,
-        "created OTLP auto-token for project"
-    );
-
     Ok(raw_token)
 }
 
-/// Create or replace a K8s Secret in the given namespace.
-#[tracing::instrument(skip(state, data), fields(%namespace, %secret_name, %project_id))]
-async fn apply_k8s_secret(
-    state: &AppState,
-    namespace: &str,
-    secret_name: &str,
-    project_id: Uuid,
-    data: BTreeMap<String, String>,
-) {
-    let k8s_secret = Secret {
-        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(secret_name.to_owned()),
-            labels: Some(BTreeMap::from([(
-                "platform.io/project".into(),
-                project_id.to_string(),
-            )])),
-            ..Default::default()
-        },
-        string_data: Some(data),
-        type_: Some("Opaque".into()),
-        ..Default::default()
-    };
-
-    let api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
-    match api.create(&PostParams::default(), &k8s_secret).await {
-        Ok(_) => {
-            tracing::info!(%secret_name, %namespace, "created deploy secrets K8s Secret");
-        }
-        Err(kube::Error::Api(err)) if err.code == 409 => {
-            match api
-                .replace(secret_name, &PostParams::default(), &k8s_secret)
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!(%secret_name, %namespace, "updated deploy secrets K8s Secret");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, %secret_name, "failed to update deploy secrets");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, %secret_name, "failed to create deploy secrets K8s Secret");
-        }
-    }
+/// Look up the stable image from the most recent completed release for the same target.
+async fn lookup_stable_image(pool: &sqlx::PgPool, target_id: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT image_ref FROM deploy_releases
+         WHERE target_id = $1 AND phase = 'completed'
+         ORDER BY completed_at DESC LIMIT 1",
+    )
+    .bind(target_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
 }
 
-/// Ensure the fixed-name registry pull secret exists in the target namespace.
-///
-/// Creates or replaces `platform-registry-pull` with a `dockerconfigjson` secret
-/// so that pods can pull images from the platform's built-in registry.
-/// Uses the registry node URL (`DaemonSet` proxy) when available, falling back to
-/// the API-facing registry URL.
-///
-/// The token is scoped to the project owner and expires after 30 days.
-/// Each deploy refreshes the secret, so credentials stay current.
-#[tracing::instrument(skip(state), fields(%project_id, %namespace))]
-pub async fn ensure_registry_pull_secret_for(
-    state: &AppState,
-    project_id: Uuid,
-    resource_id: Uuid,
-    namespace: &str,
-) {
-    let registry_url = state
-        .config
-        .registry_node_url
-        .as_deref()
-        .or(state.config.registry_url.as_deref());
-
-    let Some(registry_url) = registry_url else {
-        return; // No registry configured
-    };
-
-    let Some((owner_id, owner_name)) = resolve_project_owner(state, project_id).await else {
-        return;
-    };
-
-    let Some(raw_token) = create_deploy_pull_token(state, owner_id, resource_id).await else {
-        return;
-    };
-
-    let docker_config = build_deploy_docker_config(state, registry_url, &owner_name, &raw_token);
-
-    let secret = Secret {
-        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(REGISTRY_PULL_SECRET_NAME.to_owned()),
-            labels: Some(BTreeMap::from([
-                ("platform.io/project".into(), project_id.to_string()),
-                ("platform.io/managed-by".into(), "deployer".into()),
-            ])),
-            ..Default::default()
-        },
-        type_: Some("kubernetes.io/dockerconfigjson".into()),
-        string_data: Some(BTreeMap::from([(
-            ".dockerconfigjson".into(),
-            docker_config.to_string(),
-        )])),
-        ..Default::default()
-    };
-
-    apply_or_replace_secret(state, namespace, &secret).await;
-}
-
-/// Resolve project owner ID and name.
 async fn resolve_project_owner(state: &AppState, project_id: Uuid) -> Option<(Uuid, String)> {
-    let owner_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT owner_id FROM projects WHERE id = $1 AND is_active = true")
-            .bind(project_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten();
+    let owner_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT owner_id FROM projects WHERE id = $1 AND is_active = true",
+    )
+    .bind(project_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()?;
 
-    let (owner_id,) = owner_id?;
-
-    let owner_name: Option<(String,)> = sqlx::query_as("SELECT name FROM users WHERE id = $1")
+    let name = sqlx::query_scalar::<_, String>("SELECT name FROM users WHERE id = $1")
         .bind(owner_id)
         .fetch_optional(&state.pool)
         .await
         .ok()
-        .flatten();
+        .flatten()?;
 
-    Some((owner_id, owner_name?.0))
+    Some((owner_id, name))
 }
 
-/// Create a 30-day API token for pulling images, returning the raw token.
+/// Create/refresh registry pull secret in namespace.
+pub async fn ensure_registry_pull_secret_for(
+    state: &AppState,
+    project_id: Uuid,
+    release_id: Uuid,
+    namespace: &str,
+) {
+    let Some(registry_url) = &state.config.registry_url else {
+        return;
+    };
+
+    let owner = resolve_project_owner(state, project_id).await;
+    let Some((owner_id, owner_name)) = owner else {
+        return;
+    };
+
+    let token = create_deploy_pull_token(state, owner_id, release_id).await;
+    let Some(raw_token) = token else { return };
+
+    let node_url = state.config.registry_node_url.as_deref();
+    let docker_config = build_deploy_docker_config(registry_url, node_url, &owner_name, &raw_token);
+
+    apply_or_replace_secret(state, namespace, REGISTRY_PULL_SECRET_NAME, &docker_config).await;
+}
+
 async fn create_deploy_pull_token(
     state: &AppState,
     owner_id: Uuid,
-    deployment_id: Uuid,
+    release_id: Uuid,
 ) -> Option<String> {
-    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+    let (raw_token, hash) = crate::auth::token::generate_api_token();
+    let name = format!("deploy-pull-{}", &release_id.to_string()[..8]);
+    let expires = chrono::Utc::now() + chrono::Duration::days(30);
 
-    if let Err(e) = sqlx::query(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at)
-         VALUES ($1, $2, $3, $4, now() + interval '30 days')",
+    sqlx::query(
+        "INSERT INTO api_tokens (user_id, name, token_hash, scopes, expires_at)
+         VALUES ($1, $2, $3, ARRAY['registry:pull'], $4)",
     )
-    .bind(Uuid::new_v4())
     .bind(owner_id)
-    .bind(format!("deploy-pull-{}", &deployment_id.to_string()[..8]))
-    .bind(&token_hash)
+    .bind(&name)
+    .bind(&hash)
+    .bind(expires)
     .execute(&state.pool)
     .await
-    {
-        tracing::warn!(error = %e, "failed to create deploy pull token");
-        return None;
-    }
+    .ok()?;
 
     Some(raw_token)
 }
 
-/// Build `dockerconfigjson` with auth for both registry URLs (node + API).
 fn build_deploy_docker_config(
-    state: &AppState,
     registry_url: &str,
+    node_url: Option<&str>,
     owner_name: &str,
     raw_token: &str,
 ) -> serde_json::Value {
-    let basic_auth = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        format!("{owner_name}:{raw_token}"),
-    );
-    let auth_entry = serde_json::json!({"auth": basic_auth});
+    use base64::Engine;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("{owner_name}:{raw_token}"));
 
     let mut auths = serde_json::Map::new();
-    auths.insert(registry_url.to_owned(), auth_entry.clone());
-
-    // Also add API-facing registry URL if different from node URL
-    if let Some(api_url) = state.config.registry_url.as_deref()
-        && api_url != registry_url
+    auths.insert(registry_url.to_string(), serde_json::json!({"auth": auth}));
+    if let Some(node) = node_url
+        && node != registry_url
     {
-        auths.insert(api_url.to_owned(), auth_entry);
+        auths.insert(node.to_string(), serde_json::json!({"auth": auth}));
     }
-
     serde_json::json!({"auths": auths})
 }
 
-/// Create or replace a K8s Secret in the given namespace.
-async fn apply_or_replace_secret(state: &AppState, namespace: &str, secret: &Secret) {
-    let name = secret.metadata.name.as_deref().unwrap_or("unknown");
+async fn apply_k8s_secret(
+    state: &AppState,
+    namespace: &str,
+    secret_name: &str,
+    project_id: &Uuid,
+    data: &BTreeMap<String, String>,
+) {
+    let secret = Secret {
+        metadata: kube::api::ObjectMeta {
+            name: Some(secret_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([(
+                "platform.io/project".to_string(),
+                project_id.to_string(),
+            )])),
+            ..Default::default()
+        },
+        string_data: Some(data.clone()),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    };
 
     let api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
-    match api.create(&PostParams::default(), secret).await {
-        Ok(_) => {
-            tracing::info!(%namespace, %name, "created registry pull secret");
-        }
-        Err(kube::Error::Api(err)) if err.code == 409 => {
-            match api.replace(name, &PostParams::default(), secret).await {
-                Ok(_) => {
-                    tracing::info!(%namespace, %name, "refreshed registry pull secret");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, %name, "failed to refresh registry pull secret");
-                }
+    match api.create(&PostParams::default(), &secret).await {
+        Ok(_) => tracing::debug!(%secret_name, "K8s secret created"),
+        Err(kube::Error::Api(resp)) if resp.code == 409 => {
+            // Already exists — replace
+            if let Err(e) = api
+                .replace(secret_name, &PostParams::default(), &secret)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to replace K8s secret");
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, %name, "failed to create registry pull secret");
-        }
+        Err(e) => tracing::warn!(error = %e, "failed to create K8s secret"),
     }
 }
 
-/// Render manifests from ops repo template or generate a basic deployment manifest.
-///
-/// When an ops repo is linked, reads the template from the repo's working tree
-/// (via git show) and merges in values from the ops repo's values file. The
-/// `image_ref` from the values file takes precedence over the DB value when
-/// the ops repo is the source of truth.
+async fn apply_or_replace_secret(
+    state: &AppState,
+    namespace: &str,
+    secret_name: &str,
+    docker_config: &serde_json::Value,
+) {
+    let config_str = serde_json::to_string(docker_config).unwrap_or_default();
+    let mut data = BTreeMap::new();
+    data.insert(
+        ".dockerconfigjson".to_string(),
+        k8s_openapi::ByteString(config_str.into_bytes()),
+    );
+
+    let secret = Secret {
+        metadata: kube::api::ObjectMeta {
+            name: Some(secret_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        data: Some(data),
+        type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+        ..Default::default()
+    };
+
+    let api: Api<Secret> = Api::namespaced(state.kube.clone(), namespace);
+    match api.create(&PostParams::default(), &secret).await {
+        Ok(_) => tracing::debug!(%secret_name, "registry pull secret created"),
+        Err(kube::Error::Api(resp)) if resp.code == 409 => {
+            if let Err(e) = api
+                .replace(secret_name, &PostParams::default(), &secret)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to replace registry pull secret");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to create registry pull secret"),
+    }
+}
+
+/// Render manifests from ops repo or generate a basic one.
 async fn render_manifests(
     state: &AppState,
-    deployment: &PendingDeployment,
+    release: &PendingRelease,
 ) -> Result<(String, Option<String>), DeployerError> {
-    if let Some(ops_repo_id) = deployment.ops_repo_id {
-        let (repo_path, sha, branch) = ops_repo::sync_repo(&state.pool, ops_repo_id).await?;
+    if let Some(ops_repo_id) = release.ops_repo_id {
+        let (repo_path, _sha, branch) = ops_repo::sync_repo(&state.pool, ops_repo_id).await?;
 
-        // Look up ops repo details for path resolution
-        let repo = sqlx::query!(
-            "SELECT name, path FROM ops_repos WHERE id = $1",
-            ops_repo_id,
-        )
-        .fetch_one(&state.pool)
-        .await?;
+        let ops = sqlx::query("SELECT name, path FROM ops_repos WHERE id = $1")
+            .bind(ops_repo_id)
+            .fetch_one(&state.pool)
+            .await?;
 
-        let manifest_file = deployment
+        let ops_path: Option<String> = ops.try_get("path").ok();
+        let manifest_path = release
             .manifest_path
             .as_deref()
-            .unwrap_or("deploy/production.yaml");
+            .or(ops_path.as_deref())
+            .unwrap_or("deploy/");
+        let sha = ops_repo::get_head_sha(&repo_path).await?;
 
-        // Read the template from the bare repo
-        let manifest_ref_path = if repo.path == "/" || repo.path.is_empty() {
-            manifest_file.to_owned()
+        // If manifest_path ends with '/', read all YAML files from the directory;
+        // otherwise read a single file.
+        let template_content = if manifest_path.ends_with('/') {
+            ops_repo::read_dir_yaml_at_ref(&repo_path, &sha, manifest_path)
+                .await
+                .map_err(|e| DeployerError::RenderFailed(e.to_string()))?
         } else {
-            let subpath = repo.path.trim_matches('/');
-            format!("{subpath}/{manifest_file}")
+            ops_repo::read_file_at_ref(&repo_path, &sha, manifest_path)
+                .await
+                .map_err(|e| DeployerError::RenderFailed(e.to_string()))?
         };
 
-        let template_content = ops_repo::read_file_at_ref(&repo_path, &branch, &manifest_ref_path)
+        // Read values
+        let ops_values = ops_repo::read_values(&repo_path, &branch, &release.environment)
             .await
-            .map_err(|_| {
-                DeployerError::RenderFailed(format!(
-                    "failed to read template {manifest_ref_path} from ops repo"
-                ))
-            })?;
+            .unwrap_or_else(|_| serde_json::json!({}));
 
-        // Try to read values from the ops repo; fall back to DB values
-        let ops_values = ops_repo::read_values(&repo_path, &branch, &deployment.environment).await;
-
-        let mut base_values = deployment
+        let mut base_values = release
             .values_override
             .clone()
-            .unwrap_or(serde_json::json!({}));
-
-        // Merge ops repo values into the render context (ops repo takes precedence)
-        if let Ok(repo_values) = ops_values
-            && let (Some(base_obj), Some(repo_obj)) =
-                (base_values.as_object_mut(), repo_values.as_object())
-        {
-            for (k, v) in repo_obj {
-                base_obj.insert(k.clone(), v.clone());
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(base), Some(ops)) = (base_values.as_object_mut(), ops_values.as_object()) {
+            for (k, v) in ops {
+                base.insert(k.clone(), v.clone());
             }
         }
 
-        // image_ref: prefer ops repo values, then DB
         let image_ref = base_values
             .get("image_ref")
             .and_then(|v| v.as_str())
-            .map_or_else(|| deployment.image_ref.clone(), String::from);
+            .map_or_else(|| release.image_ref.clone(), String::from);
 
         let vars = renderer::RenderVars {
             image_ref,
-            project_name: deployment.project_name.clone(),
-            environment: deployment.environment.clone(),
+            project_name: release.project_name.clone(),
+            environment: release.environment.clone(),
             values: base_values,
             platform_api_url: state.config.platform_api_url.clone(),
+            stable_image: lookup_stable_image(&state.pool, release.target_id).await,
+            canary_image: Some(release.image_ref.clone()),
+            commit_sha: release.commit_sha.clone(),
+            app_image: None,
         };
 
         let rendered = renderer::render(&template_content, &vars)?;
         Ok((rendered, Some(sha)))
     } else {
-        // No ops repo: generate a basic deployment manifest
-        let manifest = generate_basic_manifest(deployment);
+        let manifest = generate_basic_manifest(release);
         Ok((manifest, None))
     }
 }
 
 /// Generate a minimal K8s Deployment manifest when no ops repo is configured.
-fn generate_basic_manifest(deployment: &PendingDeployment) -> String {
-    let name = format!("{}-{}", deployment.project_name, deployment.environment);
+fn generate_basic_manifest(release: &PendingRelease) -> String {
+    let name = format!("{}-{}", release.project_name, release.environment);
     format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -874,145 +1185,66 @@ fn generate_basic_manifest(deployment: &PendingDeployment) -> String {
          \x20       ports:\n\
          \x20       - containerPort: 8080\n",
         secret = REGISTRY_PULL_SECRET_NAME,
-        image = deployment.image_ref,
+        image = release.image_ref,
     )
 }
 
-/// Update deployment status to healthy and write a success history entry.
-pub async fn finalize_success(
-    state: &AppState,
-    deployment: &PendingDeployment,
-    sha: Option<&str>,
-    action: &str,
-) -> Result<(), DeployerError> {
-    sqlx::query!(
-        r#"
-        UPDATE deployments
-        SET current_status = 'healthy', deployed_at = now(), current_sha = $2
-        WHERE id = $1
-        "#,
-        deployment.id,
-        sha,
-    )
-    .execute(&state.pool)
-    .await?;
-
-    sqlx::query!(
-        r#"
-        INSERT INTO deployment_history
-            (deployment_id, image_ref, ops_repo_sha, action, status, deployed_by)
-        VALUES ($1, $2, $3, $4, 'success', $5)
-        "#,
-        deployment.id,
-        deployment.image_ref,
-        sha,
-        action,
-        deployment.deployed_by,
-    )
-    .execute(&state.pool)
-    .await?;
-
-    tracing::info!(
-        deployment_id = %deployment.id,
-        %action,
-        image = %deployment.image_ref,
-        "deployment reconciled successfully"
-    );
-    Ok(())
-}
-
-/// Mark a deployment as failed and record a failure history entry.
-pub async fn mark_failed(
-    state: &AppState,
-    deployment_id: Uuid,
-    deployed_by: Option<Uuid>,
-    message: &str,
-) {
-    let _ = sqlx::query!(
-        "UPDATE deployments SET current_status = 'failed' WHERE id = $1",
-        deployment_id,
-    )
-    .execute(&state.pool)
-    .await;
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO deployment_history
-            (deployment_id, image_ref, action, status, deployed_by, message)
-        VALUES ($1, '', 'deploy', 'failure', $2, $3)
-        "#,
-        deployment_id,
-        deployed_by,
-        message,
-    )
-    .execute(&state.pool)
-    .await;
-}
-
-async fn fire_webhook(state: &AppState, deployment: &PendingDeployment, action: &str) {
-    let payload = serde_json::json!({
-        "action": action,
-        "project_id": deployment.project_id,
-        "environment": deployment.environment,
-        "image_ref": deployment.image_ref,
-    });
-    crate::api::webhooks::fire_webhooks(&state.pool, deployment.project_id, "deploy", &payload)
-        .await;
-}
-
-/// Store the tracked resource inventory in the database.
+/// Store tracked resource inventory.
 async fn store_tracked_resources(
     state: &AppState,
-    deployment_id: Uuid,
+    release_id: Uuid,
     tracked: &[applier::TrackedResource],
 ) -> Result<(), DeployerError> {
     let json = serde_json::to_value(tracked)
         .map_err(|e| DeployerError::Other(anyhow::anyhow!("serialize tracked: {e}")))?;
 
-    sqlx::query!(
-        "UPDATE deployments SET tracked_resources = $2 WHERE id = $1",
-        deployment_id,
-        json,
-    )
-    .execute(&state.pool)
-    .await?;
+    sqlx::query("UPDATE deploy_releases SET tracked_resources = $2 WHERE id = $1")
+        .bind(release_id)
+        .bind(json)
+        .execute(&state.pool)
+        .await?;
 
     Ok(())
 }
 
-fn copy_deployment_fields(d: &PendingDeployment) -> PendingDeployment {
-    PendingDeployment {
-        id: d.id,
-        project_id: d.project_id,
-        environment: d.environment.clone(),
-        ops_repo_id: d.ops_repo_id,
-        manifest_path: d.manifest_path.clone(),
-        image_ref: d.image_ref.clone(),
-        values_override: d.values_override.clone(),
-        desired_status: d.desired_status.clone(),
-        deployed_by: d.deployed_by,
-        project_name: d.project_name.clone(),
-        namespace_slug: d.namespace_slug.clone(),
-        tracked_resources: d.tracked_resources.clone(),
-        skip_prune: d.skip_prune,
-    }
+async fn fire_webhook(state: &AppState, release: &PendingRelease, action: &str) {
+    let payload = serde_json::json!({
+        "action": action,
+        "project_id": release.project_id,
+        "environment": release.environment,
+        "image_ref": release.image_ref,
+        "release_id": release.id,
+    });
+    crate::api::webhooks::fire_webhooks(&state.pool, release.project_id, "deploy", &payload).await;
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_deployment() -> PendingDeployment {
-        PendingDeployment {
+    fn sample_release() -> PendingRelease {
+        PendingRelease {
             id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
+            image_ref: "registry.example.com/myapp:v1.2.3".into(),
+            commit_sha: None,
+            strategy: "rolling".into(),
+            phase: "pending".into(),
+            traffic_weight: 0,
+            current_step: 0,
+            rollout_config: serde_json::json!({}),
+            values_override: None,
+            deployed_by: Some(Uuid::new_v4()),
+            pipeline_id: None,
             environment: "production".into(),
             ops_repo_id: None,
             manifest_path: None,
-            image_ref: "registry.example.com/myapp:v1.2.3".into(),
-            values_override: None,
-            desired_status: "active".into(),
-            deployed_by: Some(Uuid::new_v4()),
+            branch_slug: None,
             project_name: "my-app".into(),
             namespace_slug: "my-app".into(),
             tracked_resources: Vec::new(),
@@ -1022,22 +1254,22 @@ mod tests {
 
     #[test]
     fn basic_manifest_has_correct_name() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         assert!(manifest.contains("name: my-app-production"));
     }
 
     #[test]
     fn basic_manifest_has_correct_image() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         assert!(manifest.contains("image: registry.example.com/myapp:v1.2.3"));
     }
 
     #[test]
     fn basic_manifest_is_valid_yaml() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&manifest).expect("manifest should be valid YAML");
         assert_eq!(parsed["kind"], "Deployment");
@@ -1047,15 +1279,15 @@ mod tests {
 
     #[test]
     fn basic_manifest_container_port_8080() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         assert!(manifest.contains("containerPort: 8080"));
     }
 
     #[test]
     fn basic_manifest_selector_matches_labels() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
         let selector_label = &parsed["spec"]["selector"]["matchLabels"]["app"];
         let template_label = &parsed["spec"]["template"]["metadata"]["labels"]["app"];
@@ -1063,44 +1295,16 @@ mod tests {
     }
 
     #[test]
-    fn copy_deployment_fields_preserves_all() {
-        let original = sample_deployment();
-        let copy = copy_deployment_fields(&original);
-        assert_eq!(original.id, copy.id);
-        assert_eq!(original.project_id, copy.project_id);
-        assert_eq!(original.environment, copy.environment);
-        assert_eq!(original.ops_repo_id, copy.ops_repo_id);
-        assert_eq!(original.manifest_path, copy.manifest_path);
-        assert_eq!(original.image_ref, copy.image_ref);
-        assert_eq!(original.values_override, copy.values_override);
-        assert_eq!(original.desired_status, copy.desired_status);
-        assert_eq!(original.deployed_by, copy.deployed_by);
-        assert_eq!(original.project_name, copy.project_name);
-    }
-
-    #[test]
-    fn basic_manifest_with_special_chars_in_name() {
-        let mut d = sample_deployment();
-        d.project_name = "my-app-2".into();
-        d.environment = "staging-01".into();
-        let manifest = generate_basic_manifest(&d);
-        assert!(manifest.contains("name: my-app-2-staging-01"));
-        // Verify it's still valid YAML
-        let _: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
-    }
-
-    #[test]
     fn basic_manifest_different_environments() {
         for env in &["production", "staging", "development", "preview-feat-123"] {
-            let mut d = sample_deployment();
-            d.environment = (*env).to_string();
-            let manifest = generate_basic_manifest(&d);
+            let mut r = sample_release();
+            r.environment = (*env).to_string();
+            let manifest = generate_basic_manifest(&r);
             let expected_name = format!("name: my-app-{env}");
             assert!(
                 manifest.contains(&expected_name),
-                "manifest should contain '{expected_name}', got: {manifest}"
+                "manifest should contain '{expected_name}'"
             );
-            // Must be valid YAML
             let _: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
         }
     }
@@ -1112,100 +1316,27 @@ mod tests {
             "registry.io/app:v1.0.0-rc1",
             "ghcr.io/org/repo:sha-abc123",
         ] {
-            let mut d = sample_deployment();
-            d.image_ref = (*image).to_string();
-            let manifest = generate_basic_manifest(&d);
+            let mut r = sample_release();
+            r.image_ref = (*image).to_string();
+            let manifest = generate_basic_manifest(&r);
             assert!(manifest.contains(&format!("image: {image}")));
         }
     }
 
     #[test]
-    fn copy_deployment_fields_independent_of_original() {
-        let original = sample_deployment();
-        let mut copy = copy_deployment_fields(&original);
-        copy.image_ref = "modified:v2".into();
-        copy.environment = "staging".into();
-        // Original should be unchanged
-        assert_eq!(original.image_ref, "registry.example.com/myapp:v1.2.3");
-        assert_eq!(original.environment, "production");
-    }
-
-    #[test]
-    fn pending_deployment_with_ops_repo() {
-        let d = PendingDeployment {
-            id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment: "production".into(),
-            ops_repo_id: Some(Uuid::new_v4()),
-            manifest_path: Some("deploy.yaml".into()),
-            image_ref: "registry/app:v1".into(),
-            values_override: Some(serde_json::json!({"replicas": 3})),
-            desired_status: "active".into(),
-            deployed_by: Some(Uuid::new_v4()),
-            project_name: "my-project".into(),
-            namespace_slug: "my-project".into(),
-            tracked_resources: Vec::new(),
-            skip_prune: false,
-        };
-
-        assert!(d.ops_repo_id.is_some());
-        assert!(d.manifest_path.is_some());
-        assert!(d.values_override.is_some());
-        assert!(d.deployed_by.is_some());
-    }
-
-    #[test]
-    fn pending_deployment_minimal() {
-        let d = PendingDeployment {
-            id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment: "production".into(),
-            ops_repo_id: None,
-            manifest_path: None,
-            image_ref: "app:latest".into(),
-            values_override: None,
-            desired_status: "active".into(),
-            deployed_by: None,
-            project_name: "app".into(),
-            namespace_slug: "app".into(),
-            tracked_resources: Vec::new(),
-            skip_prune: false,
-        };
-
-        assert!(d.ops_repo_id.is_none());
-        assert!(d.manifest_path.is_none());
-        assert!(d.values_override.is_none());
-        assert!(d.deployed_by.is_none());
-    }
-
-    #[test]
     fn basic_manifest_container_name_is_app() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
         let container_name = &parsed["spec"]["template"]["spec"]["containers"][0]["name"];
         assert_eq!(container_name, "app");
     }
 
     #[test]
-    fn copy_deployment_preserves_ops_repo_id() {
-        let mut d = sample_deployment();
-        d.ops_repo_id = Some(Uuid::new_v4());
-        d.manifest_path = Some("custom/deploy.yaml".into());
-        d.values_override = Some(serde_json::json!({"key": "value"}));
-        let copy = copy_deployment_fields(&d);
-        assert_eq!(d.ops_repo_id, copy.ops_repo_id);
-        assert_eq!(d.manifest_path, copy.manifest_path);
-        assert_eq!(d.values_override, copy.values_override);
-    }
-
-    #[test]
     fn basic_manifest_labels_consistent() {
-        let d = sample_deployment();
-        let manifest = generate_basic_manifest(&d);
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r);
         let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
-
-        // selector.matchLabels.app must equal template.metadata.labels.app
         let selector = &parsed["spec"]["selector"]["matchLabels"]["app"];
         let template = &parsed["spec"]["template"]["metadata"]["labels"]["app"];
         let metadata_name = &parsed["metadata"]["name"];
@@ -1250,5 +1381,36 @@ mod tests {
             target_namespace(&config, "my-app", "production"),
             "platform-test-abc-my-app-prod"
         );
+    }
+
+    #[test]
+    fn build_docker_config_single_url() {
+        let config =
+            build_deploy_docker_config("registry.example.com:5000", None, "admin", "secret_token");
+        let auths = config["auths"].as_object().unwrap();
+        assert!(auths.contains_key("registry.example.com:5000"));
+        assert_eq!(auths.len(), 1);
+    }
+
+    #[test]
+    fn build_docker_config_with_node_url() {
+        let config = build_deploy_docker_config(
+            "registry.example.com:5000",
+            Some("node-registry:5000"),
+            "admin",
+            "secret_token",
+        );
+        let auths = config["auths"].as_object().unwrap();
+        assert!(auths.contains_key("registry.example.com:5000"));
+        assert!(auths.contains_key("node-registry:5000"));
+        assert_eq!(auths.len(), 2);
+    }
+
+    #[test]
+    fn build_docker_config_same_urls_no_duplicate() {
+        let config =
+            build_deploy_docker_config("registry:5000", Some("registry:5000"), "admin", "tok");
+        let auths = config["auths"].as_object().unwrap();
+        assert_eq!(auths.len(), 1);
     }
 }

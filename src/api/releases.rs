@@ -6,6 +6,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use uuid::Uuid;
 
 use ts_rs::TS;
@@ -104,15 +105,15 @@ async fn list_releases(
 ) -> Result<Json<ListResponse<ReleaseResponse>>, ApiError> {
     require_project_read(&state, &auth, id).await?;
 
-    let rows = sqlx::query!(
-        r#"
+    let rows = sqlx::query(
+        r"
         SELECT id, project_id, tag_name, name, body, is_draft, is_prerelease,
                created_by, created_at, updated_at
         FROM releases WHERE project_id = $1
         ORDER BY created_at DESC
-        "#,
-        id,
+        ",
     )
+    .bind(id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -120,16 +121,16 @@ async fn list_releases(
     let items = rows
         .into_iter()
         .map(|r| ReleaseResponse {
-            id: r.id,
-            project_id: r.project_id,
-            tag_name: r.tag_name,
-            name: r.name,
-            body: r.body,
-            is_draft: r.is_draft,
-            is_prerelease: r.is_prerelease,
-            created_by: r.created_by,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+            id: r.get("id"),
+            project_id: r.get("project_id"),
+            tag_name: r.get("tag_name"),
+            name: r.get("name"),
+            body: r.get("body"),
+            is_draft: r.get("is_draft"),
+            is_prerelease: r.get("is_prerelease"),
+            created_by: r.get("created_by"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
         })
         .collect();
 
@@ -151,23 +152,25 @@ async fn create_release(
         validation::check_length("body", b, 0, 100_000)?;
     }
 
-    let row = sqlx::query!(
-        r#"
+    let row = sqlx::query(
+        r"
         INSERT INTO releases (project_id, tag_name, name, body, is_draft, is_prerelease, created_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, project_id, tag_name, name, body, is_draft, is_prerelease,
                   created_by, created_at, updated_at
-        "#,
-        id,
-        body.tag_name,
-        body.name,
-        body.body,
-        body.is_draft,
-        body.is_prerelease,
-        auth.user_id,
+        ",
     )
+    .bind(id)
+    .bind(&body.tag_name)
+    .bind(&body.name)
+    .bind(&body.body)
+    .bind(body.is_draft)
+    .bind(body.is_prerelease)
+    .bind(auth.user_id)
     .fetch_one(&state.pool)
     .await?;
+
+    let release_id: Uuid = row.get("id");
 
     write_audit(
         &state.pool,
@@ -176,7 +179,7 @@ async fn create_release(
             actor_name: &auth.user_name,
             action: "release.create",
             resource: "release",
-            resource_id: Some(row.id),
+            resource_id: Some(release_id),
             project_id: Some(id),
             detail: Some(serde_json::json!({"tag_name": body.tag_name})),
             ip_addr: auth.ip_addr.as_deref(),
@@ -187,16 +190,16 @@ async fn create_release(
     Ok((
         StatusCode::CREATED,
         Json(ReleaseResponse {
-            id: row.id,
-            project_id: row.project_id,
-            tag_name: row.tag_name,
-            name: row.name,
-            body: row.body,
-            is_draft: row.is_draft,
-            is_prerelease: row.is_prerelease,
-            created_by: row.created_by,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            id: release_id,
+            project_id: row.get("project_id"),
+            tag_name: row.get("tag_name"),
+            name: row.get("name"),
+            body: row.get("body"),
+            is_draft: row.get("is_draft"),
+            is_prerelease: row.get("is_prerelease"),
+            created_by: row.get("created_by"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
         }),
     ))
 }
@@ -208,30 +211,30 @@ async fn get_release(
 ) -> Result<Json<ReleaseResponse>, ApiError> {
     require_project_read(&state, &auth, id).await?;
 
-    let row = sqlx::query!(
-        r#"
+    let row = sqlx::query(
+        r"
         SELECT id, project_id, tag_name, name, body, is_draft, is_prerelease,
                created_by, created_at, updated_at
         FROM releases WHERE project_id = $1 AND tag_name = $2
-        "#,
-        id,
-        tag_name,
+        ",
     )
+    .bind(id)
+    .bind(&tag_name)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release".into()))?;
 
     Ok(Json(ReleaseResponse {
-        id: row.id,
-        project_id: row.project_id,
-        tag_name: row.tag_name,
-        name: row.name,
-        body: row.body,
-        is_draft: row.is_draft,
-        is_prerelease: row.is_prerelease,
-        created_by: row.created_by,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        id: row.get("id"),
+        project_id: row.get("project_id"),
+        tag_name: row.get("tag_name"),
+        name: row.get("name"),
+        body: row.get("body"),
+        is_draft: row.get("is_draft"),
+        is_prerelease: row.get("is_prerelease"),
+        created_by: row.get("created_by"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }))
 }
 
@@ -251,8 +254,8 @@ async fn update_release(
         validation::check_length("body", b, 0, 100_000)?;
     }
 
-    let row = sqlx::query!(
-        r#"
+    let row = sqlx::query(
+        r"
         UPDATE releases SET
             name = COALESCE($3, name),
             body = COALESCE($4, body),
@@ -262,17 +265,19 @@ async fn update_release(
         WHERE project_id = $1 AND tag_name = $2
         RETURNING id, project_id, tag_name, name, body, is_draft, is_prerelease,
                   created_by, created_at, updated_at
-        "#,
-        id,
-        tag_name,
-        body.name,
-        body.body,
-        body.is_draft,
-        body.is_prerelease,
+        ",
     )
+    .bind(id)
+    .bind(&tag_name)
+    .bind(&body.name)
+    .bind(&body.body)
+    .bind(body.is_draft)
+    .bind(body.is_prerelease)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release".into()))?;
+
+    let release_id: Uuid = row.get("id");
 
     write_audit(
         &state.pool,
@@ -281,7 +286,7 @@ async fn update_release(
             actor_name: &auth.user_name,
             action: "release.update",
             resource: "release",
-            resource_id: Some(row.id),
+            resource_id: Some(release_id),
             project_id: Some(id),
             detail: None,
             ip_addr: auth.ip_addr.as_deref(),
@@ -290,16 +295,16 @@ async fn update_release(
     .await;
 
     Ok(Json(ReleaseResponse {
-        id: row.id,
-        project_id: row.project_id,
-        tag_name: row.tag_name,
-        name: row.name,
-        body: row.body,
-        is_draft: row.is_draft,
-        is_prerelease: row.is_prerelease,
-        created_by: row.created_by,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        id: release_id,
+        project_id: row.get("project_id"),
+        tag_name: row.get("tag_name"),
+        name: row.get("name"),
+        body: row.get("body"),
+        is_draft: row.get("is_draft"),
+        is_prerelease: row.get("is_prerelease"),
+        created_by: row.get("created_by"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }))
 }
 
@@ -311,28 +316,28 @@ async fn delete_release(
 ) -> Result<StatusCode, ApiError> {
     require_project_write(&state, &auth, id).await?;
 
-    let release = sqlx::query_scalar!(
+    let release: Uuid = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM releases WHERE project_id = $1 AND tag_name = $2",
-        id,
-        tag_name,
     )
+    .bind(id)
+    .bind(&tag_name)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release".into()))?;
 
     // Delete assets from MinIO
-    let assets = sqlx::query!(
-        "SELECT minio_path FROM release_assets WHERE release_id = $1",
-        release,
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let assets = sqlx::query("SELECT minio_path FROM release_assets WHERE release_id = $1")
+        .bind(release)
+        .fetch_all(&state.pool)
+        .await?;
 
     for asset in &assets {
-        let _ = state.minio.delete(&asset.minio_path).await;
+        let minio_path: String = asset.get("minio_path");
+        let _ = state.minio.delete(&minio_path).await;
     }
 
-    sqlx::query!("DELETE FROM releases WHERE id = $1", release)
+    sqlx::query("DELETE FROM releases WHERE id = $1")
+        .bind(release)
         .execute(&state.pool)
         .await?;
 
@@ -363,11 +368,11 @@ async fn upload_asset(
 ) -> Result<impl IntoResponse, ApiError> {
     require_project_write(&state, &auth, id).await?;
 
-    let release_id = sqlx::query_scalar!(
+    let release_id: Uuid = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM releases WHERE project_id = $1 AND tag_name = $2",
-        id,
-        tag_name,
     )
+    .bind(id)
+    .bind(&tag_name)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release".into()))?;
@@ -397,30 +402,30 @@ async fn upload_asset(
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("storage write: {e}")))?;
 
-    let row = sqlx::query!(
-        r#"
+    let row = sqlx::query(
+        r"
         INSERT INTO release_assets (release_id, name, minio_path, content_type, size_bytes)
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id, release_id, name, content_type, size_bytes, created_at
-        "#,
-        release_id,
-        file_name,
-        minio_path,
-        content_type.as_deref(),
-        size_bytes,
+        ",
     )
+    .bind(release_id)
+    .bind(&file_name)
+    .bind(&minio_path)
+    .bind(content_type.as_deref())
+    .bind(size_bytes)
     .fetch_one(&state.pool)
     .await?;
 
     Ok((
         StatusCode::CREATED,
         Json(AssetResponse {
-            id: row.id,
-            release_id: row.release_id,
-            name: row.name,
-            content_type: row.content_type,
-            size_bytes: row.size_bytes,
-            created_at: row.created_at,
+            id: row.get("id"),
+            release_id: row.get("release_id"),
+            name: row.get("name"),
+            content_type: row.get("content_type"),
+            size_bytes: row.get("size_bytes"),
+            created_at: row.get("created_at"),
         }),
     ))
 }
@@ -432,43 +437,44 @@ async fn download_asset(
 ) -> Result<impl IntoResponse, ApiError> {
     require_project_read(&state, &auth, id).await?;
 
-    let release_id = sqlx::query_scalar!(
+    let release_id: Uuid = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM releases WHERE project_id = $1 AND tag_name = $2",
-        id,
-        tag_name,
     )
+    .bind(id)
+    .bind(&tag_name)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release".into()))?;
 
-    let asset = sqlx::query!(
-        r#"
+    let asset = sqlx::query(
+        r"
         SELECT name, minio_path, content_type
         FROM release_assets WHERE id = $1 AND release_id = $2
-        "#,
-        asset_id,
-        release_id,
+        ",
     )
+    .bind(asset_id)
+    .bind(release_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("release asset".into()))?;
 
+    let minio_path: String = asset.get("minio_path");
     let data = state
         .minio
-        .read(&asset.minio_path)
+        .read(&minio_path)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("storage read: {e}")))?;
 
-    let content_type = asset
-        .content_type
-        .unwrap_or_else(|| "application/octet-stream".into());
+    let content_type: Option<String> = asset.get("content_type");
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".into());
+    let name: String = asset.get("name");
 
     Ok((
         [
             ("content-type", content_type),
             (
                 "content-disposition",
-                format!("attachment; filename=\"{}\"", asset.name),
+                format!("attachment; filename=\"{name}\""),
             ),
         ],
         data.to_vec(),

@@ -1,17 +1,18 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, qs, type ListResponse } from '../lib/api';
-import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret, AgentSession, IframePanel } from '../lib/types';
+import type { Project, Issue, MergeRequest, Pipeline, Deployment, Webhook, TreeEntry, BlobResponse, BranchInfo, PreviewDeployment, Secret, AgentSession, IframePanel, LogEntry } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { Badge } from '../components/Badge';
 import { StatusDot } from '../components/StatusDot';
 import { Pagination } from '../components/Pagination';
 import { Modal } from '../components/Modal';
+import { FilterBar } from '../components/FilterBar';
 import { AgentChatPanel } from '../components/AgentChatPanel';
 import { Sessions } from './Sessions';
 
 interface Props { id?: string; tab?: string; }
 
-const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'skills', 'webhooks', 'settings'];
+const TABS = ['files', 'issues', 'mrs', 'builds', 'deployments', 'sessions', 'logs', 'skills', 'webhooks', 'settings'];
 
 export function ProjectDetail({ id, tab }: Props) {
   const [project, setProject] = useState<Project | null>(null);
@@ -155,10 +156,107 @@ export function ProjectDetail({ id, tab }: Props) {
       {currentTab === 'builds' && <BuildsTab projectId={id!} />}
       {currentTab === 'deployments' && <DeploymentsTab projectId={id!} />}
       {currentTab === 'sessions' && <Sessions projectId={id!} />}
+      {currentTab === 'logs' && <ProjectLogs projectId={id!} />}
       {currentTab === 'skills' && <SkillsTab projectId={id!} />}
       {currentTab === 'webhooks' && <WebhooksTab projectId={id!} />}
       {currentTab === 'settings' && <SettingsTab project={project} onUpdate={setProject} />}
       <AgentChatPanel projectId={id!} open={chatOpen} onClose={() => setChatOpen(false)} />
+    </div>
+  );
+}
+
+function ProjectLogs({ projectId }: { projectId: string }) {
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [filters, setFilters] = useState<Record<string, string>>({ range: '24h', level: '', source: '' });
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    const params: Record<string, string | number> = { limit: 50, offset };
+    if (filters.range) params.range = filters.range;
+    if (filters.level) params.level = filters.level;
+    if (filters.source) params.source = filters.source;
+    if (filters.q) params.q = filters.q;
+
+    api.get<ListResponse<LogEntry>>(`/api/projects/${projectId}/logs${qs(params)}`)
+      .then(r => { setLogs(r.items); setTotal(r.total); })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(load, [offset, projectId]);
+
+  const toggleExpand = (id: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const formatTime = (ts: string) => {
+    const d = new Date(ts);
+    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  const LEVEL_CLASSES: Record<string, string> = {
+    error: 'log-level-error', warn: 'log-level-warn', info: 'log-level-info',
+    debug: 'log-level-debug', trace: 'log-level-trace',
+  };
+
+  return (
+    <div>
+      <FilterBar filters={[
+        { key: 'range', label: 'Time range', type: 'select', options: [
+          { value: '1h', label: 'Last 1 hour' }, { value: '6h', label: 'Last 6 hours' },
+          { value: '24h', label: 'Last 24 hours' }, { value: '7d', label: 'Last 7 days' },
+        ] },
+        { key: 'level', label: 'Level', type: 'select', options: [
+          { value: '', label: 'All levels' }, { value: 'error', label: 'Error' },
+          { value: 'warn', label: 'Warn' }, { value: 'info', label: 'Info' },
+        ] },
+        { key: 'source', label: 'Source', type: 'select', options: [
+          { value: '', label: 'All sources' }, { value: 'system', label: 'System' },
+          { value: 'api', label: 'API' }, { value: 'session', label: 'Session' },
+          { value: 'external', label: 'External' },
+        ] },
+        { key: 'q', label: 'Search', type: 'text', placeholder: 'Full-text search...' },
+      ]} values={filters} onChange={setFilters} onApply={() => { setOffset(0); load(); }} />
+      <div class="card" style="margin-top:1rem">
+        {loading ? (
+          <div class="empty-state">Loading...</div>
+        ) : logs.length === 0 ? (
+          <div class="empty-state">No log entries found</div>
+        ) : (
+          <div class="log-list">
+            {logs.map(entry => (
+              <div key={entry.id} class="log-entry" onClick={() => toggleExpand(entry.id)}>
+                <div class="log-entry-row">
+                  <span class="log-time mono text-xs">{formatTime(entry.timestamp)}</span>
+                  <span class={`log-level ${LEVEL_CLASSES[entry.level.toLowerCase()] || ''}`}>
+                    {entry.level.toUpperCase().padEnd(5)}
+                  </span>
+                  <span class="log-source text-xs" style="opacity:0.6">{entry.source}</span>
+                  <span class="log-service text-xs">{entry.service}</span>
+                  <span class="log-message">{entry.message}</span>
+                </div>
+                {expanded.has(entry.id) && entry.attributes && (
+                  <div class="log-attributes">
+                    <pre class="log-viewer" style="max-height:200px;margin-top:0.5rem">
+                      {JSON.stringify(entry.attributes, null, 2)}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <Pagination total={total} limit={50} offset={offset} onChange={setOffset} />
+      </div>
     </div>
   );
 }

@@ -223,7 +223,7 @@ pub async fn on_api(
 ///
 /// When `dev_image_dockerfile` is `Some(path)`, an extra kaniko step is appended
 /// that builds the specified Dockerfile and pushes to `$REGISTRY/$PROJECT-dev:$COMMIT_SHA`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn create_pipeline_with_steps(
     pool: &PgPool,
     project_id: Uuid,
@@ -254,7 +254,6 @@ async fn create_pipeline_with_steps(
     .await?;
 
     for (i, step) in def.steps.iter().enumerate() {
-        let commands: Vec<&str> = step.commands.iter().map(String::as_str).collect();
         let step_order = i32::try_from(i).unwrap_or(i32::MAX);
 
         let condition_events: Vec<&str> = step
@@ -267,10 +266,6 @@ async fn create_pipeline_with_steps(
             .as_ref()
             .map(|c| c.branches.iter().map(String::as_str).collect())
             .unwrap_or_default();
-        let deploy_test_json = step
-            .deploy_test
-            .as_ref()
-            .map(|dt| serde_json::to_value(dt).unwrap_or_default());
         let depends_on: Vec<&str> = step.depends_on.iter().map(String::as_str).collect();
         let environment_json = if step.environment.is_empty() {
             None
@@ -278,86 +273,106 @@ async fn create_pipeline_with_steps(
             Some(serde_json::to_value(&step.environment).unwrap_or_default())
         };
 
-        sqlx::query!(
-            r#"
-            INSERT INTO pipeline_steps (pipeline_id, project_id, step_order, name, image, commands,
+        // Resolve step type and generate image/commands for platform-managed steps.
+        let kind = step.kind();
+        let (step_type_str, image, commands, deploy_test_json, step_config) = match kind {
+            super::definition::StepKind::ImageBuild => {
+                let image_name = step.image_name.as_deref().unwrap_or("app");
+                let dockerfile = step.dockerfile.as_deref().unwrap_or("Dockerfile");
+                let kaniko_cmd = format!(
+                    "/kaniko/executor \
+                     --context=dir:///workspace \
+                     --dockerfile={dockerfile} \
+                     --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/{image_name}:${{COMMIT_SHA}} \
+                     --build-arg=PLATFORM_RUNNER_IMAGE=${{REGISTRY}}/platform-runner:latest \
+                     --insecure --insecure-registry=${{REGISTRY}} \
+                     --insecure-pull \
+                     --cache=true --cache-repo=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/cache"
+                );
+                let config = serde_json::json!({
+                    "image_name": image_name,
+                    "dockerfile": dockerfile,
+                    "secrets": step.secrets,
+                });
+                (
+                    "imagebuild",
+                    DEV_IMAGE_KANIKO.to_string(),
+                    vec![kaniko_cmd],
+                    None,
+                    Some(config),
+                )
+            }
+            super::definition::StepKind::DeployTest => {
+                let dt_json = step
+                    .deploy_test
+                    .as_ref()
+                    .map(|dt| serde_json::to_value(dt).unwrap_or_default());
+                (
+                    "deploy_test",
+                    step.image.clone(),
+                    step.commands.clone(),
+                    dt_json,
+                    None,
+                )
+            }
+            super::definition::StepKind::GitopsSync => {
+                let config = step
+                    .gitops
+                    .as_ref()
+                    .map(|g| serde_json::to_value(g).unwrap_or_default());
+                ("gitops_sync", String::new(), vec![], None, config)
+            }
+            super::definition::StepKind::DeployWatch => {
+                let config = step
+                    .deploy_watch
+                    .as_ref()
+                    .map(|dw| serde_json::to_value(dw).unwrap_or_default());
+                ("deploy_watch", String::new(), vec![], None, config)
+            }
+            super::definition::StepKind::Command => (
+                "command",
+                step.image.clone(),
+                step.commands.clone(),
+                None,
+                None,
+            ),
+        };
+        let commands_refs: Vec<&str> = commands.iter().map(String::as_str).collect();
+
+        sqlx::query(
+            "INSERT INTO pipeline_steps (pipeline_id, project_id, step_order, name, image, commands,
                                         condition_events, condition_branches, deploy_test,
-                                        depends_on, environment, gate)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            "#,
-            pipeline_id,
-            project_id,
-            step_order,
-            step.name,
-            step.image,
-            &commands as &[&str],
-            &condition_events as &[&str],
-            &condition_branches as &[&str],
-            deploy_test_json,
-            &depends_on as &[&str],
-            environment_json,
-            step.gate,
+                                        depends_on, environment, gate, step_type, step_config)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
+        .bind(pipeline_id)
+        .bind(project_id)
+        .bind(step_order)
+        .bind(&step.name)
+        .bind(&image)
+        .bind(&commands_refs as &[&str])
+        .bind(&condition_events as &[&str])
+        .bind(&condition_branches as &[&str])
+        .bind(&deploy_test_json)
+        .bind(&depends_on as &[&str])
+        .bind(&environment_json)
+        .bind(step.gate)
+        .bind(step_type_str)
+        .bind(&step_config)
         .execute(&mut *tx)
         .await?;
     }
 
-    if let Some(dockerfile) = dev_image_dockerfile {
-        insert_dev_image_step(
-            &mut tx,
-            pipeline_id,
-            project_id,
-            def.steps.len(),
-            dockerfile,
-        )
-        .await?;
-    }
+    // NOTE: dev_image_dockerfile is no longer auto-injected as a magic step.
+    // Projects should declare `type: imagebuild` steps for dev images in .platform.yaml.
+    // The parameter is kept for backwards compat (callers still pass it) but ignored.
+    let _ = dev_image_dockerfile;
 
     tx.commit().await?;
     Ok(pipeline_id)
 }
 
-/// Insert the auto-generated kaniko step that builds a dev image.
-///
-/// The `dockerfile` parameter specifies which Dockerfile to use (e.g. `Dockerfile.dev`).
-async fn insert_dev_image_step(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pipeline_id: Uuid,
-    project_id: Uuid,
-    existing_step_count: usize,
-    dockerfile: &str,
-) -> Result<(), PipelineError> {
-    let step_order = i32::try_from(existing_step_count).unwrap_or(i32::MAX);
-    let cmd = format!(
-        "/kaniko/executor \
-        --dockerfile={dockerfile} \
-        --context=/workspace \
-        --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/dev:${{COMMIT_SHA:-latest}} \
-        --build-arg=PLATFORM_RUNNER_IMAGE=${{REGISTRY}}/platform-runner:latest \
-        --insecure \
-        --insecure-pull \
-        --cache=true"
-    );
-    let commands: Vec<&str> = vec![&cmd];
-
-    sqlx::query!(
-        r#"
-        INSERT INTO pipeline_steps (pipeline_id, project_id, step_order, name, image, commands)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        "#,
-        pipeline_id,
-        project_id,
-        step_order,
-        DEV_IMAGE_STEP_NAME,
-        DEV_IMAGE_KANIKO,
-        &commands as &[&str],
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    tracing::info!(%pipeline_id, "added auto dev-image build step");
-    Ok(())
-}
+// insert_dev_image_step removed — dev images are now explicit `type: imagebuild` steps.
 
 /// Check if `Dockerfile.dev` exists at the given git ref.
 async fn has_dockerfile_dev(repo_path: &Path, git_ref: &str) -> bool {

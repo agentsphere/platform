@@ -33,7 +33,7 @@ export function Logs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [filters, setFilters] = useState<Record<string, string>>({ time_range: '1h', level: '', project_id: '' });
+  const [filters, setFilters] = useState<Record<string, string>>({ range: '1h', level: '', project_id: '', source: '', task_name: '', trace_id: '' });
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [liveTail, setLiveTail] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -53,20 +53,32 @@ export function Logs() {
 
   const filterDefs: FilterDef[] = [
     { key: 'project_id', label: 'Project', type: 'select', options: projects },
-    { key: 'time_range', label: 'Time range', type: 'select', options: TIME_RANGES },
+    { key: 'range', label: 'Time range', type: 'select', options: TIME_RANGES },
     { key: 'level', label: 'Level', type: 'select', options: LEVELS },
+    { key: 'source', label: 'Source', type: 'select', options: [
+      { value: '', label: 'All sources' },
+      { value: 'system', label: 'System' },
+      { value: 'api', label: 'API' },
+      { value: 'session', label: 'Session' },
+      { value: 'external', label: 'External' },
+    ] },
+    { key: 'task_name', label: 'Task', type: 'text', placeholder: 'Filter by task...' },
     { key: 'service', label: 'Service', type: 'text', placeholder: 'All services' },
-    { key: 'query', label: 'Search', type: 'text', placeholder: 'Full-text search...' },
+    { key: 'trace_id', label: 'Trace', type: 'text', placeholder: 'Trace ID...' },
+    { key: 'q', label: 'Search', type: 'text', placeholder: 'Full-text search...' },
   ];
 
   const load = () => {
     setLoading(true);
     const params: Record<string, string | number> = { limit: 50, offset };
     if (filters.project_id) params.project_id = filters.project_id;
-    if (filters.time_range) params.time_range = filters.time_range;
+    if (filters.range) params.range = filters.range;
     if (filters.level) params.level = filters.level;
+    if (filters.source) params.source = filters.source;
+    if (filters.task_name) params.task_name = filters.task_name;
     if (filters.service) params.service = filters.service;
-    if (filters.query) params.query = filters.query;
+    if (filters.trace_id) params.trace_id = filters.trace_id;
+    if (filters.q) params.q = filters.q;
 
     api.get<ListResponse<LogEntry>>(`/api/observe/logs${qs(params)}`)
       .then(r => { setLogs(r.items); setTotal(r.total); })
@@ -133,13 +145,17 @@ export function Logs() {
                   <span class={`log-level ${LEVEL_CLASSES[entry.level.toLowerCase()] || ''}`}>
                     {entry.level.toUpperCase().padEnd(5)}
                   </span>
+                  <span class="log-source text-xs" style="opacity:0.6">{entry.source}</span>
                   <span class="log-service text-xs">{entry.service}</span>
                   <span class="log-message">{entry.message}</span>
                   {entry.trace_id && (
                     <a class="log-trace-link text-xs"
-                      href={`/observe/traces/${entry.trace_id}`}
-                      onClick={(e) => e.stopPropagation()}>
-                      trace
+                      href="#"
+                      onClick={(e) => { e.stopPropagation(); e.preventDefault();
+                        setFilters(prev => ({ ...prev, trace_id: entry.trace_id! }));
+                        setOffset(0);
+                      }}>
+                      {entry.trace_id.slice(0, 8)}
                     </a>
                   )}
                 </div>

@@ -25,7 +25,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from app import cart, db
+from app import cart, db, flags
 
 # ---------------------------------------------------------------------------
 # OpenTelemetry — always on; reads OTEL_* env vars injected by platform
@@ -119,6 +119,10 @@ async def lifespan(application: FastAPI):
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
+# Progressive delivery env vars
+THEME_COLOR = os.getenv("THEME_COLOR", "blue")
+APP_VERSION = os.getenv("APP_VERSION", "stable")
+
 app = FastAPI(title="Platform Demo Shop", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app)
 
@@ -271,6 +275,11 @@ async def orders_page(request: Request):
 @app.get("/api/products")
 async def api_products(request: Request):
     return request.app.state.products_cache
+
+
+@app.get("/api/version")
+async def api_version():
+    return {"version": APP_VERSION, "theme_color": THEME_COLOR}
 
 
 # ---------------------------------------------------------------------------

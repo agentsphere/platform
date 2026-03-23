@@ -9,6 +9,18 @@ pub struct RenderVars {
     pub values: serde_json::Value,
     /// Platform API URL for OTLP endpoint, service discovery, etc.
     pub platform_api_url: String,
+    /// Current stable image (for canary/AB deploys).
+    #[serde(default)]
+    pub stable_image: Option<String>,
+    /// New canary image (for canary/AB deploys).
+    #[serde(default)]
+    pub canary_image: Option<String>,
+    /// Git commit SHA.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    /// App image for testinfra/ rendering.
+    #[serde(default)]
+    pub app_image: Option<String>,
 }
 
 /// Render a manifest template with the given variables using minijinja.
@@ -30,6 +42,10 @@ pub fn render(template_content: &str, vars: &RenderVars) -> Result<String, Deplo
         environment => &vars.environment,
         values => &vars.values,
         platform_api_url => &vars.platform_api_url,
+        stable_image => &vars.stable_image,
+        canary_image => &vars.canary_image,
+        commit_sha => &vars.commit_sha,
+        app_image => &vars.app_image,
     })
     .map_err(|e| DeployerError::RenderFailed(e.to_string()))
 }
@@ -76,6 +92,10 @@ spec:
             environment: "production".into(),
             values: serde_json::json!({"replicas": 3}),
             platform_api_url: "http://platform:8080".into(),
+            stable_image: None,
+            canary_image: None,
+            commit_sha: None,
+            app_image: None,
         };
 
         let result = render(template, &vars).unwrap();
@@ -93,6 +113,10 @@ spec:
             environment: "staging".into(),
             values: serde_json::json!({"resources": {"cpu": "500m", "memory": "256Mi"}}),
             platform_api_url: "http://platform:8080".into(),
+            stable_image: None,
+            canary_image: None,
+            commit_sha: None,
+            app_image: None,
         };
 
         let result = render(template, &vars).unwrap();
@@ -109,6 +133,10 @@ spec:
             environment: "staging".into(),
             values: serde_json::json!({}),
             platform_api_url: "http://platform:8080".into(),
+            stable_image: None,
+            canary_image: None,
+            commit_sha: None,
+            app_image: None,
         };
 
         // minijinja renders undefined as empty string by default (not an error)
@@ -177,6 +205,45 @@ spec:
     }
 
     #[test]
+    fn render_canary_vars() {
+        let template =
+            "stable: {{ stable_image }}\ncanary: {{ canary_image }}\nsha: {{ commit_sha }}";
+        let vars = RenderVars {
+            image_ref: "img:v2".into(),
+            project_name: "app".into(),
+            environment: "production".into(),
+            values: serde_json::json!({}),
+            platform_api_url: "http://platform:8080".into(),
+            stable_image: Some("registry/app:v1".into()),
+            canary_image: Some("registry/app:v2".into()),
+            commit_sha: Some("abc123".into()),
+            app_image: None,
+        };
+        let result = render(template, &vars).unwrap();
+        assert!(result.contains("stable: registry/app:v1"));
+        assert!(result.contains("canary: registry/app:v2"));
+        assert!(result.contains("sha: abc123"));
+    }
+
+    #[test]
+    fn render_app_image_for_testinfra() {
+        let template = "image: {{ app_image }}";
+        let vars = RenderVars {
+            image_ref: "img:v1".into(),
+            project_name: "app".into(),
+            environment: "test".into(),
+            values: serde_json::json!({}),
+            platform_api_url: "http://platform:8080".into(),
+            stable_image: None,
+            canary_image: None,
+            commit_sha: None,
+            app_image: Some("registry/app:abc123".into()),
+        };
+        let result = render(template, &vars).unwrap();
+        assert!(result.contains("image: registry/app:abc123"));
+    }
+
+    #[test]
     fn render_invalid_template_syntax_errors() {
         let template = "{{ unclosed";
         let vars = RenderVars {
@@ -185,6 +252,10 @@ spec:
             environment: "staging".into(),
             values: serde_json::json!({}),
             platform_api_url: "http://platform:8080".into(),
+            stable_image: None,
+            canary_image: None,
+            commit_sha: None,
+            app_image: None,
         };
         assert!(render(template, &vars).is_err());
     }

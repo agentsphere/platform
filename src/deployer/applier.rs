@@ -46,6 +46,9 @@ const ALLOWED_KINDS: &[&str] = &[
     "DaemonSet",
     "PersistentVolumeClaim",
     "NetworkPolicy",
+    // Gateway API (Envoy Gateway)
+    "HTTPRoute",
+    "Gateway",
 ];
 
 /// Apply manifests with optional deployment tracking.
@@ -327,6 +330,7 @@ pub async fn wait_healthy(
 }
 
 /// Scale a Deployment to the given number of replicas.
+#[allow(dead_code)]
 #[tracing::instrument(skip(kube_client), fields(%namespace, %deployment_name, %replicas), err)]
 pub async fn scale(
     kube_client: &kube::Client,
@@ -503,6 +507,8 @@ fn kind_to_plural(kind: &str) -> String {
         "DaemonSet" => "daemonsets".into(),
         "PersistentVolumeClaim" => "persistentvolumeclaims".into(),
         "NetworkPolicy" => "networkpolicies".into(),
+        "HTTPRoute" => "httproutes".into(),
+        "Gateway" => "gateways".into(),
         // Fallback: lowercase + "s" (works for most standard resources)
         other => format!("{}s", other.to_lowercase()),
     }
@@ -873,6 +879,8 @@ mod tests {
             "StatefulSet",
             "DaemonSet",
             "NetworkPolicy",
+            "HTTPRoute",
+            "Gateway",
         ] {
             assert!(
                 ALLOWED_KINDS.contains(kind),

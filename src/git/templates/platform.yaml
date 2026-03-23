@@ -33,3 +33,23 @@ pipeline:
 
   dev_image:
     dockerfile: Dockerfile.dev
+
+# --- Progressive Delivery (uncomment to enable) ---
+#
+# flags:
+#   - key: my_feature
+#     default_value: false
+#     description: "Feature flag description"
+#
+# deploy:
+#   enable_staging: false
+#   specs:
+#     - name: api
+#       type: rolling
+#       # For canary deployments:
+#       # type: canary
+#       # canary:
+#       #   stable_service: myapp-stable
+#       #   canary_service: myapp-canary
+#       #   steps: [10, 25, 50, 100]
+#       #   interval: 120

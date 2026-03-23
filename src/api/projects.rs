@@ -247,8 +247,8 @@ pub async fn setup_project_infrastructure(
             let ops_repo_path_str = ops_repo_path.to_string_lossy().to_string();
             if let Err(e) = sqlx::query!(
                 r#"
-                INSERT INTO ops_repos (name, repo_path, branch, project_id)
-                VALUES ($1, $2, 'main', $3)
+                INSERT INTO ops_repos (name, repo_path, branch, path, project_id)
+                VALUES ($1, $2, 'main', 'deploy/', $3)
                 ON CONFLICT (project_id) WHERE project_id IS NOT NULL DO NOTHING
                 "#,
                 format!("{namespace_slug}-ops"),

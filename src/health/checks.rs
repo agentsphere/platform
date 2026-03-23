@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use fred::interfaces::ClientLike;
 use sqlx::Row;
+use tracing::Instrument;
 
 use crate::store::AppState;
 
@@ -292,21 +293,30 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                 break;
             }
             _ = interval.tick() => {
-                let snapshot = build_snapshot(&state, start_time).await;
+                let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let span = tracing::info_span!(
+                    "task_iteration",
+                    task_name = "health_checks",
+                    trace_id = %iter_trace_id,
+                    source = "system",
+                );
+                async {
+                    let snapshot = build_snapshot(&state, start_time).await;
 
-                // Publish to Valkey for SSE subscribers
-                if let Ok(json) = serde_json::to_string(&snapshot) {
-                    let _: Result<(), _> = fred::interfaces::PubsubInterface::publish::<(), _, _>(
-                        state.valkey.next(),
-                        "health:stream",
-                        json,
-                    ).await;
-                }
+                    // Publish to Valkey for SSE subscribers
+                    if let Ok(json) = serde_json::to_string(&snapshot) {
+                        let _: Result<(), _> = fred::interfaces::PubsubInterface::publish::<(), _, _>(
+                            state.valkey.next(),
+                            "health:stream",
+                            json,
+                        ).await;
+                    }
 
-                // Update shared snapshot
-                if let Ok(mut snap) = state.health.write() {
-                    *snap = snapshot;
-                }
+                    // Update shared snapshot
+                    if let Ok(mut snap) = state.health.write() {
+                        *snap = snapshot;
+                    }
+                }.instrument(span).await;
             }
         }
     }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use fred::interfaces::PubsubInterface;
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::store::AppState;
@@ -66,6 +67,37 @@ pub enum PlatformEvent {
         message: String,
         alert_name: String,
     },
+    /// A release was created (for reconciler wake-up).
+    ReleaseCreated {
+        target_id: Uuid,
+        release_id: Uuid,
+        project_id: Uuid,
+        image_ref: String,
+        strategy: String,
+    },
+    /// A release was promoted (canary → 100% or staging → prod).
+    ReleasePromoted {
+        release_id: Uuid,
+        project_id: Uuid,
+        image_ref: String,
+    },
+    /// A release was rolled back.
+    ReleaseRolledBack {
+        release_id: Uuid,
+        project_id: Uuid,
+        reason: String,
+    },
+    /// Traffic weights were shifted on a release.
+    TrafficShifted {
+        release_id: Uuid,
+        project_id: Uuid,
+        weights: std::collections::HashMap<String, u32>,
+    },
+    /// Feature flags registered from pipeline (key + `default_value`).
+    FlagsRegistered {
+        project_id: Uuid,
+        flags: Vec<(String, serde_json::Value)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +153,18 @@ pub async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>
                             }
                         };
                         let state = state.clone();
+                        let iter_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                        let span = tracing::info_span!(
+                            "task_iteration",
+                            task_name = "event_bus",
+                            trace_id = %iter_trace_id,
+                            source = "system",
+                        );
                         tokio::spawn(async move {
                             if let Err(e) = handle_event(&state, &payload).await {
                                 tracing::error!(error = %e, "event handler failed");
                             }
-                        });
+                        }.instrument(span));
                     }
                     Err(e) => {
                         state.task_registry.report_error("event_bus", &e.to_string());
@@ -211,6 +250,17 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
             )
             .await
         }
+        // New progressive delivery events — wake reconciler, no special handler needed
+        PlatformEvent::ReleaseCreated { .. }
+        | PlatformEvent::ReleasePromoted { .. }
+        | PlatformEvent::ReleaseRolledBack { .. }
+        | PlatformEvent::TrafficShifted { .. } => {
+            state.deploy_notify.notify_one();
+            Ok(())
+        }
+        PlatformEvent::FlagsRegistered { project_id, flags } => {
+            handle_flags_registered(state, project_id, &flags).await
+        }
     }
 }
 
@@ -218,193 +268,91 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// Pipeline built an image → sync deploy/ → commit values to ops repo → publish `OpsRepoUpdated`.
+/// Legacy: pipeline now writes to ops repo directly and publishes `OpsRepoUpdated`.
+/// This handler is kept for backward compatibility but is a no-op.
+#[allow(clippy::unused_async)]
 async fn handle_image_built(
-    state: &AppState,
-    project_id: Uuid,
-    environment: &str,
-    image_ref: &str,
-    pipeline_id: Uuid,
+    _state: &AppState,
+    _project_id: Uuid,
+    _environment: &str,
+    _image_ref: &str,
+    _pipeline_id: Uuid,
     _triggered_by: Option<Uuid>,
 ) -> anyhow::Result<()> {
-    // Look up project info and auto-created ops repo (Phase 2: 1:1 project → ops repo)
-    let project = sqlx::query!(
-        "SELECT name, repo_path FROM projects WHERE id = $1 AND is_active = true",
-        project_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let Some(project) = project else {
-        tracing::warn!(%project_id, "image_built: project not found or inactive, skipping");
-        return Ok(());
-    };
-    let project_name = project.name.clone();
-
-    let ops_repo = sqlx::query!(
-        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
-        project_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
-
-    // Sync deploy/ from project repo to ops repo (best-effort)
-    if let Some(ops) = &ops_repo
-        && let Some(repo_path) = &project.repo_path
-    {
-        sync_deploy_to_ops(state, repo_path, &ops.repo_path, &ops.branch, pipeline_id).await;
-    }
-
-    // Find or create deployment row; get linked ops_repo_id (if any)
-    let fallback_ops_id = ops_repo.as_ref().map(|o| o.id);
-    let Some(ops_repo_id) =
-        upsert_deployment(state, project_id, environment, image_ref, fallback_ops_id).await?
-    else {
-        return Ok(());
-    };
-
-    // Ops repo linked — commit values and update deployment directly.
-    // R5: Don't publish OpsRepoUpdated (avoids double-write + double-notify).
-    // OpsRepoUpdated is only for external ops repo pushes.
-    let ops = sqlx::query!(
-        "SELECT repo_path, branch FROM ops_repos WHERE id = $1",
-        ops_repo_id,
-    )
-    .fetch_one(&state.pool)
-    .await?;
-
-    let repo_path = PathBuf::from(&ops.repo_path);
-
-    let values = serde_json::json!({
-        "image_ref": image_ref,
-        "project_name": project_name,
-        "environment": environment,
-    });
-
-    let commit_sha =
-        crate::deployer::ops_repo::commit_values(&repo_path, &ops.branch, environment, &values)
-            .await?;
-
-    // Single DB update: set image_ref + pending + commit_sha
-    sqlx::query!(
-        r#"UPDATE deployments SET image_ref = $3, current_status = 'pending', current_sha = $4
-           WHERE project_id = $1 AND environment = $2"#,
-        project_id,
-        environment,
-        image_ref,
-        commit_sha,
-    )
-    .execute(&state.pool)
-    .await?;
-
-    tracing::info!(
-        %project_id,
-        %ops_repo_id,
-        %commit_sha,
-        %image_ref,
-        "ops repo updated with new image"
-    );
-
-    state.deploy_notify.notify_one();
-
+    tracing::debug!("ImageBuilt event received (legacy, no-op)");
     Ok(())
 }
 
-/// Find or create deployment row. Returns `Some(ops_repo_id)` if an ops repo
-/// is linked (caller should commit values), or `None` if handled inline.
-async fn upsert_deployment(
+/// Upsert a deploy target for (project, environment). Returns the target ID.
+async fn upsert_deploy_target_simple(
     state: &AppState,
     project_id: Uuid,
     environment: &str,
-    image_ref: &str,
-    fallback_ops_id: Option<Uuid>,
-) -> anyhow::Result<Option<Uuid>> {
-    let deployment = sqlx::query!(
-        "SELECT ops_repo_id FROM deployments WHERE project_id = $1 AND environment = $2",
-        project_id,
-        environment,
+    ops_repo_id: Option<Uuid>,
+) -> anyhow::Result<Uuid> {
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM deploy_targets
+         WHERE project_id = $1 AND environment = $2 AND branch_slug IS NULL AND is_active = true",
     )
+    .bind(project_id)
+    .bind(environment)
     .fetch_optional(&state.pool)
     .await?;
 
-    let Some(deployment) = deployment else {
-        tracing::info!(%project_id, %environment, %image_ref, "no deployment found, creating default");
-        sqlx::query!(
-            r#"INSERT INTO deployments (project_id, environment, image_ref, ops_repo_id, desired_status, current_status)
-               VALUES ($1, $2, $3, $4, 'active', 'pending')
-               ON CONFLICT (project_id, environment)
-               DO UPDATE SET image_ref = $3, ops_repo_id = COALESCE($4, deployments.ops_repo_id),
-                             desired_status = 'active', current_status = 'pending'"#,
-            project_id, environment, image_ref, fallback_ops_id,
-        )
-        .execute(&state.pool)
-        .await?;
-        state.deploy_notify.notify_one();
-        return Ok(None);
-    };
+    if let Some(id) = existing {
+        if let Some(ops_id) = ops_repo_id {
+            sqlx::query(
+                "UPDATE deploy_targets SET ops_repo_id = COALESCE(ops_repo_id, $2) WHERE id = $1",
+            )
+            .bind(id)
+            .bind(ops_id)
+            .execute(&state.pool)
+            .await?;
+        }
+        return Ok(id);
+    }
 
-    let Some(ops_repo_id) = deployment.ops_repo_id else {
-        sqlx::query!(
-            r#"UPDATE deployments SET image_ref = $3, current_status = 'pending',
-               ops_repo_id = COALESCE($4, ops_repo_id)
-               WHERE project_id = $1 AND environment = $2"#,
-            project_id,
-            environment,
-            image_ref,
-            fallback_ops_id,
-        )
-        .execute(&state.pool)
-        .await?;
-        state.deploy_notify.notify_one();
-        return Ok(None);
-    };
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO deploy_targets (project_id, name, environment, ops_repo_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (project_id, environment, branch_slug) DO UPDATE SET
+             ops_repo_id = COALESCE(deploy_targets.ops_repo_id, $4)
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(environment)
+    .bind(environment)
+    .bind(ops_repo_id)
+    .fetch_one(&state.pool)
+    .await?;
 
-    Ok(Some(ops_repo_id))
+    Ok(id)
 }
 
-/// Sync the `deploy/` directory from the project repo to the ops repo.
-/// Best-effort: logs warnings on failure but doesn't block the deployment.
-async fn sync_deploy_to_ops(
-    state: &AppState,
-    project_repo_path: &str,
-    ops_repo_path: &str,
-    ops_branch: &str,
-    pipeline_id: Uuid,
-) {
-    let Some(commit_sha) = get_pipeline_commit_sha(state, pipeline_id).await else {
-        tracing::debug!(%pipeline_id, "no commit SHA for pipeline, skipping deploy/ sync");
-        return;
+/// Resolve deploy config (strategy + `rollout_config`) from parsed platform file specs.
+fn resolve_deploy_config_from_specs(
+    pf: &crate::pipeline::definition::PlatformFile,
+) -> (serde_json::Value, Option<String>) {
+    let Some(ref deploy) = pf.deploy else {
+        return (serde_json::json!({}), None);
     };
 
-    let project_path = PathBuf::from(project_repo_path);
-    let ops_path = PathBuf::from(ops_repo_path);
-
-    if let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
-        &project_path,
-        &ops_path,
-        ops_branch,
-        &commit_sha,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "failed to sync deploy/ to ops repo");
+    if let Some(spec) = deploy.specs.first() {
+        let strategy = spec.deploy_type.clone();
+        let config = if let Some(ref canary) = spec.canary {
+            serde_json::to_value(canary).unwrap_or_default()
+        } else if let Some(ref ab) = spec.ab_test {
+            serde_json::to_value(ab).unwrap_or_default()
+        } else {
+            serde_json::json!({})
+        };
+        (config, Some(strategy))
+    } else {
+        (serde_json::json!({}), None)
     }
 }
 
-/// Get the commit SHA from a pipeline run for deploy/ sync.
-async fn get_pipeline_commit_sha(state: &AppState, pipeline_id: Uuid) -> Option<String> {
-    sqlx::query_scalar!(
-        "SELECT commit_sha FROM pipelines WHERE id = $1",
-        pipeline_id,
-    )
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-}
-
-/// Ops repo was updated → update deployment DB row → wake deployer.
+/// Ops repo was updated → read platform.yaml → create release with strategy → register flags → wake deployer.
 async fn handle_ops_repo_updated(
     state: &AppState,
     project_id: Uuid,
@@ -412,31 +360,77 @@ async fn handle_ops_repo_updated(
     commit_sha: &str,
     image_ref: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query!(
-        r#"UPDATE deployments
-           SET image_ref = $3, current_status = 'pending', current_sha = $4
-           WHERE project_id = $1 AND environment = $2"#,
+    // 1. Read platform.yaml from ops repo (for deploy specs + flags)
+    let ops_repo = sqlx::query!(
+        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
         project_id,
-        environment,
-        image_ref,
-        commit_sha,
     )
-    .execute(&state.pool)
+    .fetch_optional(&state.pool)
     .await?;
 
+    let platform_file = if let Some(ref ops) = ops_repo {
+        let ops_path = std::path::PathBuf::from(&ops.repo_path);
+        let branch = if environment == "staging" {
+            "staging"
+        } else {
+            &ops.branch
+        };
+        match crate::deployer::ops_repo::read_file_at_ref(&ops_path, branch, "platform.yaml").await
+        {
+            Ok(content) => serde_yaml::from_str(&content).ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // 2. Resolve deploy config (strategy + rollout_config) from platform.yaml specs
+    let (rollout_config, strategy_override) = if let Some(ref pf) = platform_file {
+        resolve_deploy_config_from_specs(pf)
+    } else {
+        (serde_json::json!({}), None)
+    };
+
+    // 3. Find or create deploy target
+    let ops_repo_id = ops_repo.as_ref().map(|o| o.id);
+    let target_id =
+        upsert_deploy_target_simple(state, project_id, environment, ops_repo_id).await?;
+
+    // 4. Create release with strategy + rollout_config
+    let release_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO deploy_releases (target_id, project_id, image_ref, commit_sha, strategy, rollout_config)
+         VALUES ($1, $2, $3, $4, COALESCE($5, (SELECT default_strategy FROM deploy_targets WHERE id = $1)), $6)
+         RETURNING id",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .bind(image_ref)
+    .bind(commit_sha)
+    .bind(&strategy_override)
+    .bind(&rollout_config)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // 5. Register feature flags from platform.yaml
+    if let Some(ref pf) = platform_file
+        && !pf.flags.is_empty()
+    {
+        let flag_defs: Vec<(String, serde_json::Value)> = pf
+            .flags
+            .iter()
+            .map(|f| (f.key.clone(), f.default_value.clone()))
+            .collect();
+        handle_flags_registered_inner(state, project_id, &flag_defs).await;
+    }
+
+    // 6. Wake reconciler
     state.deploy_notify.notify_one();
 
-    tracing::info!(
-        %project_id,
-        %environment,
-        %image_ref,
-        "deployment marked pending from ops repo update"
-    );
-
+    tracing::info!(%project_id, %environment, %image_ref, %release_id, "release created from ops repo update");
     Ok(())
 }
 
-/// Manual deploy request → commit values to ops repo → mark pending → wake deployer.
+/// Manual deploy request → commit to ops repo → publish `OpsRepoUpdated`.
 async fn handle_deploy_requested(
     state: &AppState,
     project_id: Uuid,
@@ -444,84 +438,91 @@ async fn handle_deploy_requested(
     image_ref: &str,
     _requested_by: Option<Uuid>,
 ) -> anyhow::Result<()> {
-    // Same flow as image_built but triggered manually
-    handle_image_built(state, project_id, environment, image_ref, Uuid::nil(), None).await
+    let ops_repo = sqlx::query!(
+        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some(ops) = ops_repo else {
+        tracing::warn!(%project_id, "deploy_requested: no ops repo found");
+        return Ok(());
+    };
+
+    let project_name = sqlx::query_scalar!("SELECT name FROM projects WHERE id = $1", project_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .unwrap_or_default();
+
+    let ops_path = PathBuf::from(&ops.repo_path);
+    let values = serde_json::json!({
+        "image_ref": image_ref,
+        "project_name": project_name,
+        "environment": environment,
+    });
+
+    let commit_sha =
+        crate::deployer::ops_repo::commit_values(&ops_path, &ops.branch, environment, &values)
+            .await?;
+
+    let _ = publish(
+        &state.valkey,
+        &PlatformEvent::OpsRepoUpdated {
+            project_id,
+            ops_repo_id: ops.id,
+            environment: environment.into(),
+            commit_sha,
+            image_ref: image_ref.into(),
+        },
+    )
+    .await;
+
+    Ok(())
 }
 
-/// Rollback request → revert ops repo commit → read reverted values → update DB → wake deployer.
+/// Rollback request → revert ops repo commit → publish `OpsRepoUpdated`.
 async fn handle_rollback_requested(
     state: &AppState,
     project_id: Uuid,
     environment: &str,
     _requested_by: Option<Uuid>,
 ) -> anyhow::Result<()> {
-    let deployment = sqlx::query!(
-        "SELECT ops_repo_id FROM deployments WHERE project_id = $1 AND environment = $2",
+    let ops_repo = sqlx::query!(
+        "SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1",
         project_id,
-        environment,
     )
     .fetch_optional(&state.pool)
     .await?;
 
-    let Some(deployment) = deployment else {
-        tracing::warn!(%project_id, %environment, "rollback: no deployment found");
+    let Some(ops) = ops_repo else {
+        tracing::warn!(%project_id, "rollback: no ops repo found");
         return Ok(());
     };
 
-    if let Some(ops_repo_id) = deployment.ops_repo_id {
-        let ops_repo = sqlx::query!(
-            "SELECT repo_path, branch FROM ops_repos WHERE id = $1",
-            ops_repo_id,
-        )
-        .fetch_one(&state.pool)
-        .await?;
+    let ops_path = PathBuf::from(&ops.repo_path);
+    let new_sha = crate::deployer::ops_repo::revert_last_commit(&ops_path, &ops.branch).await?;
 
-        let repo_path = PathBuf::from(&ops_repo.repo_path);
+    let reverted_values =
+        crate::deployer::ops_repo::read_values(&ops_path, &ops.branch, environment).await?;
+    let old_image = reverted_values["image_ref"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
 
-        // Revert the last commit in the ops repo
-        let new_sha =
-            crate::deployer::ops_repo::revert_last_commit(&repo_path, &ops_repo.branch).await?;
+    tracing::info!(%project_id, %environment, %old_image, %new_sha, "ops repo reverted for rollback");
 
-        // Read the reverted values to get the old image_ref
-        let reverted_values =
-            crate::deployer::ops_repo::read_values(&repo_path, &ops_repo.branch, environment)
-                .await?;
-
-        let old_image_ref = reverted_values["image_ref"].as_str().unwrap_or("unknown");
-
-        // Update DB to match
-        sqlx::query!(
-            r#"UPDATE deployments
-               SET image_ref = $3, current_status = 'pending', current_sha = $4,
-                   desired_status = 'active'
-               WHERE project_id = $1 AND environment = $2"#,
+    let _ = publish(
+        &state.valkey,
+        &PlatformEvent::OpsRepoUpdated {
             project_id,
-            environment,
-            old_image_ref,
-            new_sha,
-        )
-        .execute(&state.pool)
-        .await?;
-
-        tracing::info!(
-            %project_id,
-            %environment,
-            %old_image_ref,
-            "ops repo reverted, deployment marked pending"
-        );
-    } else {
-        // No ops repo — fall back to DB-based rollback (legacy path)
-        // The reconciler's handle_rollback will pick this up
-        sqlx::query!(
-            "UPDATE deployments SET desired_status = 'rollback', current_status = 'pending' WHERE project_id = $1 AND environment = $2",
-            project_id,
-            environment,
-        )
-        .execute(&state.pool)
-        .await?;
-    }
-
-    state.deploy_notify.notify_one();
+            ops_repo_id: ops.id,
+            environment: environment.into(),
+            commit_sha: new_sha,
+            image_ref: old_image,
+        },
+    )
+    .await;
 
     Ok(())
 }
@@ -721,6 +722,67 @@ async fn spawn_ops_agent(
     Ok(())
 }
 
+/// Inner flag registration logic, shared by `handle_flags_registered` and `handle_ops_repo_updated`.
+/// Registers new flags and prunes flags not in the current set.
+async fn handle_flags_registered_inner(
+    state: &AppState,
+    project_id: Uuid,
+    flags: &[(String, serde_json::Value)],
+) {
+    for (key, default_value) in flags {
+        let _ = sqlx::query(
+            "INSERT INTO feature_flags (project_id, key, default_value, flag_type)
+             VALUES ($1, $2, $3, 'boolean')
+             ON CONFLICT (key, project_id, environment) DO NOTHING",
+        )
+        .bind(project_id)
+        .bind(key)
+        .bind(default_value)
+        .execute(&state.pool)
+        .await;
+    }
+
+    // Prune flags not in the current platform.yaml.
+    // Only delete flags that have no rules/overrides (never user-configured).
+    if !flags.is_empty() {
+        let current_keys: Vec<&str> = flags.iter().map(|(k, _)| k.as_str()).collect();
+        let deleted = sqlx::query(
+            "DELETE FROM feature_flags
+             WHERE project_id = $1
+               AND key != ALL($2)
+               AND environment IS NULL
+               AND NOT EXISTS (SELECT 1 FROM feature_flag_rules WHERE flag_id = feature_flags.id)
+               AND NOT EXISTS (SELECT 1 FROM feature_flag_overrides WHERE flag_id = feature_flags.id)",
+        )
+        .bind(project_id)
+        .bind(&current_keys as &[&str])
+        .execute(&state.pool)
+        .await;
+
+        if let Ok(result) = deleted {
+            let count = result.rows_affected();
+            if count > 0 {
+                tracing::info!(%project_id, pruned = count, "pruned stale feature flags");
+            }
+        }
+    }
+}
+
+/// Register feature flags from `.platform.yaml` — upserts defaults, never overwrites user-toggled state.
+#[tracing::instrument(skip(state), fields(%project_id), err)]
+async fn handle_flags_registered(
+    state: &AppState,
+    project_id: Uuid,
+    flags: &[(String, serde_json::Value)],
+) -> anyhow::Result<()> {
+    handle_flags_registered_inner(state, project_id, flags).await;
+    tracing::info!(
+        count = flags.len(),
+        "registered feature flags from pipeline"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +853,37 @@ mod tests {
                 value: Some(95.5),
                 message: "Alert condition met".into(),
                 alert_name: "High CPU".into(),
+            },
+            PlatformEvent::ReleaseCreated {
+                target_id: Uuid::nil(),
+                release_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+                image_ref: "img:v1".into(),
+                strategy: "canary".into(),
+            },
+            PlatformEvent::ReleasePromoted {
+                release_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+                image_ref: "img:v1".into(),
+            },
+            PlatformEvent::ReleaseRolledBack {
+                release_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+                reason: "gate failure".into(),
+            },
+            PlatformEvent::TrafficShifted {
+                release_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+                weights: [("stable".into(), 80), ("canary".into(), 20)]
+                    .into_iter()
+                    .collect(),
+            },
+            PlatformEvent::FlagsRegistered {
+                project_id: Uuid::nil(),
+                flags: vec![
+                    ("feature_a".into(), serde_json::json!(false)),
+                    ("feature_b".into(), serde_json::json!(true)),
+                ],
             },
         ];
 
@@ -872,6 +965,23 @@ mod tests {
                     alert_name: "Error Rate".into(),
                 },
                 "AlertFired",
+            ),
+            (
+                PlatformEvent::ReleaseCreated {
+                    target_id: Uuid::nil(),
+                    release_id: Uuid::nil(),
+                    project_id: Uuid::nil(),
+                    image_ref: "img:v1".into(),
+                    strategy: "rolling".into(),
+                },
+                "ReleaseCreated",
+            ),
+            (
+                PlatformEvent::FlagsRegistered {
+                    project_id: Uuid::nil(),
+                    flags: vec![("flag_a".into(), serde_json::json!(false))],
+                },
+                "FlagsRegistered",
             ),
         ];
 

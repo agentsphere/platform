@@ -162,7 +162,7 @@ _Test patterns:_
 - [ ] No `FLUSHDB` or global Valkey operations (all keys are UUID-scoped)
 - [ ] Pipeline tests spawn `ExecutorGuard` and call `state.pipeline_notify.notify_one()`
 - [ ] Webhook test URLs inserted directly into DB (SSRF blocks localhost)
-- [ ] E2E git repos created under `/tmp/platform-e2e/` (Kind shared mount)
+- [ ] E2E git repos created under `/tmp/platform-e2e/` (cluster shared mount)
 - [ ] E2E tests marked `#[ignore]` and placed in `tests/e2e_*.rs`
 
 _Test quality:_
@@ -323,7 +323,7 @@ Use `diff-cover` to automatically analyze which changed lines lack test coverage
 ```bash
 # On a feature branch (committed changes vs main):
 just cov-diff
-# Runs: unit + integration + E2E in Kind cluster → coverage-total.lcov → diff-cover vs main
+# Runs: unit + integration + E2E in dev cluster → coverage-total.lcov → diff-cover vs main
 
 # On main with uncommitted changes (diff-cover needs committed diffs):
 bash hack/test-in-cluster.sh --type total --lcov coverage-total.lcov

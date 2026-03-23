@@ -36,6 +36,15 @@ pub enum DeployerError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("invalid phase transition: {0} -> {1}")]
+    InvalidTransition(String, String),
+
+    #[error("gateway API error: {0}")]
+    GatewayError(String),
+
+    #[error("analysis failed: {0}")]
+    AnalysisFailed(String),
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 
@@ -55,7 +64,8 @@ impl From<DeployerError> for ApiError {
             DeployerError::NoPreviousDeployment
             | DeployerError::RenderFailed(_)
             | DeployerError::InvalidManifest(_)
-            | DeployerError::ValuesNotFound(_) => Self::BadRequest(err.to_string()),
+            | DeployerError::ValuesNotFound(_)
+            | DeployerError::InvalidTransition(_, _) => Self::BadRequest(err.to_string()),
             DeployerError::Db(e) => Self::from(e),
             DeployerError::Kube(e) => Self::from(e),
             DeployerError::Other(e) => Self::Internal(e),
@@ -113,6 +123,25 @@ mod tests {
     #[test]
     fn other_maps_to_internal() {
         let api: ApiError = DeployerError::Other(anyhow::anyhow!("boom")).into();
+        assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn invalid_transition_maps_to_bad_request() {
+        let api: ApiError =
+            DeployerError::InvalidTransition("pending".into(), "completed".into()).into();
+        assert!(matches!(api, ApiError::BadRequest(msg) if msg.contains("pending")));
+    }
+
+    #[test]
+    fn gateway_error_maps_to_internal() {
+        let api: ApiError = DeployerError::GatewayError("no gateway".into()).into();
+        assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn analysis_failed_maps_to_internal() {
+        let api: ApiError = DeployerError::AnalysisFailed("metric missing".into()).into();
         assert!(matches!(api, ApiError::Internal(_)));
     }
 }

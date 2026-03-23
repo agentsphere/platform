@@ -30,9 +30,23 @@ pub struct AuthUser {
     /// Hard project boundary from scoped API token.
     /// When set, all requests are restricted to this specific project.
     pub boundary_project_id: Option<Uuid>,
+    /// Agent session ID, extracted from token name `agent-session-{uuid}`.
+    /// Present only when authenticated via an agent API token.
+    pub session_id: Option<Uuid>,
 }
 
 impl AuthUser {
+    /// Record auth context fields into the current tracing span.
+    /// Called after successful authentication so request-level spans carry identity.
+    fn record_to_span(&self) {
+        let span = tracing::Span::current();
+        span.record("user_id", tracing::field::display(self.user_id));
+        span.record("user_type", tracing::field::display(&self.user_type));
+        if let Some(sid) = &self.session_id {
+            span.record("session_id", tracing::field::display(sid));
+        }
+    }
+
     /// Verify this request is allowed to access the given project.
     /// Returns 404 for scope violations (don't leak resource existence).
     pub fn check_project_scope(&self, project_id: Uuid) -> Result<(), ApiError> {
@@ -73,6 +87,7 @@ struct TokenAuthLookup {
     user_name: String,
     user_type: String,
     is_active: bool,
+    name: String,
     scopes: Vec<String>,
     scope_project_id: Option<Uuid>,
     scope_workspace_id: Option<Uuid>,
@@ -105,7 +120,14 @@ impl FromRequestParts<AppState> for AuthUser {
                 // API token auth intentionally does NOT check can_login() —
                 // agent users authenticate exclusively via API tokens, not sessions.
                 let user_type = parse_user_type(&user.user_type)?;
-                return Ok(Self {
+                let session_id = if user_type == UserType::Agent {
+                    user.name
+                        .strip_prefix("agent-session-")
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                } else {
+                    None
+                };
+                let auth_user = Self {
                     user_id: user.user_id,
                     user_name: user.user_name,
                     user_type,
@@ -113,7 +135,10 @@ impl FromRequestParts<AppState> for AuthUser {
                     token_scopes: Some(user.scopes),
                     boundary_workspace_id: user.scope_workspace_id,
                     boundary_project_id: user.scope_project_id,
-                });
+                    session_id,
+                };
+                auth_user.record_to_span();
+                return Ok(auth_user);
             }
             // Bearer token not in api_tokens — try as session token
             if let Some(user) = lookup_session(&state.pool, raw_token).await? {
@@ -124,7 +149,7 @@ impl FromRequestParts<AppState> for AuthUser {
                 if !user_type.can_login() {
                     return Err(ApiError::Unauthorized);
                 }
-                return Ok(Self {
+                let auth_user = Self {
                     user_id: user.user_id,
                     user_name: user.user_name,
                     user_type,
@@ -132,7 +157,10 @@ impl FromRequestParts<AppState> for AuthUser {
                     token_scopes: None,
                     boundary_workspace_id: None,
                     boundary_project_id: None,
-                });
+                    session_id: None,
+                };
+                auth_user.record_to_span();
+                return Ok(auth_user);
             }
         }
 
@@ -148,7 +176,7 @@ impl FromRequestParts<AppState> for AuthUser {
             if !user_type.can_login() {
                 return Err(ApiError::Unauthorized);
             }
-            return Ok(Self {
+            let auth_user = Self {
                 user_id: user.user_id,
                 user_name: user.user_name,
                 user_type,
@@ -156,7 +184,10 @@ impl FromRequestParts<AppState> for AuthUser {
                 token_scopes: None,
                 boundary_workspace_id: None,
                 boundary_project_id: None,
-            });
+                session_id: None,
+            };
+            auth_user.record_to_span();
+            return Ok(auth_user);
         }
 
         Err(ApiError::Unauthorized)
@@ -237,6 +268,7 @@ async fn lookup_api_token(
         r#"
         SELECT u.id as "user_id!", u.name as "user_name!",
                u.user_type as "user_type!", u.is_active as "is_active!",
+               t.name as "name!",
                t.scopes as "scopes!",
                t.project_id as "scope_project_id?",
                t.scope_workspace_id as "scope_workspace_id?"
@@ -304,6 +336,7 @@ impl AuthUser {
             token_scopes: None,
             boundary_workspace_id: None,
             boundary_project_id: None,
+            session_id: None,
         }
     }
 
@@ -317,6 +350,7 @@ impl AuthUser {
             token_scopes: None,
             boundary_workspace_id: None,
             boundary_project_id: None,
+            session_id: None,
         }
     }
 
@@ -330,6 +364,7 @@ impl AuthUser {
             token_scopes: Some(scopes),
             boundary_workspace_id: None,
             boundary_project_id: None,
+            session_id: None,
         }
     }
 
@@ -343,6 +378,7 @@ impl AuthUser {
             token_scopes: None,
             boundary_workspace_id: None,
             boundary_project_id: Some(project_id),
+            session_id: None,
         }
     }
 
@@ -356,6 +392,7 @@ impl AuthUser {
             token_scopes: None,
             boundary_workspace_id: Some(workspace_id),
             boundary_project_id: None,
+            session_id: None,
         }
     }
 }

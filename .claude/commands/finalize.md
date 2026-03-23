@@ -245,7 +245,7 @@ Use `diff-cover` to check coverage on changed lines. This is now on a feature br
 ```bash
 # Strict check: fails if any changed line is uncovered
 just cov-diff-check
-# Runs: unit + integration + E2E in Kind cluster → coverage-total.lcov → diff-cover --fail-under=100
+# Runs: unit + integration + E2E in dev cluster → coverage-total.lcov → diff-cover --fail-under=100
 
 # If you need to see the report without failing:
 just cov-diff

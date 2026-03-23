@@ -780,7 +780,12 @@ pub fn pipeline_test_router(state: AppState) -> Router {
 pub async fn start_pipeline_server(
     pool: PgPool,
 ) -> (AppState, String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+    // Bind to the port the test script allocated (PLATFORM_LISTEN_PORT).
+    let listen_port: u16 = std::env::var("PLATFORM_LISTEN_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{listen_port}"))
         .await
         .expect("bind listener");
     let port = listener.local_addr().unwrap().port();
@@ -795,6 +800,93 @@ pub async fn start_pipeline_server(
     });
 
     (state, token, handle)
+}
+
+/// Build a full API + git + registry + observe router for E2E tests that need
+/// OTLP ingest (traces/logs/metrics from deployed pods).
+///
+/// Returns `(Router, IngestChannels)`. The channels must be kept alive and can
+/// be used to spawn flush tasks for writing ingested data to the DB.
+pub fn observe_pipeline_test_router(
+    state: AppState,
+    channels: platform::observe::ingest::IngestChannels,
+) -> Router {
+    use axum::extract::DefaultBodyLimit;
+    use tower_http::limit::RequestBodyLimitLayer;
+    Router::new()
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .merge(platform::api::router())
+        .merge(platform::observe::router(channels))
+        .merge(
+            platform::git::git_protocol_router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
+        .merge(
+            platform::registry::router()
+                .layer(DefaultBodyLimit::disable())
+                .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024)),
+        )
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+}
+
+/// Start a real TCP server with OTLP ingest endpoints for E2E tests that need
+/// deployed pods to send telemetry.
+///
+/// Spawns flush tasks for traces/logs/metrics so ingested data reaches the DB.
+/// Returns `(state, token, server_handle, shutdown_tx)`.
+/// Send to `shutdown_tx` to stop the flush tasks cleanly.
+pub async fn start_observe_pipeline_server(
+    pool: PgPool,
+) -> (
+    AppState,
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<()>,
+) {
+    // Bind to the port the test script allocated (PLATFORM_LISTEN_PORT).
+    // This keeps registry_url, DaemonSet proxy, and API URL all consistent.
+    let listen_port: u16 = std::env::var("PLATFORM_LISTEN_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{listen_port}"))
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().unwrap().port();
+    let host = host_addr_for_kind();
+    let platform_api_url = format!("http://{host}:{port}");
+
+    let (state, token) = e2e_state_with_api_url(pool.clone(), Some(platform_api_url)).await;
+
+    let (channels, spans_rx, logs_rx, metrics_rx) = platform::observe::ingest::create_channels();
+    let app = observe_pipeline_test_router(state.clone(), channels);
+
+    // Spawn flush tasks so ingested OTLP data reaches the DB
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    {
+        let p = pool.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(platform::observe::ingest::flush_spans(p, spans_rx, rx));
+    }
+    {
+        let p = pool.clone();
+        let v = state.valkey.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(platform::observe::ingest::flush_logs(p, v, logs_rx, rx));
+    }
+    {
+        let p = pool.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(platform::observe::ingest::flush_metrics(p, metrics_rx, rx));
+    }
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (state, token, handle, shutdown_tx)
 }
 
 /// Extract JSON body from a response.
@@ -887,12 +979,7 @@ pub async fn poll_session_messages(
 }
 
 /// Stop a session via the API (POST /api/projects/{id}/sessions/{sid}/stop).
-pub async fn stop_session(
-    app: &axum::Router,
-    token: &str,
-    project_id: Uuid,
-    session_id: &str,
-) {
+pub async fn stop_session(app: &axum::Router, token: &str, project_id: Uuid, session_id: &str) {
     let url = format!("/api/projects/{project_id}/sessions/{session_id}/stop");
     let (status, _) = post_json(app, token, &url, serde_json::json!({})).await;
     assert!(

@@ -2,6 +2,7 @@ mod helpers;
 
 use fred::prelude::*;
 use sqlx::PgPool;
+use sqlx::Row;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -23,12 +24,12 @@ async fn handle_event_unknown_type(pool: PgPool) {
     assert!(result.is_err());
 }
 
-/// `ImageBuilt` with no existing deployment → creates default deployment.
+/// `ImageBuilt` is now a legacy no-op — no deploy targets or releases created.
 #[sqlx::test(migrations = "./migrations")]
-async fn image_built_no_deployment_creates_default(pool: PgPool) {
+async fn image_built_is_noop(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-img-new", "public").await;
+    let project_id = helpers::create_project(&app, &admin_token, "eb-img-noop", "public").await;
 
     let event = serde_json::json!({
         "type": "ImageBuilt",
@@ -42,73 +43,53 @@ async fn image_built_no_deployment_creates_default(pool: PgPool) {
     let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
     assert!(result.is_ok(), "handle_event failed: {result:?}");
 
-    // Verify deployment was created
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT image_ref, current_status FROM deployments WHERE project_id = $1 AND environment = 'production'",
-    )
-    .bind(project_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    // No release should be created (ImageBuilt is now a no-op)
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "ImageBuilt should not create releases (legacy no-op)"
+    );
 
-    let (image_ref, status) = row.expect("deployment should exist");
-    assert_eq!(image_ref, "registry/app:v1");
-    assert_eq!(status, "pending");
+    // No deploy target should be created either
+    let target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_targets WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        target_count, 0,
+        "ImageBuilt should not create deploy targets (legacy no-op)"
+    );
 }
 
-/// `ImageBuilt` with existing deployment but no ops repo → updates `image_ref` directly.
-#[sqlx::test(migrations = "./migrations")]
-async fn image_built_deployment_no_ops_repo(pool: PgPool) {
-    let (state, admin_token) = helpers::test_state(pool.clone()).await;
-    let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-img-noop", "public").await;
-
-    // Insert deployment without ops_repo_id
-    sqlx::query(
-        "INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status) \
-         VALUES ($1, 'production', 'old:v1', 'active', 'healthy')",
-    )
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let event = serde_json::json!({
-        "type": "ImageBuilt",
-        "project_id": project_id,
-        "environment": "production",
-        "image_ref": "new:v2",
-        "pipeline_id": Uuid::nil(),
-        "triggered_by": null,
-    });
-
-    let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
-    assert!(result.is_ok(), "handle_event failed: {result:?}");
-
-    let (image_ref, status): (String, String) = sqlx::query_as(
-        "SELECT image_ref, current_status FROM deployments WHERE project_id = $1 AND environment = 'production'",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(image_ref, "new:v2");
-    assert_eq!(status, "pending");
-}
-
-/// `OpsRepoUpdated` → updates deployment row and marks pending.
+/// `OpsRepoUpdated` → creates new pending release on existing target.
 #[sqlx::test(migrations = "./migrations")]
 async fn ops_repo_updated_marks_pending(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
     let project_id = helpers::create_project(&app, &admin_token, "eb-ops-upd", "public").await;
 
-    // Insert deployment
-    sqlx::query(
-        "INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status) \
-         VALUES ($1, 'staging', 'old:v1', 'active', 'healthy')",
+    // Insert deploy target + completed release
+    let target_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO deploy_targets (project_id, name, environment) \
+         VALUES ($1, 'staging', 'staging') RETURNING id",
     )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO deploy_releases (target_id, project_id, image_ref, phase) \
+         VALUES ($1, $2, 'old:v1', 'completed')",
+    )
+    .bind(target_id)
     .bind(project_id)
     .execute(&pool)
     .await
@@ -126,8 +107,12 @@ async fn ops_repo_updated_marks_pending(pool: PgPool) {
     let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
     assert!(result.is_ok(), "handle_event failed: {result:?}");
 
-    let (image_ref, status, sha): (String, String, Option<String>) = sqlx::query_as(
-        "SELECT image_ref, current_status, current_sha FROM deployments WHERE project_id = $1 AND environment = 'staging'",
+    let (image_ref, phase, sha): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT dr.image_ref, dr.phase, dr.commit_sha \
+         FROM deploy_releases dr \
+         JOIN deploy_targets dt ON dt.id = dr.target_id \
+         WHERE dt.project_id = $1 AND dt.environment = 'staging' \
+         ORDER BY dr.created_at DESC LIMIT 1",
     )
     .bind(project_id)
     .fetch_one(&pool)
@@ -135,16 +120,225 @@ async fn ops_repo_updated_marks_pending(pool: PgPool) {
     .unwrap();
 
     assert_eq!(image_ref, "new:v2");
-    assert_eq!(status, "pending");
+    assert_eq!(phase, "pending");
     assert_eq!(sha.as_deref(), Some("abc123"));
 }
 
-/// `DeployRequested` delegates to `ImageBuilt` logic → creates deployment.
+/// `OpsRepoUpdated` reads `platform.yaml` from the ops repo, parses deploy specs
+/// for strategy/rollout_config, and creates a release with those values.
 #[sqlx::test(migrations = "./migrations")]
-async fn deploy_requested_creates_deployment(pool: PgPool) {
+async fn ops_repo_updated_reads_platform_yaml(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-deploy", "public").await;
+    let project_id = helpers::create_project(&app, &admin_token, "eb-ops-yaml", "public").await;
+
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "canary-ops", "main")
+        .await
+        .unwrap();
+
+    // Write platform.yaml with canary config
+    let platform_yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: alpine
+      commands: ["echo hi"]
+deploy:
+  specs:
+    - name: api
+      type: canary
+      canary:
+        stable_service: app-stable
+        canary_service: app-canary
+        steps: [10, 50, 100]
+flags:
+  - key: dark_mode
+    default_value: false
+"#;
+    platform::deployer::ops_repo::write_file_to_repo(
+        &ops_path,
+        "main",
+        "platform.yaml",
+        platform_yaml,
+    )
+    .await
+    .unwrap();
+
+    // Insert ops_repos row linking to the project
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id) \
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind(format!("canary-ops-{}", Uuid::new_v4()))
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Publish OpsRepoUpdated
+    let event = serde_json::json!({
+        "type": "OpsRepoUpdated",
+        "project_id": project_id,
+        "ops_repo_id": ops_repo_id,
+        "environment": "production",
+        "commit_sha": "abc1234567",
+        "image_ref": "registry/app:v1",
+    });
+    platform::store::eventbus::handle_event(&state, &event.to_string())
+        .await
+        .unwrap();
+
+    // Verify release created with canary strategy
+    let row =
+        sqlx::query("SELECT strategy, rollout_config FROM deploy_releases WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let strategy: String = row.get("strategy");
+    assert_eq!(strategy, "canary");
+
+    let config: serde_json::Value = row.get("rollout_config");
+    assert_eq!(config["steps"], serde_json::json!([10, 50, 100]));
+
+    // Verify flag registered
+    let flag_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM feature_flags WHERE project_id = $1 AND key = 'dark_mode'",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flag_count, 1);
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+/// `OpsRepoUpdated` without a `platform.yaml` → release created with default strategy (rolling).
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_updated_without_platform_yaml(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let project_id = helpers::create_project(&app, &admin_token, "eb-ops-nofile", "public").await;
+
+    // Create ops repo on disk — no platform.yaml written
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "no-yaml-ops", "main")
+        .await
+        .unwrap();
+
+    // Write something so the branch exists (bare repo needs at least one commit)
+    platform::deployer::ops_repo::write_file_to_repo(&ops_path, "main", "README.md", "# ops")
+        .await
+        .unwrap();
+
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id) \
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind(format!("no-yaml-ops-{}", Uuid::new_v4()))
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let event = serde_json::json!({
+        "type": "OpsRepoUpdated",
+        "project_id": project_id,
+        "ops_repo_id": ops_repo_id,
+        "environment": "production",
+        "commit_sha": "def456",
+        "image_ref": "registry/app:v2",
+    });
+    platform::store::eventbus::handle_event(&state, &event.to_string())
+        .await
+        .unwrap();
+
+    // Verify release created with default rolling strategy
+    let row =
+        sqlx::query("SELECT strategy, rollout_config FROM deploy_releases WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let strategy: String = row.get("strategy");
+    assert_eq!(
+        strategy, "rolling",
+        "should use default strategy when no platform.yaml"
+    );
+
+    let config: serde_json::Value = row.get("rollout_config");
+    assert_eq!(
+        config,
+        serde_json::json!({}),
+        "rollout_config should be empty default"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+/// `DeployRequested` commits values to ops repo then publishes `OpsRepoUpdated`.
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_requested_commits_to_ops_repo(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let project_id = helpers::create_project(&app, &admin_token, "eb-deploy-ops", "public").await;
+
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "deploy-ops", "main")
+        .await
+        .unwrap();
+
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id) \
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind(format!("deploy-ops-{}", Uuid::new_v4()))
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let event = serde_json::json!({
+        "type": "DeployRequested",
+        "project_id": project_id,
+        "environment": "production",
+        "image_ref": "registry/app:manual-v1",
+        "requested_by": null,
+    });
+    platform::store::eventbus::handle_event(&state, &event.to_string())
+        .await
+        .unwrap();
+
+    // Verify values committed to ops repo
+    let values = platform::deployer::ops_repo::read_values(&ops_path, "main", "production")
+        .await
+        .unwrap();
+    assert_eq!(values["image_ref"], "registry/app:manual-v1");
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+/// `DeployRequested` with no ops repo → graceful skip (no error, no release).
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_requested_no_ops_repo_skips(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let project_id = helpers::create_project(&app, &admin_token, "eb-deploy-noop", "public").await;
 
     let event = serde_json::json!({
         "type": "DeployRequested",
@@ -157,20 +351,22 @@ async fn deploy_requested_creates_deployment(pool: PgPool) {
     let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
     assert!(result.is_ok(), "handle_event failed: {result:?}");
 
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT image_ref FROM deployments WHERE project_id = $1 AND environment = 'staging'",
-    )
-    .bind(project_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(row.unwrap().0, "deploy:v1");
+    // No release should be created (no ops repo to commit to)
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "DeployRequested without ops repo should create no releases"
+    );
 }
 
-/// `RollbackRequested` with no deployment → graceful skip (no error).
+/// `RollbackRequested` with no ops repo → graceful skip (no error).
 #[sqlx::test(migrations = "./migrations")]
-async fn rollback_no_deployment_graceful(pool: PgPool) {
+async fn rollback_no_ops_repo_graceful(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool).await;
     let app = helpers::test_router(state.clone());
     let project_id = helpers::create_project(&app, &admin_token, "eb-rb-none", "public").await;
@@ -185,101 +381,89 @@ async fn rollback_no_deployment_graceful(pool: PgPool) {
     let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
     assert!(
         result.is_ok(),
-        "rollback with no deployment should be ok: {result:?}"
+        "rollback with no ops repo should be ok: {result:?}"
     );
 }
 
-/// `RollbackRequested` with deployment but no ops repo → sets `desired_status` = 'rollback'.
+/// `RollbackRequested` reverts the ops repo and publishes `OpsRepoUpdated`.
 #[sqlx::test(migrations = "./migrations")]
-async fn rollback_no_ops_repo_legacy_path(pool: PgPool) {
+async fn rollback_reverts_ops_repo(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-rb-leg", "public").await;
+    let project_id = helpers::create_project(&app, &admin_token, "eb-rb-revert", "public").await;
 
-    // Insert deployment without ops_repo_id
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "rollback-ops", "main")
+        .await
+        .unwrap();
+
+    // Commit v1 values
+    let v1_values = serde_json::json!({
+        "image_ref": "app:v1",
+        "project_name": "eb-rb-revert",
+        "environment": "production",
+    });
+    platform::deployer::ops_repo::commit_values(&ops_path, "main", "production", &v1_values)
+        .await
+        .unwrap();
+
+    // Commit v2 values
+    let v2_values = serde_json::json!({
+        "image_ref": "app:v2",
+        "project_name": "eb-rb-revert",
+        "environment": "production",
+    });
+    platform::deployer::ops_repo::commit_values(&ops_path, "main", "production", &v2_values)
+        .await
+        .unwrap();
+
+    // Insert ops_repos row
+    let ops_repo_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status) \
-         VALUES ($1, 'production', 'app:v1', 'active', 'healthy')",
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id) \
+         VALUES ($1, $2, $3, 'main', '/', $4)",
     )
+    .bind(ops_repo_id)
+    .bind(format!("rollback-ops-{}", Uuid::new_v4()))
+    .bind(ops_path.to_string_lossy().to_string())
     .bind(project_id)
     .execute(&pool)
     .await
     .unwrap();
 
+    // Send RollbackRequested
     let event = serde_json::json!({
         "type": "RollbackRequested",
         "project_id": project_id,
         "environment": "production",
         "requested_by": null,
     });
-
-    let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
-    assert!(result.is_ok(), "rollback legacy path failed: {result:?}");
-
-    let (desired, current): (String, String) = sqlx::query_as(
-        "SELECT desired_status, current_status FROM deployments WHERE project_id = $1 AND environment = 'production'",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(desired, "rollback");
-    assert_eq!(current, "pending");
-}
-
-/// `ImageBuilt` on conflict upserts existing deployment.
-#[sqlx::test(migrations = "./migrations")]
-async fn image_built_upserts_on_conflict(pool: PgPool) {
-    let (state, admin_token) = helpers::test_state(pool.clone()).await;
-    let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-upsert", "public").await;
-
-    // First ImageBuilt → creates deployment
-    let event1 = serde_json::json!({
-        "type": "ImageBuilt",
-        "project_id": project_id,
-        "environment": "production",
-        "image_ref": "app:v1",
-        "pipeline_id": Uuid::nil(),
-        "triggered_by": null,
-    });
-    platform::store::eventbus::handle_event(&state, &event1.to_string())
+    platform::store::eventbus::handle_event(&state, &event.to_string())
         .await
         .unwrap();
 
-    // Second ImageBuilt → upserts (same project+environment)
-    let event2 = serde_json::json!({
-        "type": "ImageBuilt",
-        "project_id": project_id,
-        "environment": "production",
-        "image_ref": "app:v2",
-        "pipeline_id": Uuid::nil(),
-        "triggered_by": null,
-    });
-    platform::store::eventbus::handle_event(&state, &event2.to_string())
+    // Verify ops repo values reverted to v1
+    let reverted = platform::deployer::ops_repo::read_values(&ops_path, "main", "production")
         .await
         .unwrap();
+    assert_eq!(
+        reverted["image_ref"], "app:v1",
+        "ops repo should be reverted to v1"
+    );
 
-    let (image_ref,): (String,) = sqlx::query_as(
-        "SELECT image_ref FROM deployments WHERE project_id = $1 AND environment = 'production'",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(image_ref, "app:v2");
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
 }
 
-/// `ImageBuilt` then `OpsRepoUpdated` sequence → both handlers execute in order.
+/// `ImageBuilt` then `OpsRepoUpdated` sequence: ImageBuilt is a no-op,
+/// only OpsRepoUpdated creates the release.
 #[sqlx::test(migrations = "./migrations")]
 async fn image_built_then_ops_repo_updated(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
     let project_id = helpers::create_project(&app, &admin_token, "eb-seq", "public").await;
 
-    // Step 1: ImageBuilt creates deployment
+    // Step 1: ImageBuilt is a no-op — no release created
     let event1 = serde_json::json!({
         "type": "ImageBuilt",
         "project_id": project_id,
@@ -292,7 +476,16 @@ async fn image_built_then_ops_repo_updated(pool: PgPool) {
         .await
         .unwrap();
 
-    // Step 2: OpsRepoUpdated updates the deployment
+    // Verify no releases after ImageBuilt
+    let count_after_ib: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count_after_ib, 0, "ImageBuilt should not create releases");
+
+    // Step 2: OpsRepoUpdated creates the release
     let event2 = serde_json::json!({
         "type": "OpsRepoUpdated",
         "project_id": project_id,
@@ -306,7 +499,11 @@ async fn image_built_then_ops_repo_updated(pool: PgPool) {
         .unwrap();
 
     let (image_ref, sha): (String, Option<String>) = sqlx::query_as(
-        "SELECT image_ref, current_sha FROM deployments WHERE project_id = $1 AND environment = 'staging'",
+        "SELECT dr.image_ref, dr.commit_sha \
+         FROM deploy_releases dr \
+         JOIN deploy_targets dt ON dt.id = dr.target_id \
+         WHERE dt.project_id = $1 AND dt.environment = 'staging' \
+         ORDER BY dr.created_at DESC LIMIT 1",
     )
     .bind(project_id)
     .fetch_one(&pool)
@@ -317,49 +514,54 @@ async fn image_built_then_ops_repo_updated(pool: PgPool) {
     assert_eq!(sha.as_deref(), Some("def456"));
 }
 
-/// Multiple environments for the same project are independent.
+/// Multiple OpsRepoUpdated events for different environments are independent.
 #[sqlx::test(migrations = "./migrations")]
 async fn different_environments_independent(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
     let app = helpers::test_router(state.clone());
     let project_id = helpers::create_project(&app, &admin_token, "eb-multi-env", "public").await;
 
-    // Deploy to staging
+    // Deploy to staging via OpsRepoUpdated
     let staging = serde_json::json!({
-        "type": "ImageBuilt",
+        "type": "OpsRepoUpdated",
         "project_id": project_id,
+        "ops_repo_id": Uuid::new_v4(),
         "environment": "staging",
+        "commit_sha": "stg1",
         "image_ref": "app:staging-v1",
-        "pipeline_id": Uuid::nil(),
-        "triggered_by": null,
     });
     platform::store::eventbus::handle_event(&state, &staging.to_string())
         .await
         .unwrap();
 
-    // Deploy to production
+    // Deploy to production via OpsRepoUpdated
     let prod = serde_json::json!({
-        "type": "ImageBuilt",
+        "type": "OpsRepoUpdated",
         "project_id": project_id,
+        "ops_repo_id": Uuid::new_v4(),
         "environment": "production",
+        "commit_sha": "prod1",
         "image_ref": "app:prod-v1",
-        "pipeline_id": Uuid::nil(),
-        "triggered_by": null,
     });
     platform::store::eventbus::handle_event(&state, &prod.to_string())
         .await
         .unwrap();
 
-    // Verify both exist with different image refs
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deployments WHERE project_id = $1")
-        .bind(project_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    // Verify both deploy targets exist with different image refs
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_targets WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 2);
 
     let (staging_img,): (String,) = sqlx::query_as(
-        "SELECT image_ref FROM deployments WHERE project_id = $1 AND environment = 'staging'",
+        "SELECT dr.image_ref \
+         FROM deploy_releases dr \
+         JOIN deploy_targets dt ON dt.id = dr.target_id \
+         WHERE dt.project_id = $1 AND dt.environment = 'staging' \
+         ORDER BY dr.created_at DESC LIMIT 1",
     )
     .bind(project_id)
     .fetch_one(&pool)
@@ -368,7 +570,11 @@ async fn different_environments_independent(pool: PgPool) {
     assert_eq!(staging_img, "app:staging-v1");
 
     let (prod_img,): (String,) = sqlx::query_as(
-        "SELECT image_ref FROM deployments WHERE project_id = $1 AND environment = 'production'",
+        "SELECT dr.image_ref \
+         FROM deploy_releases dr \
+         JOIN deploy_targets dt ON dt.id = dr.target_id \
+         WHERE dt.project_id = $1 AND dt.environment = 'production' \
+         ORDER BY dr.created_at DESC LIMIT 1",
     )
     .bind(project_id)
     .fetch_one(&pool)
@@ -763,45 +969,4 @@ async fn alert_fired_cooldown_is_per_rule(pool: PgPool) {
         exists,
         "rule_b should have its own cooldown (not blocked by rule_a)"
     );
-}
-
-/// `DeployRequested` with existing deployment → upserts (not duplicates).
-#[sqlx::test(migrations = "./migrations")]
-async fn deploy_requested_upserts_existing(pool: PgPool) {
-    let (state, admin_token) = helpers::test_state(pool.clone()).await;
-    let app = helpers::test_router(state.clone());
-    let project_id = helpers::create_project(&app, &admin_token, "eb-dr-ups", "public").await;
-
-    // Insert existing deployment
-    sqlx::query(
-        "INSERT INTO deployments (project_id, environment, image_ref, desired_status, current_status) \
-         VALUES ($1, 'production', 'old:v1', 'active', 'healthy')",
-    )
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let event = serde_json::json!({
-        "type": "DeployRequested",
-        "project_id": project_id,
-        "environment": "production",
-        "image_ref": "new:v3",
-        "requested_by": null,
-    });
-
-    platform::store::eventbus::handle_event(&state, &event.to_string())
-        .await
-        .unwrap();
-
-    let (image_ref, status): (String, String) = sqlx::query_as(
-        "SELECT image_ref, current_status FROM deployments WHERE project_id = $1 AND environment = 'production'",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(image_ref, "new:v3");
-    assert_eq!(status, "pending");
 }

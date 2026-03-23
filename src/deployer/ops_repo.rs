@@ -72,6 +72,26 @@ pub async fn get_head_sha(repo_path: &Path) -> Result<String, DeployerError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Get the SHA of a specific branch in a bare repo.
+pub async fn get_branch_sha(repo_path: &Path, branch: &str) -> Result<String, DeployerError> {
+    let output = tokio::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo_path)
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .await
+        .map_err(|e| DeployerError::SyncFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployerError::SyncFailed(format!(
+            "git rev-parse refs/heads/{branch} failed: {stderr}"
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Read a file from a bare repo at a given ref without a working tree.
 /// Uses `git show {ref}:{path}`.
 pub async fn read_file_at_ref(
@@ -95,6 +115,53 @@ pub async fn read_file_at_ref(
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read all YAML files from a directory in a bare repo at a given ref.
+/// Returns concatenated content with `---` separators.
+pub async fn read_dir_yaml_at_ref(
+    repo_path: &Path,
+    git_ref: &str,
+    dir_path: &str,
+) -> Result<String, DeployerError> {
+    let dir = dir_path.trim_end_matches('/');
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["ls-tree", "--name-only", git_ref, &format!("{dir}/")])
+        .output()
+        .await
+        .map_err(|e| DeployerError::SyncFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(DeployerError::ValuesNotFound(format!(
+            "{dir_path} at {git_ref}"
+        )));
+    }
+
+    let file_list = String::from_utf8_lossy(&output.stdout);
+    let mut combined = String::new();
+
+    for file in file_list.lines() {
+        let ext = std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str());
+        if matches!(ext, Some("yaml" | "yml")) {
+            if !combined.is_empty() {
+                combined.push_str("\n---\n");
+            }
+            let content = read_file_at_ref(repo_path, git_ref, file).await?;
+            combined.push_str(&content);
+        }
+    }
+
+    if combined.is_empty() {
+        return Err(DeployerError::ValuesNotFound(format!(
+            "no YAML files in {dir_path} at {git_ref}"
+        )));
+    }
+
+    Ok(combined)
 }
 
 /// Read the values file for a given environment from the ops repo.
@@ -155,7 +222,100 @@ pub async fn commit_values(
 
     result?;
 
-    get_head_sha(repo_path).await
+    get_branch_sha(repo_path, branch).await
+}
+
+/// Write a single file to the ops repo at a given branch.
+/// Uses git worktree to write into a bare repo.
+/// Returns the new commit SHA on the given branch.
+#[tracing::instrument(skip(content), fields(%file_path), err)]
+pub async fn write_file_to_repo(
+    repo_path: &Path,
+    branch: &str,
+    file_path: &str,
+    content: &str,
+) -> Result<String, DeployerError> {
+    ensure_branch_exists(repo_path, branch).await?;
+
+    let worktree_dir = repo_path.join(format!("_file_worktree_{}", Uuid::new_v4()));
+
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("worktree")
+        .arg("add")
+        .arg(&worktree_dir)
+        .arg(branch)
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployerError::CommitFailed(format!(
+            "git worktree add failed: {stderr}"
+        )));
+    }
+
+    let result = async {
+        let dest = worktree_dir.join(file_path);
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| DeployerError::CommitFailed(format!("mkdir: {e}")))?;
+        }
+        tokio::fs::write(&dest, content)
+            .await
+            .map_err(|e| DeployerError::CommitFailed(format!("write {file_path}: {e}")))?;
+
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_dir)
+            .args(["add", file_path])
+            .output()
+            .await;
+
+        // Check if there are changes to commit
+        let diff = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_dir)
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .await;
+
+        if diff.map(|s| s.success()).unwrap_or(false) {
+            // No changes
+            return Ok(());
+        }
+
+        let commit_msg = format!("update {file_path}");
+        let commit_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_dir)
+            .env("GIT_AUTHOR_NAME", "Platform")
+            .env("GIT_AUTHOR_EMAIL", "platform@localhost")
+            .env("GIT_COMMITTER_NAME", "Platform")
+            .env("GIT_COMMITTER_EMAIL", "platform@localhost")
+            .args(["commit", "-m", &commit_msg])
+            .output()
+            .await
+            .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr);
+            if !stderr.contains("nothing to commit") {
+                return Err(DeployerError::CommitFailed(format!(
+                    "git commit failed: {stderr}"
+                )));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    cleanup_worktree(repo_path, &worktree_dir).await;
+    result?;
+    get_branch_sha(repo_path, branch).await
 }
 
 /// Internal: write the values file, stage, and commit inside a worktree.
@@ -585,6 +745,90 @@ pub async fn sync_repo(
     let sha = get_head_sha(&repo_path).await?;
 
     Ok((repo_path, sha, repo.branch))
+}
+
+// ---------------------------------------------------------------------------
+// Branch merging (staging → prod promotion)
+// ---------------------------------------------------------------------------
+
+/// Merge one branch into another in a bare repo.
+/// Uses git worktree for the merge.
+/// Returns the new commit SHA on the target branch.
+#[tracing::instrument(fields(repo = %repo_path.display(), %source_branch, %target_branch), err)]
+pub async fn merge_branch(
+    repo_path: &Path,
+    source_branch: &str,
+    target_branch: &str,
+) -> Result<String, DeployerError> {
+    ensure_branch_exists(repo_path, source_branch).await?;
+    ensure_branch_exists(repo_path, target_branch).await?;
+
+    let worktree_dir = repo_path.join(format!("_merge_worktree_{}", Uuid::new_v4()));
+
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("worktree")
+        .arg("add")
+        .arg(&worktree_dir)
+        .arg(target_branch)
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployerError::CommitFailed(format!(
+            "git worktree add failed: {stderr}"
+        )));
+    }
+
+    let result = merge_in_worktree(&worktree_dir, source_branch).await;
+
+    cleanup_worktree(repo_path, &worktree_dir).await;
+
+    result?;
+
+    // Return the new HEAD sha of the target branch
+    get_branch_sha(repo_path, target_branch).await
+}
+
+/// Internal: merge `source_branch` into current branch in worktree.
+async fn merge_in_worktree(worktree_dir: &Path, source_branch: &str) -> Result<(), DeployerError> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_dir)
+        .env("GIT_AUTHOR_NAME", "Platform")
+        .env("GIT_AUTHOR_EMAIL", "platform@localhost")
+        .env("GIT_COMMITTER_NAME", "Platform")
+        .env("GIT_COMMITTER_EMAIL", "platform@localhost")
+        .args(["merge", source_branch, "--no-ff", "-m"])
+        .arg(format!("promote: merge {source_branch} to production"))
+        .output()
+        .await
+        .map_err(|e| DeployerError::CommitFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployerError::CommitFailed(format!(
+            "merge failed: {stderr}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Compare two branches to determine if they've diverged.
+/// Returns (diverged, `source_sha`, `target_sha`).
+pub async fn compare_branches(
+    repo_path: &Path,
+    source_branch: &str,
+    target_branch: &str,
+) -> Result<(bool, String, String), DeployerError> {
+    let source_sha = get_branch_sha(repo_path, source_branch).await?;
+    let target_sha = get_branch_sha(repo_path, target_branch).await?;
+    let diverged = source_sha != target_sha;
+    Ok((diverged, source_sha, target_sha))
 }
 
 #[cfg(test)]
@@ -1164,5 +1408,179 @@ mod tests {
     #[test]
     fn validate_commit_sha_empty() {
         assert!(validate_commit_sha("").is_err());
+    }
+
+    // --- write_file_to_repo tests ---
+
+    #[tokio::test]
+    async fn write_file_to_repo_creates_file() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        write_file_to_repo(
+            &repo_path,
+            "main",
+            "platform.yaml",
+            "pipeline:\n  steps: []\n",
+        )
+        .await
+        .unwrap();
+
+        let content = read_file_at_ref(&repo_path, "main", "platform.yaml")
+            .await
+            .unwrap();
+        assert!(content.contains("pipeline:"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_to_repo_no_change_is_noop() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let content = "key: value\n";
+        write_file_to_repo(&repo_path, "main", "test.yaml", content)
+            .await
+            .unwrap();
+        let sha1 = get_branch_sha(&repo_path, "main").await.unwrap();
+
+        // Write same content again — should not create new commit
+        write_file_to_repo(&repo_path, "main", "test.yaml", content)
+            .await
+            .unwrap();
+        let sha2 = get_branch_sha(&repo_path, "main").await.unwrap();
+
+        assert_eq!(sha1, sha2, "identical content should not create new commit");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_subdirectories() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        write_file_to_repo(&repo_path, "main", "deep/nested/file.txt", "hello")
+            .await
+            .unwrap();
+
+        let content = read_file_at_ref(&repo_path, "main", "deep/nested/file.txt")
+            .await
+            .unwrap();
+        assert_eq!(content, "hello");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // --- merge_branch tests ---
+
+    #[tokio::test]
+    async fn merge_branch_combines_content() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        // Create staging branch from main (shared history) via git branch
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["branch", "staging", "main"])
+            .output()
+            .await
+            .unwrap();
+
+        // Commit values to staging
+        let staging_values = serde_json::json!({"image_ref": "app:v2", "environment": "staging"});
+        commit_values(&repo_path, "staging", "staging", &staging_values)
+            .await
+            .unwrap();
+
+        // Verify staging has the values
+        let staging_read = read_values(&repo_path, "staging", "staging").await.unwrap();
+        assert_eq!(staging_read["image_ref"], "app:v2");
+
+        // Main should NOT have staging values yet
+        let main_result = read_values(&repo_path, "main", "staging").await;
+        assert!(main_result.is_err());
+
+        // Merge staging into main
+        merge_branch(&repo_path, "staging", "main").await.unwrap();
+
+        // Now main should have the staging values
+        let main_read = read_values(&repo_path, "main", "staging").await.unwrap();
+        assert_eq!(main_read["image_ref"], "app:v2");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // --- compare_branches tests ---
+
+    #[tokio::test]
+    async fn compare_branches_same_sha() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let main_sha = get_branch_sha(&repo_path, "main").await.unwrap();
+        // Compare main with itself
+        let (diverged, sha1, sha2) = compare_branches(&repo_path, "main", "main").await.unwrap();
+        assert!(!diverged);
+        assert_eq!(sha1, sha2);
+        assert_eq!(sha1, main_sha);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn compare_branches_diverged() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        // Create staging from main (shared history)
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["branch", "staging", "main"])
+            .output()
+            .await
+            .unwrap();
+
+        // Commit to staging only
+        let values = serde_json::json!({"image_ref": "app:staging-v1"});
+        commit_values(&repo_path, "staging", "staging", &values)
+            .await
+            .unwrap();
+
+        let (diverged, staging_sha, main_sha) = compare_branches(&repo_path, "staging", "main")
+            .await
+            .unwrap();
+        assert!(diverged);
+        assert_ne!(staging_sha, main_sha);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // --- get_branch_sha tests ---
+
+    #[tokio::test]
+    async fn get_branch_sha_valid() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let sha = get_branch_sha(&repo_path, "main").await.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_sha_missing_branch() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let result = get_branch_sha(&repo_path, "nonexistent").await;
+        assert!(result.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

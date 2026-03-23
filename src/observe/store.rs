@@ -39,6 +39,7 @@ pub struct LogEntryRecord {
     pub user_id: Option<Uuid>,
     pub service: String,
     pub level: String,
+    pub source: String,
     pub message: String,
     pub attributes: Option<JsonValue>,
 }
@@ -60,6 +61,7 @@ pub struct LogTailMessage {
     pub timestamp: DateTime<Utc>,
     pub service: String,
     pub level: String,
+    pub source: String,
     pub message: String,
     pub trace_id: Option<String>,
 }
@@ -189,16 +191,17 @@ pub async fn write_logs(pool: &PgPool, logs: &[LogEntryRecord]) -> Result<(), Ob
     let user_ids: Vec<Option<Uuid>> = logs.iter().map(|l| l.user_id).collect();
     let services: Vec<&str> = logs.iter().map(|l| l.service.as_str()).collect();
     let levels: Vec<&str> = logs.iter().map(|l| l.level.as_str()).collect();
+    let sources: Vec<&str> = logs.iter().map(|l| l.source.as_str()).collect();
     let messages: Vec<&str> = logs.iter().map(|l| l.message.as_str()).collect();
     let attributes: Vec<Option<&JsonValue>> = logs.iter().map(|l| l.attributes.as_ref()).collect();
 
     sqlx::query(
         r"
         INSERT INTO log_entries (timestamp, trace_id, span_id, project_id, session_id, user_id,
-                                 service, level, message, attributes)
+                                 service, level, source, message, attributes)
         SELECT * FROM UNNEST(
             $1::timestamptz[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::uuid[],
-            $7::text[], $8::text[], $9::text[], $10::jsonb[]
+            $7::text[], $8::text[], $9::text[], $10::text[], $11::jsonb[]
         )
         ",
     )
@@ -210,6 +213,7 @@ pub async fn write_logs(pool: &PgPool, logs: &[LogEntryRecord]) -> Result<(), Ob
     .bind(&user_ids)
     .bind(&services)
     .bind(&levels)
+    .bind(&sources)
     .bind(&messages)
     .bind(&attributes)
     .execute(pool)

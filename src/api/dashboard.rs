@@ -113,14 +113,14 @@ async fn dashboard_stats(
     .unwrap_or(0);
 
     let healthy_deployments =
-        sqlx::query_scalar("SELECT COUNT(*) FROM deployments WHERE current_status = 'healthy'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE health = 'healthy' AND phase NOT IN ('completed','rolled_back','cancelled','failed')")
             .fetch_one(&state.pool)
             .await
             .unwrap_or(Some(0))
             .unwrap_or(0);
 
     let degraded_deployments =
-        sqlx::query_scalar("SELECT COUNT(*) FROM deployments WHERE current_status = 'degraded'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE health = 'degraded' AND phase NOT IN ('completed','rolled_back','cancelled','failed')")
             .fetch_one(&state.pool)
             .await
             .unwrap_or(Some(0))

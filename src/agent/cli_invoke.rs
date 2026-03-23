@@ -43,6 +43,10 @@ pub struct CliInvokeParams {
     pub oauth_token: Option<String>,
     pub anthropic_api_key: Option<String>,
     pub max_turns: Option<u32>,
+    /// Extra environment variables from custom LLM provider config.
+    pub extra_env: Vec<(String, String)>,
+    /// Model override from custom LLM provider config.
+    pub model_override: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +86,8 @@ pub async fn invoke_cli(
         max_turns: params.max_turns.or(Some(1)),
         permission_mode: Some("bypassPermissions".into()),
         cwd: Some(std::path::PathBuf::from("/tmp")),
+        extra_env: params.extra_env,
+        model: params.model_override,
         ..Default::default()
     };
 

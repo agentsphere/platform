@@ -5,6 +5,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use uuid::Uuid;
 
 use ts_rs::TS;
@@ -16,54 +17,115 @@ use crate::rbac::{Permission, resolver};
 use crate::store::AppState;
 use crate::validation;
 
-use super::helpers::require_admin;
+use super::helpers::{require_admin, require_project_read};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, TS)]
-#[ts(export, rename = "Deployment")]
-pub struct DeploymentResponse {
+#[ts(export, rename = "DeployTarget")]
+pub struct TargetResponse {
     pub id: Uuid,
     pub project_id: Uuid,
+    pub name: String,
     pub environment: String,
+    pub branch: Option<String>,
+    pub branch_slug: Option<String>,
+    pub ttl_hours: Option<i32>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub default_strategy: String,
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
-    pub image_ref: String,
-    pub values_override: Option<serde_json::Value>,
-    pub desired_status: String,
-    pub current_status: String,
-    pub current_sha: Option<String>,
-    pub deployed_by: Option<Uuid>,
-    pub deployed_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdateDeploymentRequest {
-    pub image_ref: Option<String>,
-    pub desired_status: Option<String>,
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "Release")]
+pub struct ReleaseResponse {
+    pub id: Uuid,
+    pub target_id: Uuid,
+    pub project_id: Uuid,
+    pub image_ref: String,
+    pub commit_sha: Option<String>,
+    pub strategy: String,
+    pub phase: String,
+    pub traffic_weight: i32,
+    pub health: String,
+    pub current_step: i32,
+    pub rollout_config: serde_json::Value,
     pub values_override: Option<serde_json::Value>,
+    pub deployed_by: Option<Uuid>,
+    pub pipeline_id: Option<Uuid>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ReleaseHistory")]
+pub struct HistoryResponse {
+    pub id: Uuid,
+    pub release_id: Uuid,
+    pub target_id: Uuid,
+    pub action: String,
+    pub phase: String,
+    pub traffic_weight: Option<i32>,
+    pub image_ref: String,
+    pub detail: Option<serde_json::Value>,
+    pub actor_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTargetRequest {
+    pub name: String,
+    pub environment: Option<String>,
+    pub default_strategy: Option<String>,
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, TS)]
-#[ts(export, rename = "DeploymentHistory")]
-pub struct HistoryResponse {
-    pub id: Uuid,
-    pub deployment_id: Uuid,
+#[derive(Debug, Deserialize)]
+pub struct CreateReleaseRequest {
     pub image_ref: String,
-    pub ops_repo_sha: Option<String>,
-    pub action: String,
-    pub status: String,
-    pub deployed_by: Option<Uuid>,
-    pub message: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub commit_sha: Option<String>,
+    pub strategy: Option<String>,
+    pub rollout_config: Option<serde_json::Value>,
+    pub values_override: Option<serde_json::Value>,
+    pub pipeline_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AdjustTrafficRequest {
+    pub traffic_weight: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StagingStatusResponse {
+    pub diverged: bool,
+    pub staging_image: Option<String>,
+    pub prod_image: Option<String>,
+    pub staging_sha: String,
+    pub prod_sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListResponse<T: Serialize> {
+    pub items: Vec<T>,
+    pub total: i64,
+}
+
+// Ops repo types (unchanged)
 #[derive(Debug, Deserialize)]
 pub struct CreateOpsRepoRequest {
     pub name: String,
@@ -88,63 +150,65 @@ pub struct OpsRepoResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, TS)]
-#[ts(export, rename = "PreviewDeployment")]
-pub struct PreviewResponse {
-    pub id: Uuid,
-    pub project_id: Uuid,
-    pub branch: String,
-    pub branch_slug: String,
-    pub image_ref: String,
-    pub pipeline_id: Option<Uuid>,
-    pub desired_status: String,
-    pub current_status: String,
-    pub ttl_hours: i32,
-    pub expires_at: DateTime<Utc>,
-    pub created_by: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ListParams {
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
-
-use super::helpers::{ListResponse, require_project_read, require_project_write};
-
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/projects/{id}/deployments", get(list_deployments))
+        // Deploy targets
         .route(
-            "/api/projects/{id}/deployments/{env}",
-            get(get_deployment).patch(update_deployment),
+            "/api/projects/{id}/targets",
+            get(list_targets).post(create_target),
+        )
+        .route("/api/projects/{id}/targets/{target_id}", get(get_target))
+        // Releases
+        .route(
+            "/api/projects/{id}/deploy-releases",
+            get(list_releases).post(create_release),
         )
         .route(
-            "/api/projects/{id}/deployments/{env}/rollback",
-            axum::routing::post(rollback_deployment),
+            "/api/projects/{id}/deploy-releases/{release_id}",
+            get(get_release),
+        )
+        // Release actions (traffic management)
+        .route(
+            "/api/projects/{id}/deploy-releases/{release_id}/traffic",
+            axum::routing::patch(adjust_traffic),
         )
         .route(
-            "/api/projects/{id}/deployments/{env}/history",
-            get(list_history),
+            "/api/projects/{id}/deploy-releases/{release_id}/promote",
+            axum::routing::post(promote_release),
         )
-        // Deploy preview iframes
+        .route(
+            "/api/projects/{id}/deploy-releases/{release_id}/rollback",
+            axum::routing::post(rollback_release),
+        )
+        .route(
+            "/api/projects/{id}/deploy-releases/{release_id}/pause",
+            axum::routing::post(pause_release),
+        )
+        .route(
+            "/api/projects/{id}/deploy-releases/{release_id}/resume",
+            axum::routing::post(resume_release),
+        )
+        // Release history
+        .route(
+            "/api/projects/{id}/deploy-releases/{release_id}/history",
+            get(release_history),
+        )
+        // Staging promotion
+        .route(
+            "/api/projects/{id}/promote-staging",
+            axum::routing::post(promote_staging),
+        )
+        .route("/api/projects/{id}/staging-status", get(staging_status))
+        // Deploy preview iframes (unchanged)
         .route(
             "/api/projects/{id}/deploy-preview/iframes",
             get(list_deploy_iframes),
         )
-        // Preview deployment routes
-        .route("/api/projects/{id}/previews", get(list_previews))
-        .route(
-            "/api/projects/{id}/previews/{slug}",
-            get(get_preview).delete(delete_preview),
-        )
-        // Ops repo admin routes
+        // Ops repo admin routes (unchanged)
         .route(
             "/api/admin/ops-repos",
             get(list_ops_repos).post(create_ops_repo),
@@ -205,348 +269,495 @@ async fn require_deploy_promote(
     Ok(())
 }
 
-fn validate_environment(env: &str) -> Result<(), ApiError> {
-    if !matches!(env, "preview" | "staging" | "production") {
-        return Err(ApiError::BadRequest(
-            "environment must be one of: preview, staging, production".into(),
-        ));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// Deployment handlers
+// Target handlers
 // ---------------------------------------------------------------------------
 
-async fn list_deployments(
+async fn list_targets(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<Uuid>,
     Query(params): Query<ListParams>,
-) -> Result<Json<ListResponse<DeploymentResponse>>, ApiError> {
+) -> Result<Json<ListResponse<TargetResponse>>, ApiError> {
     require_deploy_read(&state, &auth, id).await?;
 
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let total = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!: i64" FROM deployments WHERE project_id = $1"#,
-        id,
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deploy_targets WHERE project_id = $1 AND is_active = true",
     )
+    .bind(id)
     .fetch_one(&state.pool)
     .await?;
 
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, project_id, environment, ops_repo_id, manifest_path,
-               image_ref, values_override, desired_status, current_status,
-               current_sha, deployed_by, deployed_at, created_at, updated_at
-        FROM deployments WHERE project_id = $1
-        ORDER BY environment
-        LIMIT $2 OFFSET $3
-        "#,
-        id,
-        limit,
-        offset,
+    let rows = sqlx::query(
+        "SELECT id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
+                default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at
+         FROM deploy_targets WHERE project_id = $1 AND is_active = true
+         ORDER BY environment, name LIMIT $2 OFFSET $3",
     )
+    .bind(id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
-    let items = rows
-        .into_iter()
-        .map(|r| DeploymentResponse {
-            id: r.id,
-            project_id: r.project_id,
-            environment: r.environment,
-            ops_repo_id: r.ops_repo_id,
-            manifest_path: r.manifest_path,
-            image_ref: r.image_ref,
-            values_override: r.values_override,
-            desired_status: r.desired_status,
-            current_status: r.current_status,
-            current_sha: r.current_sha,
-            deployed_by: r.deployed_by,
-            deployed_at: r.deployed_at,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
-        .collect();
-
+    let items = rows.iter().map(row_to_target).collect();
     Ok(Json(ListResponse { items, total }))
 }
 
-async fn get_deployment(
+async fn get_target(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((id, env)): Path<(Uuid, String)>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
-    validate_environment(&env)?;
+    Path((id, target_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TargetResponse>, ApiError> {
     require_deploy_read(&state, &auth, id).await?;
 
-    let r = sqlx::query!(
-        r#"
-        SELECT id, project_id, environment, ops_repo_id, manifest_path,
-               image_ref, values_override, desired_status, current_status,
-               current_sha, deployed_by, deployed_at, created_at, updated_at
-        FROM deployments WHERE project_id = $1 AND environment = $2
-        "#,
-        id,
-        env,
+    let row = sqlx::query(
+        "SELECT id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
+                default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at
+         FROM deploy_targets WHERE id = $1 AND project_id = $2 AND is_active = true",
     )
+    .bind(target_id)
+    .bind(id)
     .fetch_optional(&state.pool)
     .await?
-    .ok_or_else(|| ApiError::NotFound("deployment".into()))?;
+    .ok_or_else(|| ApiError::NotFound("target".into()))?;
 
-    Ok(Json(DeploymentResponse {
-        id: r.id,
-        project_id: r.project_id,
-        environment: r.environment,
-        ops_repo_id: r.ops_repo_id,
-        manifest_path: r.manifest_path,
-        image_ref: r.image_ref,
-        values_override: r.values_override,
-        desired_status: r.desired_status,
-        current_status: r.current_status,
-        current_sha: r.current_sha,
-        deployed_by: r.deployed_by,
-        deployed_at: r.deployed_at,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
+    Ok(Json(row_to_target(&row)))
 }
 
-#[tracing::instrument(skip(state, body), fields(%id, %env), err)]
-async fn update_deployment(
+async fn create_target(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((id, env)): Path<(Uuid, String)>,
-    Json(body): Json<UpdateDeploymentRequest>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
-    validate_environment(&env)?;
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateTargetRequest>,
+) -> Result<(StatusCode, Json<TargetResponse>), ApiError> {
     require_deploy_promote(&state, &auth, id).await?;
-    validate_update_body(&body)?;
+    validation::check_name(&body.name)?;
 
-    // Reset current_status to 'pending' when image_ref or desired_status
-    // changes so the reconciler picks up the deployment for processing.
-    let needs_reconcile = body.image_ref.is_some() || body.desired_status.is_some();
+    let env = body.environment.as_deref().unwrap_or("production");
+    let strategy = body.default_strategy.as_deref().unwrap_or("rolling");
 
-    let r = sqlx::query!(
-        r#"
-        UPDATE deployments SET
-            image_ref = COALESCE($3, image_ref),
-            desired_status = COALESCE($4, desired_status),
-            values_override = COALESCE($5, values_override),
-            ops_repo_id = COALESCE($6, ops_repo_id),
-            manifest_path = COALESCE($7, manifest_path),
-            deployed_by = $8,
-            current_status = CASE WHEN $9 THEN 'pending' ELSE current_status END
-        WHERE project_id = $1 AND environment = $2
-        RETURNING id, project_id, environment, ops_repo_id, manifest_path,
-                  image_ref, values_override, desired_status, current_status,
-                  current_sha, deployed_by, deployed_at, created_at, updated_at
-        "#,
-        id,
-        env,
-        body.image_ref,
-        body.desired_status,
-        body.values_override,
-        body.ops_repo_id,
-        body.manifest_path,
-        auth.user_id,
-        needs_reconcile,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("deployment".into()))?;
-
-    write_audit(
-        &state.pool,
-        &AuditEntry {
-            actor_id: auth.user_id,
-            actor_name: &auth.user_name,
-            action: "deployment.update",
-            resource: "deployment",
-            resource_id: Some(r.id),
-            project_id: Some(id),
-            detail: Some(serde_json::json!({"environment": env})),
-            ip_addr: auth.ip_addr.as_deref(),
-        },
-    )
-    .await;
-
-    // If image_ref was updated, publish a DeployRequested event
-    // to commit the new image to the ops repo and trigger deployment
-    if let Some(ref new_image) = body.image_ref {
-        let event = crate::store::eventbus::PlatformEvent::DeployRequested {
-            project_id: id,
-            environment: env.clone(),
-            image_ref: new_image.clone(),
-            requested_by: Some(auth.user_id),
-        };
-        if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
-            tracing::error!(error = %e, "failed to publish DeployRequested event");
-        }
-    }
-
-    // Wake the reconciler immediately so it picks up the change
-    if needs_reconcile {
-        state.deploy_notify.notify_one();
-    }
-
-    crate::api::webhooks::fire_webhooks(
-        &state.pool,
-        id,
-        "deploy",
-        &serde_json::json!({"action": "updated", "environment": env}),
-    )
-    .await;
-
-    Ok(Json(DeploymentResponse {
-        id: r.id,
-        project_id: r.project_id,
-        environment: r.environment,
-        ops_repo_id: r.ops_repo_id,
-        manifest_path: r.manifest_path,
-        image_ref: r.image_ref,
-        values_override: r.values_override,
-        desired_status: r.desired_status,
-        current_status: r.current_status,
-        current_sha: r.current_sha,
-        deployed_by: r.deployed_by,
-        deployed_at: r.deployed_at,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
-}
-
-fn validate_update_body(body: &UpdateDeploymentRequest) -> Result<(), ApiError> {
-    if let Some(ref image_ref) = body.image_ref {
-        validation::check_length("image_ref", image_ref, 1, 500)?;
-    }
-    if let Some(ref desired_status) = body.desired_status
-        && !matches!(desired_status.as_str(), "active" | "stopped")
-    {
+    if !matches!(env, "preview" | "staging" | "production") {
         return Err(ApiError::BadRequest(
-            "desired_status must be 'active' or 'stopped' (use rollback endpoint for rollback)"
-                .into(),
+            "environment must be preview, staging, or production".into(),
         ));
     }
-    if let Some(ref manifest_path) = body.manifest_path {
-        validation::check_length("manifest_path", manifest_path, 1, 500)?;
-    }
-    Ok(())
-}
-
-#[tracing::instrument(skip(state), fields(%id, %env), err)]
-async fn rollback_deployment(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((id, env)): Path<(Uuid, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    validate_environment(&env)?;
-    require_deploy_promote(&state, &auth, id).await?;
-
-    // Verify deployment exists
-    let result = sqlx::query!(
-        r#"
-        UPDATE deployments
-        SET desired_status = 'rollback', current_status = 'pending', deployed_by = $3
-        WHERE project_id = $1 AND environment = $2
-        RETURNING id
-        "#,
-        id,
-        env,
-        auth.user_id,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("deployment".into()))?;
-
-    // Publish RollbackRequested event — the event bus handler will revert
-    // the ops repo and wake the deployer
-    let event = crate::store::eventbus::PlatformEvent::RollbackRequested {
-        project_id: id,
-        environment: env.clone(),
-        requested_by: Some(auth.user_id),
-    };
-    if let Err(e) = crate::store::eventbus::publish(&state.valkey, &event).await {
-        tracing::error!(error = %e, "failed to publish RollbackRequested event");
+    if !matches!(strategy, "rolling" | "canary" | "ab_test") {
+        return Err(ApiError::BadRequest(
+            "strategy must be rolling, canary, or ab_test".into(),
+        ));
     }
 
-    write_audit(
-        &state.pool,
-        &AuditEntry {
-            actor_id: auth.user_id,
-            actor_name: &auth.user_name,
-            action: "deployment.rollback",
-            resource: "deployment",
-            resource_id: Some(result.id),
-            project_id: Some(id),
-            detail: Some(serde_json::json!({"environment": env})),
-            ip_addr: auth.ip_addr.as_deref(),
-        },
+    let row = sqlx::query(
+        "INSERT INTO deploy_targets (project_id, name, environment, default_strategy, ops_repo_id, manifest_path, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
+                   default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at",
     )
-    .await;
+    .bind(id)
+    .bind(&body.name)
+    .bind(env)
+    .bind(strategy)
+    .bind(body.ops_repo_id)
+    .bind(&body.manifest_path)
+    .bind(auth.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+            ApiError::Conflict("target already exists for this environment".into())
+        }
+        _ => ApiError::from(e),
+    })?;
 
-    Ok(Json(serde_json::json!({"ok": true})))
+    Ok((StatusCode::CREATED, Json(row_to_target(&row))))
 }
 
-async fn list_history(
+// ---------------------------------------------------------------------------
+// Release handlers
+// ---------------------------------------------------------------------------
+
+async fn list_releases(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((id, env)): Path<(Uuid, String)>,
+    Path(id): Path<Uuid>,
     Query(params): Query<ListParams>,
-) -> Result<Json<ListResponse<HistoryResponse>>, ApiError> {
-    validate_environment(&env)?;
+) -> Result<Json<ListResponse<ReleaseResponse>>, ApiError> {
     require_deploy_read(&state, &auth, id).await?;
-
-    let deployment_id = sqlx::query_scalar!(
-        "SELECT id FROM deployments WHERE project_id = $1 AND environment = $2",
-        id,
-        env,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("deployment".into()))?;
 
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let total = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!: i64" FROM deployment_history WHERE deployment_id = $1"#,
-        deployment_id,
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE project_id = $1")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    let rows = sqlx::query(
+        "SELECT id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                traffic_weight, health, current_step, rollout_config, values_override,
+                deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at
+         FROM deploy_releases WHERE project_id = $1
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
+    .bind(id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let items = rows.iter().map(row_to_release).collect();
+    Ok(Json(ListResponse { items, total }))
+}
+
+async fn get_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_read(&state, &auth, id).await?;
+
+    let row = sqlx::query(
+        "SELECT id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                traffic_weight, health, current_step, rollout_config, values_override,
+                deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at
+         FROM deploy_releases WHERE id = $1 AND project_id = $2",
+    )
+    .bind(release_id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("release".into()))?;
+
+    Ok(Json(row_to_release(&row)))
+}
+
+async fn create_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateReleaseRequest>,
+) -> Result<(StatusCode, Json<ReleaseResponse>), ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    // Find or require a target
+    let target = sqlx::query(
+        "SELECT id, default_strategy FROM deploy_targets
+         WHERE project_id = $1 AND environment = 'production' AND is_active = true
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("no production target exists; create one first".into()))?;
+
+    let target_id: Uuid = target.get("id");
+    let default_strategy: String = target.get("default_strategy");
+    let strategy = body.strategy.as_deref().unwrap_or(&default_strategy);
+
+    let rollout_config = body
+        .rollout_config
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let row = sqlx::query(
+        "INSERT INTO deploy_releases (target_id, project_id, image_ref, commit_sha, strategy, rollout_config, values_override, deployed_by, pipeline_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(target_id)
+    .bind(id)
+    .bind(&body.image_ref)
+    .bind(&body.commit_sha)
+    .bind(strategy)
+    .bind(&rollout_config)
+    .bind(&body.values_override)
+    .bind(auth.user_id)
+    .bind(body.pipeline_id)
     .fetch_one(&state.pool)
     .await?;
 
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, deployment_id, image_ref, ops_repo_sha, action,
-               status, deployed_by, message, created_at
-        FROM deployment_history
-        WHERE deployment_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-        deployment_id,
-        limit,
-        offset,
+    let release_id: Uuid = row.get("id");
+
+    // Record history
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "created",
+        "pending",
+        None,
+        &body.image_ref,
+        Some(auth.user_id),
     )
+    .await;
+
+    // Wake reconciler
+    state.deploy_notify.notify_one();
+
+    // Publish event
+    let _ = crate::store::eventbus::publish(
+        &state.valkey,
+        &crate::store::eventbus::PlatformEvent::ReleaseCreated {
+            target_id,
+            release_id,
+            project_id: id,
+            image_ref: body.image_ref.clone(),
+            strategy: strategy.to_string(),
+        },
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(row_to_release(&row))))
+}
+
+// ---------------------------------------------------------------------------
+// Traffic management handlers
+// ---------------------------------------------------------------------------
+
+async fn adjust_traffic(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<AdjustTrafficRequest>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    if !(0..=100).contains(&body.traffic_weight) {
+        return Err(ApiError::BadRequest("traffic_weight must be 0-100".into()));
+    }
+
+    let row = sqlx::query(
+        "UPDATE deploy_releases SET traffic_weight = $3
+         WHERE id = $1 AND project_id = $2 AND phase NOT IN ('completed','rolled_back','cancelled','failed')
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(release_id)
+    .bind(id)
+    .bind(body.traffic_weight)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("release".into()))?;
+
+    let target_id: Uuid = row.get("target_id");
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "traffic_shifted",
+        row.get::<String, _>("phase").as_str(),
+        Some(body.traffic_weight),
+        row.get::<String, _>("image_ref").as_str(),
+        Some(auth.user_id),
+    )
+    .await;
+
+    state.deploy_notify.notify_one();
+    Ok(Json(row_to_release(&row)))
+}
+
+async fn promote_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    let row = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100
+         WHERE id = $1 AND project_id = $2 AND phase IN ('progressing','holding','paused')
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(release_id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("release not found or not in a promotable phase".into()))?;
+
+    let target_id: Uuid = row.get("target_id");
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "promoted",
+        "promoting",
+        Some(100),
+        row.get::<String, _>("image_ref").as_str(),
+        Some(auth.user_id),
+    )
+    .await;
+
+    state.deploy_notify.notify_one();
+    Ok(Json(row_to_release(&row)))
+}
+
+async fn rollback_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    let row = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'rolling_back'
+         WHERE id = $1 AND project_id = $2 AND phase IN ('progressing','holding','paused')
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(release_id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| {
+        ApiError::BadRequest("release not found or not in a rollback-able phase".into())
+    })?;
+
+    let target_id: Uuid = row.get("target_id");
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "rolled_back",
+        "rolling_back",
+        None,
+        row.get::<String, _>("image_ref").as_str(),
+        Some(auth.user_id),
+    )
+    .await;
+
+    state.deploy_notify.notify_one();
+    Ok(Json(row_to_release(&row)))
+}
+
+async fn pause_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    let row = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'paused'
+         WHERE id = $1 AND project_id = $2 AND phase = 'progressing'
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(release_id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("release not found or not progressing".into()))?;
+
+    let target_id: Uuid = row.get("target_id");
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "paused",
+        "paused",
+        None,
+        row.get::<String, _>("image_ref").as_str(),
+        Some(auth.user_id),
+    )
+    .await;
+
+    Ok(Json(row_to_release(&row)))
+}
+
+async fn resume_release(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    let row = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing'
+         WHERE id = $1 AND project_id = $2 AND phase = 'paused'
+         RETURNING id, target_id, project_id, image_ref, commit_sha, strategy, phase,
+                   traffic_weight, health, current_step, rollout_config, values_override,
+                   deployed_by, pipeline_id, started_at, completed_at, created_at, updated_at",
+    )
+    .bind(release_id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("release not found or not paused".into()))?;
+
+    let target_id: Uuid = row.get("target_id");
+    record_release_history(
+        &state.pool,
+        release_id,
+        target_id,
+        "resumed",
+        "progressing",
+        None,
+        row.get::<String, _>("image_ref").as_str(),
+        Some(auth.user_id),
+    )
+    .await;
+
+    state.deploy_notify.notify_one();
+    Ok(Json(row_to_release(&row)))
+}
+
+// ---------------------------------------------------------------------------
+// Release history
+// ---------------------------------------------------------------------------
+
+async fn release_history(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((id, release_id)): Path<(Uuid, Uuid)>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListResponse<HistoryResponse>>, ApiError> {
+    require_deploy_read(&state, &auth, id).await?;
+
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM release_history WHERE release_id = $1")
+            .bind(release_id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    let rows = sqlx::query(
+        "SELECT id, release_id, target_id, action, phase, traffic_weight, image_ref, detail, actor_id, created_at
+         FROM release_history WHERE release_id = $1
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(release_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
     let items = rows
-        .into_iter()
+        .iter()
         .map(|r| HistoryResponse {
-            id: r.id,
-            deployment_id: r.deployment_id,
-            image_ref: r.image_ref,
-            ops_repo_sha: r.ops_repo_sha,
-            action: r.action,
-            status: r.status,
-            deployed_by: r.deployed_by,
-            message: r.message,
-            created_at: r.created_at,
+            id: r.get("id"),
+            release_id: r.get("release_id"),
+            target_id: r.get("target_id"),
+            action: r.get("action"),
+            phase: r.get("phase"),
+            traffic_weight: r.get("traffic_weight"),
+            image_ref: r.get("image_ref"),
+            detail: r.get("detail"),
+            actor_id: r.get("actor_id"),
+            created_at: r.get("created_at"),
         })
         .collect();
 
@@ -554,10 +765,135 @@ async fn list_history(
 }
 
 // ---------------------------------------------------------------------------
-// Deploy preview iframes
+// Staging promotion handlers
 // ---------------------------------------------------------------------------
 
-/// Response type for deploy iframe panels (same shape as session iframes).
+async fn staging_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<StagingStatusResponse>, ApiError> {
+    require_deploy_read(&state, &auth, id).await?;
+
+    let ops_repo = fetch_ops_repo_for_project(&state, id).await?;
+    let ops_path = std::path::PathBuf::from(&ops_repo.repo_path);
+
+    let (diverged, staging_sha, prod_sha) =
+        crate::deployer::ops_repo::compare_branches(&ops_path, "staging", &ops_repo.branch)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let staging_image = crate::deployer::ops_repo::read_values(&ops_path, "staging", "staging")
+        .await
+        .ok()
+        .and_then(|v| v["image_ref"].as_str().map(String::from));
+
+    let prod_image =
+        crate::deployer::ops_repo::read_values(&ops_path, &ops_repo.branch, "production")
+            .await
+            .ok()
+            .and_then(|v| v["image_ref"].as_str().map(String::from));
+
+    Ok(Json(StagingStatusResponse {
+        diverged,
+        staging_image,
+        prod_image,
+        staging_sha,
+        prod_sha,
+    }))
+}
+
+async fn promote_staging(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_deploy_promote(&state, &auth, id).await?;
+
+    let ops_repo = fetch_ops_repo_for_project(&state, id).await?;
+    let ops_path = std::path::PathBuf::from(&ops_repo.repo_path);
+
+    let staging_values = crate::deployer::ops_repo::read_values(&ops_path, "staging", "staging")
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("no staging deployment to promote: {e}")))?;
+
+    let image_ref = staging_values["image_ref"]
+        .as_str()
+        .ok_or_else(|| ApiError::BadRequest("staging values missing image_ref".into()))?
+        .to_string();
+
+    let new_sha = crate::deployer::ops_repo::merge_branch(&ops_path, "staging", &ops_repo.branch)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let _ = crate::store::eventbus::publish(
+        &state.valkey,
+        &crate::store::eventbus::PlatformEvent::OpsRepoUpdated {
+            project_id: id,
+            ops_repo_id: ops_repo.id,
+            environment: "production".into(),
+            commit_sha: new_sha.clone(),
+            image_ref: image_ref.clone(),
+        },
+    )
+    .await;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.promote_staging",
+            resource: "project",
+            resource_id: Some(id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({
+                "image_ref": image_ref,
+                "commit_sha": new_sha,
+            })),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "promoted",
+        "image_ref": image_ref,
+        "commit_sha": new_sha,
+    })))
+}
+
+/// Fetch the ops repo associated with a project, returning 404 if none exists.
+async fn fetch_ops_repo_for_project(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<OpsRepoRow, ApiError> {
+    let row = sqlx::query!(
+        r#"SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1"#,
+        project_id,
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("ops_repo".into()))?;
+
+    Ok(OpsRepoRow {
+        id: row.id,
+        repo_path: row.repo_path,
+        branch: row.branch,
+    })
+}
+
+/// Lightweight struct for ops repo fields needed by staging endpoints.
+struct OpsRepoRow {
+    id: Uuid,
+    repo_path: String,
+    branch: String,
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview iframes (unchanged — uses K8s API, not DB tables)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Serialize)]
 struct DeployIframePanel {
     service_name: String,
@@ -576,8 +912,6 @@ fn default_deploy_env() -> String {
     "production".into()
 }
 
-/// List iframe panels for a project's deploy namespace.
-/// Discovers K8s Services labeled `platform.io/component=iframe-preview`.
 #[tracing::instrument(skip(state, auth), fields(%id), err)]
 async fn list_deploy_iframes(
     State(state): State<AppState>,
@@ -613,7 +947,6 @@ async fn list_deploy_iframes(
     let svcs = match svc_api.list(&lp).await {
         Ok(list) => list,
         Err(kube::Error::Api(resp)) if resp.code == 404 => {
-            // Namespace doesn't exist yet — no iframes
             return Ok(Json(vec![]));
         }
         Err(e) => return Err(ApiError::Internal(e.into())),
@@ -644,148 +977,7 @@ async fn list_deploy_iframes(
 }
 
 // ---------------------------------------------------------------------------
-// Preview deployment handlers
-// ---------------------------------------------------------------------------
-
-async fn list_previews(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path(id): Path<Uuid>,
-    Query(params): Query<ListParams>,
-) -> Result<Json<ListResponse<PreviewResponse>>, ApiError> {
-    require_project_read(&state, &auth, id).await?;
-
-    let limit = params.limit.unwrap_or(50).min(100);
-    let offset = params.offset.unwrap_or(0);
-
-    let total = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!: i64" FROM preview_deployments
-           WHERE project_id = $1 AND desired_status = 'active'"#,
-        id,
-    )
-    .fetch_one(&state.pool)
-    .await?;
-
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, project_id, branch, branch_slug, image_ref, pipeline_id,
-               desired_status, current_status, ttl_hours, expires_at,
-               created_by, created_at, updated_at
-        FROM preview_deployments
-        WHERE project_id = $1 AND desired_status = 'active'
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-        id,
-        limit,
-        offset,
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    let items = rows
-        .into_iter()
-        .map(|r| PreviewResponse {
-            id: r.id,
-            project_id: r.project_id,
-            branch: r.branch,
-            branch_slug: r.branch_slug,
-            image_ref: r.image_ref,
-            pipeline_id: r.pipeline_id,
-            desired_status: r.desired_status,
-            current_status: r.current_status,
-            ttl_hours: r.ttl_hours,
-            expires_at: r.expires_at,
-            created_by: r.created_by,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
-        .collect();
-
-    Ok(Json(ListResponse { items, total }))
-}
-
-async fn get_preview(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((id, slug)): Path<(Uuid, String)>,
-) -> Result<Json<PreviewResponse>, ApiError> {
-    require_project_read(&state, &auth, id).await?;
-
-    let r = sqlx::query!(
-        r#"
-        SELECT id, project_id, branch, branch_slug, image_ref, pipeline_id,
-               desired_status, current_status, ttl_hours, expires_at,
-               created_by, created_at, updated_at
-        FROM preview_deployments
-        WHERE project_id = $1 AND branch_slug = $2 AND desired_status = 'active'
-        "#,
-        id,
-        slug,
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("preview".into()))?;
-
-    Ok(Json(PreviewResponse {
-        id: r.id,
-        project_id: r.project_id,
-        branch: r.branch,
-        branch_slug: r.branch_slug,
-        image_ref: r.image_ref,
-        pipeline_id: r.pipeline_id,
-        desired_status: r.desired_status,
-        current_status: r.current_status,
-        ttl_hours: r.ttl_hours,
-        expires_at: r.expires_at,
-        created_by: r.created_by,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
-}
-
-#[tracing::instrument(skip(state), fields(%id, %slug), err)]
-async fn delete_preview(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((id, slug)): Path<(Uuid, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_project_write(&state, &auth, id).await?;
-
-    let result = sqlx::query!(
-        r#"UPDATE preview_deployments
-           SET desired_status = 'stopped', updated_at = now()
-           WHERE project_id = $1 AND branch_slug = $2 AND desired_status = 'active'"#,
-        id,
-        slug,
-    )
-    .execute(&state.pool)
-    .await?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("preview".into()));
-    }
-
-    write_audit(
-        &state.pool,
-        &AuditEntry {
-            actor_id: auth.user_id,
-            actor_name: &auth.user_name,
-            action: "preview.delete",
-            resource: "preview_deployment",
-            resource_id: None,
-            project_id: Some(id),
-            detail: Some(serde_json::json!({"branch_slug": slug})),
-            ip_addr: auth.ip_addr.as_deref(),
-        },
-    )
-    .await;
-
-    Ok(Json(serde_json::json!({"ok": true})))
-}
-
-// ---------------------------------------------------------------------------
-// Ops repo admin handlers
+// Ops repo admin handlers (unchanged — ops_repos table not affected)
 // ---------------------------------------------------------------------------
 
 #[tracing::instrument(skip(state, body), err)]
@@ -800,7 +992,6 @@ async fn create_ops_repo(
     let branch = body.branch.as_deref().unwrap_or("main");
     let path = body.path.as_deref().unwrap_or("/");
 
-    // Initialize the bare repo on disk
     let repo_path =
         crate::deployer::ops_repo::init_ops_repo(&state.config.ops_repos_path, &body.name, branch)
             .await
@@ -988,16 +1179,16 @@ async fn delete_ops_repo(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state, &auth).await?;
 
-    let ref_count = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!: i64" FROM deployments WHERE ops_repo_id = $1"#,
-        repo_id,
-    )
-    .fetch_one(&state.pool)
-    .await?;
+    // Check if any deploy targets reference this ops repo
+    let ref_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deploy_targets WHERE ops_repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&state.pool)
+            .await?;
 
     if ref_count > 0 {
         return Err(ApiError::Conflict(
-            "ops repo is referenced by active deployments".into(),
+            "ops repo is referenced by active deploy targets".into(),
         ));
     }
 
@@ -1025,4 +1216,76 @@ async fn delete_ops_repo(
     .await;
 
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn row_to_target(row: &sqlx::postgres::PgRow) -> TargetResponse {
+    TargetResponse {
+        id: row.get("id"),
+        project_id: row.get("project_id"),
+        name: row.get("name"),
+        environment: row.get("environment"),
+        branch: row.get("branch"),
+        branch_slug: row.get("branch_slug"),
+        ttl_hours: row.get("ttl_hours"),
+        expires_at: row.get("expires_at"),
+        default_strategy: row.get("default_strategy"),
+        ops_repo_id: row.get("ops_repo_id"),
+        manifest_path: row.get("manifest_path"),
+        is_active: row.get("is_active"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn row_to_release(row: &sqlx::postgres::PgRow) -> ReleaseResponse {
+    ReleaseResponse {
+        id: row.get("id"),
+        target_id: row.get("target_id"),
+        project_id: row.get("project_id"),
+        image_ref: row.get("image_ref"),
+        commit_sha: row.get("commit_sha"),
+        strategy: row.get("strategy"),
+        phase: row.get("phase"),
+        traffic_weight: row.get("traffic_weight"),
+        health: row.get("health"),
+        current_step: row.get("current_step"),
+        rollout_config: row.get("rollout_config"),
+        values_override: row.get("values_override"),
+        deployed_by: row.get("deployed_by"),
+        pipeline_id: row.get("pipeline_id"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_release_history(
+    pool: &sqlx::PgPool,
+    release_id: Uuid,
+    target_id: Uuid,
+    action: &str,
+    phase: &str,
+    traffic_weight: Option<i32>,
+    image_ref: &str,
+    actor_id: Option<Uuid>,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO release_history (release_id, target_id, action, phase, traffic_weight, image_ref, actor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(action)
+    .bind(phase)
+    .bind(traffic_weight)
+    .bind(image_ref)
+    .bind(actor_id)
+    .execute(pool)
+    .await;
 }
