@@ -303,7 +303,7 @@ async fn reconciler_optimistic_lock(pool: PgPool) {
         .await;
 }
 
-/// Preview cleanup deactivates expired preview deploy_targets.
+/// Preview cleanup deactivates expired preview `deploy_targets`.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn preview_expired_cleanup(pool: PgPool) {

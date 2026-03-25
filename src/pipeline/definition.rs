@@ -96,6 +96,10 @@ pub struct DeploySpec {
     /// Whether this spec also deploys to staging (when `enable_staging=true`).
     #[serde(default)]
     pub include_staging: bool,
+    /// Which environments this spec applies to (e.g. `["staging"]`).
+    /// Default: `canary` → `["staging"]`, others → `["staging", "production"]`.
+    #[serde(default)]
+    pub stages: Option<Vec<String>>,
 }
 
 fn default_deploy_type() -> String {
@@ -390,9 +394,22 @@ fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
                         step.name,
                     )));
                 }
+                if let Some(ref img) = step.image_name {
+                    crate::validation::check_pipeline_image(img).map_err(|e| {
+                        PipelineError::InvalidDefinition(format!(
+                            "step '{}': imageName: {e}",
+                            step.name,
+                        ))
+                    })?;
+                }
             }
             StepKind::DeployTest => {
-                let dt = step.deploy_test.as_ref().unwrap();
+                let dt = step.deploy_test.as_ref().ok_or_else(|| {
+                    PipelineError::InvalidDefinition(format!(
+                        "step '{}': deploy_test kind but no deploy_test config",
+                        step.name,
+                    ))
+                })?;
                 if !step.commands.is_empty() {
                     return Err(PipelineError::InvalidDefinition(format!(
                         "step '{}': deploy_test and commands are mutually exclusive",
@@ -425,6 +442,9 @@ fn validate(def: &PipelineDefinition) -> Result<(), PipelineError> {
                         step.name
                     )));
                 }
+                crate::validation::check_pipeline_image(&step.image).map_err(|e| {
+                    PipelineError::InvalidDefinition(format!("step '{}': image: {e}", step.name,))
+                })?;
             }
         }
 
@@ -661,6 +681,11 @@ fn validate_deploy_test(step_name: &str, dt: &DeployTestDef) -> Result<(), Pipel
             "step '{step_name}': deploy_test.test_image must not be empty"
         )));
     }
+    crate::validation::check_pipeline_image(&dt.test_image).map_err(|e| {
+        PipelineError::InvalidDefinition(
+            format!("step '{step_name}': deploy_test.test_image: {e}",),
+        )
+    })?;
     if let Some(ref manifests) = dt.manifests
         && manifests.contains("..")
     {
@@ -782,7 +807,7 @@ fn validate_canary_config(spec_name: &str, c: &CanaryConfig) -> Result<(), Pipel
         }
     }
     // Last step must be 100
-    if *c.steps.last().unwrap() != 100 {
+    if c.steps.last().copied().unwrap_or(0) != 100 {
         return Err(PipelineError::InvalidDefinition(format!(
             "deploy spec '{spec_name}': canary.steps must end with 100"
         )));
@@ -872,6 +897,56 @@ pub fn expand_step_env(value: &str, env_vars: &[(String, String)]) -> String {
         result = result.replace(&format!("${key}"), val);
     }
     result
+}
+
+/// Validate that canary deploy specs reference services that exist in the manifests.
+///
+/// Parses multi-doc YAML, extracts `kind: Service` names, and checks that each
+/// canary spec's `stable_service` and `canary_service` match a declared service.
+pub fn validate_canary_service_refs(
+    specs: &[DeploySpec],
+    manifest_content: &str,
+) -> Result<(), PipelineError> {
+    // Extract service names from multi-doc YAML
+    let mut service_names: Vec<String> = Vec::new();
+    for doc in manifest_content.split("\n---") {
+        let trimmed = doc.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(trimmed)
+            && value.get("kind").and_then(|k| k.as_str()) == Some("Service")
+            && let Some(name) = value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+        {
+            service_names.push(name.to_string());
+        }
+    }
+
+    for spec in specs {
+        if let Some(ref canary) = spec.canary {
+            if !service_names.iter().any(|s| s == &canary.stable_service) {
+                return Err(PipelineError::InvalidDefinition(format!(
+                    "canary spec '{}': stable_service '{}' not found in manifests (available: {})",
+                    spec.name,
+                    canary.stable_service,
+                    service_names.join(", "),
+                )));
+            }
+            if !service_names.iter().any(|s| s == &canary.canary_service) {
+                return Err(PipelineError::InvalidDefinition(format!(
+                    "canary spec '{}': canary_service '{}' not found in manifests (available: {})",
+                    spec.name,
+                    canary.canary_service,
+                    service_names.join(", "),
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,7 +1496,7 @@ pipeline:
 
     #[test]
     fn parse_only_with_events() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: lint
@@ -1429,7 +1504,7 @@ pipeline:
       commands: [cargo clippy]
       only:
         events: [mr]
-"#;
+";
         let def = parse(yaml).unwrap();
         let cond = def.steps[0].only.as_ref().unwrap();
         assert_eq!(cond.events, vec!["mr"]);
@@ -1483,14 +1558,14 @@ pipeline:
 
     #[test]
     fn parse_only_invalid_event() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: test
       image: alpine
       only:
         events: [invalid]
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("invalid event")),
@@ -1564,7 +1639,7 @@ pipeline:
 
     #[test]
     fn parse_deploy_test_step() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
@@ -1572,7 +1647,7 @@ pipeline:
         test_image: registry/test:v1
         readiness_path: /healthz
         readiness_timeout: 60
-"#;
+";
         let def = parse(yaml).unwrap();
         let dt = def.steps[0].deploy_test.as_ref().unwrap();
         assert_eq!(dt.test_image, "registry/test:v1");
@@ -1584,14 +1659,14 @@ pipeline:
 
     #[test]
     fn parse_deploy_test_with_commands() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       deploy_test:
         test_image: registry/test:v1
         commands: [npm test, npm run e2e]
-"#;
+";
         let def = parse(yaml).unwrap();
         let dt = def.steps[0].deploy_test.as_ref().unwrap();
         assert_eq!(dt.commands, vec!["npm test", "npm run e2e"]);
@@ -1599,13 +1674,13 @@ pipeline:
 
     #[test]
     fn parse_deploy_test_defaults() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       deploy_test:
         test_image: registry/test:v1
-"#;
+";
         let def = parse(yaml).unwrap();
         let dt = def.steps[0].deploy_test.as_ref().unwrap();
         assert_eq!(dt.readiness_path, "/healthz");
@@ -1614,14 +1689,14 @@ pipeline:
 
     #[test]
     fn validate_deploy_test_and_commands_mutual_exclusion() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       commands: [echo hello]
       deploy_test:
         test_image: registry/test:v1
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("mutually exclusive")),
@@ -1647,14 +1722,14 @@ pipeline:
 
     #[test]
     fn validate_deploy_test_bad_readiness_path() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       deploy_test:
         test_image: registry/test:v1
         readiness_path: healthz
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("readiness_path must start with")),
@@ -1664,14 +1739,14 @@ pipeline:
 
     #[test]
     fn validate_deploy_test_bad_timeout() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       deploy_test:
         test_image: registry/test:v1
         readiness_timeout: 0
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("readiness_timeout must be 1-600")),
@@ -1865,7 +1940,7 @@ pipeline:
         assert_eq!(layers[0], vec![0]);
         // Layer 1: b, c (parallel)
         let mut l1 = layers[1].clone();
-        l1.sort();
+        l1.sort_unstable();
         assert_eq!(l1, vec![1, 2]);
         // Layer 2: d
         assert_eq!(layers[2], vec![3]);
@@ -1988,7 +2063,7 @@ pipeline:
 
     #[test]
     fn parse_deploy_canary_config() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2012,7 +2087,7 @@ deploy:
           - metric: error_rate
             condition: gt
             threshold: 0.50
-"#;
+";
         let file = parse_platform_file(yaml).unwrap();
         let deploy = file.deploy.unwrap();
         assert!(!deploy.enable_staging);
@@ -2028,7 +2103,7 @@ deploy:
 
     #[test]
     fn parse_deploy_ab_test_config() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2047,7 +2122,7 @@ deploy:
         success_condition: gt
         duration: 86400
         min_samples: 1000
-"#;
+";
         let file = parse_platform_file(yaml).unwrap();
         let spec = &file.deploy.unwrap().specs[0];
         assert_eq!(spec.deploy_type, "ab_test");
@@ -2083,7 +2158,7 @@ deploy:
 
     #[test]
     fn validate_canary_steps_ascending() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2096,7 +2171,7 @@ deploy:
         stable_service: s
         canary_service: c
         steps: [50, 20, 100]
-"#;
+";
         let err = parse_platform_file(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("ascending")),
@@ -2106,7 +2181,7 @@ deploy:
 
     #[test]
     fn validate_canary_steps_must_end_at_100() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2119,7 +2194,7 @@ deploy:
         stable_service: s
         canary_service: c
         steps: [10, 50]
-"#;
+";
         let err = parse_platform_file(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("end with 100")),
@@ -2225,7 +2300,7 @@ flags:
 
     #[test]
     fn validate_duplicate_flag_keys() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2235,7 +2310,7 @@ flags:
     default_value: false
   - key: my_flag
     default_value: true
-"#;
+";
         let err = parse_platform_file(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("duplicate flag")),
@@ -2245,7 +2320,7 @@ flags:
 
     #[test]
     fn validate_custom_metric_gate_requires_name() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2262,7 +2337,7 @@ deploy:
           - metric: custom
             condition: lt
             threshold: 0.05
-"#;
+";
         let err = parse_platform_file(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("custom") && msg.contains("name")),
@@ -2272,7 +2347,7 @@ deploy:
 
     #[test]
     fn parse_wait_for_services() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
@@ -2280,7 +2355,7 @@ pipeline:
         test_image: registry/test:v1
         manifests: testinfra/
         wait_for_services: [api, postgres]
-"#;
+";
         let def = parse(yaml).unwrap();
         let dt = def.steps[0].deploy_test.as_ref().unwrap();
         assert_eq!(dt.wait_for_services, vec!["api", "postgres"]);
@@ -2372,7 +2447,7 @@ deploy:
 
     #[test]
     fn parse_imagebuild_step() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build-app
@@ -2381,7 +2456,7 @@ pipeline:
       dockerfile: Dockerfile
       secrets:
         - MY_SECRET
-"#;
+";
         let def = parse(yaml).unwrap();
         let step = &def.steps[0];
         assert_eq!(step.step_type.as_deref(), Some("imagebuild"));
@@ -2393,12 +2468,12 @@ pipeline:
 
     #[test]
     fn imagebuild_missing_image_name_rejected() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build-app
       type: imagebuild
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("imageName")),
@@ -2425,12 +2500,12 @@ pipeline:
 
     #[test]
     fn gitops_sync_missing_copy_rejected() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: sync
       type: gitops_sync
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("gitops.copy")),
@@ -2440,7 +2515,7 @@ pipeline:
 
     #[test]
     fn parse_deploy_watch_step() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: watch
@@ -2448,7 +2523,7 @@ pipeline:
       deploy_watch:
         environment: staging
         timeout: 600
-"#;
+";
         let def = parse(yaml).unwrap();
         let step = &def.steps[0];
         assert_eq!(step.kind(), StepKind::DeployWatch);
@@ -2459,12 +2534,12 @@ pipeline:
 
     #[test]
     fn deploy_watch_missing_config_rejected() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: watch
       type: deploy_watch
-"#;
+";
         let err = parse(yaml).unwrap_err();
         assert!(
             matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("deploy_watch")),
@@ -2474,14 +2549,14 @@ pipeline:
 
     #[test]
     fn deploy_watch_default_timeout() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: watch
       type: deploy_watch
       deploy_watch:
         environment: production
-"#;
+";
         let def = parse(yaml).unwrap();
         let dw = def.steps[0].deploy_watch.as_ref().unwrap();
         assert_eq!(dw.timeout, 300);
@@ -2490,14 +2565,14 @@ pipeline:
     #[test]
     fn step_kind_infers_correctly() {
         // deploy_test inferred from field, not type
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: e2e
       deploy_test:
         test_image: my-image:latest
         manifests: testinfra/
-"#;
+";
         let def = parse(yaml).unwrap();
         assert_eq!(def.steps[0].kind(), StepKind::DeployTest);
 
@@ -2515,7 +2590,7 @@ pipeline:
 
     #[test]
     fn parse_deploy_variables() {
-        let yaml = r#"
+        let yaml = r"
 pipeline:
   steps:
     - name: build
@@ -2525,7 +2600,7 @@ deploy:
     staging: deploy/variables_staging.yaml
     production: deploy/variables_prod.yaml
   specs: []
-"#;
+";
         let pf = parse_platform_file(yaml).unwrap();
         let deploy = pf.deploy.unwrap();
         assert_eq!(
@@ -2620,7 +2695,7 @@ deploy:
         assert!(pf.deploy.is_some());
 
         // Verify step kinds
-        let kinds: Vec<StepKind> = pf.pipeline.steps.iter().map(|s| s.kind()).collect();
+        let kinds: Vec<StepKind> = pf.pipeline.steps.iter().map(super::StepDef::kind).collect();
         assert_eq!(
             kinds,
             vec![
@@ -2632,6 +2707,210 @@ deploy:
                 StepKind::GitopsSync,
                 StepKind::DeployWatch,
             ]
+        );
+    }
+
+    // -- validate_canary_service_refs --
+
+    #[test]
+    fn validate_canary_refs_ok() {
+        let manifest = r"
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-v0-1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-v0-2
+";
+        let specs = vec![DeploySpec {
+            name: "api".into(),
+            deploy_type: "canary".into(),
+            canary: Some(CanaryConfig {
+                stable_service: "app-v0-1".into(),
+                canary_service: "app-v0-2".into(),
+                steps: vec![10, 50, 100],
+                interval: 60,
+                min_requests: 100,
+                max_failures: 3,
+                progress_gates: vec![],
+                rollback_triggers: vec![],
+            }),
+            ab_test: None,
+            include_staging: false,
+            stages: None,
+        }];
+        assert!(validate_canary_service_refs(&specs, manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_canary_refs_missing_stable() {
+        let manifest = r"
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-v0-2
+";
+        let specs = vec![DeploySpec {
+            name: "api".into(),
+            deploy_type: "canary".into(),
+            canary: Some(CanaryConfig {
+                stable_service: "app-v0-1".into(),
+                canary_service: "app-v0-2".into(),
+                steps: vec![10, 100],
+                interval: 60,
+                min_requests: 100,
+                max_failures: 3,
+                progress_gates: vec![],
+                rollback_triggers: vec![],
+            }),
+            ab_test: None,
+            include_staging: false,
+            stages: None,
+        }];
+        let err = validate_canary_service_refs(&specs, manifest).unwrap_err();
+        assert!(err.to_string().contains("stable_service"));
+        assert!(err.to_string().contains("app-v0-1"));
+    }
+
+    #[test]
+    fn validate_canary_refs_missing_canary() {
+        let manifest = r"
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-v0-1
+";
+        let specs = vec![DeploySpec {
+            name: "api".into(),
+            deploy_type: "canary".into(),
+            canary: Some(CanaryConfig {
+                stable_service: "app-v0-1".into(),
+                canary_service: "app-v0-2".into(),
+                steps: vec![10, 100],
+                interval: 60,
+                min_requests: 100,
+                max_failures: 3,
+                progress_gates: vec![],
+                rollback_triggers: vec![],
+            }),
+            ab_test: None,
+            include_staging: false,
+            stages: None,
+        }];
+        let err = validate_canary_service_refs(&specs, manifest).unwrap_err();
+        assert!(err.to_string().contains("canary_service"));
+    }
+
+    #[test]
+    fn validate_canary_refs_no_canary_specs_ok() {
+        let specs = vec![DeploySpec {
+            name: "api".into(),
+            deploy_type: "rolling".into(),
+            canary: None,
+            ab_test: None,
+            include_staging: false,
+            stages: None,
+        }];
+        assert!(validate_canary_service_refs(&specs, "").is_ok());
+    }
+
+    #[test]
+    fn deploy_spec_stages_parsing() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: canary
+      stages: [staging]
+      canary:
+        stable_service: s
+        canary_service: c
+        steps: [10, 100]
+";
+        let pf: PlatformFile = serde_yaml::from_str(yaml).unwrap();
+        let spec = pf.deploy.unwrap().specs[0].clone();
+        assert_eq!(spec.stages.as_deref().unwrap(), &["staging".to_string()]);
+    }
+
+    #[test]
+    fn deploy_spec_stages_default_none() {
+        let yaml = r"
+pipeline:
+  steps:
+    - name: test
+      image: alpine
+deploy:
+  specs:
+    - name: api
+      type: rolling
+";
+        let pf: PlatformFile = serde_yaml::from_str(yaml).unwrap();
+        let spec = pf.deploy.unwrap().specs[0].clone();
+        assert!(spec.stages.is_none());
+    }
+
+    // A7: Pipeline image validation
+    #[test]
+    fn pipeline_rejects_image_with_shell_chars() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: evil
+      image: "alpine;rm -rf /"
+      commands:
+        - echo hello
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("forbidden characters")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_deploy_test_image_injection() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: test
+      type: deploy_test
+      deploy_test:
+        test_image: "alpine;whoami"
+        manifests: deploy/
+        test_commands:
+          - echo test
+        readiness_path: /health
+        readiness_timeout: 30
+"#;
+        let err = parse_platform_file(yaml).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::InvalidDefinition(ref msg) if msg.contains("forbidden characters")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_accepts_valid_image() {
+        let yaml = r#"
+pipeline:
+  steps:
+    - name: build
+      image: "registry.example.com/app:v1.2.3"
+      commands:
+        - cargo build
+"#;
+        let result = parse_platform_file(yaml);
+        assert!(
+            result.is_ok(),
+            "valid image should pass: {:?}",
+            result.err()
         );
     }
 }

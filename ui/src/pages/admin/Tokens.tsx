@@ -13,7 +13,7 @@ export function Tokens() {
 
   const load = () => {
     api.get<ApiToken[]>('/api/tokens?limit=100')
-      .then(r => setTokens(r)).catch(() => {});
+      .then(r => setTokens(r)).catch(e => console.warn(e));
   };
   useEffect(load, []);
 

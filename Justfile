@@ -259,8 +259,8 @@ agent-image registry_url="${PLATFORM_REGISTRY_URL:-localhost:8080}":
 
 [group('build')]
 agent-image-bare registry_url="${PLATFORM_REGISTRY_URL:-localhost:8080}":
-    docker build -f docker/Dockerfile.platform-runner-bare -t {{registry_url}}/platform-runner:latest .
-    docker push {{registry_url}}/platform-runner:latest
+    docker build -f docker/Dockerfile.platform-runner-bare -t {{registry_url}}/platform-runner-bare:latest .
+    docker push {{registry_url}}/platform-runner-bare:latest
 
 [group('build')]
 agent-images registry_url="${PLATFORM_REGISTRY_URL:-localhost:8080}":

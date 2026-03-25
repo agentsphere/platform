@@ -17,19 +17,19 @@ export function MRDetail({ id: projectId, number: num }: Props) {
 
   useEffect(() => {
     if (!projectId || !num) return;
-    api.get<MergeRequest>(`/api/projects/${projectId}/merge-requests/${num}`).then(setMr).catch(() => {});
+    api.get<MergeRequest>(`/api/projects/${projectId}/merge-requests/${num}`).then(setMr).catch(e => console.warn(e));
     loadReviews();
     loadComments();
   }, [projectId, num]);
 
   const loadReviews = () => {
     api.get<ListResponse<Review>>(`/api/projects/${projectId}/merge-requests/${num}/reviews?limit=100`)
-      .then(r => setReviews(r.items)).catch(() => {});
+      .then(r => setReviews(r.items)).catch(e => console.warn(e));
   };
 
   const loadComments = () => {
     api.get<ListResponse<Comment>>(`/api/projects/${projectId}/merge-requests/${num}/comments?limit=100`)
-      .then(r => setComments(r.items)).catch(() => {});
+      .then(r => setComments(r.items)).catch(e => console.warn(e));
   };
 
   const addComment = async (e: Event) => {

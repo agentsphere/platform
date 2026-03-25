@@ -8,7 +8,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { apiGet, apiPost, apiPatch, apiDelete } from "../lib/client.js";
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from "../lib/client.js";
 
 const server = new Server(
   { name: "platform-admin", version: "0.1.0" },
@@ -26,7 +26,6 @@ const TOOLS = [
       properties: {
         limit: { type: "number", description: "Max results (default 50, max 100)" },
         offset: { type: "number", description: "Offset for pagination" },
-        search: { type: "string", description: "Search by name or email" },
       },
     },
   },
@@ -136,14 +135,14 @@ const TOOLS = [
   },
   {
     name: "remove_role",
-    description: "Remove a role assignment from a user.",
+    description: "Remove a role from a user.",
     inputSchema: {
       type: "object",
       properties: {
         user_id: { type: "string", description: "User UUID (required)" },
-        role_assignment_id: { type: "string", description: "Role assignment UUID (required)" },
+        role_id: { type: "string", description: "Role UUID (required)" },
       },
-      required: ["user_id", "role_assignment_id"],
+      required: ["user_id", "role_id"],
     },
   },
   // --- Delegations ---
@@ -200,7 +199,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // --- Users ---
       case "list_users": {
         const data = await apiGet("/api/users/list", {
-          query: { limit: args.limit, offset: args.offset, search: args.search },
+          query: { limit: args.limit, offset: args.offset },
         });
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
@@ -239,14 +238,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
       case "create_role": {
-        const data = await apiPost("/api/admin/roles", {
-          body: {
-            name: args.name,
-            description: args.description,
-            permissions: args.permissions,
-          },
+        const role = await apiPost("/api/admin/roles", {
+          body: { name: args.name, description: args.description },
         });
-        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        if (args.permissions && args.permissions.length > 0) {
+          await apiPut(`/api/admin/roles/${role.id}/permissions`, {
+            body: { permissions: args.permissions },
+          });
+        }
+        return { content: [{ type: "text", text: JSON.stringify(role, null, 2) }] };
       }
       case "assign_role": {
         const data = await apiPost(`/api/admin/users/${args.user_id}/roles`, {
@@ -256,7 +256,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "remove_role": {
         const data = await apiDelete(
-          `/api/admin/users/${args.user_id}/roles/${args.role_assignment_id}`,
+          `/api/admin/users/${args.user_id}/roles/${args.role_id}`,
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }

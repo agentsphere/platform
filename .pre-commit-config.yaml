@@ -36,6 +36,6 @@ repos:
       - id: rust-clippy
         name: clippy
         language: system
-        entry: cargo clippy --all-features -- -D warnings
+        entry: env SQLX_OFFLINE=true cargo clippy --all-features -- -D warnings
         types: [rust]
         pass_filenames: false

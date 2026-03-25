@@ -230,6 +230,7 @@ async fn require_deploy_read(
     auth: &AuthUser,
     project_id: Uuid,
 ) -> Result<(), ApiError> {
+    auth.check_project_scope(project_id)?;
     let allowed = resolver::has_permission_scoped(
         &state.pool,
         &state.valkey,
@@ -242,7 +243,7 @@ async fn require_deploy_read(
     .map_err(ApiError::Internal)?;
 
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("project".into()));
     }
     Ok(())
 }
@@ -252,6 +253,7 @@ async fn require_deploy_promote(
     auth: &AuthUser,
     project_id: Uuid,
 ) -> Result<(), ApiError> {
+    auth.check_project_scope(project_id)?;
     let allowed = resolver::has_permission_scoped(
         &state.pool,
         &state.valkey,
@@ -372,6 +374,22 @@ async fn create_target(
         }
         _ => ApiError::from(e),
     })?;
+
+    let target_id: Uuid = row.get("id");
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.target.create",
+            resource: "deploy_target",
+            resource_id: Some(target_id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({"name": body.name, "environment": env})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(row_to_target(&row))))
 }
@@ -498,6 +516,21 @@ async fn create_release(
     )
     .await;
 
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.release.create",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({"image_ref": body.image_ref, "strategy": strategy})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
     // Wake reconciler
     state.deploy_notify.notify_one();
 
@@ -559,6 +592,20 @@ async fn adjust_traffic(
         Some(auth.user_id),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.traffic.adjust",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: Some(serde_json::json!({"traffic_weight": body.traffic_weight})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     state.deploy_notify.notify_one();
     Ok(Json(row_to_release(&row)))
@@ -594,6 +641,20 @@ async fn promote_release(
         Some(100),
         row.get::<String, _>("image_ref").as_str(),
         Some(auth.user_id),
+    )
+    .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.release.promote",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
     )
     .await;
 
@@ -635,6 +696,20 @@ async fn rollback_release(
         Some(auth.user_id),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.release.rollback",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     state.deploy_notify.notify_one();
     Ok(Json(row_to_release(&row)))
@@ -672,6 +747,20 @@ async fn pause_release(
         Some(auth.user_id),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.release.pause",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
     Ok(Json(row_to_release(&row)))
 }
@@ -706,6 +795,20 @@ async fn resume_release(
         None,
         row.get::<String, _>("image_ref").as_str(),
         Some(auth.user_id),
+    )
+    .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "deploy.release.resume",
+            resource: "deploy_release",
+            resource_id: Some(release_id),
+            project_id: Some(id),
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
     )
     .await;
 

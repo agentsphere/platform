@@ -191,16 +191,15 @@ async fn add_workspace_permissions(
     user_id: Uuid,
     project_id: Uuid,
 ) -> anyhow::Result<()> {
-    let role = sqlx::query_scalar!(
-        r#"
-        SELECT wm.role as "role!"
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT wm.role
         FROM workspace_members wm
         JOIN projects p ON p.workspace_id = wm.workspace_id
-        WHERE p.id = $1 AND p.is_active = true AND wm.user_id = $2
-        "#,
-        project_id,
-        user_id,
+        JOIN workspaces w ON w.id = wm.workspace_id
+        WHERE p.id = $1 AND p.is_active = true AND w.is_active = true AND wm.user_id = $2",
     )
+    .bind(project_id)
+    .bind(user_id)
     .fetch_optional(pool)
     .await?;
 

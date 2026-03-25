@@ -36,19 +36,25 @@ async function request(method, path, { params = {}, body, query } = {}) {
     }
   }
 
-  const options = {
-    method,
-    headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  };
+  const headers = { Authorization: `Bearer ${API_TOKEN}` };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const options = { method, headers, signal: controller.signal };
   if (body !== undefined) {
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url.toString(), options);
-  const text = await res.text();
+  let res, text;
+  try {
+    res = await fetch(url.toString(), options);
+    text = await res.text();
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!res.ok) {
     let detail = text;
@@ -62,7 +68,11 @@ async function request(method, path, { params = {}, body, query } = {}) {
   }
 
   if (!text) return null;
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`API ${method} ${path} returned non-JSON: ${text.slice(0, 200)}`);
+  }
 }
 
 export function apiGet(path, opts) {
@@ -75,6 +85,10 @@ export function apiPost(path, opts) {
 
 export function apiPatch(path, opts) {
   return request("PATCH", path, opts);
+}
+
+export function apiPut(path, opts) {
+  return request("PUT", path, opts);
 }
 
 export function apiDelete(path, opts) {

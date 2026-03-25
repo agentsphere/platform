@@ -130,14 +130,14 @@ const TOOLS = [
   {
     name: "list_alerts",
     description:
-      "List alerts. Filter by project, status (firing/resolved/pending), with pagination.",
+      "List alert rules. Filter by project, enabled status, with pagination.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: { type: "string", description: "Filter by project UUID" },
-        status: {
-          type: "string",
-          description: "Filter by alert status (firing/resolved/pending)",
+        enabled: {
+          type: "boolean",
+          description: "Filter by enabled/disabled status",
         },
         limit: {
           type: "integer",
@@ -229,7 +229,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const data = await apiGet("/api/observe/alerts", {
           query: {
             project_id: p,
-            status: args.status,
+            enabled: args.enabled,
             limit: args.limit,
             offset: args.offset,
           },

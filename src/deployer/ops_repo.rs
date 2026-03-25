@@ -1,9 +1,28 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use sqlx::PgPool;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::error::DeployerError;
+
+/// Per-repo mutex to serialize git operations on bare repos.
+/// Multiple concurrent worktree operations on the same bare repo cause ref lock conflicts.
+static REPO_LOCKS: LazyLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Acquire a per-repo lock for serializing git operations.
+async fn repo_lock(repo_path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let mut locks = REPO_LOCKS.lock().await;
+    let lock = locks
+        .entry(repo_path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone();
+    drop(locks); // Release the outer lock before awaiting the inner one
+    lock.lock_owned().await
+}
 
 // ---------------------------------------------------------------------------
 // Ops repo lifecycle (local bare repos)
@@ -192,6 +211,7 @@ pub async fn commit_values(
     environment: &str,
     values: &serde_json::Value,
 ) -> Result<String, DeployerError> {
+    let _lock = repo_lock(repo_path).await;
     // Ensure the branch exists (bare repo may be empty after init)
     ensure_branch_exists(repo_path, branch).await?;
 
@@ -235,6 +255,7 @@ pub async fn write_file_to_repo(
     file_path: &str,
     content: &str,
 ) -> Result<String, DeployerError> {
+    let _lock = repo_lock(repo_path).await;
     ensure_branch_exists(repo_path, branch).await?;
 
     let worktree_dir = repo_path.join(format!("_file_worktree_{}", Uuid::new_v4()));
@@ -540,6 +561,7 @@ pub async fn sync_from_project_repo(
     branch: &str,
     commit_sha: &str,
 ) -> Result<String, DeployerError> {
+    let _lock = repo_lock(ops_repo_path).await;
     validate_commit_sha(commit_sha)?;
 
     // List files in deploy/ at the given SHA
@@ -760,6 +782,7 @@ pub async fn merge_branch(
     source_branch: &str,
     target_branch: &str,
 ) -> Result<String, DeployerError> {
+    let _lock = repo_lock(repo_path).await;
     ensure_branch_exists(repo_path, source_branch).await?;
     ensure_branch_exists(repo_path, target_branch).await?;
 
@@ -802,7 +825,13 @@ async fn merge_in_worktree(worktree_dir: &Path, source_branch: &str) -> Result<(
         .env("GIT_AUTHOR_EMAIL", "platform@localhost")
         .env("GIT_COMMITTER_NAME", "Platform")
         .env("GIT_COMMITTER_EMAIL", "platform@localhost")
-        .args(["merge", source_branch, "--no-ff", "-m"])
+        .args([
+            "merge",
+            source_branch,
+            "--no-ff",
+            "--allow-unrelated-histories",
+            "-m",
+        ])
         .arg(format!("promote: merge {source_branch} to production"))
         .output()
         .await

@@ -24,6 +24,38 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 helm repo add cnpg https://cloudnative-pg.github.io/charts --force-update
 helm upgrade --install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespace --wait
 
+# Install Envoy Gateway (includes Gateway API CRDs)
+helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+  --version v1.3.0 \
+  -n envoy-gateway-system --create-namespace --wait
+
+# Create GatewayClass + shared platform Gateway (ClusterIP, cross-namespace routes allowed)
+cat <<'EOF' | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: platform-gateway
+  namespace: envoy-gateway-system
+  labels:
+    platform.io/managed-by: platform
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+EOF
+
 # Create shared temp directory for e2e test repos (mounted via extraMounts)
 mkdir -p /tmp/platform-e2e
 

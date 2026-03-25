@@ -93,8 +93,13 @@ ensure_kubectl() {
 }
 
 install_k0s() {
-  info "Installing k0s..."
-  curl -sSLf https://get.k0s.sh | sudo sh
+  local K0S_VERSION="v1.31.4+k0s.0"
+  info "Installing k0s ${K0S_VERSION}..."
+  curl -sSLf "https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION}/k0s-${K0S_VERSION}-${ARCH}" -o /tmp/k0s
+  curl -sSLf "https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION}/sha256sums.txt" -o /tmp/k0s-checksums.txt
+  grep "k0s-${K0S_VERSION}-${ARCH}$" /tmp/k0s-checksums.txt | sha256sum -c - || fatal "k0s checksum verification failed"
+  sudo install -m 0755 /tmp/k0s /usr/local/bin/k0s
+  rm -f /tmp/k0s /tmp/k0s-checksums.txt
 
   info "Installing k0s controller (single-node)..."
   sudo k0s install controller --single
@@ -139,8 +144,15 @@ ensure_helm() {
     return
   fi
 
-  info "Installing Helm..."
-  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  local HELM_VERSION="v3.17.3"
+  info "Installing Helm ${HELM_VERSION}..."
+  curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-${OS}-${ARCH}.tar.gz" -o /tmp/helm.tar.gz
+  curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-${OS}-${ARCH}.tar.gz.sha256sum" -o /tmp/helm.sha256
+  cd /tmp && sha256sum -c helm.sha256 || fatal "Helm checksum verification failed"
+  tar xzf /tmp/helm.tar.gz -C /tmp
+  sudo install -m 0755 "/tmp/${OS}-${ARCH}/helm" /usr/local/bin/helm
+  rm -rf /tmp/helm.tar.gz /tmp/helm.sha256 "/tmp/${OS}-${ARCH}"
+  cd - >/dev/null
   ok "Helm installed"
 }
 

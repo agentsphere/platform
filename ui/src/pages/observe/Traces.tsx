@@ -25,7 +25,7 @@ export function Traces({ path }: TraceListProps) {
         for (const p of r.items) opts.push({ value: p.id, label: p.display_name || p.name });
         setProjects(opts);
       })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, []);
 
   const filterDefs: FilterDef[] = [
@@ -54,7 +54,7 @@ export function Traces({ path }: TraceListProps) {
 
     api.get<ListResponse<TraceSummary>>(`/api/observe/traces${qs(params)}`)
       .then(r => { setTraces(r.items); setTotal(r.total); })
-      .catch(() => {})
+      .catch(e => console.warn(e))
       .finally(() => setLoading(false));
   };
 
@@ -234,7 +234,7 @@ export function TraceDetail({ traceId }: TraceDetailProps) {
             </div>
           )}
           <div class="mt-md">
-            <a href={`/observe/logs?trace_id=${selected.span_id}`} class="text-sm">
+            <a href={`/observe/logs?trace_id=${traceId}`} class="text-sm">
               View related logs
             </a>
           </div>

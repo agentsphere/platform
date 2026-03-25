@@ -64,9 +64,112 @@ pub fn slugify_branch(branch: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline status state machine (A9)
+// ---------------------------------------------------------------------------
+
+/// Pipeline run status with enforced transition rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PipelineStatus {
+    Pending,
+    Running,
+    Success,
+    Failure,
+    Cancelled,
+}
+
+#[allow(dead_code)]
+impl PipelineStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "success" => Some(Self::Success),
+            "failure" => Some(Self::Failure),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Success | Self::Failure | Self::Cancelled)
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        matches!(
+            (self, next),
+            (
+                Self::Pending,
+                Self::Running | Self::Cancelled | Self::Failure
+            ) | (
+                Self::Running,
+                Self::Success | Self::Failure | Self::Cancelled
+            )
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_status_valid_transitions() {
+        assert!(PipelineStatus::Pending.can_transition_to(PipelineStatus::Running));
+        assert!(PipelineStatus::Pending.can_transition_to(PipelineStatus::Cancelled));
+        assert!(PipelineStatus::Pending.can_transition_to(PipelineStatus::Failure));
+        assert!(PipelineStatus::Running.can_transition_to(PipelineStatus::Success));
+        assert!(PipelineStatus::Running.can_transition_to(PipelineStatus::Failure));
+        assert!(PipelineStatus::Running.can_transition_to(PipelineStatus::Cancelled));
+    }
+
+    #[test]
+    fn pipeline_status_invalid_transitions() {
+        assert!(!PipelineStatus::Pending.can_transition_to(PipelineStatus::Success));
+        assert!(!PipelineStatus::Running.can_transition_to(PipelineStatus::Pending));
+        assert!(!PipelineStatus::Running.can_transition_to(PipelineStatus::Running));
+    }
+
+    #[test]
+    fn pipeline_status_terminal_cannot_transition() {
+        for terminal in [
+            PipelineStatus::Success,
+            PipelineStatus::Failure,
+            PipelineStatus::Cancelled,
+        ] {
+            assert!(!terminal.can_transition_to(PipelineStatus::Running));
+            assert!(!terminal.can_transition_to(PipelineStatus::Pending));
+            assert!(!terminal.can_transition_to(PipelineStatus::Success));
+        }
+    }
+
+    #[test]
+    fn pipeline_status_parse_roundtrip() {
+        for status in [
+            PipelineStatus::Pending,
+            PipelineStatus::Running,
+            PipelineStatus::Success,
+            PipelineStatus::Failure,
+            PipelineStatus::Cancelled,
+        ] {
+            assert_eq!(PipelineStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(PipelineStatus::parse("unknown"), None);
+    }
 
     #[test]
     fn slugify_simple_branch() {

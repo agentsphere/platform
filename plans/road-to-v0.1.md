@@ -38,7 +38,24 @@ Keep Kind for local dev (macOS, Windows WSL) and CI tests. Add k0s prod setup sc
 8. Update .claude/commands/ skill files for new recipe names
 9. Verify: `just cluster-up` + `just dev-up` + `just dev` + `just ci-full`
 
-### 3. Code cleanup (Plan 30)
+### 3. Ecosystem audit fix verification (E1–E15)
+
+**Status:** IN PROGRESS — implementation done, verification pending
+
+All code changes from `plans/ecosystem-audit-fixes.md` are implemented. Remaining verification steps require a running cluster or Docker build.
+
+**Tasks:**
+1. `docker build -f docker/Dockerfile .` — verify non-root image builds, `docker run --rm <image> whoami` prints `platform`
+2. `docker build -f docker/Dockerfile.platform-runner .` — verify pinned kaniko v1.23.2 + claude-code@1.0.16 build successfully
+3. `docker build -f docker/Dockerfile.platform-runner-bare .` — verify pinned kaniko builds
+4. `just cluster-up && just deploy-local` — verify platform starts as UID 1000 with fsGroup, can create projects, push code, create agent sessions (E7 + E4 + E5)
+5. `helm install` on fresh cluster — verify `PLATFORM_MASTER_KEY` is valid hex and secrets engine starts without error (E3a)
+6. `helm template ... | grep PLATFORM_PIPELINE_NAMESPACE` — already verified, produces `{ns}-pipelines` (E6)
+7. Create an issue with body `<img src=x onerror=alert(1)>` in the UI — verify `onerror` is stripped from rendered HTML (E1)
+8. Verify Rust compile after working tree stabilizes — `publish_control()` JSON shape fix (E3b) is a 1-line change in dead code, needs `cargo check` to confirm no regressions
+9. Run `install.sh` on a clean Linux VM — verify k0s and Helm download with checksum verification (E15)
+
+### 4. Code cleanup (Plan 30)
 
 **Status:** TODO
 

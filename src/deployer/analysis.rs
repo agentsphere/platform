@@ -196,6 +196,27 @@ async fn evaluate_progress_gates(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    // Check min_requests threshold before evaluating any gates.
+    // If traffic volume is too low, return Inconclusive — the reconciler will wait.
+    let min_requests = rollout_config
+        .get("min_requests")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(100);
+
+    if min_requests > 0 {
+        let request_count = count_project_requests(state, project_id).await;
+        if request_count < min_requests {
+            return Ok((
+                AnalysisVerdict::Inconclusive,
+                vec![serde_json::json!({
+                    "reason": "insufficient_traffic",
+                    "min_requests": min_requests,
+                    "actual_requests": request_count,
+                })],
+            ));
+        }
+    }
+
     let mut all_pass = true;
     let mut results = Vec::new();
     for gate in &progress_gates {
@@ -227,6 +248,32 @@ async fn evaluate_progress_gates(
     };
 
     Ok((verdict, results))
+}
+
+/// Count total HTTP requests for a project in the recent time window.
+///
+/// Queries the metrics store for any metric with the project's label.
+/// Returns 0 on error (fail-open: analysis treats as "no traffic yet").
+async fn count_project_requests(state: &AppState, project_id: Uuid) -> u64 {
+    let labels = serde_json::json!({
+        "platform.project_id": project_id.to_string()
+    });
+
+    // Use a broad metric name and sum aggregation over 5-minute window
+    let result = crate::observe::alert::evaluate_metric(
+        &state.pool,
+        "http_requests_total",
+        Some(&labels),
+        "sum",
+        300, // 5 min window
+    )
+    .await;
+
+    match result {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(Some(val)) => val as u64,
+        _ => 0, // No data or error → treat as zero requests
+    }
 }
 
 /// Query a metric value based on the gate config, scoped to the project.
@@ -306,5 +353,15 @@ mod tests {
     #[test]
     fn invert_condition_eq_unchanged() {
         assert_eq!(invert_condition("eq"), "eq");
+    }
+
+    #[test]
+    fn inconclusive_verdict_is_not_terminal() {
+        assert!(!AnalysisVerdict::Inconclusive.is_terminal());
+    }
+
+    #[test]
+    fn inconclusive_verdict_as_str() {
+        assert_eq!(AnalysisVerdict::Inconclusive.as_str(), "inconclusive");
     }
 }

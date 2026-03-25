@@ -23,9 +23,9 @@ fn phase1_template_files() -> Vec<TemplateFile> {
     ]
 }
 
-/// Full demo app files for Phase 2 — committed on the `feature/shop-app` branch.
+/// PR1 demo files: full app + VERSION (v0.1) + deployment-v0.1 + rolling .platform.yaml.
 #[allow(clippy::too_many_lines)]
-pub fn demo_project_template_files() -> Vec<TemplateFile> {
+pub fn demo_pr1_template_files() -> Vec<TemplateFile> {
     vec![
         TemplateFile {
             path: "app/main.py",
@@ -84,16 +84,16 @@ pub fn demo_project_template_files() -> Vec<TemplateFile> {
             content: include_str!("templates/requirements-test.txt").to_owned(),
         },
         TemplateFile {
+            path: "VERSION",
+            content: include_str!("templates/VERSION").to_owned(),
+        },
+        TemplateFile {
             path: ".platform.yaml",
-            content: include_str!("templates/platform.yaml").to_owned(),
+            content: include_str!("templates/platform_v0.1.yaml").to_owned(),
         },
         TemplateFile {
             path: "Dockerfile",
             content: include_str!("templates/Dockerfile").to_owned(),
-        },
-        TemplateFile {
-            path: "Dockerfile.canary",
-            content: include_str!("templates/Dockerfile.canary").to_owned(),
         },
         TemplateFile {
             path: "Dockerfile.test",
@@ -104,10 +104,6 @@ pub fn demo_project_template_files() -> Vec<TemplateFile> {
             content: include_str!("templates/Dockerfile.dev").to_owned(),
         },
         TemplateFile {
-            path: "deploy/production.yaml",
-            content: include_str!("templates/deploy/production.yaml").to_owned(),
-        },
-        TemplateFile {
             path: "deploy/postgres.yaml",
             content: include_str!("templates/deploy/postgres.yaml").to_owned(),
         },
@@ -116,20 +112,8 @@ pub fn demo_project_template_files() -> Vec<TemplateFile> {
             content: include_str!("templates/deploy/valkey.yaml").to_owned(),
         },
         TemplateFile {
-            path: "deploy/deployment-stable.yaml",
-            content: include_str!("templates/deploy/deployment-stable.yaml").to_owned(),
-        },
-        TemplateFile {
-            path: "deploy/deployment-canary.yaml",
-            content: include_str!("templates/deploy/deployment-canary.yaml").to_owned(),
-        },
-        TemplateFile {
-            path: "deploy/service-stable.yaml",
-            content: include_str!("templates/deploy/service-stable.yaml").to_owned(),
-        },
-        TemplateFile {
-            path: "deploy/service-canary.yaml",
-            content: include_str!("templates/deploy/service-canary.yaml").to_owned(),
+            path: "deploy/deployment-v0.1.yaml",
+            content: include_str!("templates/deploy/deployment-v0.1.yaml").to_owned(),
         },
         TemplateFile {
             path: "deploy/variables_staging.yaml",
@@ -150,6 +134,28 @@ pub fn demo_project_template_files() -> Vec<TemplateFile> {
         TemplateFile {
             path: "testinfra/service.yaml",
             content: include_str!("templates/testinfra/service.yaml").to_owned(),
+        },
+    ]
+}
+
+/// PR2 demo files: only changed files for v0.2 canary deployment.
+pub fn demo_pr2_template_files() -> Vec<TemplateFile> {
+    vec![
+        TemplateFile {
+            path: "VERSION",
+            content: "app=0.2.0\n".to_owned(),
+        },
+        TemplateFile {
+            path: ".platform.yaml",
+            content: include_str!("templates/platform_v0.2.yaml").to_owned(),
+        },
+        TemplateFile {
+            path: "deploy/deployment-v0.2.yaml",
+            content: include_str!("templates/deploy/deployment-v0.2.yaml").to_owned(),
+        },
+        TemplateFile {
+            path: "deploy/traffic-generator.yaml",
+            content: include_str!("templates/deploy/traffic-generator.yaml").to_owned(),
         },
     ]
 }
@@ -251,17 +257,17 @@ pub async fn create_demo_project(
     Ok((project_id, project_name.to_owned()))
 }
 
-/// Phase 2: Push feature branch with demo app, create MR, trigger pipeline.
+/// Phase 2: Push feature branch with demo app (PR1 — v0.1, rolling deploy).
 async fn create_feature_branch_and_mr(
     state: &AppState,
     project_id: Uuid,
     repo_path: &std::path::Path,
     owner_id: Uuid,
 ) {
-    let branch_name = "feature/shop-app";
+    let branch_name = "feature/shop-app-v0.1";
 
-    // Create worktree, write files, commit, clean up
-    if !commit_feature_branch(repo_path, branch_name).await {
+    // Create worktree, write PR1 files, commit, clean up
+    if !commit_feature_branch(repo_path, branch_name, &demo_pr1_template_files()).await {
         return;
     }
 
@@ -276,13 +282,26 @@ async fn create_feature_branch_and_mr(
         owner_id,
         branch_name,
         branch_sha,
+        "feat: Add shop demo app (v0.1 — rolling deploy)",
+        "Adds the full shop demo application with:\n\
+         - FastAPI + HTMX frontend\n\
+         - PostgreSQL + Valkey backends\n\
+         - Versioned deployment (v0.1)\n\
+         - Rolling deploy strategy\n\
+         - Feature flags (new_checkout_flow, dark_mode)\n\
+         - E2E test infrastructure\n\
+         - OpenTelemetry observability",
     )
     .await;
 }
 
-/// Create a git worktree, write all demo files, commit, and clean up.
+/// Create a git worktree, write files, commit, and clean up.
 /// Returns `true` on success.
-async fn commit_feature_branch(repo_path: &std::path::Path, branch_name: &str) -> bool {
+async fn commit_feature_branch(
+    repo_path: &std::path::Path,
+    branch_name: &str,
+    files: &[TemplateFile],
+) -> bool {
     let worktree_dir = repo_path
         .parent()
         .unwrap_or(repo_path)
@@ -328,8 +347,8 @@ async fn commit_feature_branch(repo_path: &std::path::Path, branch_name: &str) -
         _ => {}
     }
 
-    // Write all demo files to the worktree
-    for file in demo_project_template_files() {
+    // Write all files to the worktree
+    for file in files {
         let dest = worktree_dir.join(file.path);
         if let Some(parent) = dest.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -376,6 +395,7 @@ async fn commit_feature_branch(repo_path: &std::path::Path, branch_name: &str) -
 }
 
 /// Insert the MR row and trigger a pipeline on the feature branch.
+#[allow(clippy::too_many_arguments)]
 async fn create_demo_mr_and_pipeline(
     state: &AppState,
     project_id: Uuid,
@@ -383,6 +403,8 @@ async fn create_demo_mr_and_pipeline(
     owner_id: Uuid,
     branch_name: &str,
     branch_sha: Option<String>,
+    title: &str,
+    body: &str,
 ) {
     // Atomically allocate an MR number
     let mr_number = sqlx::query_scalar::<_, i32>(
@@ -417,16 +439,8 @@ async fn create_demo_mr_and_pipeline(
     .bind(number)
     .bind(owner_id)
     .bind(branch_name)
-    .bind("feat: Add shop demo app with progressive delivery")
-    .bind(
-        "Adds the full shop demo application with:\n\
-         - FastAPI + HTMX frontend\n\
-         - PostgreSQL + Valkey backends\n\
-         - Progressive delivery (canary deployments)\n\
-         - Feature flags (new_checkout_flow, dark_mode)\n\
-         - E2E test infrastructure\n\
-         - OpenTelemetry observability",
-    )
+    .bind(title)
+    .bind(body)
     .bind(branch_sha.as_deref())
     .fetch_optional(&state.pool)
     .await;
@@ -480,6 +494,52 @@ async fn trigger_mr_pipeline(
         Ok(None) => tracing::warn!(%project_id, "demo MR pipeline: trigger did not match"),
         Err(e) => tracing::warn!(error = %e, "demo MR pipeline trigger failed"),
     }
+}
+
+/// Create PR2 (v0.2, canary deployment) after PR1 merges.
+///
+/// Called from `run_post_merge_side_effects` when the merged MR is the demo v0.1 MR.
+pub async fn create_demo_pr2(state: &AppState, project_id: Uuid, owner_id: Uuid) {
+    let repo_path_str: Option<String> =
+        sqlx::query_scalar("SELECT repo_path FROM projects WHERE id = $1 AND is_active = true")
+            .bind(project_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+
+    let Some(repo_path_str) = repo_path_str else {
+        tracing::warn!(%project_id, "cannot create PR2: project repo_path not found");
+        return;
+    };
+    let repo_path = std::path::PathBuf::from(&repo_path_str);
+
+    let branch_name = "feature/shop-app-v0.2";
+
+    if !commit_feature_branch(&repo_path, branch_name, &demo_pr2_template_files()).await {
+        tracing::warn!(%project_id, "demo PR2: feature branch commit failed");
+        return;
+    }
+
+    let branch_sha = resolve_branch_sha(&repo_path, branch_name).await;
+
+    create_demo_mr_and_pipeline(
+        state,
+        project_id,
+        &repo_path,
+        owner_id,
+        branch_name,
+        branch_sha,
+        "feat: Add v0.2 with canary deployment",
+        "Adds canary deployment for v0.2:\n\
+         - VERSION bumped to 0.2.0\n\
+         - New deployment-v0.2 manifest\n\
+         - Canary deploy strategy (v0.1 → v0.2)\n\
+         - Traffic shifting: 10% → 25% → 50% → 100%",
+    )
+    .await;
+
+    tracing::info!(%project_id, "demo PR2 (v0.2 canary) created");
 }
 
 /// Resolve the HEAD SHA of a branch in a bare repo.
@@ -625,12 +685,12 @@ Each feature connects to show a complete development workflow."#,
             "Set up progressive delivery pipeline",
             "open",
             vec!["enhancement", "devops"],
-            "Configure the canary deployment pipeline:\n\n\
-             1. Review `.platform.yaml` for the canary steps\n\
-             2. Check `deploy/` manifests for stable/canary split\n\
+            "Configure the progressive delivery pipeline:\n\n\
+             1. Review `.platform.yaml` for the rolling deploy steps\n\
+             2. Check `deploy/` manifests for v0.1/v0.2 versioned deployments\n\
              3. Merge the demo MR to trigger first deployment\n\
              4. Use `POST /api/projects/{id}/promote-staging` to promote to production\n\
-             5. Monitor canary traffic via deploy releases API",
+             5. Monitor deployment progress via deploy releases API",
         ),
         (
             "Add feature flag for new checkout flow",
@@ -717,15 +777,17 @@ mod tests {
         assert!(f.content.contains("STEP"));
     }
 
+    // -- PR1 template tests --
+
     #[test]
-    fn demo_template_file_count() {
-        let files = demo_project_template_files();
-        assert_eq!(files.len(), 31);
+    fn pr1_template_file_count() {
+        let files = demo_pr1_template_files();
+        assert_eq!(files.len(), 27);
     }
 
     #[test]
-    fn demo_template_has_main_py() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_main_py() {
+        let files = demo_pr1_template_files();
         let main = files.iter().find(|f| f.path == "app/main.py").unwrap();
         assert!(main.content.contains("FastAPI"));
         assert!(main.content.contains("healthz"));
@@ -733,54 +795,47 @@ mod tests {
     }
 
     #[test]
-    fn demo_template_has_flags_py() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_flags_py() {
+        let files = demo_pr1_template_files();
         let f = files.iter().find(|f| f.path == "app/flags.py").unwrap();
         assert!(f.content.contains("evaluate"));
     }
 
     #[test]
-    fn demo_template_has_platform_yaml() {
-        let files = demo_project_template_files();
-        let f = files.iter().find(|f| f.path == ".platform.yaml").unwrap();
-        assert!(f.content.contains("pipeline"));
-        assert!(f.content.contains("canary"));
-        assert!(f.content.contains("flags"));
+    fn pr1_template_has_version_file() {
+        let files = demo_pr1_template_files();
+        let f = files.iter().find(|f| f.path == "VERSION").unwrap();
+        assert!(f.content.contains("app=0.1.0"));
     }
 
     #[test]
-    fn demo_template_has_dockerfile() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_platform_yaml() {
+        let files = demo_pr1_template_files();
+        let f = files.iter().find(|f| f.path == ".platform.yaml").unwrap();
+        assert!(f.content.contains("pipeline"));
+        assert!(f.content.contains("flags"));
+        assert!(!f.content.contains("canary"));
+    }
+
+    #[test]
+    fn pr1_template_has_dockerfile() {
+        let files = demo_pr1_template_files();
         let f = files.iter().find(|f| f.path == "Dockerfile").unwrap();
         assert!(f.content.contains("uvicorn"));
     }
 
     #[test]
-    fn demo_template_has_canary_dockerfile() {
-        let files = demo_project_template_files();
-        let f = files
-            .iter()
-            .find(|f| f.path == "Dockerfile.canary")
-            .unwrap();
-        assert!(f.content.contains("canary"));
-    }
-
-    #[test]
-    fn demo_template_has_deploy_manifests() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_deploy_manifests() {
+        let files = demo_pr1_template_files();
         let names: Vec<&str> = files.iter().map(|f| f.path).collect();
         assert!(names.contains(&"deploy/postgres.yaml"));
         assert!(names.contains(&"deploy/valkey.yaml"));
-        assert!(names.contains(&"deploy/deployment-stable.yaml"));
-        assert!(names.contains(&"deploy/deployment-canary.yaml"));
-        assert!(names.contains(&"deploy/service-stable.yaml"));
-        assert!(names.contains(&"deploy/service-canary.yaml"));
-        assert!(names.contains(&"deploy/production.yaml"));
+        assert!(names.contains(&"deploy/deployment-v0.1.yaml"));
     }
 
     #[test]
-    fn demo_template_has_testinfra() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_testinfra() {
+        let files = demo_pr1_template_files();
         let names: Vec<&str> = files.iter().map(|f| f.path).collect();
         assert!(names.contains(&"testinfra/postgres.yaml"));
         assert!(names.contains(&"testinfra/app.yaml"));
@@ -788,8 +843,8 @@ mod tests {
     }
 
     #[test]
-    fn demo_template_has_tests() {
-        let files = demo_project_template_files();
+    fn pr1_template_has_tests() {
+        let files = demo_pr1_template_files();
         let f = files
             .iter()
             .find(|f| f.path == "tests-e2e/test_app.py")
@@ -798,12 +853,46 @@ mod tests {
     }
 
     #[test]
-    fn demo_template_paths_unique() {
-        let files = demo_project_template_files();
+    fn pr1_template_paths_unique() {
+        let files = demo_pr1_template_files();
         let mut paths: Vec<&str> = files.iter().map(|f| f.path).collect();
         let len_before = paths.len();
         paths.sort_unstable();
         paths.dedup();
         assert_eq!(paths.len(), len_before, "duplicate template paths");
+    }
+
+    // -- PR2 template tests --
+
+    #[test]
+    fn pr2_template_file_count() {
+        let files = demo_pr2_template_files();
+        assert_eq!(files.len(), 4);
+    }
+
+    #[test]
+    fn pr2_template_has_version_file() {
+        let files = demo_pr2_template_files();
+        let f = files.iter().find(|f| f.path == "VERSION").unwrap();
+        assert!(f.content.contains("app=0.2.0"));
+    }
+
+    #[test]
+    fn pr2_template_has_canary_platform_yaml() {
+        let files = demo_pr2_template_files();
+        let f = files.iter().find(|f| f.path == ".platform.yaml").unwrap();
+        assert!(f.content.contains("canary"));
+        assert!(f.content.contains("platform-demo-app-v0-1"));
+        assert!(f.content.contains("platform-demo-app-v0-2"));
+    }
+
+    #[test]
+    fn pr2_template_has_deployment_v02() {
+        let files = demo_pr2_template_files();
+        let f = files
+            .iter()
+            .find(|f| f.path == "deploy/deployment-v0.2.yaml")
+            .unwrap();
+        assert!(f.content.contains("app-v0-2"));
     }
 }

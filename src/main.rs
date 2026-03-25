@@ -256,6 +256,12 @@ async fn main() -> anyhow::Result<()> {
             HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("strict-origin-when-cross-origin"),
         ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:",
+            ),
+        ))
         .layer(build_cors_layer(&cfg));
 
     let addr: SocketAddr = cfg.listen.parse()?;

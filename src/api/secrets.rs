@@ -121,7 +121,7 @@ async fn require_secret_read(
     .map_err(ApiError::Internal)?;
 
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("secret".into()));
     }
     Ok(())
 }

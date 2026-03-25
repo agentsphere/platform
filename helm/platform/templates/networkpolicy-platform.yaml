@@ -51,6 +51,12 @@ spec:
         - port: 6443
           protocol: TCP
 
+    # Preview proxy — egress to platform-managed namespaces (agent sessions, deploy previews)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              platform.io/managed-by: platform
+
     # Internet (webhooks, SMTP, OCI registry pulls, Claude API)
     - to:
         - ipBlock:

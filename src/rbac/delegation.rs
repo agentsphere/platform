@@ -61,6 +61,32 @@ pub async fn create_delegation(
         return Err(ApiError::Forbidden);
     }
 
+    // A6: Prevent re-delegation of delegated permissions.
+    // Check if the delegator holds this permission via a direct role assignment.
+    #[allow(clippy::needless_raw_string_hashes)]
+    let has_via_role: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM user_roles ur
+            JOIN role_permissions rp ON rp.role_id = ur.role_id
+            JOIN permissions p ON p.id = rp.permission_id
+            WHERE ur.user_id = $1 AND p.name = $2
+            AND (ur.project_id = $3 OR $3::uuid IS NULL)
+        )"#,
+    )
+    .bind(req.delegator_id)
+    .bind(req.permission.as_str())
+    .bind(req.project_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !has_via_role {
+        return Err(ApiError::BadRequest(
+            "cannot delegate a permission obtained only via delegation".into(),
+        ));
+    }
+
     // Look up the permission ID from the name
     let permission_id = sqlx::query_scalar!(
         "SELECT id FROM permissions WHERE name = $1",

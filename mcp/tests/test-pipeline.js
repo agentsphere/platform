@@ -39,10 +39,11 @@ describe("platform-pipeline", () => {
 
   it("trigger_pipeline sends POST /api/projects/:id/pipelines", async () => {
     api.setResponse(201, { id: "pipe-id", status: "pending" });
-    await client.callTool("trigger_pipeline", { branch: "main" });
+    await client.callTool("trigger_pipeline", { git_ref: "main" });
     const req = api.lastRequest();
     assert.equal(req.method, "POST");
     assert.ok(req.path.includes("/pipelines"));
+    assert.equal(req.body.git_ref, "main");
   });
 
   it("cancel_pipeline sends POST .../pipelines/:id/cancel", async () => {

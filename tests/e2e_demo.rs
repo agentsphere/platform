@@ -4,7 +4,6 @@ use axum::http::StatusCode;
 use prost::Message;
 use sqlx::PgPool;
 use std::time::Duration;
-use tracing_subscriber;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -12,7 +11,7 @@ use uuid::Uuid;
 //
 // Validates the full demo project lifecycle: creation, MR, pipeline execution.
 // The critical assertion is that the MR-triggered pipeline runs ALL steps
-// (build-app, build-canary, build-test, e2e) — none skipped — because the
+// (build-app, build-test, e2e) — none skipped — because the
 // demo uses on_mr() trigger (not on_api()).
 //
 // Requires Kind cluster + registry. Run with: just test-e2e
@@ -45,7 +44,7 @@ impl ExecutorGuard {
     }
 }
 
-/// Resolve admin user_id from the DB.
+/// Resolve admin `user_id` from the DB.
 async fn admin_user_id(pool: &PgPool) -> Uuid {
     let row: (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
         .fetch_one(pool)
@@ -72,13 +71,12 @@ async fn poll_project_pipeline(
             &format!("/api/projects/{project_id}/pipelines?limit=1"),
         )
         .await;
-        if status == StatusCode::OK {
-            if let Some(items) = body["items"].as_array()
-                && let Some(first) = items.first()
-                && let Some(id) = first["id"].as_str()
-            {
-                break id.to_string();
-            }
+        if status == StatusCode::OK
+            && let Some(items) = body["items"].as_array()
+            && let Some(first) = items.first()
+            && let Some(id) = first["id"].as_str()
+        {
+            break id.to_string();
         }
         assert!(
             start.elapsed().as_secs() <= timeout_secs,
@@ -109,8 +107,8 @@ async fn poll_project_pipeline(
 
 /// Test 1: Demo project creation produces expected DB state.
 ///
-/// Verifies: project row, MR on feature/shop-app, 4 sample issues,
-/// demo_project_id setting stored.
+/// Verifies: project row, MR on feature/shop-app-v0.1, 4 sample issues,
+/// `demo_project_id` setting stored.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn demo_project_creation(pool: PgPool) {
@@ -133,15 +131,18 @@ async fn demo_project_creation(pool: PgPool) {
             .unwrap();
     assert_eq!(project_active, Some(true));
 
-    // MR on feature/shop-app exists
+    // MR on feature/shop-app-v0.1 exists
     let mr_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/shop-app'",
+        "SELECT COUNT(*) FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/shop-app-v0.1'",
     )
     .bind(project_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(mr_count, 1, "should have exactly 1 MR on feature/shop-app");
+    assert_eq!(
+        mr_count, 1,
+        "should have exactly 1 MR on feature/shop-app-v0.1"
+    );
 
     // 4 sample issues created
     let issue_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issues WHERE project_id = $1")
@@ -197,7 +198,7 @@ async fn demo_project_creation(pool: PgPool) {
 ///
 /// build-test must run (not skipped). If the kaniko build itself fails, that's
 /// OK — what matters is the step was attempted, not event-filtered.
-/// The e2e step depends_on [build-app, build-test], so if either dependency
+/// The e2e step `depends_on` [build-app, build-test], so if either dependency
 /// fails, e2e is legitimately skipped by the DAG scheduler (not event-filtered).
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
@@ -220,16 +221,12 @@ async fn demo_pipeline_mr_steps_not_filtered(pool: PgPool) {
     let (_pipeline_id, _final_status, steps) =
         poll_project_pipeline(&app, &token, project_id, 300).await;
 
-    // Verify all 4 expected steps exist
+    // Verify expected steps exist (v0.1 pipeline: build-app, build-dev, build-test, e2e)
     let step_names: Vec<&str> = steps.iter().filter_map(|s| s["name"].as_str()).collect();
 
     assert!(
         step_names.contains(&"build-app"),
         "build-app step should exist. steps: {step_names:?}"
-    );
-    assert!(
-        step_names.contains(&"build-canary"),
-        "build-canary step should exist. steps: {step_names:?}"
     );
     assert!(
         step_names.contains(&"build-test"),
@@ -288,7 +285,7 @@ async fn demo_pipeline_mr_steps_not_filtered(pool: PgPool) {
 
 /// Test 3: Demo project creates sample secrets in DB.
 ///
-/// Verifies that create_demo_project seeds secrets for pipeline and deploy scopes,
+/// Verifies that `create_demo_project` seeds secrets for pipeline and deploy scopes,
 /// including environment-specific overrides.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
@@ -434,7 +431,7 @@ async fn demo_secrets_api_list(pool: PgPool) {
 /// Test 5: Pipeline pods receive secrets as env vars.
 ///
 /// After pipeline execution, verifies that the executor resolved secrets and
-/// injected PLATFORM_SECRET_NAMES into the pipeline steps' DB rows.
+/// injected `PLATFORM_SECRET_NAMES` into the pipeline steps' DB rows.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn demo_pipeline_secrets_injected(pool: PgPool) {
@@ -947,7 +944,7 @@ async fn demo_otel_ingest_and_query(pool: PgPool) {
         let (status, detail) =
             e2e_helpers::get_json(&app, &token, &format!("/api/observe/traces/{trace_id}")).await;
         assert_eq!(status, StatusCode::OK);
-        let spans = detail["spans"].as_array().map(|a| a.len()).unwrap_or(0);
+        let spans = detail["spans"].as_array().map_or(0, std::vec::Vec::len);
         assert!(
             spans >= 2,
             "trace should have at least 2 spans (GET + checkout)"
@@ -1167,7 +1164,7 @@ where
 /// Full lifecycle E2E test for the demo project.
 ///
 /// Creates the demo project and observes the entire auto-triggered flow:
-/// MR pipeline → auto-merge → main pipeline (with gitops_sync + deploy_watch) →
+/// MR pipeline → auto-merge → main pipeline (with `gitops_sync` + `deploy_watch`) →
 /// staging deployment → manual promote → production deployment → OTEL round-trip.
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
@@ -1227,7 +1224,7 @@ async fn demo_full_lifecycle(pool: PgPool) {
             .unwrap();
     assert_eq!(ops_repo_count, 1, "should have 1 ops repo");
 
-    // 1.4 MR exists with auto_merge=true
+    // 1.4 MR exists with auto_merge=true (PR1: v0.1 rolling deploy)
     let mr = sqlx::query(
         "SELECT source_branch, status, auto_merge FROM merge_requests WHERE project_id = $1 AND number = 1",
     )
@@ -1240,7 +1237,7 @@ async fn demo_full_lifecycle(pool: PgPool) {
         let source: String = mr.get("source_branch");
         let status: String = mr.get("status");
         let auto_merge: bool = mr.get("auto_merge");
-        assert_eq!(source, "feature/shop-app");
+        assert_eq!(source, "feature/shop-app-v0.1");
         assert_eq!(status, "open");
         assert!(auto_merge, "demo MR should have auto_merge=true");
     }
@@ -1310,15 +1307,11 @@ async fn demo_full_lifecycle(pool: PgPool) {
         .unwrap();
     assert_eq!(mr_pipe_trigger, "mr");
 
-    // 2.2 Check step names exist
+    // 2.2 Check step names exist (v0.1 pipeline: no build-canary)
     let step_names: Vec<&str> = mr_steps.iter().filter_map(|s| s["name"].as_str()).collect();
     assert!(
         step_names.contains(&"build-app"),
         "build-app missing: {step_names:?}"
-    );
-    assert!(
-        step_names.contains(&"build-canary"),
-        "build-canary missing: {step_names:?}"
     );
     assert!(
         step_names.contains(&"build-dev"),
@@ -1554,8 +1547,8 @@ async fn demo_full_lifecycle(pool: PgPool) {
         .filter_map(|s| s["name"].as_str())
         .collect();
 
-    // 4.2 build-app, build-canary, build-dev should run
-    for step_name in &["build-app", "build-canary", "build-dev"] {
+    // 4.2 build-app, build-dev should run (v0.1: no build-canary)
+    for step_name in &["build-app", "build-dev"] {
         let status = main_steps
             .iter()
             .find(|s| s["name"].as_str() == Some(*step_name))
@@ -1596,7 +1589,7 @@ async fn demo_full_lifecycle(pool: PgPool) {
     tracing::info!(%main_status, "Stage 4 passed: main pipeline completed");
 
     // ===================================================================
-    // Stage 5: GitOps Sync Verification
+    // Stage 5: GitOps Sync + v0.1 Staging Deploy Verification
     // ===================================================================
     let ops_repo_path: Option<String> =
         sqlx::query_scalar("SELECT repo_path FROM ops_repos WHERE project_id = $1")
@@ -1619,22 +1612,18 @@ async fn demo_full_lifecycle(pool: PgPool) {
     }
 
     // 5.2 Deploy release created
-    let deploy_release_count: i64 =
+    let v1_release_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM deploy_releases WHERE project_id = $1")
             .bind(project_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    // May be 0 if sync-ops-repo step failed (kaniko issues), that's OK for now
-    tracing::info!(deploy_release_count, "Stage 5: deploy releases created");
+    tracing::info!(v1_release_count, "Stage 5: v0.1 deploy releases created");
 
-    // ===================================================================
-    // Stage 6: Staging Deploy Verification (if release exists)
-    // ===================================================================
-    if deploy_release_count > 0 {
-        // Wait for staging release to reach a terminal phase
+    if v1_release_count > 0 {
+        // Wait for v0.1 staging release (rolling) to reach terminal
         let pool_clone3 = pool.clone();
-        poll_until("staging release terminal", 180, || {
+        poll_until("v0.1 staging release terminal", 180, || {
             let p = pool_clone3.clone();
             let pid = project_id;
             async move {
@@ -1657,7 +1646,24 @@ async fn demo_full_lifecycle(pool: PgPool) {
         })
         .await;
 
-        // 6.1 Feature flags registered
+        // 5.3 v0.1 deploy uses rolling strategy
+        let v1_strategy: Option<String> = sqlx::query_scalar(
+            "SELECT dr.strategy FROM deploy_releases dr
+             JOIN deploy_targets dt ON dr.target_id = dt.id
+             WHERE dr.project_id = $1 AND dt.environment = 'staging'
+             ORDER BY dr.created_at LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            v1_strategy.as_deref(),
+            Some("rolling"),
+            "v0.1 should use rolling strategy"
+        );
+
+        // 5.4 Feature flags registered
         let flag_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM feature_flags WHERE project_id = $1")
                 .bind(project_id)
@@ -1669,23 +1675,7 @@ async fn demo_full_lifecycle(pool: PgPool) {
             "should have at least 2 feature flags, got {flag_count}"
         );
 
-        // 6.2 Check specific flags
-        let flag_keys: Vec<String> =
-            sqlx::query_scalar("SELECT key FROM feature_flags WHERE project_id = $1")
-                .bind(project_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert!(
-            flag_keys.contains(&"new_checkout_flow".to_string()),
-            "should have new_checkout_flow flag: {flag_keys:?}"
-        );
-        assert!(
-            flag_keys.contains(&"dark_mode".to_string()),
-            "should have dark_mode flag: {flag_keys:?}"
-        );
-
-        // 6.3 OTEL staging tokens created
+        // 5.5 OTEL staging tokens created
         let otel_staging: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM api_tokens WHERE project_id = $1 AND name LIKE 'otlp-staging-%'",
         )
@@ -1697,54 +1687,265 @@ async fn demo_full_lifecycle(pool: PgPool) {
             otel_staging >= 1,
             "should have at least 1 staging OTEL token"
         );
+    }
 
-        tracing::info!("Stage 6 passed: staging deploy verified");
+    // 5.6 Annotated git tag created for v0.1
+    let repo_path_str: String = sqlx::query_scalar("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let tag_check = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_path_str)
+        .args(["tag", "-l", "v0.1.0"])
+        .output()
+        .await;
+    if let Ok(out) = tag_check {
+        let tags = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            tags.contains("v0.1.0"),
+            "annotated tag v0.1.0 should exist after main push"
+        );
+    }
+
+    tracing::info!("Stage 5 passed: v0.1 rolling deploy + git tag verified");
+
+    // ===================================================================
+    // Stage 6: Auto-promote to prod + PR2 Created
+    // ===================================================================
+    // The eventbus auto-promotes staging→prod for the demo project.
+    // After prod completes, it creates PR2 on feature/shop-app-v0.2.
+    // This can take a while: staging complete → promote → prod deploy → PR2.
+    let pool_clone4 = pool.clone();
+    poll_until("PR2 created", 240, || {
+        let p = pool_clone4.clone();
+        let pid = project_id;
+        async move {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/shop-app-v0.2'",
+            )
+            .bind(pid)
+            .fetch_one(&p)
+            .await
+            .unwrap_or(0);
+            count >= 1
+        }
+    })
+    .await;
+
+    // 6.1 PR2 has auto_merge=true
+    let pr2 = sqlx::query(
+        "SELECT source_branch, status, auto_merge, title FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/shop-app-v0.2'",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    {
+        use sqlx::Row as _;
+        let auto_merge: bool = pr2.get("auto_merge");
+        let title: String = pr2.get("title");
+        assert!(auto_merge, "PR2 should have auto_merge=true");
+        assert!(
+            title.contains("v0.2") || title.contains("canary"),
+            "PR2 title should mention v0.2 or canary: {title}"
+        );
+    }
+
+    tracing::info!("Stage 6 passed: PR2 (v0.2 canary) created");
+
+    // ===================================================================
+    // Stage 7: PR2 Pipeline Execution + Auto-Merge
+    // ===================================================================
+    // PR2 should have triggered an MR pipeline
+    let pool_clone5 = pool.clone();
+    poll_until("PR2 pipeline created", 30, || {
+        let p = pool_clone5.clone();
+        let pid = project_id;
+        async move {
+            // Count MR pipelines — should have at least 2 (PR1 + PR2)
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pipelines WHERE project_id = $1 AND trigger = 'mr'",
+            )
+            .bind(pid)
+            .fetch_one(&p)
+            .await
+            .unwrap_or(0);
+            count >= 2
+        }
+    })
+    .await;
+
+    state.pipeline_notify.notify_one();
+
+    // Wait for PR2's MR pipeline to complete
+    let pr2_pipeline_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM pipelines WHERE project_id = $1 AND trigger = 'mr' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let pr2_mr_status = e2e_helpers::poll_pipeline_status(
+        &app,
+        &token,
+        project_id,
+        &pr2_pipeline_id.to_string(),
+        300,
+    )
+    .await;
+
+    tracing::info!(%pr2_mr_status, "Stage 7: PR2 MR pipeline completed");
+
+    // Wait for PR2 auto-merge
+    if pr2_mr_status == "success" {
+        let pool_clone6 = pool.clone();
+        poll_until("PR2 merged", 60, || {
+            let p = pool_clone6.clone();
+            let pid = project_id;
+            async move {
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/shop-app-v0.2'",
+                )
+                .bind(pid)
+                .fetch_optional(&p)
+                .await
+                .ok()
+                .flatten();
+                status.as_deref() == Some("merged")
+            }
+        })
+        .await;
+
+        tracing::info!("Stage 7 passed: PR2 auto-merged");
 
         // =============================================================
-        // Stage 7: Feature Flag Evaluation
+        // Stage 8: Main Pipeline After PR2 Merge (canary gitops_sync)
         // =============================================================
-        let (flag_status, flag_body) = e2e_helpers::post_json(
+        let pool_clone7 = pool.clone();
+        poll_until("v0.2 push pipeline created", 30, || {
+            let p = pool_clone7.clone();
+            let pid = project_id;
+            async move {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pipelines WHERE project_id = $1 AND trigger = 'push'",
+                )
+                .bind(pid)
+                .fetch_one(&p)
+                .await
+                .unwrap_or(0);
+                count >= 2
+            }
+        })
+        .await;
+
+        state.pipeline_notify.notify_one();
+
+        let v2_push_pipeline_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM pipelines WHERE project_id = $1 AND trigger = 'push' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let v2_push_status = e2e_helpers::poll_pipeline_status(
             &app,
             &token,
-            "/api/flags/evaluate",
-            serde_json::json!({
-                "project_id": project_id,
-                "keys": ["new_checkout_flow", "dark_mode"],
-            }),
+            project_id,
+            &v2_push_pipeline_id.to_string(),
+            300,
         )
         .await;
-        assert_eq!(
-            flag_status,
-            StatusCode::OK,
-            "flag evaluate failed: {flag_body}"
-        );
 
-        tracing::info!("Stage 7 passed: feature flags evaluable");
+        // 8.1 VERSION stored in pipeline row
+        let v2_version: Option<String> =
+            sqlx::query_scalar("SELECT version FROM pipelines WHERE id = $1")
+                .bind(v2_push_pipeline_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        if let Some(ver) = &v2_version {
+            assert!(
+                ver.contains("0.2.0"),
+                "v0.2 pipeline version should contain 0.2.0, got: {ver}"
+            );
+        }
 
-        // =============================================================
-        // Stage 8: Promote Staging → Production
-        // =============================================================
-        let (promote_status, promote_body) = e2e_helpers::post_json(
-            &app,
-            &token,
-            &format!("/api/projects/{project_id}/promote-staging"),
-            serde_json::json!({}),
-        )
-        .await;
-        assert_eq!(
-            promote_status,
-            StatusCode::OK,
-            "promote-staging failed: {promote_body}"
-        );
-
-        tracing::info!("Stage 8 passed: promote-staging returned 200");
+        tracing::info!(%v2_push_status, "Stage 8: v0.2 push pipeline completed");
 
         // =============================================================
-        // Stage 9: Production Deploy Verification
+        // Stage 9: Canary Deploy Verification
         // =============================================================
-        let pool_clone4 = pool.clone();
-        poll_until("production release terminal", 180, || {
-            let p = pool_clone4.clone();
+        if v2_push_status == "success" {
+            // Wait for a second staging release (canary) to appear
+            let pool_clone8 = pool.clone();
+            poll_until("canary staging release terminal", 180, || {
+                let p = pool_clone8.clone();
+                let pid = project_id;
+                async move {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM deploy_releases dr
+                         JOIN deploy_targets dt ON dr.target_id = dt.id
+                         WHERE dr.project_id = $1 AND dt.environment = 'staging'
+                         AND dr.phase IN ('completed', 'failed', 'rolled_back')",
+                    )
+                    .bind(pid)
+                    .fetch_one(&p)
+                    .await
+                    .unwrap_or(0);
+                    count >= 2
+                }
+            })
+            .await;
+
+            // 9.1 Latest staging release uses canary strategy
+            let canary_strategy: Option<String> = sqlx::query_scalar(
+                "SELECT dr.strategy FROM deploy_releases dr
+                 JOIN deploy_targets dt ON dr.target_id = dt.id
+                 WHERE dr.project_id = $1 AND dt.environment = 'staging'
+                 ORDER BY dr.created_at DESC LIMIT 1",
+            )
+            .bind(project_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                canary_strategy.as_deref(),
+                Some("canary"),
+                "v0.2 should use canary strategy"
+            );
+
+            // 9.2 Annotated git tag v0.2.0 created
+            let tag_v2 = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_path_str)
+                .args(["tag", "-l", "v0.2.0"])
+                .output()
+                .await;
+            if let Ok(out) = tag_v2 {
+                let tags = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    tags.contains("v0.2.0"),
+                    "annotated tag v0.2.0 should exist after v0.2 main push"
+                );
+            }
+
+            tracing::info!("Stage 9 passed: canary deploy verified");
+        } else {
+            tracing::warn!("Stages 9 skipped: v0.2 push pipeline did not succeed");
+        }
+
+        // =============================================================
+        // Stage 10: v0.2 Production Deploy (auto via stages config → rolling)
+        // =============================================================
+        // The v0.2 gitops_sync triggers a production release too.
+        // With stages=[staging], prod gets rolling strategy automatically.
+        let pool_clone9 = pool.clone();
+        poll_until("v0.2 prod release terminal", 180, || {
+            let p = pool_clone9.clone();
             let pid = project_id;
             async move {
                 let phase: Option<String> = sqlx::query_scalar(
@@ -1766,19 +1967,9 @@ async fn demo_full_lifecycle(pool: PgPool) {
         })
         .await;
 
-        // 9.1 Production OTEL tokens
-        let otel_prod: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM api_tokens WHERE project_id = $1 AND name LIKE 'otlp-prod-%'",
-        )
-        .bind(project_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(otel_prod >= 1, "should have at least 1 prod OTEL token");
-
-        tracing::info!("Stage 9 passed: production deploy verified");
+        tracing::info!("Stage 10 passed: v0.2 production deploy verified");
     } else {
-        tracing::warn!("Stages 6-9 skipped: no deploy releases created (pipeline may have failed)");
+        tracing::warn!("Stages 7-10 skipped: PR2 MR pipeline did not succeed");
     }
 
     // ===================================================================

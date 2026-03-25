@@ -23,7 +23,7 @@ export function Sessions({ projectId }: Props) {
     const params: Record<string, string | number> = { limit: 20, offset };
     if (statusFilter) params.status = statusFilter;
     api.get<ListResponse<AgentSession>>(`/api/projects/${projectId}/sessions${qs(params)}`)
-      .then(r => { setSessions(r.items); setTotal(r.total); }).catch(() => {});
+      .then(r => { setSessions(r.items); setTotal(r.total); }).catch(e => console.warn(e));
   };
 
   useEffect(load, [projectId, offset, statusFilter]);

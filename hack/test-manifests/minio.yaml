@@ -9,7 +9,7 @@ metadata:
 spec:
   containers:
     - name: minio
-      image: minio/minio:latest
+      image: quay.io/minio/minio:RELEASE.2025-02-28T09-55-16Z
       args: ["server", "/data"]
       env:
         - name: MINIO_ROOT_USER

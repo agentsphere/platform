@@ -1646,10 +1646,12 @@ async fn post_merge_deploy(
     let image_ref = format!("{registry}/{project_name}/app:{source_head_sha}");
 
     // Read VERSION file from target branch (post-merge)
-    let version = crate::pipeline::trigger::read_version_at_ref(repo_path, target_branch).await;
+    let version_info =
+        crate::pipeline::trigger::read_version_at_ref(repo_path, target_branch).await;
 
-    // Optional: add version alias tag in registry
-    if let Some(ref ver) = version
+    // Optional: add version alias tag in registry (use the "app" image version)
+    if let Some(ref vi) = version_info
+        && let Some(ver) = vi.images.get("app")
         && state.config.registry_url.is_some()
     {
         match crate::registry::copy_tag(&state.pool, &project_name, &image_tag, ver).await {
@@ -1728,7 +1730,7 @@ async fn post_merge_deploy(
 
             let values = serde_json::json!({
                 "image_ref": image_ref,
-                "version": version.as_deref().unwrap_or(short_sha),
+                "version": version_info.as_ref().and_then(|vi| vi.images.get("app").map(String::as_str)).unwrap_or(short_sha),
             });
             if let Err(e) = crate::deployer::ops_repo::commit_values(
                 &ops_path,

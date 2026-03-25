@@ -43,24 +43,24 @@ export function WorkspaceDetail({ id }: Props) {
     api.get<Workspace>(`/api/workspaces/${id}`).then(w => {
       setWs(w);
       setEditForm({ display_name: w.display_name || '', description: w.description || '' });
-    }).catch(() => {});
+    }).catch(e => console.warn(e));
   };
 
   const loadMembers = () => {
     if (!id) return;
-    api.get<WorkspaceMember[]>(`/api/workspaces/${id}/members`).then(setMembers).catch(() => {});
+    api.get<WorkspaceMember[]>(`/api/workspaces/${id}/members`).then(setMembers).catch(e => console.warn(e));
   };
 
   const loadProjects = () => {
     if (!id) return;
     api.get<ListResponse<Project>>(`/api/workspaces/${id}/projects${qs({ limit: 50 })}`)
       .then(r => { setProjects(r.items); setProjectTotal(r.total); })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   };
 
   const loadSkills = () => {
     if (!id) return;
-    api.get<{ items: WsCommand[]; total: number }>(`/api/workspaces/${id}/commands`).then(r => setSkills(r.items)).catch(() => {});
+    api.get<{ items: WsCommand[]; total: number }>(`/api/workspaces/${id}/commands`).then(r => setSkills(r.items)).catch(e => console.warn(e));
   };
 
   useEffect(() => { loadWorkspace(); loadMembers(); loadProjects(); loadSkills(); }, [id]);

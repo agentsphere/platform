@@ -96,12 +96,31 @@ fn render_result(r: &ResultMessage) {
     }
 }
 
+/// Desktop notification kinds — closed enum prevents AppleScript injection.
+pub enum Notification {
+    AgentCompleted,
+    AgentError,
+}
+
+impl Notification {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::AgentCompleted => "agent-runner",
+            Self::AgentError => "agent-runner",
+        }
+    }
+    fn body(&self) -> &'static str {
+        match self {
+            Self::AgentCompleted => "Agent turn completed",
+            Self::AgentError => "Agent completed with error",
+        }
+    }
+}
+
 /// Send a desktop notification (terminal bell on all platforms).
-///
-/// SAFETY: `title` and `body` must be hardcoded string literals — they are
-/// interpolated into an AppleScript command on macOS with minimal escaping.
-/// Do NOT pass user-controlled input.
-pub fn notify_desktop(title: &str, body: &str) {
+pub fn notify_desktop(notif: Notification) {
+    let title = notif.title();
+    let body = notif.body();
     // Terminal bell as universal notification
     eprint!("\x07");
 
@@ -130,7 +149,7 @@ pub fn notify_desktop(title: &str, body: &str) {
 }
 
 /// Truncate a string to `max_len` chars, appending "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
+pub fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_owned()
     } else {
@@ -422,7 +441,8 @@ mod tests {
 
     #[test]
     fn notify_desktop_does_not_panic() {
-        notify_desktop("test", "body");
+        notify_desktop(Notification::AgentCompleted);
+        notify_desktop(Notification::AgentError);
     }
 
     #[test]

@@ -589,7 +589,11 @@ async fn llm_create_app_full_flow(pool: PgPool) {
                         .lines()
                         .any(|l| l == "requirements-test.txt" || l.contains("test"));
                     let has_app_code = tree.lines().any(|l| {
-                        l.starts_with("app/") || l.starts_with("src/") || l.ends_with(".py")
+                        l.starts_with("app/")
+                            || l.starts_with("src/")
+                            || std::path::Path::new(l)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
                     });
                     let has_frontend = tree
                         .lines()
@@ -990,9 +994,13 @@ async fn llm_create_app_full_flow(pool: PgPool) {
             );
 
             // App structure: source code must exist
-            let has_app_code = tree
-                .lines()
-                .any(|l| l.starts_with("app/") || l.starts_with("src/") || l.ends_with(".py"));
+            let has_app_code = tree.lines().any(|l| {
+                l.starts_with("app/")
+                    || l.starts_with("src/")
+                    || std::path::Path::new(l)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
+            });
             assert!(
                 has_app_code,
                 "worker should have created application source code"

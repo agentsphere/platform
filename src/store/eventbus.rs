@@ -250,9 +250,19 @@ pub async fn handle_event(state: &AppState, payload: &str) -> anyhow::Result<()>
             )
             .await
         }
+        PlatformEvent::ReleasePromoted {
+            release_id,
+            project_id,
+            ..
+        } => {
+            state.deploy_notify.notify_one();
+            // Demo auto-promotion: if this is a staging completion for the demo project,
+            // auto-promote to production
+            handle_demo_auto_promote(state, project_id, release_id).await;
+            Ok(())
+        }
         // New progressive delivery events — wake reconciler, no special handler needed
         PlatformEvent::ReleaseCreated { .. }
-        | PlatformEvent::ReleasePromoted { .. }
         | PlatformEvent::ReleaseRolledBack { .. }
         | PlatformEvent::TrafficShifted { .. } => {
             state.deploy_notify.notify_one();
@@ -330,26 +340,50 @@ async fn upsert_deploy_target_simple(
 }
 
 /// Resolve deploy config (strategy + `rollout_config`) from parsed platform file specs.
+///
+/// If the spec has a `stages` list and the current `environment` is not in it,
+/// the strategy falls back to `"rolling"` with an empty config.
 fn resolve_deploy_config_from_specs(
     pf: &crate::pipeline::definition::PlatformFile,
+    environment: &str,
 ) -> (serde_json::Value, Option<String>) {
     let Some(ref deploy) = pf.deploy else {
         return (serde_json::json!({}), None);
     };
 
-    if let Some(spec) = deploy.specs.first() {
-        let strategy = spec.deploy_type.clone();
-        let config = if let Some(ref canary) = spec.canary {
-            serde_json::to_value(canary).unwrap_or_default()
-        } else if let Some(ref ab) = spec.ab_test {
-            serde_json::to_value(ab).unwrap_or_default()
-        } else {
-            serde_json::json!({})
-        };
-        (config, Some(strategy))
+    let Some(spec) = deploy.specs.first() else {
+        return (serde_json::json!({}), None);
+    };
+
+    // Check if this environment is in the spec's stages list.
+    // Default stages: canary → [staging], ab_test → [staging, production], rolling → [staging, production]
+    let default_stages = if spec.deploy_type == "canary" {
+        vec!["staging".to_string()]
     } else {
-        (serde_json::json!({}), None)
+        vec!["staging".to_string(), "production".to_string()]
+    };
+    let stages = spec.stages.as_deref().unwrap_or(&default_stages);
+    tracing::debug!(
+        deploy_type = %spec.deploy_type,
+        ?stages,
+        %environment,
+        "resolve_deploy_config: checking stages"
+    );
+
+    if !stages.iter().any(|s| s == environment) {
+        // This environment is not in the spec's stages — use rolling
+        return (serde_json::json!({}), Some("rolling".into()));
     }
+
+    let strategy = spec.deploy_type.clone();
+    let config = if let Some(ref canary) = spec.canary {
+        serde_json::to_value(canary).unwrap_or_default()
+    } else if let Some(ref ab) = spec.ab_test {
+        serde_json::to_value(ab).unwrap_or_default()
+    } else {
+        serde_json::json!({})
+    };
+    (config, Some(strategy))
 }
 
 /// Ops repo was updated → read platform.yaml → create release with strategy → register flags → wake deployer.
@@ -368,7 +402,9 @@ async fn handle_ops_repo_updated(
     .fetch_optional(&state.pool)
     .await?;
 
-    let platform_file = if let Some(ref ops) = ops_repo {
+    let platform_file: Option<crate::pipeline::definition::PlatformFile> = if let Some(ref ops) =
+        ops_repo
+    {
         let ops_path = std::path::PathBuf::from(&ops.repo_path);
         let branch = if environment == "staging" {
             "staging"
@@ -385,16 +421,46 @@ async fn handle_ops_repo_updated(
     };
 
     // 2. Resolve deploy config (strategy + rollout_config) from platform.yaml specs
+    let has_deploy_specs = match &platform_file {
+        Some(pf) => pf.deploy.as_ref().map_or(0, |d| d.specs.len()),
+        None => 0,
+    };
+    tracing::info!(
+        %environment,
+        platform_file_present = platform_file.is_some(),
+        deploy_specs_count = has_deploy_specs,
+        "resolving deploy config for release creation"
+    );
     let (rollout_config, strategy_override) = if let Some(ref pf) = platform_file {
-        resolve_deploy_config_from_specs(pf)
+        resolve_deploy_config_from_specs(pf, environment)
     } else {
         (serde_json::json!({}), None)
     };
+    tracing::info!(
+        %environment,
+        strategy = ?strategy_override,
+        "resolved deploy strategy for release"
+    );
 
     // 3. Find or create deploy target
     let ops_repo_id = ops_repo.as_ref().map(|o| o.id);
     let target_id =
         upsert_deploy_target_simple(state, project_id, environment, ops_repo_id).await?;
+
+    // 3b. Cancel any in-progress releases for this target (cancel-and-replace)
+    let cancelled = sqlx::query(
+        "UPDATE deploy_releases SET phase = 'cancelled', completed_at = now()
+         WHERE target_id = $1 AND phase IN ('pending', 'progressing', 'holding', 'paused')",
+    )
+    .bind(target_id)
+    .execute(&state.pool)
+    .await;
+    if let Ok(result) = &cancelled {
+        let count = result.rows_affected();
+        if count > 0 {
+            tracing::info!(%target_id, cancelled_count = count, "cancelled in-progress releases (superseded)");
+        }
+    }
 
     // 4. Create release with strategy + rollout_config
     let release_id = sqlx::query_scalar::<_, Uuid>(
@@ -720,6 +786,141 @@ async fn spawn_ops_agent(
     }
 
     Ok(())
+}
+
+/// Demo project: auto-promote staging to production after rolling deploy completes,
+/// then create PR2 after production completes.
+async fn handle_demo_auto_promote(state: &AppState, project_id: Uuid, release_id: Uuid) {
+    use sqlx::Row as _;
+
+    // Check if this is the demo project
+    let demo_project_id =
+        match crate::onboarding::presets::get_setting(&state.pool, "demo_project_id").await {
+            Ok(Some(val)) => val
+                .as_str()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .or_else(|| serde_json::from_value::<Uuid>(val).ok()),
+            _ => None,
+        };
+
+    let Some(demo_id) = demo_project_id else {
+        return;
+    };
+    if demo_id != project_id {
+        return;
+    }
+
+    // Get the release details
+    let release = sqlx::query(
+        "SELECT dr.strategy, dt.environment FROM deploy_releases dr
+         JOIN deploy_targets dt ON dr.target_id = dt.id
+         WHERE dr.id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    let Ok(Some(row)) = release else { return };
+    let strategy: String = row.get("strategy");
+    let environment: String = row.get("environment");
+
+    if environment == "staging" && strategy == "rolling" {
+        demo_promote_staging_to_prod(state, project_id).await;
+    } else if environment == "production" && strategy == "rolling" {
+        demo_mark_prod_complete(state, project_id).await;
+    }
+}
+
+/// Staging rolling completed → merge staging branch into prod and publish `OpsRepoUpdated`.
+async fn demo_promote_staging_to_prod(state: &AppState, project_id: Uuid) {
+    use sqlx::Row as _;
+
+    // Check we haven't already promoted
+    let already = crate::onboarding::presets::get_setting(&state.pool, "demo_v1_prod_promoted")
+        .await
+        .ok()
+        .flatten();
+    if already.is_some() {
+        return;
+    }
+
+    tracing::info!(%project_id, "demo: auto-promoting v0.1 staging → production");
+
+    let ops_repo = sqlx::query("SELECT id, repo_path, branch FROM ops_repos WHERE project_id = $1")
+        .bind(project_id)
+        .fetch_optional(&state.pool)
+        .await;
+
+    let Ok(Some(ops)) = ops_repo else { return };
+    let ops_id: Uuid = ops.get("id");
+    let ops_path_str: String = ops.get("repo_path");
+    let ops_branch: String = ops.get("branch");
+    let ops_path = std::path::PathBuf::from(&ops_path_str);
+
+    // Read staging values for image_ref
+    let Ok(staging_values) =
+        crate::deployer::ops_repo::read_values(&ops_path, "staging", "staging").await
+    else {
+        return;
+    };
+    let image_ref = staging_values["image_ref"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Merge staging → production branch in the ops repo.
+    // The per-repo mutex in ops_repo serializes this with concurrent gitops_sync writes.
+    let merge_result =
+        crate::deployer::ops_repo::merge_branch(&ops_path, "staging", &ops_branch).await;
+
+    if let Ok(new_sha) = merge_result {
+        let _ = publish(
+            &state.valkey,
+            &PlatformEvent::OpsRepoUpdated {
+                project_id,
+                ops_repo_id: ops_id,
+                environment: "production".into(),
+                commit_sha: new_sha,
+                image_ref,
+            },
+        )
+        .await;
+    }
+}
+
+/// Production rolling completed → mark as promoted and spawn PR2 creation.
+async fn demo_mark_prod_complete(state: &AppState, project_id: Uuid) {
+    let already = crate::onboarding::presets::get_setting(&state.pool, "demo_v1_prod_promoted")
+        .await
+        .ok()
+        .flatten();
+    if already.is_some() {
+        return;
+    }
+
+    let _ = crate::onboarding::presets::upsert_setting_pub(
+        &state.pool,
+        "demo_v1_prod_promoted",
+        &serde_json::json!(true),
+    )
+    .await;
+
+    tracing::info!(%project_id, "demo: production v0.1 complete, creating PR2");
+
+    // Get project owner for PR2 creation
+    let owner_id: Option<Uuid> = sqlx::query_scalar("SELECT owner_id FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(owner_id) = owner_id {
+        let state = state.clone();
+        tokio::spawn(async move {
+            crate::onboarding::demo_project::create_demo_pr2(&state, project_id, owner_id).await;
+        });
+    }
 }
 
 /// Inner flag registration logic, shared by `handle_flags_registered` and `handle_ops_repo_updated`.

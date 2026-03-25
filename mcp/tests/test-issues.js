@@ -75,16 +75,19 @@ describe("platform-issues", () => {
     assert.ok(req.path.includes(`/issues/1`));
   });
 
-  it("create_merge_request sends POST .../merge-requests", async () => {
+  it("create_merge_request sends POST .../merge-requests with target_branch", async () => {
     api.setResponse(201, { number: 1, title: "Feature" });
     await client.callTool("create_merge_request", {
       title: "Feature",
       source_branch: "feat/x",
+      target_branch: "main",
     });
     const req = api.lastRequest();
     assert.equal(req.method, "POST");
     assert.ok(req.path.includes("/merge-requests"));
     assert.equal(req.body.title, "Feature");
     assert.equal(req.body.source_branch, "feat/x");
+    assert.equal(req.body.target_branch, "main");
+    assert.equal(req.body.labels, undefined, "labels should not be sent");
   });
 });

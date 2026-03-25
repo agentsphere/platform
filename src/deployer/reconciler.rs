@@ -275,7 +275,33 @@ async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<()
         transition_phase(state, release, "completed", Some(100), Some("healthy")).await?;
         record_history(state, release, "promoted", "completed", Some(100)).await;
         fire_webhook(state, release, "deployed").await;
+
+        let _ = crate::store::eventbus::publish(
+            &state.valkey,
+            &crate::store::eventbus::PlatformEvent::ReleasePromoted {
+                release_id: release.id,
+                project_id: release.project_id,
+                image_ref: release.image_ref.clone(),
+            },
+        )
+        .await;
     } else {
+        // Canary/AB: wait for canary deployment health before traffic switch
+        if let Some(deploy_name) = applier::find_deployment_name(&applied) {
+            applier::wait_healthy(&state.kube, &ns, deploy_name, Duration::from_secs(300)).await?;
+        }
+
+        // Re-check phase — release may have been cancelled while waiting for health
+        let current_phase: Option<String> =
+            sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+                .bind(release.id)
+                .fetch_optional(&state.pool)
+                .await?;
+        if current_phase.as_deref() != Some("pending") {
+            tracing::info!(release_id = %release.id, phase = ?current_phase, "release phase changed during health wait, aborting");
+            return Ok(());
+        }
+
         // Canary/AB: transition to progressing with initial weight
         #[allow(clippy::cast_possible_truncation)]
         let initial_weight = release
@@ -395,6 +421,10 @@ async fn handle_canary_progress(
                 record_history(state, release, "health_changed", "holding", None).await;
             }
         }
+        Some("inconclusive") => {
+            // Insufficient traffic — wait for more data, don't count as failure
+            tracing::info!(release_id = %release.id, "analysis inconclusive, waiting for traffic");
+        }
         // Analysis still running or not started yet — wait
         _ => {}
     }
@@ -444,6 +474,17 @@ async fn handle_promoting(state: &AppState, release: &PendingRelease) -> Result<
         // The new stable is the canary image
         let (rendered, _sha) = render_manifests(state, release).await?;
         let _ = applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(release.id)).await;
+    }
+
+    // Post-promotion: downscale the old (stable) deployment for canary strategies
+    if release.strategy == "canary"
+        && let Some(stable_svc) = release
+            .rollout_config
+            .get("stable_service")
+            .and_then(|v| v.as_str())
+        && let Err(e) = applier::scale(&state.kube, &ns, stable_svc, 0).await
+    {
+        tracing::warn!(error = %e, %stable_svc, "failed to downscale old stable deployment after promotion");
     }
 
     transition_phase(state, release, "completed", Some(100), Some("healthy")).await?;
@@ -496,7 +537,7 @@ async fn handle_rolling_back(
 // Gateway API helpers
 // ---------------------------------------------------------------------------
 
-/// Apply Gateway + `HTTPRoute` resources for traffic splitting.
+/// Apply `HTTPRoute` resources for traffic splitting (references shared Gateway).
 /// For canary: weighted split between `stable_service` and `canary_service`.
 /// For AB test: header-based routing.
 async fn apply_gateway_resources(
@@ -511,6 +552,10 @@ async fn apply_gateway_resources(
         .and_then(|v| v.as_str())
         .unwrap_or("*");
     let route_name = format!("{}-traffic", release.project_name);
+    let gw = super::gateway::GatewayRef {
+        name: &state.config.gateway_name,
+        namespace: &state.config.gateway_namespace,
+    };
 
     match release.strategy.as_str() {
         "canary" => {
@@ -526,11 +571,6 @@ async fn apply_gateway_resources(
             let cw = canary_weight.unsigned_abs();
             let sw = 100 - cw;
 
-            // Ensure Gateway exists
-            let gw = super::gateway::build_gateway(namespace);
-            apply_json_to_k8s(state, &gw, namespace).await;
-
-            // Create/update HTTPRoute with weights
             let route = super::gateway::build_weighted_httproute(
                 &route_name,
                 namespace,
@@ -539,6 +579,7 @@ async fn apply_gateway_resources(
                 canary_svc,
                 sw,
                 cw,
+                &gw,
             );
             apply_json_to_k8s(state, &route, namespace).await;
         }
@@ -552,15 +593,11 @@ async fn apply_gateway_resources(
                 .and_then(|v| v.as_str())
                 .unwrap_or("treatment");
 
-            // Parse header match rules
             let headers: std::collections::HashMap<String, String> = config
                 .get("match")
                 .and_then(|m| m.get("headers"))
                 .and_then(|h| serde_json::from_value(h.clone()).ok())
                 .unwrap_or_default();
-
-            let gw = super::gateway::build_gateway(namespace);
-            apply_json_to_k8s(state, &gw, namespace).await;
 
             let route = super::gateway::build_header_match_httproute(
                 &route_name,
@@ -569,6 +606,7 @@ async fn apply_gateway_resources(
                 control_svc,
                 treatment_svc,
                 &headers,
+                &gw,
             );
             apply_json_to_k8s(state, &route, namespace).await;
         }
@@ -587,6 +625,39 @@ async fn apply_json_to_k8s(state: &AppState, resource: &serde_json::Value, names
     };
     if let Err(e) = applier::apply_with_tracking(&state.kube, &yaml, namespace, None).await {
         tracing::warn!(error = %e, "failed to apply gateway resource");
+    }
+}
+
+/// Discover the in-cluster URL for the shared Envoy Gateway proxy service.
+///
+/// Queries the K8s API for Services labelled with the gateway name in the gateway namespace.
+/// Returns `http://{svc-name}.{namespace}.svc.cluster.local:80` or `None` if not found.
+async fn resolve_gateway_url(state: &AppState) -> Option<String> {
+    use kube::api::ListParams;
+
+    let gw_ns = &state.config.gateway_namespace;
+    let gw_name = &state.config.gateway_name;
+
+    let svc_api: kube::Api<k8s_openapi::api::core::v1::Service> =
+        kube::Api::namespaced(state.kube.clone(), gw_ns);
+
+    let label = format!("gateway.envoyproxy.io/owning-gateway-name={gw_name}");
+    let lp = ListParams::default().labels(&label);
+
+    match svc_api.list(&lp).await {
+        Ok(list) => {
+            if let Some(svc) = list.items.first() {
+                let svc_name = svc.metadata.name.as_deref()?;
+                Some(format!("http://{svc_name}.{gw_ns}.svc.cluster.local:80"))
+            } else {
+                tracing::debug!(%gw_name, %gw_ns, "no envoy proxy service found for gateway");
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to discover gateway proxy service");
+            None
+        }
     }
 }
 
@@ -642,7 +713,7 @@ async fn cleanup_expired_previews(state: &AppState) {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Transition a release to a new phase.
+/// Transition a release to a new phase, validating the state machine.
 async fn transition_phase(
     state: &AppState,
     release: &PendingRelease,
@@ -650,6 +721,21 @@ async fn transition_phase(
     traffic_weight: Option<i32>,
     health: Option<&str>,
 ) -> Result<(), DeployerError> {
+    // Validate state machine transition
+    if let (Some(current), Some(next)) = (
+        super::types::ReleasePhase::parse(&release.phase),
+        super::types::ReleasePhase::parse(new_phase),
+    ) && !current.can_transition_to(next)
+    {
+        tracing::warn!(
+            release_id = %release.id,
+            from = %release.phase,
+            to = %new_phase,
+            "invalid release phase transition, skipping"
+        );
+        return Ok(());
+    }
+
     sqlx::query(
         "UPDATE deploy_releases SET
             phase = $2,
@@ -1139,16 +1225,23 @@ async fn render_manifests(
             .and_then(|v| v.as_str())
             .map_or_else(|| release.image_ref.clone(), String::from);
 
+        let stable_image = Some(
+            lookup_stable_image(&state.pool, release.target_id)
+                .await
+                .unwrap_or_else(|| image_ref.clone()),
+        );
+        let gateway_url = resolve_gateway_url(state).await;
         let vars = renderer::RenderVars {
             image_ref,
             project_name: release.project_name.clone(),
             environment: release.environment.clone(),
             values: base_values,
             platform_api_url: state.config.platform_api_url.clone(),
-            stable_image: lookup_stable_image(&state.pool, release.target_id).await,
+            stable_image,
             canary_image: Some(release.image_ref.clone()),
             commit_sha: release.commit_sha.clone(),
             app_image: None,
+            gateway_url,
         };
 
         let rendered = renderer::render(&template_content, &vars)?;

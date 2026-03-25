@@ -78,3 +78,13 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ServiceAccounts (agent identity, per-project namespaces)
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Gateway API (progressive delivery traffic splitting)
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "gateways"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

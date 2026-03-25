@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ project_name }}-traffic-gen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ project_name }}-traffic-gen
+  template:
+    metadata:
+      labels:
+        app: {{ project_name }}-traffic-gen
+    spec:
+      containers:
+        - name: curler
+          image: curlimages/curl:8.11.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "Traffic generator starting"
+              echo "Gateway URL: ${GATEWAY_URL:-not set}"
+              # Wait for services to be ready
+              sleep 10
+              while true; do
+                # Hit the gateway (routes to versioned backends via HTTPRoute weights)
+                if [ -n "${GATEWAY_URL}" ]; then
+                  curl -sf -o /dev/null -w "gw=%{http_code} " "${GATEWAY_URL}/healthz" 2>/dev/null || true
+                  curl -sf -o /dev/null -w "gw=%{http_code} " "${GATEWAY_URL}/product/1" 2>/dev/null || true
+                fi
+                # Also hit versioned services directly (ensures both get traffic for OTEL metrics)
+                curl -sf -o /dev/null -w "v1=%{http_code} " "http://{{ project_name }}-app-v0-1:8080/healthz" 2>/dev/null || true
+                curl -sf -o /dev/null -w "v2=%{http_code} " "http://{{ project_name }}-app-v0-2:8080/healthz" 2>/dev/null || true
+                echo ""
+                sleep 2
+              done
+          env:
+            - name: GATEWAY_URL
+              value: "{{ gateway_url | default('') }}"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

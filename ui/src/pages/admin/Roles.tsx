@@ -14,7 +14,7 @@ export function Roles() {
   const [error, setError] = useState('');
 
   const load = () => {
-    api.get<Role[]>('/api/admin/roles').then(setRoles).catch(() => {});
+    api.get<Role[]>('/api/admin/roles').then(setRoles).catch(e => console.warn(e));
   };
   useEffect(load, []);
 

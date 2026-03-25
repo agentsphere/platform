@@ -186,7 +186,16 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
 
     // Create registry auth Secret if registry is configured
     let registry_creds = if state.config.registry_url.is_some() {
-        match create_registry_secret(state, pipeline_id, auth_user_id, &meta.namespace).await {
+        match create_registry_secret(
+            state,
+            pipeline_id,
+            project_id,
+            &meta.project_name,
+            auth_user_id,
+            &meta.namespace,
+        )
+        .await
+        {
             Ok(creds) => Some(creds),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to create registry secret, continuing without");
@@ -554,7 +563,10 @@ async fn run_steps_dag(
             let registry_secret = registry_secret.map(String::from);
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .expect("pipeline concurrency semaphore closed unexpectedly");
                 let step_row = StepRow {
                     id: step_id,
                     step_order: 0, // not used in dispatch
@@ -796,6 +808,7 @@ async fn execute_single_step(
         git_ref: &pipeline.git_ref,
         registry_secret,
         git_auth_token: &pipeline.git_auth_token,
+        step_type: &step.step_type,
     });
 
     let step_svc = format!("pipeline/{}/{}", pipeline.project_name, step.name);
@@ -1162,6 +1175,8 @@ async fn cleanup_git_auth_token(state: &AppState, token_hash: &str) {
 async fn create_registry_secret(
     state: &AppState,
     pipeline_id: Uuid,
+    project_id: Uuid,
+    project_name: &str,
     triggered_by: Uuid,
     namespace: &str,
 ) -> Result<(String, String), PipelineError> {
@@ -1174,13 +1189,16 @@ async fn create_registry_secret(
     // Create a short-lived API token (1 hour) for the triggering user
     let (raw_token, token_hash) = token::generate_api_token();
 
+    let tag_pattern = format!("{project_name}/*");
     sqlx::query!(
-        r#"INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at)
-           VALUES ($1, $2, $3, $4, now() + interval '1 hour')"#,
+        r#"INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, project_id, registry_tag_pattern)
+           VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5, $6)"#,
         Uuid::new_v4(),
         triggered_by,
         format!("pipeline-{pipeline_id}"),
         token_hash,
+        project_id,
+        tag_pattern,
     )
     .execute(&state.pool)
     .await?;
@@ -1273,6 +1291,8 @@ struct PodSpecParams<'a> {
     registry_secret: Option<&'a str>,
     /// Short-lived API token for authenticating git clone via `GIT_ASKPASS`.
     git_auth_token: &'a str,
+    /// Step type — `imagebuild` steps need root (kaniko), others get hardened context.
+    step_type: &'a str,
 }
 
 /// Build the volumes and step container mounts for a pipeline pod.
@@ -1378,9 +1398,13 @@ fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
                 working_dir: Some("/workspace".into()),
                 env: Some(p.env_vars.to_vec()),
                 volume_mounts: Some(step_mounts),
-                // No restrictive security context on step containers — kaniko
-                // and other build tools need root + capabilities (CHOWN, etc.)
-                // to unpack base image layers and build containers.
+                // Imagebuild (kaniko) needs root + capabilities to unpack base
+                // image layers. All other step types get hardened context.
+                security_context: if p.step_type == "imagebuild" {
+                    None
+                } else {
+                    Some(container_security())
+                },
                 resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                     limits: Some(BTreeMap::from([
                         ("cpu".into(), Quantity("1".into())),
@@ -1833,6 +1857,7 @@ async fn execute_deploy_test_step(
         canary_image: None,
         commit_sha: pipeline.commit_sha.clone(),
         app_image: Some(app_image_ref),
+        gateway_url: None,
     };
     let rendered = crate::deployer::renderer::render(&manifest_content, &vars)
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -2222,7 +2247,7 @@ async fn execute_gitops_sync_inner(
     _pipeline_id: Uuid,
     project_id: Uuid,
     pipeline: &PipelineMeta,
-    step: &StepRow,
+    _step: &StepRow,
 ) -> Result<bool, PipelineError> {
     use sqlx::Row as _;
 
@@ -2275,7 +2300,7 @@ async fn execute_gitops_sync_inner(
 
     let ops_path = std::path::PathBuf::from(&ops_repo_path);
 
-    // 1. Copy files from code repo → ops repo
+    // 1. Copy files from code repo → ops repo (default branch — reconciler reads from here)
     if let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
         std::path::Path::new(repo_path),
         &ops_path,
@@ -2287,46 +2312,80 @@ async fn execute_gitops_sync_inner(
         tracing::warn!(error = %e, "failed to sync deploy/ to ops repo");
     }
 
-    // 2. Write platform.yaml to ops repo root
-    if let Some(ref yaml_content) = platform_yaml
-        && let Err(e) = crate::deployer::ops_repo::write_file_to_repo(
+    // Also sync to target branch if different (so eventbus reads platform.yaml from there)
+    if target_branch != ops_repo_branch
+        && let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
+            std::path::Path::new(repo_path),
+            &ops_path,
+            target_branch,
+            sha,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to sync deploy/ to ops repo target branch");
+    }
+
+    // 2. Write platform.yaml to BOTH default and target branches
+    if let Some(ref yaml_content) = platform_yaml {
+        if let Err(e) = crate::deployer::ops_repo::write_file_to_repo(
             &ops_path,
             &ops_repo_branch,
             "platform.yaml",
             yaml_content,
         )
         .await
+        {
+            tracing::warn!(error = %e, "failed to write platform.yaml to ops repo");
+        }
+        if target_branch != ops_repo_branch
+            && let Err(e) = crate::deployer::ops_repo::write_file_to_repo(
+                &ops_path,
+                target_branch,
+                "platform.yaml",
+                yaml_content,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write platform.yaml to target branch");
+        }
+    }
+
+    // 2b. Validate canary service refs against deploy manifests.
+    // Read from target_branch (staging/production) where files were synced, not default branch.
+    if let Some(ref pf) = platform_file
+        && let Some(ref deploy) = pf.deploy
     {
-        tracing::warn!(error = %e, "failed to write platform.yaml to ops repo");
+        let deploy_content =
+            crate::deployer::ops_repo::read_dir_yaml_at_ref(&ops_path, target_branch, "deploy/")
+                .await
+                .unwrap_or_default();
+        if let Err(e) =
+            super::definition::validate_canary_service_refs(&deploy.specs, &deploy_content)
+        {
+            tracing::warn!(error = %e, "canary service ref validation failed");
+        }
     }
 
     // 3. Build values (image refs + user variables)
     let registry = node_registry_url(&state.config).unwrap_or("localhost:5000");
-    let tag = sha;
+
+    // Read VERSION file from project repo for version-tagged image refs
+    let version_info =
+        crate::pipeline::trigger::read_version_at_ref(std::path::Path::new(repo_path), sha).await;
+
+    // Use version tag when available, fall back to commit SHA
+    let app_version = version_info
+        .as_ref()
+        .and_then(|vi| vi.images.get("app"))
+        .cloned();
+    let tag = app_version.as_deref().unwrap_or(sha);
     let image_ref = format!("{registry}/{project_name}/app:{tag}");
-
-    // Check if any build step was for canary
-    let step_config = step.step_config.as_ref();
-    let _ = step_config; // gitops config from step (copy list, etc.)
-
-    let has_canary = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pipeline_steps WHERE pipeline_id = (SELECT id FROM pipelines WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1) AND name ILIKE '%canary%' AND status = 'success'",
-    )
-    .bind(project_id)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0) > 0;
-
-    let canary_image_ref = format!("{registry}/{project_name}/canary:{tag}");
 
     let mut values = serde_json::json!({
         "image_ref": image_ref,
         "project_name": project_name,
         "environment": environment,
     });
-    if has_canary {
-        values["canary_image_ref"] = serde_json::Value::String(canary_image_ref);
-    }
 
     // 3b. Merge per-environment variables from code repo (deploy/variables_{env}.yaml)
     let var_path = platform_file
@@ -3254,6 +3313,7 @@ mod tests {
             git_ref: "refs/heads/main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         assert_eq!(pod.metadata.name.as_deref(), Some("pl-test-build"));
@@ -3303,6 +3363,7 @@ mod tests {
             git_ref: "refs/heads/feature-branch",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3337,6 +3398,7 @@ mod tests {
             git_ref: "refs/tags/v1.0",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3364,6 +3426,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3391,6 +3454,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -3415,6 +3479,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -3443,6 +3508,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -3465,6 +3531,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let labels = pod.metadata.labels.as_ref().unwrap();
@@ -3481,7 +3548,7 @@ mod tests {
             .and_then(|v| v.value.clone())
     }
 
-    /// Test helper: wraps `build_env_vars_core` with default trigger_type "push".
+    /// Test helper: wraps `build_env_vars_core` with default `trigger_type` "push".
     #[allow(clippy::too_many_arguments)]
     fn test_env_vars(
         pipeline_id: Uuid,
@@ -3780,6 +3847,7 @@ mod tests {
             git_ref: "main",
             registry_secret: Some("pl-registry-00000000"),
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3802,6 +3870,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3825,6 +3894,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -3848,6 +3918,7 @@ mod tests {
             git_ref: "main",
             registry_secret: Some("pl-registry-00000000"),
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -4070,6 +4141,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4091,6 +4163,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4112,6 +4185,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let init = &pod.spec.unwrap().init_containers.unwrap()[0];
@@ -4169,6 +4243,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4280,6 +4355,7 @@ mod tests {
             git_ref: "feat/$(malicious-cmd)",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let init = &pod.spec.unwrap().init_containers.unwrap()[0];
@@ -4316,6 +4392,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -4342,6 +4419,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();
@@ -4366,6 +4444,7 @@ mod tests {
             git_ref: "main",
             registry_secret: None,
             git_auth_token: "test-token",
+            step_type: "command",
         });
 
         let spec = pod.spec.unwrap();

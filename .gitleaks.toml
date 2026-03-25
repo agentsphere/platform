@@ -1,4 +1,12 @@
 [allowlist]
-paths = [
-  "hack/test-in-cluster.sh",
-]
+description = "Allow known dev-only test credentials"
+
+[[allowlist.rules]]
+description = "Dev-only PLATFORM_MASTER_KEY in test scripts"
+regex = '''[0-9a-f]{64}'''
+paths = ["hack/test-in-cluster\\.sh"]
+
+[[allowlist.rules]]
+description = "Dev-only database/minio credentials in test and kustomize files"
+regex = '''devdevdev|dev@.*:5432'''
+paths = ["hack/.*\\.sh", "deploy/base/.*\\.yaml"]

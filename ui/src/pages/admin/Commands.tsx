@@ -32,7 +32,7 @@ export function Commands() {
 
   const load = () => {
     api.get<ListResponse<Command>>(`/api/commands${qs({ limit: LIMIT, offset })}`)
-      .then(r => { setCommands(r.items); setTotal(r.total); }).catch(() => {});
+      .then(r => { setCommands(r.items); setTotal(r.total); }).catch(e => console.warn(e));
   };
   useEffect(load, [offset]);
 
@@ -56,7 +56,7 @@ export function Commands() {
       api.post<{ prompt: string }>('/api/commands/resolve', { input: `/${cmd.name}`, project_id: null })
         .then(r => setEditForm({ description: full.description, prompt_template: r.prompt, persistent_session: full.persistent_session }))
         .catch(() => setEditForm({ description: full.description, prompt_template: '', persistent_session: full.persistent_session }));
-    }).catch(() => {});
+    }).catch(e => console.warn(e));
   };
 
   const saveEdit = async (e: Event) => {

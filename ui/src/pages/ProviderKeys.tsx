@@ -93,17 +93,17 @@ export function ProviderKeys() {
 
   const load = () => {
     api.get<ProviderKeyMeta[]>('/api/users/me/provider-keys')
-      .then(setKeys).catch(() => {});
+      .then(setKeys).catch(e => console.warn(e));
   };
 
   const loadCliCreds = () => {
     api.get<CredentialStatus>('/api/auth/cli-credentials')
-      .then(setCliCreds).catch(() => {});
+      .then(setCliCreds).catch(e => console.warn(e));
   };
 
   const loadActive = () => {
     api.get<ActiveProviderInfo>('/api/users/me/active-provider')
-      .then(setActiveInfo).catch(() => {});
+      .then(setActiveInfo).catch(e => console.warn(e));
   };
 
   useEffect(() => { load(); loadCliCreds(); loadActive(); }, []);

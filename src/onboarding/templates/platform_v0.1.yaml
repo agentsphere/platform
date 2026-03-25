@@ -11,11 +11,6 @@ pipeline:
       imageName: app
       dockerfile: Dockerfile
 
-    - name: build-canary
-      type: imagebuild
-      imageName: canary
-      dockerfile: Dockerfile.canary
-
     - name: build-dev
       type: imagebuild
       imageName: dev
@@ -40,7 +35,7 @@ pipeline:
 
     - name: sync-ops-repo
       type: gitops_sync
-      depends_on: [build-app, build-canary]
+      depends_on: [build-app]
       only:
         events: [push]
         branches: ["main"]
@@ -69,15 +64,3 @@ deploy:
   variables:
     staging: deploy/variables_staging.yaml
     production: deploy/variables_prod.yaml
-  specs:
-    - name: api
-      type: canary
-      canary:
-        stable_service: platform-demo-app-stable
-        canary_service: platform-demo-app-canary
-        steps: [10, 25, 50, 100]
-        interval: 120
-        progress_gates:
-          - metric: error_rate
-            condition: lt
-            threshold: 0.05

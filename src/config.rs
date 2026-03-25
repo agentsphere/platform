@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code, clippy::struct_excessive_bools)] // fields consumed by modules 03-09
 pub struct Config {
     pub listen: String,
@@ -84,6 +84,10 @@ pub struct Config {
     pub preview_proxy_url: Option<String>,
     /// Maximum concurrent pipeline step pods per pipeline (default 4).
     pub pipeline_max_parallel: usize,
+    /// Name of the shared Gateway resource for traffic splitting (default "platform-gateway").
+    pub gateway_name: String,
+    /// Namespace where the shared Gateway lives (default: same as `platform_namespace`).
+    pub gateway_namespace: String,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -94,6 +98,36 @@ fn parse_cors_origins(s: &str) -> Vec<String> {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("database_url", &"[REDACTED]")
+            .field("valkey_url", &"[REDACTED]")
+            .field("minio_endpoint", &self.minio_endpoint)
+            .field("minio_access_key", &self.minio_access_key)
+            .field("minio_secret_key", &"[REDACTED]")
+            .field(
+                "master_key",
+                &self.master_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "smtp_password",
+                &self.smtp_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "admin_password",
+                &self.admin_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("dev_mode", &self.dev_mode)
+            .field("secure_cookies", &self.secure_cookies)
+            .field("pipeline_namespace", &self.pipeline_namespace)
+            .field("agent_namespace", &self.agent_namespace)
+            .field("platform_namespace", &self.platform_namespace)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -189,6 +223,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
+            gateway_name: env::var("PLATFORM_GATEWAY_NAME")
+                .unwrap_or_else(|_| "platform-gateway".into()),
+            gateway_namespace: env::var("PLATFORM_GATEWAY_NAMESPACE").unwrap_or_else(|_| {
+                env::var("PLATFORM_NAMESPACE").unwrap_or_else(|_| "platform".into())
+            }),
         }
     }
 
@@ -264,6 +303,8 @@ impl Config {
             session_idle_timeout_secs: 1800,
             preview_proxy_url: None,
             pipeline_max_parallel: 4,
+            gateway_name: "platform-gateway".into(),
+            gateway_namespace: "test-platform".into(),
         }
     }
 }
@@ -504,5 +545,42 @@ mod tests {
         let _ = config.admin_password;
         // cors_origins should be a Vec (empty or populated)
         let _ = config.cors_origins.len();
+    }
+
+    #[test]
+    fn config_debug_redacts_sensitive_fields() {
+        let config = Config {
+            database_url: "postgres://secret:password@db:5432/prod".into(),
+            valkey_url: "redis://:hunter2@valkey:6379".into(),
+            minio_secret_key: "super-secret-minio-key".into(),
+            master_key: Some("0123456789abcdef".into()),
+            smtp_password: Some("smtp-secret".into()),
+            admin_password: Some("admin-secret".into()),
+            ..Config::test_default()
+        };
+        let debug = format!("{config:?}");
+        // Sensitive values must NOT appear
+        assert!(!debug.contains("secret:password"), "database_url leaked");
+        assert!(!debug.contains("hunter2"), "valkey_url leaked");
+        assert!(
+            !debug.contains("super-secret-minio-key"),
+            "minio_secret_key leaked"
+        );
+        assert!(!debug.contains("0123456789abcdef"), "master_key leaked");
+        assert!(!debug.contains("smtp-secret"), "smtp_password leaked");
+        assert!(!debug.contains("admin-secret"), "admin_password leaked");
+        // Redaction markers must appear
+        assert!(debug.contains("[REDACTED]"), "missing [REDACTED] markers");
+    }
+
+    #[test]
+    fn config_debug_shows_non_sensitive_fields() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("127.0.0.1:0"), "listen should be visible");
+        assert!(
+            debug.contains("dev_mode"),
+            "dev_mode field should be visible"
+        );
     }
 }

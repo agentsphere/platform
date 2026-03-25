@@ -232,6 +232,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
+  try {
   switch (name) {
     case "get_project": {
       const pid = args.project_id || PROJECT_ID;
@@ -389,6 +390,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
+  }
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Error: ${err.message}` }],
+      isError: true,
+    };
   }
 });
 

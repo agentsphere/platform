@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn validate_env_vars_empty_value() {
         let vars = HashMap::from([
-            ("AWS_ACCESS_KEY_ID".into(), "".into()),
+            ("AWS_ACCESS_KEY_ID".into(), String::new()),
             ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
         ]);
         assert!(validate_env_vars("bedrock", &vars).is_err());

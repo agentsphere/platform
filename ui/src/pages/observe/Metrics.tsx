@@ -44,13 +44,13 @@ export function Metrics() {
         setNames(unique);
         if (unique.length > 0 && !unique.includes(selectedMetric)) setSelectedMetric(unique[0]);
       })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, [selectedProject]);
 
   useEffect(() => {
     api.get<ListResponse<Project>>('/api/projects?limit=100')
       .then(r => setProjects(r.items))
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, []);
 
   const loadData = () => {

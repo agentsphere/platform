@@ -80,7 +80,7 @@ function SystemLogs() {
   useEffect(() => {
     api.get('/api/observe/logs?source=system&range=1h&limit=30')
       .then((r: any) => setLogs(r.items || []))
-      .catch(() => {})
+      .catch(e => console.warn(e))
       .finally(() => setLoading(false));
   }, []);
 
@@ -135,20 +135,17 @@ export function Health() {
       .then(setData)
       .catch(e => setError(e.message || 'Failed to load health data'));
 
-    // SSE for real-time updates
-    const token = localStorage.getItem('token');
-    if (token) {
-      const es = new EventSource(`/api/health/stream?token=${encodeURIComponent(token)}`);
-      es.addEventListener('health', (e: any) => {
-        try {
-          setData(JSON.parse(e.data));
-        } catch { /* ignore parse errors */ }
-      });
-      es.onerror = () => {
-        // SSE may fail if not admin or no Valkey — non-fatal
-      };
-      eventSourceRef.current = es;
-    }
+    // SSE for real-time updates (cookies sent automatically via same-origin)
+    const es = new EventSource('/api/health/stream');
+    es.addEventListener('health', (e: any) => {
+      try {
+        setData(JSON.parse(e.data));
+      } catch { /* ignore parse errors */ }
+    });
+    es.onerror = () => {
+      // SSE may fail if not admin or no Valkey — non-fatal
+    };
+    eventSourceRef.current = es;
 
     return () => {
       eventSourceRef.current?.close();

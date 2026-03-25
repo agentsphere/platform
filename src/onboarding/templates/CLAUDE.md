@@ -16,7 +16,8 @@ requirements.txt         — Python dependencies
 Dockerfile               — Production image (uvicorn)
 Dockerfile.test          — Test runner image (pytest)
 Dockerfile.dev           — Agent dev environment
-deploy/production.yaml   — K8s deployment (Postgres + Valkey + App)
+VERSION                  — Image version tracking (app=0.1.0)
+deploy/                  — K8s deployment manifests (versioned)
 .platform.yaml           — CI/CD pipeline definition
 ```
 

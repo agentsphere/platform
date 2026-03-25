@@ -15,13 +15,13 @@ export function IssueDetail({ id: projectId, number: num }: Props) {
 
   useEffect(() => {
     if (!projectId || !num) return;
-    api.get<Issue>(`/api/projects/${projectId}/issues/${num}`).then(setIssue).catch(() => {});
+    api.get<Issue>(`/api/projects/${projectId}/issues/${num}`).then(setIssue).catch(e => console.warn(e));
     loadComments();
   }, [projectId, num]);
 
   const loadComments = () => {
     api.get<ListResponse<Comment>>(`/api/projects/${projectId}/issues/${num}/comments?limit=100`)
-      .then(r => setComments(r.items)).catch(() => {});
+      .then(r => setComments(r.items)).catch(e => console.warn(e));
   };
 
   const addComment = async (e: Event) => {

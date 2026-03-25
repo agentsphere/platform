@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 /// Build a state WITHOUT running full bootstrap — only seeds permissions/roles, no admin user.
 /// This lets us test the setup flow (which requires zero users).
+#[allow(clippy::too_many_lines)]
 async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -95,6 +96,8 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         pipeline_max_parallel: 4,
         mcp_servers_tarball: "/tmp/mcp-servers.tar.gz".into(),
         seed_commands_path: "/tmp/seed-commands".into(),
+        gateway_name: "platform-gateway".into(),
+        gateway_namespace: "envoy-gateway-system".into(),
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");

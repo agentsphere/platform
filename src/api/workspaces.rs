@@ -267,9 +267,18 @@ async fn delete_workspace(
         return Err(ApiError::Forbidden);
     }
 
+    // Collect members BEFORE deletion so we can invalidate their permission caches
+    let members = service::list_members(&state.pool, id).await?;
+
     let deleted = service::delete_workspace(&state.pool, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("workspace".into()));
+    }
+
+    // Invalidate permission caches for all workspace members — workspace-derived
+    // project permissions must be revoked immediately, not after cache TTL.
+    for member in &members {
+        let _ = resolver::invalidate_permissions(&state.valkey, member.user_id, None).await;
     }
 
     write_audit(
@@ -315,6 +324,22 @@ async fn add_member(
     if !matches!(role, "admin" | "member") {
         return Err(ApiError::BadRequest(
             "role must be 'admin' or 'member'".into(),
+        ));
+    }
+
+    // Prevent demoting the workspace owner via the upsert
+    let existing_role = sqlx::query_scalar!(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        id,
+        body.user_id,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    if existing_role.as_deref() == Some("owner") {
+        return Err(ApiError::BadRequest(
+            "cannot modify workspace owner role".into(),
         ));
     }
 

@@ -23,7 +23,7 @@ fn compute_signature(payload: &[u8], secret: &str) -> Option<String> {
 /// Deliver a JSON payload to a webhook URL with optional HMAC-SHA256 signing.
 ///
 /// Reuses the shared webhook HTTP client and SSRF protection from `api::webhooks`.
-#[tracing::instrument(skip(payload, secret), err)]
+#[tracing::instrument(skip(url, payload, secret), err)]
 pub async fn deliver(
     url: &str,
     payload: &serde_json::Value,
@@ -34,10 +34,7 @@ pub async fn deliver(
 
     // Acquire concurrency permit
     let _permit = WEBHOOK_SEMAPHORE.try_acquire().map_err(|_| {
-        tracing::warn!(
-            url,
-            "notification webhook dropped: concurrency limit reached"
-        );
+        tracing::warn!("notification webhook dropped: concurrency limit reached");
         ApiError::ServiceUnavailable("webhook delivery limit reached".into())
     })?;
 
@@ -60,14 +57,14 @@ pub async fn deliver(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let success = resp.status().is_success();
-            tracing::info!(url, status, "notification webhook delivered");
+            tracing::info!(status, "notification webhook delivered");
             Ok(DeliveryResult {
                 status_code: status,
                 success,
             })
         }
         Err(e) => {
-            tracing::warn!(url, error = %e, "notification webhook delivery failed");
+            tracing::warn!(error = %e, "notification webhook delivery failed");
             Err(ApiError::Internal(anyhow::anyhow!(
                 "webhook delivery failed: {e}"
             )))

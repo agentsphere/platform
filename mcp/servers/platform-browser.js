@@ -17,7 +17,12 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 import { chromium } from "playwright-core";
 
 const CDP_URL = process.env.BROWSER_CDP_URL || "http://localhost:9222";
-const ALLOWED_ORIGINS = JSON.parse(process.env.BROWSER_ALLOWED_ORIGINS || "[]");
+let ALLOWED_ORIGINS = [];
+try {
+  ALLOWED_ORIGINS = JSON.parse(process.env.BROWSER_ALLOWED_ORIGINS || "[]");
+} catch {
+  console.error("Invalid BROWSER_ALLOWED_ORIGINS JSON, using empty list");
+}
 
 // ---------------------------------------------------------------------------
 // URL validation

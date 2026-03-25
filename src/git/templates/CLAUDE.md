@@ -493,18 +493,23 @@ Evaluate in your app via `POST /api/flags/evaluate`:
 {"project_id": "...", "keys": ["my_feature"], "user_id": "optional"}
 ```
 
+### Versioned Deployments
+
+Use a `VERSION` file in the project root to track image versions:
+```
+app=0.1.0
+```
+
+The platform uses this to:
+- Tag container images with the version (e.g. `app:0.1.0`)
+- Create annotated git tags on main (e.g. `v0.1.0`)
+- Auto-bump patch if you forget to update VERSION before opening an MR
+
 ### Canary Deployments
 
-Split deployments into stable/canary variants:
-1. Create `deploy/deployment-stable.yaml` and `deploy/deployment-canary.yaml`
-2. Add `Dockerfile.canary` for the canary image
-3. Configure `.platform.yaml` with `deploy.specs[].type: canary`
+Create versioned deployments for canary rollouts:
+1. Create `deploy/deployment-v0.1.yaml` (current) and `deploy/deployment-v0.2.yaml` (new)
+2. Bump `VERSION` to the new version
+3. Configure `.platform.yaml` with `deploy.specs[].type: canary` referencing versioned services
 
-Traffic is shifted automatically: 10% → 25% → 50% → 100%.
-
-### Staging Promotion
-
-When `deploy.enable_staging: true`:
-- Pipeline commits to `staging` branch first
-- Promote to production: `POST /api/projects/{id}/promote-staging`
-- Check status: `GET /api/projects/{id}/staging-status`
+Traffic is shifted automatically: 10% → 25% → 50% → 100%. After promotion, the old version is downscaled.

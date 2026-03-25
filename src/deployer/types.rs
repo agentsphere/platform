@@ -54,6 +54,22 @@ impl ReleasePhase {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "progressing" => Some(Self::Progressing),
+            "holding" => Some(Self::Holding),
+            "paused" => Some(Self::Paused),
+            "promoting" => Some(Self::Promoting),
+            "completed" => Some(Self::Completed),
+            "rolling_back" => Some(Self::RollingBack),
+            "rolled_back" => Some(Self::RolledBack),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -181,7 +197,7 @@ impl AnalysisVerdict {
     }
 
     pub fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        !matches!(self, Self::Running | Self::Inconclusive)
     }
 }
 

@@ -20,7 +20,7 @@ export function Projects() {
   const load = () => {
     api.get<ListResponse<Project>>(`/api/projects${qs({ limit: LIMIT, offset, search: search || undefined })}`)
       .then(r => { setProjects(r.items); setTotal(r.total); })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   };
 
   useEffect(load, [offset, search]);

@@ -71,7 +71,7 @@ spec:
         - operator: Exists
       containers:
         - name: socat
-          image: alpine/socat:latest
+          image: alpine/socat:1.8.0.1
           args:
             - "TCP-LISTEN:${REGISTRY_NODE_PORT},fork,reuseaddr"
             - "TCP:${REGISTRY_BACKEND_HOST}:${REGISTRY_BACKEND_PORT}"

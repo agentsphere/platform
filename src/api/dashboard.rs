@@ -11,7 +11,7 @@ use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
 use crate::store::AppState;
 
-use super::helpers::ListResponse;
+use super::helpers::{ListResponse, require_admin};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -81,8 +81,10 @@ pub fn router() -> Router<AppState> {
 
 async fn dashboard_stats(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
 ) -> Result<Json<DashboardStats>, ApiError> {
+    require_admin(&state, &auth).await?;
+
     let projects = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE is_active = true")
         .fetch_one(&state.pool)
         .await
@@ -138,9 +140,11 @@ async fn dashboard_stats(
 
 async fn list_audit_log(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Query(params): Query<AuditLogParams>,
 ) -> Result<Json<ListResponse<AuditLogEntry>>, ApiError> {
+    require_admin(&state, &auth).await?;
+
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 

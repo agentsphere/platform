@@ -118,6 +118,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const p = args.project_id || pid();
 
+  try {
   switch (name) {
     case "list_pipelines": {
       const data = await apiGet(`/api/projects/${p}/pipelines`, {
@@ -163,6 +164,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
+  }
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Error: ${err.message}` }],
+      isError: true,
+    };
   }
 });
 

@@ -23,7 +23,7 @@ async fn insert_session(
     insert_session_opt(pool, Some(project_id), user_id, status, session_namespace).await
 }
 
-/// Insert a session with optional project_id (NULL for project-less sessions).
+/// Insert a session with optional `project_id` (NULL for project-less sessions).
 async fn insert_session_opt(
     pool: &PgPool,
     project_id: Option<Uuid>,
@@ -201,7 +201,7 @@ async fn proxy_backend_unreachable_returns_502(pool: PgPool) {
     let project_id = create_project(&app, &admin_token, "preview-502", "private").await;
     let session_id = insert_session(&pool, project_id, admin_id, "running", Some("valid-ns")).await;
 
-    let (status, body) = helpers::get_json(
+    let (status, _body) = helpers::get_json(
         &app,
         &admin_token,
         &format!("/preview/{session_id}/index.html"),

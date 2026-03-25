@@ -144,31 +144,22 @@ const TOOLS = [
         title: { type: "string", description: "MR title (1-500 chars)" },
         body: { type: "string", description: "MR description (markdown)" },
         source_branch: { type: "string", description: "Source branch name" },
-        target_branch: { type: "string", description: "Target branch (defaults to project default)" },
-        labels: {
-          type: "array",
-          items: { type: "string" },
-          description: "Labels to apply",
-        },
+        target_branch: { type: "string", description: "Target branch" },
         project_id: { type: "string", description: "Project UUID (defaults to current)" },
       },
-      required: ["title", "source_branch"],
+      required: ["title", "source_branch", "target_branch"],
     },
   },
   {
     name: "update_merge_request",
-    description: "Update a merge request (title, body, labels).",
+    description: "Update a merge request (title, body, status).",
     inputSchema: {
       type: "object",
       properties: {
         number: { type: "integer", description: "MR number" },
         title: { type: "string", description: "New title" },
         body: { type: "string", description: "New body" },
-        labels: {
-          type: "array",
-          items: { type: "string" },
-          description: "New labels",
-        },
+        status: { type: "string", description: "New status (open/closed)" },
         project_id: { type: "string", description: "Project UUID (defaults to current)" },
       },
       required: ["number"],
@@ -207,6 +198,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const p = args.project_id || pid();
 
+  try {
   switch (name) {
     // --- Issues ---
     case "list_issues": {
@@ -264,7 +256,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           body: args.body,
           source_branch: args.source_branch,
           target_branch: args.target_branch,
-          labels: args.labels,
         },
       });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -273,7 +264,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const body = {};
       if (args.title !== undefined) body.title = args.title;
       if (args.body !== undefined) body.body = args.body;
-      if (args.labels !== undefined) body.labels = args.labels;
+      if (args.status !== undefined) body.status = args.status;
       const data = await apiPatch(`/api/projects/${p}/merge-requests/${args.number}`, { body });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
@@ -289,6 +280,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
+  }
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Error: ${err.message}` }],
+      isError: true,
+    };
   }
 });
 

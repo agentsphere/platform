@@ -87,6 +87,10 @@ SESSION_ID=${SESSION_ID:-}
 PLATFORM_API_URL=${PLATFORM_API_URL:-}
 PLATFORM_API_TOKEN=${PLATFORM_API_TOKEN:-}
 ENVEOF
+chmod 600 /workspace/.platform/.env
+
+# Ensure platform secrets dir is never committed
+grep -qxF '.platform/' /workspace/.gitignore 2>/dev/null || echo '.platform/' >> /workspace/.gitignore
 
 # ---------------------------------------------------------------------------
 # Run Claude Code with MCP config, streaming JSON output
@@ -99,7 +103,7 @@ EXIT_CODE=$?
 # After claude exits, push whatever it did
 # ---------------------------------------------------------------------------
 if [ -n "$(git status --porcelain)" ]; then
-  git add -A
+  git add -A -- ':!.platform/'
   git commit -m "agent session ${SESSION_ID:-unknown}"
   git push origin "${BRANCH:-agent/${SESSION_ID:-unknown}}"
 fi

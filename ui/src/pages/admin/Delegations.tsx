@@ -11,7 +11,7 @@ export function Delegations() {
   const [error, setError] = useState('');
 
   const load = () => {
-    api.get<Delegation[]>('/api/admin/delegations').then(setDelegations).catch(() => {});
+    api.get<Delegation[]>('/api/admin/delegations').then(setDelegations).catch(e => console.warn(e));
   };
   useEffect(load, []);
 

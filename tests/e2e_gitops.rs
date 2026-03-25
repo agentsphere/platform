@@ -1,4 +1,4 @@
-//! E2E tests for GitOps deploy, staging promotion, and OTLP observability.
+//! E2E tests for `GitOps` deploy, staging promotion, and OTLP observability.
 //!
 //! These tests exercise multi-step user journeys spanning ops-repo commits,
 //! the deployer reconciler, staging promotion, and OTLP ingest+query.
@@ -190,7 +190,7 @@ async fn post_protobuf(
     (status, bytes)
 }
 
-/// GET JSON helper that works with a custom Router (not from e2e_helpers).
+/// GET JSON helper that works with a custom Router (not from `e2e_helpers`).
 async fn get_json_app(app: &Router, token: &str, path: &str) -> (StatusCode, serde_json::Value) {
     use axum::body::Body;
     use axum::http::Request;
@@ -218,7 +218,7 @@ async fn get_json_app(app: &Router, token: &str, path: &str) -> (StatusCode, ser
 // Test 1: GitOps deploy and reconcile
 // ---------------------------------------------------------------------------
 
-/// Full GitOps flow: commit to ops repo -> OpsRepoUpdated event -> reconciler
+/// Full `GitOps` flow: commit to ops repo -> `OpsRepoUpdated` event -> reconciler
 /// creates release -> applies manifests -> deployment reaches completed state.
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires Kind cluster"]
@@ -256,7 +256,7 @@ async fn gitops_deploy_and_reconcile(pool: PgPool) {
     let namespace = state.config.project_namespace(&ns_slug, "prod");
 
     // 4. Write nginx deployment manifest to ops repo
-    let manifest = r#"apiVersion: apps/v1
+    let manifest = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gitops-e2e-app
@@ -275,7 +275,7 @@ spec:
           image: nginx:alpine
           ports:
             - containerPort: 80
-"#;
+";
     platform::deployer::ops_repo::write_file_to_repo(
         &ops_path,
         &ops_branch,
@@ -328,9 +328,10 @@ spec:
     // 9. Poll release phase until completed
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            panic!("release did not complete within 120s");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "release did not complete within 120s"
+        );
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")

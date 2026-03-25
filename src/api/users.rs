@@ -38,6 +38,7 @@ pub struct UpdateUserRequest {
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub password: Option<String>,
+    pub current_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,6 +512,21 @@ async fn update_user(
     }
     if let Some(ref pw) = body.password {
         validation::check_length("password", pw, 8, 1024)?;
+        // Non-admin users changing their own password must verify current password
+        if auth.user_id == id {
+            let cp = body
+                .current_password
+                .as_deref()
+                .ok_or_else(|| ApiError::BadRequest("current_password is required".into()))?;
+            let current_hash: String =
+                sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&state.pool)
+                    .await?;
+            if !password::verify_password(cp, &current_hash) {
+                return Err(ApiError::BadRequest("current password is incorrect".into()));
+            }
+        }
     }
 
     let password_hash = match &body.password {

@@ -160,6 +160,10 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         pipeline_max_parallel: 4,
         mcp_servers_tarball: std::env::var("PLATFORM_MCP_SERVERS_TARBALL")
             .map_or_else(|_| "/tmp/mcp-servers.tar.gz".into(), PathBuf::from),
+        gateway_name: std::env::var("PLATFORM_GATEWAY_NAME")
+            .unwrap_or_else(|_| "platform-gateway".into()),
+        gateway_namespace: std::env::var("PLATFORM_GATEWAY_NAMESPACE")
+            .unwrap_or_else(|_| "envoy-gateway-system".into()),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)

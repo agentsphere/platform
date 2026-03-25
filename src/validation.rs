@@ -9,6 +9,15 @@ pub fn check_length(field: &str, value: &str, min: usize, max: usize) -> Result<
             "{field} must be between {min} and {max} characters (got {len})"
         )));
     }
+    // Reject null bytes and control characters (allow \t, \n, \r for bodies/descriptions)
+    if value
+        .bytes()
+        .any(|b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{field}: contains control characters"
+        )));
+    }
     Ok(())
 }
 
@@ -21,7 +30,7 @@ pub fn check_name(value: &str) -> Result<(), ApiError> {
     }
     if !value
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(ApiError::BadRequest(
             "name must contain only alphanumeric characters, hyphens, underscores, or dots".into(),
@@ -171,6 +180,28 @@ pub fn check_container_image(image: &str) -> Result<(), ApiError> {
     }
 
     // Must contain at least one alphanumeric character
+    if !image.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err(ApiError::BadRequest(
+            "image: must contain alphanumeric characters".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Like [`check_container_image`] but allows `$` for K8s env var substitution
+/// (e.g., `$REGISTRY/$PROJECT/app:$COMMIT_SHA`). Used in pipeline definitions
+/// where images are template strings resolved by K8s, not executed in a shell.
+pub fn check_pipeline_image(image: &str) -> Result<(), ApiError> {
+    check_length("image", image, 1, 500)?;
+
+    let forbidden = [';', '&', '|', '`', '\'', '"', '\\', '\n', '\r', ' ', '\t'];
+    if image.chars().any(|c| forbidden.contains(&c)) {
+        return Err(ApiError::BadRequest(
+            "image: contains forbidden characters".into(),
+        ));
+    }
+
     if !image.chars().any(|c| c.is_ascii_alphanumeric()) {
         return Err(ApiError::BadRequest(
             "image: must contain alphanumeric characters".into(),
@@ -334,15 +365,30 @@ mod tests {
 
     #[test]
     fn check_name_rejects_unicode_alphanumeric() {
-        // is_alphanumeric() is Unicode-aware: 'é' passes it, but we only want ASCII
-        // This test documents the current behavior
-        let result = check_name("café");
-        // 'é' is alphanumeric in Unicode, so current impl allows it
-        // If this is undesired, the check should use is_ascii_alphanumeric()
-        assert!(
-            result.is_ok(),
-            "current impl allows Unicode alphanumeric: {result:?}"
-        );
+        // A12: check_name now uses is_ascii_alphanumeric() — Unicode chars rejected
+        assert!(check_name("café").is_err());
+        assert!(check_name("tëst").is_err());
+        // ASCII names still pass
+        assert!(check_name("test-name_v1.0").is_ok());
+    }
+
+    #[test]
+    fn check_length_rejects_null_bytes() {
+        // A13: null bytes and control chars rejected
+        assert!(check_length("f", "ab\0cd", 1, 100).is_err());
+    }
+
+    #[test]
+    fn check_length_rejects_control_chars() {
+        assert!(check_length("f", "ab\x01cd", 1, 100).is_err());
+    }
+
+    #[test]
+    fn check_length_allows_newlines_tabs() {
+        // Newlines and tabs are valid in bodies/descriptions
+        assert!(check_length("f", "line1\nline2", 1, 100).is_ok());
+        assert!(check_length("f", "col1\tcol2", 1, 100).is_ok());
+        assert!(check_length("f", "line\r\n", 1, 100).is_ok());
     }
 
     // -----------------------------------------------------------------------

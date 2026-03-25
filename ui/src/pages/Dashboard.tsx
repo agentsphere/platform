@@ -25,7 +25,7 @@ export function Dashboard() {
       .catch(() => setTotal(0));
     api.get<DashboardStats>('/api/dashboard/stats')
       .then(setStats)
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, []);
 
   // Still loading

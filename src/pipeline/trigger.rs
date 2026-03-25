@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use sqlx::PgPool;
@@ -31,6 +32,67 @@ pub struct MrTriggerParams {
     pub source_branch: String,
     pub commit_sha: Option<String>,
     pub action: String,
+}
+
+/// Parsed VERSION file contents.
+#[derive(Debug, Clone)]
+pub struct VersionInfo {
+    /// Mapping of image name → semver version (e.g. "app" → "0.1.0").
+    pub images: BTreeMap<String, String>,
+    /// Raw file content for storage in the pipeline DB row.
+    pub raw: String,
+}
+
+/// Parse a VERSION file into a map of image name → version.
+///
+/// Format: `key=major.minor.patch` lines. Lines starting with `#` are comments.
+/// Blank lines are skipped. Returns error for invalid formats.
+pub fn parse_version_file(content: &str) -> Result<BTreeMap<String, String>, PipelineError> {
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "Invalid VERSION file line: expected key=value, got: {trimmed}"
+            )));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if !is_valid_semver(value) {
+            return Err(PipelineError::InvalidDefinition(format!(
+                "Invalid version format in VERSION file: expected major.minor.patch, got: {value}"
+            )));
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
+/// Check if a string is valid strict semver (major.minor.patch, all numeric).
+fn is_valid_semver(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Increment the patch component of a semver version string.
+/// `"0.1.0"` → `"0.1.1"`.
+pub fn increment_patch(version: &str) -> Result<String, PipelineError> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3 {
+        return Err(PipelineError::InvalidDefinition(format!(
+            "Cannot increment non-semver version: {version}"
+        )));
+    }
+    let patch: u64 = parts[2].parse().map_err(|_| {
+        PipelineError::InvalidDefinition(format!("Invalid patch version: {}", parts[2]))
+    })?;
+    Ok(format!("{}.{}.{}", parts[0], parts[1], patch + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -78,9 +140,25 @@ pub async fn on_push(
         "push",
         &def,
         dev_dockerfile,
-        version.as_deref(),
+        version.as_ref(),
     )
     .await?;
+
+    // Create annotated git tags for versioned pushes to main
+    if (params.branch == "main" || params.branch == "master")
+        && let Some(ref vi) = version
+    {
+        for ver in vi.images.values() {
+            let tag_name = format!("v{ver}");
+            create_annotated_tag(
+                &params.repo_path,
+                &tag_name,
+                params.commit_sha.as_deref().unwrap_or("HEAD"),
+                &format!("Release {ver}"),
+            )
+            .await;
+        }
+    }
 
     tracing::info!(pipeline_id = %pipeline_id, ?dev_dockerfile, "pipeline triggered by push");
     Ok(Some(pipeline_id))
@@ -91,6 +169,10 @@ pub async fn on_push(
 // ---------------------------------------------------------------------------
 
 /// Handle a merge request event: read `.platform.yaml`, check trigger match, create pipeline + steps.
+///
+/// Safety-net: if the VERSION file on the source branch is identical to the target branch,
+/// auto-increment the patch version and commit to the source branch so the developer
+/// doesn't forget to bump.
 #[tracing::instrument(skip(pool, params), fields(project_id = %params.project_id, source_branch = %params.source_branch), err)]
 pub async fn on_mr(pool: &PgPool, params: &MrTriggerParams) -> Result<Option<Uuid>, PipelineError> {
     let Some(yaml) =
@@ -105,18 +187,54 @@ pub async fn on_mr(pool: &PgPool, params: &MrTriggerParams) -> Result<Option<Uui
         return Ok(None);
     }
 
+    // Safety-net auto-bump: compare VERSION on source vs target (main)
+    let mut version = read_version_at_ref(&params.repo_path, &params.source_branch).await;
+    let mut commit_sha = params.commit_sha.clone();
+    if let Some(ref source_vi) = version {
+        let target_vi = read_version_at_ref(&params.repo_path, "main").await;
+        if let Some(target_vi) = target_vi {
+            // Check if all versions are identical — agent forgot to bump
+            if source_vi.raw == target_vi.raw {
+                tracing::info!(
+                    source_branch = %params.source_branch,
+                    "VERSION identical to main, auto-bumping patch"
+                );
+                match auto_bump_version(&params.repo_path, &params.source_branch, &source_vi.images)
+                    .await
+                {
+                    Ok((bumped_vi, new_sha)) => {
+                        // Post MR comment about the auto-bump (best-effort)
+                        if let Some(first_ver) = bumped_vi.images.values().next() {
+                            post_auto_bump_comment(
+                                pool,
+                                params.project_id,
+                                &params.source_branch,
+                                first_ver,
+                            )
+                            .await;
+                        }
+                        version = Some(bumped_vi);
+                        commit_sha = Some(new_sha);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-bump VERSION failed, continuing with original");
+                    }
+                }
+            }
+        }
+    }
+
     let git_ref = format!("refs/heads/{}", params.source_branch);
-    let version = read_version_at_ref(&params.repo_path, &params.source_branch).await;
     let pipeline_id = create_pipeline_with_steps(
         pool,
         params.project_id,
         &git_ref,
-        params.commit_sha.as_deref(),
+        commit_sha.as_deref(),
         params.user_id,
         "mr",
         &def,
         None,
-        version.as_deref(),
+        version.as_ref(),
     )
     .await?;
 
@@ -166,7 +284,7 @@ pub async fn on_tag(
         "tag",
         &def,
         None,
-        version.as_deref(),
+        version.as_ref(),
     )
     .await?;
 
@@ -210,7 +328,7 @@ pub async fn on_api(
         "api",
         &def,
         None,
-        version.as_deref(),
+        version.as_ref(),
     )
     .await
 }
@@ -233,7 +351,7 @@ async fn create_pipeline_with_steps(
     trigger_type: &str,
     def: &PipelineDefinition,
     dev_image_dockerfile: Option<&str>,
-    version: Option<&str>,
+    version: Option<&VersionInfo>,
 ) -> Result<Uuid, PipelineError> {
     let mut tx = pool.begin().await?;
 
@@ -248,7 +366,7 @@ async fn create_pipeline_with_steps(
         git_ref,
         commit_sha,
         triggered_by,
-        version,
+        version.map(|v| v.raw.as_str()),
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -279,11 +397,29 @@ async fn create_pipeline_with_steps(
             super::definition::StepKind::ImageBuild => {
                 let image_name = step.image_name.as_deref().unwrap_or("app");
                 let dockerfile = step.dockerfile.as_deref().unwrap_or("Dockerfile");
+
+                // Version tag: if VERSION maps this image, add a second --destination
+                let version_dest = version
+                    .and_then(|vi| vi.images.get(image_name))
+                    .map(|ver| {
+                        let short_sha = commit_sha.map_or("unknown", |s| &s[..s.len().min(8)]);
+                        if trigger_type == "push" {
+                            format!(
+                                " --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/{image_name}:{ver}"
+                            )
+                        } else {
+                            format!(
+                                " --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/{image_name}:{ver}-rc-{short_sha}"
+                            )
+                        }
+                    })
+                    .unwrap_or_default();
+
                 let kaniko_cmd = format!(
                     "/kaniko/executor \
                      --context=dir:///workspace \
                      --dockerfile={dockerfile} \
-                     --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/{image_name}:${{COMMIT_SHA}} \
+                     --destination=${{REGISTRY}}/${{PLATFORM_PROJECT_NAME}}/{image_name}:${{COMMIT_SHA}}{version_dest} \
                      --build-arg=PLATFORM_RUNNER_IMAGE=${{REGISTRY}}/platform-runner:latest \
                      --insecure --insecure-registry=${{REGISTRY}} \
                      --insecure-pull \
@@ -457,14 +593,22 @@ pub async fn read_dir_at_ref(repo_path: &Path, git_ref: &str, dir_path: &str) ->
 }
 
 /// Read the VERSION file from a git repo at a given ref.
-/// Returns the trimmed contents, or None if the file doesn't exist.
-pub async fn read_version_at_ref(repo_path: &Path, git_ref: &str) -> Option<String> {
+/// Returns parsed `VersionInfo`, or None if the file doesn't exist or is invalid.
+pub async fn read_version_at_ref(repo_path: &Path, git_ref: &str) -> Option<VersionInfo> {
     let content = read_file_at_ref(repo_path, git_ref, "VERSION").await?;
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+        return None;
+    }
+    match parse_version_file(&trimmed) {
+        Ok(images) => Some(VersionInfo {
+            images,
+            raw: trimmed,
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse VERSION file");
+            None
+        }
     }
 }
 
@@ -483,6 +627,205 @@ async fn get_ref_sha(repo_path: &Path, git_ref: &str) -> Option<String> {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git tag + auto-bump helpers
+// ---------------------------------------------------------------------------
+
+/// Create an annotated git tag on a commit. Best-effort — logs warnings on failure.
+async fn create_annotated_tag(repo_path: &Path, tag_name: &str, commit_sha: &str, message: &str) {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .env("GIT_COMMITTER_NAME", "Platform")
+        .env("GIT_COMMITTER_EMAIL", "platform@localhost")
+        .args(["tag", "-a", tag_name, "-m", message, commit_sha])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(%tag_name, %commit_sha, "annotated git tag created");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // Tag already exists is not an error worth warning about
+            if stderr.contains("already exists") {
+                tracing::debug!(%tag_name, "git tag already exists, skipping");
+            } else {
+                tracing::warn!(%tag_name, %stderr, "failed to create annotated git tag");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %tag_name, "git tag command failed");
+        }
+    }
+}
+
+/// Auto-bump VERSION file on a feature branch when it matches main.
+///
+/// Creates a direct commit on the branch (bypassing hooks) with the bumped version.
+/// Returns the new `VersionInfo` and the new commit SHA.
+async fn auto_bump_version(
+    repo_path: &Path,
+    branch: &str,
+    current_images: &BTreeMap<String, String>,
+) -> Result<(VersionInfo, String), PipelineError> {
+    // Bump all image versions
+    let mut bumped: BTreeMap<String, String> = BTreeMap::new();
+    let mut raw_lines = Vec::new();
+    for (name, ver) in current_images {
+        let new_ver = increment_patch(ver)?;
+        raw_lines.push(format!("{name}={new_ver}"));
+        bumped.insert(name.clone(), new_ver);
+    }
+    let new_raw = raw_lines.join("\n");
+
+    // Write the bumped VERSION via a temporary worktree
+    let worktree_dir = repo_path
+        .parent()
+        .unwrap_or(repo_path)
+        .join(format!("_autobump_{}", Uuid::new_v4()));
+
+    // Prune stale worktrees
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "prune"])
+        .output()
+        .await;
+
+    let wt = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "add"])
+        .arg(&worktree_dir)
+        .arg(branch)
+        .output()
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    if !wt.status.success() {
+        let stderr = String::from_utf8_lossy(&wt.stderr);
+        return Err(PipelineError::Other(anyhow::anyhow!(
+            "failed to create worktree for auto-bump: {stderr}"
+        )));
+    }
+
+    // Write VERSION file
+    tokio::fs::write(worktree_dir.join("VERSION"), format!("{new_raw}\n"))
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // Stage and commit
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree_dir)
+        .args(["add", "VERSION"])
+        .output()
+        .await;
+
+    let commit = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree_dir)
+        .env("GIT_AUTHOR_NAME", "Platform")
+        .env("GIT_AUTHOR_EMAIL", "platform@localhost")
+        .env("GIT_COMMITTER_NAME", "Platform")
+        .env("GIT_COMMITTER_EMAIL", "platform@localhost")
+        .args([
+            "commit",
+            "-m",
+            &format!(
+                "chore: auto-bump VERSION to {}",
+                bumped.values().next().unwrap_or(&"unknown".to_string())
+            ),
+        ])
+        .output()
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr);
+        // Clean up worktree before returning error
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree_dir)
+            .output()
+            .await;
+        let _ = tokio::fs::remove_dir_all(&worktree_dir).await;
+        return Err(PipelineError::Other(anyhow::anyhow!(
+            "auto-bump commit failed: {stderr}"
+        )));
+    }
+
+    // Get the new commit SHA
+    let sha_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let new_sha = String::from_utf8_lossy(&sha_output.stdout)
+        .trim()
+        .to_string();
+
+    // Clean up worktree
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree_dir)
+        .output()
+        .await;
+    let _ = tokio::fs::remove_dir_all(&worktree_dir).await;
+
+    let vi = VersionInfo {
+        images: bumped,
+        raw: new_raw,
+    };
+
+    tracing::info!(branch, new_sha = %new_sha, "auto-bumped VERSION on feature branch");
+    Ok((vi, new_sha))
+}
+
+/// Post a comment on the MR explaining the auto-bump (best-effort).
+async fn post_auto_bump_comment(
+    pool: &PgPool,
+    project_id: Uuid,
+    source_branch: &str,
+    new_version: &str,
+) {
+    let comment = format!(
+        "Automatically bumped VERSION to {new_version} — your local branch is now behind \
+         remote. Run `git pull` before pushing again."
+    );
+
+    // Find the open MR for this source branch
+    let mr = sqlx::query(
+        "SELECT id FROM merge_requests WHERE project_id = $1 AND source_branch = $2 AND status = 'open' LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(source_branch)
+    .fetch_optional(pool)
+    .await;
+
+    if let Ok(Some(mr_row)) = mr {
+        use sqlx::Row as _;
+        let mr_id: Uuid = mr_row.get("id");
+        let _ = sqlx::query(
+            "INSERT INTO mr_comments (merge_request_id, author_id, body) \
+             VALUES ($1, (SELECT owner_id FROM projects WHERE id = $2), $3)",
+        )
+        .bind(mr_id)
+        .bind(project_id)
+        .bind(&comment)
+        .execute(pool)
+        .await;
     }
 }
 
@@ -580,5 +923,76 @@ mod tests {
         .unwrap();
         assert!(should_trigger_push(&def, "feature/login"));
         assert!(!should_trigger_push(&def, "main"));
+    }
+
+    // -- parse_version_file --
+
+    #[test]
+    fn parse_version_file_simple() {
+        let result = parse_version_file("app=0.1.0").unwrap();
+        assert_eq!(result.get("app").unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn parse_version_file_multiple() {
+        let result = parse_version_file("app=0.1.0\nworker=1.2.3").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["app"], "0.1.0");
+        assert_eq!(result["worker"], "1.2.3");
+    }
+
+    #[test]
+    fn parse_version_file_comments_and_blanks() {
+        let content = "# This is a version file\n\napp=0.1.0\n# another comment\n";
+        let result = parse_version_file(content).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["app"], "0.1.0");
+    }
+
+    #[test]
+    fn parse_version_file_rejects_non_semver() {
+        let result = parse_version_file("app=latest");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("major.minor.patch"));
+    }
+
+    #[test]
+    fn parse_version_file_rejects_partial_semver() {
+        assert!(parse_version_file("app=1.0").is_err());
+    }
+
+    #[test]
+    fn parse_version_file_rejects_invalid_line() {
+        assert!(parse_version_file("no-equals-sign").is_err());
+    }
+
+    #[test]
+    fn parse_version_file_handles_whitespace() {
+        let result = parse_version_file("  app = 0.1.0  ").unwrap();
+        assert_eq!(result["app"], "0.1.0");
+    }
+
+    // -- increment_patch --
+
+    #[test]
+    fn increment_patch_basic() {
+        assert_eq!(increment_patch("0.1.0").unwrap(), "0.1.1");
+    }
+
+    #[test]
+    fn increment_patch_high_numbers() {
+        assert_eq!(increment_patch("1.2.99").unwrap(), "1.2.100");
+    }
+
+    #[test]
+    fn increment_patch_rejects_non_semver() {
+        assert!(increment_patch("1.0").is_err());
+        assert!(increment_patch("latest").is_err());
+    }
+
+    #[test]
+    fn increment_patch_rejects_non_numeric() {
+        assert!(increment_patch("1.2.abc").is_err());
     }
 }

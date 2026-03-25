@@ -89,6 +89,7 @@ pub fn build_session_rbac(
 ///
 /// Creates: Namespace + `NetworkPolicy` (unless `dev_mode`) + `ServiceAccount` + `Role` + `RoleBinding`.
 /// All operations use server-side apply (idempotent).
+#[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(kube_client), fields(%ns_name), err)]
 pub async fn ensure_session_namespace(
     kube_client: &kube::Client,
@@ -146,6 +147,72 @@ pub async fn ensure_session_namespace(
         "rolebindings",
         "agent-edit-binding",
         rb_json,
+    )
+    .await?;
+
+    // 4. ResourceQuota — prevent agents from creating unbounded pods/resources
+    let quota_json = json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+            "name": "session-quota",
+            "namespace": ns_name
+        },
+        "spec": {
+            "hard": {
+                "pods": "10",
+                "requests.cpu": "4",
+                "requests.memory": "8Gi",
+                "limits.cpu": "8",
+                "limits.memory": "16Gi"
+            }
+        }
+    });
+
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "",
+        "v1",
+        "ResourceQuota",
+        "resourcequotas",
+        "session-quota",
+        quota_json,
+    )
+    .await?;
+
+    // 5. LimitRange — ensure agent-created pods get default resource limits
+    let limit_range_json = json!({
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+            "name": "session-limits",
+            "namespace": ns_name
+        },
+        "spec": {
+            "limits": [{
+                "type": "Container",
+                "default": {
+                    "cpu": "1",
+                    "memory": "1Gi"
+                },
+                "defaultRequest": {
+                    "cpu": "100m",
+                    "memory": "128Mi"
+                }
+            }]
+        }
+    });
+
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "",
+        "v1",
+        "LimitRange",
+        "limitranges",
+        "session-limits",
+        limit_range_json,
     )
     .await?;
 
@@ -250,16 +317,41 @@ pub fn slugify_namespace(name: &str) -> String {
 ///
 /// `ns_name` is the full namespace name (e.g. `my-app-dev` or `prefix-my-app-dev`).
 pub fn build_namespace_object(ns_name: &str, env: &str, project_id: &str) -> serde_json::Value {
+    let mut labels = serde_json::json!({
+        "platform.io/project": project_id,
+        "platform.io/env": env,
+        "platform.io/managed-by": "platform"
+    });
+
+    // S3: PodSecurityAdmission — baseline enforcement on session namespaces
+    // prevents agents from creating privileged pods, hostPath mounts, hostNetwork, etc.
+    // Warn on restricted to surface what would break under stricter policy.
+    if env == "session" {
+        let labels_obj = labels.as_object_mut().unwrap();
+        labels_obj.insert(
+            "pod-security.kubernetes.io/enforce".into(),
+            "baseline".into(),
+        );
+        labels_obj.insert(
+            "pod-security.kubernetes.io/enforce-version".into(),
+            "latest".into(),
+        );
+        labels_obj.insert(
+            "pod-security.kubernetes.io/warn".into(),
+            "restricted".into(),
+        );
+        labels_obj.insert(
+            "pod-security.kubernetes.io/warn-version".into(),
+            "latest".into(),
+        );
+    }
+
     json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {
             "name": ns_name,
-            "labels": {
-                "platform.io/project": project_id,
-                "platform.io/env": env,
-                "platform.io/managed-by": "platform"
-            }
+            "labels": labels
         }
     })
 }

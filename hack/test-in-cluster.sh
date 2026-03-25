@@ -144,6 +144,11 @@ for i in $(seq 1 30); do
   echo -n "."
   sleep 0.5
 done
+if ! nc -z "$NODE_IP" "$PG_PORT" 2>/dev/null; then
+  echo ""
+  echo "ERROR: Could not connect to services after 15s"
+  exit 1
+fi
 echo " ready"
 
 # ── RBAC for all test types ───────────────────────────────────────────────
@@ -164,6 +169,30 @@ kubectl create serviceaccount test-runner -n "${SVC_NS}" 2>/dev/null || true
 kubectl create clusterrolebinding "${NS_PREFIX}-runner" \
   --clusterrole=test-runner \
   --serviceaccount="${SVC_NS}:test-runner" 2>/dev/null || true
+
+# Create shared platform Gateway for test (if Envoy Gateway is installed)
+if kubectl get gatewayclass eg &>/dev/null; then
+  cat <<GWEOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: platform-gateway
+  namespace: ${NS_PREFIX}-services
+  labels:
+    platform.io/managed-by: platform
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+GWEOF
+  export PLATFORM_GATEWAY_NAMESPACE="${NS_PREFIX}-services"
+  echo "  Gateway: platform-gateway in ${NS_PREFIX}-services"
+fi
 
 # ── Run tests ─────────────────────────────────────────────────────────────
 echo ""
@@ -186,6 +215,7 @@ export PLATFORM_REGISTRY_NODE_URL="localhost:${REGISTRY_NODE_PORT}"
 export PLATFORM_API_URL="http://${PLATFORM_HOST}:${BACKEND_PORT}"
 export PLATFORM_PIPELINE_NAMESPACE="${PIPELINE_NS}"
 export PLATFORM_AGENT_NAMESPACE="${AGENT_NS}"
+export PLATFORM_GATEWAY_NAMESPACE="${PLATFORM_GATEWAY_NAMESPACE:-${SVC_NS}}"
 export PLATFORM_VALKEY_AGENT_HOST="valkey.${SVC_NS}.svc.cluster.local:6379"
 export PLATFORM_PREVIEW_PROXY_URL="http://${NODE_IP}:${PREVIEW_PROXY_PORT}"
 export PLATFORM_SEED_IMAGES_PATH="/tmp/platform-e2e/${WORKTREE}/seed-images"

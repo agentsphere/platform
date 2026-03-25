@@ -2,7 +2,7 @@
 #
 # Contains only Node.js, git, curl, and sudo. The platform's setup-tools init
 # container will download agent-runner and install Claude CLI at pod start.
-FROM gcr.io/kaniko-project/executor:latest AS kaniko
+FROM gcr.io/kaniko-project/executor:v1.23.2 AS kaniko
 
 FROM node:22-slim
 

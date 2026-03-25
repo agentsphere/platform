@@ -64,6 +64,20 @@ platform:
   # -- Admin password (dev mode only — leave empty for production setup token flow)
   adminPassword: ""
 
+  # -- Pod security context (non-root by default, fsGroup for PVC ownership)
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  # -- Gateway API configuration (for progressive delivery traffic splitting)
+  gateway:
+    name: ""       # defaults to "platform-gateway" in config.rs
+    namespace: ""  # defaults to PLATFORM_NAMESPACE in config.rs
+
+  # -- Valkey host for agent pods (auto-derived from subchart if empty)
+  valkeyAgentHost: ""
+
   # -- Additional pod annotations
   podAnnotations: {}
 

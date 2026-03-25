@@ -48,7 +48,7 @@ export function Logs() {
         for (const p of r.items) opts.push({ value: p.id, label: p.display_name || p.name });
         setProjects(opts);
       })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, []);
 
   const filterDefs: FilterDef[] = [
@@ -82,7 +82,7 @@ export function Logs() {
 
     api.get<ListResponse<LogEntry>>(`/api/observe/logs${qs(params)}`)
       .then(r => { setLogs(r.items); setTotal(r.total); })
-      .catch(() => {})
+      .catch(e => console.warn(e))
       .finally(() => setLoading(false));
   };
 

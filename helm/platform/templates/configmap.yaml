@@ -17,6 +17,8 @@ data:
 
   # --- K8s namespaces ---
   PLATFORM_NAMESPACE: {{ .Release.Namespace | quote }}
+  PLATFORM_PIPELINE_NAMESPACE: {{ printf "%s-pipelines" .Release.Namespace | quote }}
+  PLATFORM_AGENT_NAMESPACE: {{ printf "%s-agents" .Release.Namespace | quote }}
 
   # --- Internal service URL (for agent/pipeline pods to reach platform) ---
   PLATFORM_API_URL: "http://{{ include "platform.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:8080"
@@ -41,6 +43,21 @@ data:
   PLATFORM_SEED_IMAGES_PATH: "/data/seed-images"
   PLATFORM_SEED_COMMANDS_PATH: "/data/seed-commands"
   PLATFORM_SSH_HOST_KEY_PATH: "/data/ssh_host_ed25519_key"
+
+  # --- Gateway API ---
+  {{- if .Values.platform.gateway.name }}
+  PLATFORM_GATEWAY_NAME: {{ .Values.platform.gateway.name | quote }}
+  {{- end }}
+  {{- if .Values.platform.gateway.namespace }}
+  PLATFORM_GATEWAY_NAMESPACE: {{ .Values.platform.gateway.namespace | quote }}
+  {{- end }}
+
+  # --- Valkey agent host ---
+  {{- if .Values.platform.valkeyAgentHost }}
+  PLATFORM_VALKEY_AGENT_HOST: {{ .Values.platform.valkeyAgentHost | quote }}
+  {{- else if .Values.valkey.enabled }}
+  PLATFORM_VALKEY_AGENT_HOST: {{ printf "%s-valkey-master:6379" .Release.Name | quote }}
+  {{- end }}
 
   # --- CORS ---
   {{- if .Values.ingress.enabled }}

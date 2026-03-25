@@ -42,7 +42,6 @@ pipeline:
 #     description: "Feature flag description"
 #
 # deploy:
-#   enable_staging: false
 #   specs:
 #     - name: api
 #       type: rolling

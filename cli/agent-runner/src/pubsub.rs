@@ -221,15 +221,7 @@ fn extract_result_preview(block: &serde_json::Value) -> Option<String> {
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_owned()
-    } else {
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
+    crate::render::truncate_str(s, max_len)
 }
 
 fn convert_result(r: &ResultMessage) -> PubSubEvent {
@@ -315,52 +307,77 @@ impl PubSubClient {
     /// 2. Subscribes to `session:{id}:input`
     /// 3. Parses incoming JSON into `PubSubInput` (rejects messages > 1 MB)
     /// 4. Forwards via mpsc channel
+    /// 5. Reconnects with exponential backoff on disconnect
     pub async fn subscribe_input(
         &self,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<PubSubInput>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<PubSubInput>(32);
         let channel = self.input_channel();
-
-        // Dedicated subscriber connection
-        let subscriber = self.client.clone_new();
-        subscriber.init().await?;
-        subscriber.subscribe(&channel).await?;
-
-        let mut message_rx = subscriber.message_rx();
+        let client = self.client.clone();
 
         tokio::spawn(async move {
-            while let Ok(message) = message_rx.recv().await {
-                let payload = match message.value.convert::<String>() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[warn] pub/sub message not a string: {e}");
-                        continue;
-                    }
-                };
+            let mut backoff = std::time::Duration::from_millis(500);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
-                if payload.len() > MAX_INPUT_MESSAGE_SIZE {
-                    eprintln!(
-                        "[warn] pub/sub message too large ({} bytes, max {})",
-                        payload.len(),
-                        MAX_INPUT_MESSAGE_SIZE
-                    );
+            loop {
+                // Create a dedicated subscriber connection
+                let subscriber = client.clone_new();
+                if let Err(e) = subscriber.init().await {
+                    eprintln!("[warn] pub/sub subscriber init failed: {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                if let Err(e) = subscriber.subscribe(&channel).await {
+                    eprintln!("[warn] pub/sub subscribe failed: {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
 
-                match serde_json::from_str::<PubSubInput>(&payload) {
-                    Ok(input) => {
-                        if tx.send(input).await.is_err() {
-                            break; // receiver dropped
+                let mut message_rx = subscriber.message_rx();
+
+                while let Ok(message) = message_rx.recv().await {
+                    backoff = std::time::Duration::from_millis(500); // reset on success
+
+                    let payload = match message.value.convert::<String>() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[warn] pub/sub message not a string: {e}");
+                            continue;
+                        }
+                    };
+
+                    if payload.len() > MAX_INPUT_MESSAGE_SIZE {
+                        eprintln!(
+                            "[warn] pub/sub message too large ({} bytes, max {})",
+                            payload.len(),
+                            MAX_INPUT_MESSAGE_SIZE
+                        );
+                        continue;
+                    }
+
+                    match serde_json::from_str::<PubSubInput>(&payload) {
+                        Ok(input) => {
+                            if tx.send(input).await.is_err() {
+                                return; // receiver dropped — session terminated
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[warn] invalid pub/sub input: {e}");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[warn] invalid pub/sub input: {e}");
-                    }
                 }
+
+                // Connection lost — reconnect with backoff
+                eprintln!(
+                    "[warn] pub/sub subscriber disconnected, reconnecting in {}ms",
+                    backoff.as_millis()
+                );
+                drop(subscriber);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            eprintln!("[warn] pub/sub subscriber disconnected");
-            // Keep subscriber alive until task ends
-            let _subscriber = subscriber;
         });
 
         Ok(rx)

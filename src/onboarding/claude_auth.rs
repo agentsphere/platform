@@ -239,6 +239,12 @@ impl CliAuthManager {
         sessions.get(&session_id).map(|s| s.state.clone())
     }
 
+    /// Get the user who owns a session.
+    pub async fn get_owner(&self, session_id: Uuid) -> Option<Uuid> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(&session_id).map(|s| s.user_id)
+    }
+
     /// Cancel an auth session, kill the process, clean up temp dir.
     pub async fn cancel(&self, session_id: Uuid) {
         let mut sessions = self.sessions.lock().await;

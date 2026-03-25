@@ -30,9 +30,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y --auto-remove autoconf \
     && rm -rf /var/lib/apt/lists/*
 
-# kubectl
-RUN curl -fsSL "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
-    -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+# kubectl (pinned + checksum, arch-aware)
+RUN ARCH=$(dpkg --print-architecture) \
+  && KUBECTL_VERSION=v1.32.3 \
+  && curl -sfSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o /tmp/kubectl \
+  && curl -sfSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o /tmp/kubectl.sha256 \
+  && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c - \
+  && mv /tmp/kubectl /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl \
+  && rm -f /tmp/kubectl.sha256
 
 # Node.js 22
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -49,8 +54,8 @@ RUN cargo install sqlx-cli --locked --no-default-features --features postgres,ru
 RUN cargo install cargo-deny --locked
 RUN cargo install just --locked
 
-# Python tools (diff-cover for `just cov-diff`) — install system-wide
-RUN pip3 install --break-system-packages diff-cover
+# Python tools (diff-cover for `just cov-diff`)
+RUN pipx install diff-cover && pipx ensurepath
 
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code

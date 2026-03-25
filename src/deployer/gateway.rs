@@ -1,14 +1,22 @@
 //! Gateway API (`HTTPRoute`) builders for traffic splitting.
 //!
-//! Platform creates/manages `HTTPRoute` resources referencing user-defined services.
+//! Platform creates/manages `HTTPRoute` resources referencing a shared Gateway
+//! (created at cluster setup time) via cross-namespace `parentRefs`.
 //! Uses kube-rs `DynamicObject` — no new crate dependency needed.
-#![allow(dead_code)]
 
 use serde_json::json;
+
+/// Shared Gateway reference used by all `HTTPRoute` builders.
+pub struct GatewayRef<'a> {
+    pub name: &'a str,
+    pub namespace: &'a str,
+}
 
 /// Build an `HTTPRoute` JSON for weighted traffic splitting between stable and canary services.
 ///
 /// The route sends `stable_weight`% to `stable_service` and `canary_weight`% to `canary_service`.
+/// References a shared Gateway via cross-namespace `parentRefs`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_weighted_httproute(
     name: &str,
     namespace: &str,
@@ -17,7 +25,33 @@ pub fn build_weighted_httproute(
     canary_service: &str,
     stable_weight: u32,
     canary_weight: u32,
+    gw: &GatewayRef<'_>,
 ) -> serde_json::Value {
+    let mut spec = serde_json::json!({
+        "parentRefs": [{
+            "name": gw.name,
+            "namespace": gw.namespace,
+        }],
+        "rules": [{
+            "backendRefs": [
+                {
+                    "name": stable_service,
+                    "port": 8080,
+                    "weight": stable_weight,
+                },
+                {
+                    "name": canary_service,
+                    "port": 8080,
+                    "weight": canary_weight,
+                },
+            ]
+        }]
+    });
+    // Only add hostnames if it's a real hostname (not wildcard "*")
+    if hostname != "*" {
+        spec["hostnames"] = json!([hostname]);
+    }
+
     json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "HTTPRoute",
@@ -28,27 +62,7 @@ pub fn build_weighted_httproute(
                 "platform.io/managed-by": "platform-deployer"
             }
         },
-        "spec": {
-            "parentRefs": [{
-                "name": format!("{namespace}-gateway"),
-                "namespace": namespace,
-            }],
-            "hostnames": [hostname],
-            "rules": [{
-                "backendRefs": [
-                    {
-                        "name": stable_service,
-                        "port": 80,
-                        "weight": stable_weight,
-                    },
-                    {
-                        "name": canary_service,
-                        "port": 80,
-                        "weight": canary_weight,
-                    },
-                ]
-            }]
-        }
+        "spec": spec
     })
 }
 
@@ -56,6 +70,7 @@ pub fn build_weighted_httproute(
 ///
 /// Requests matching the specified header are routed to the treatment service;
 /// all other requests go to the control service.
+/// References a shared Gateway via cross-namespace `parentRefs`.
 pub fn build_header_match_httproute<S: std::hash::BuildHasher>(
     name: &str,
     namespace: &str,
@@ -63,6 +78,7 @@ pub fn build_header_match_httproute<S: std::hash::BuildHasher>(
     control_service: &str,
     treatment_service: &str,
     headers: &std::collections::HashMap<String, String, S>,
+    gw: &GatewayRef<'_>,
 ) -> serde_json::Value {
     let header_matches: Vec<serde_json::Value> = headers
         .iter()
@@ -75,6 +91,33 @@ pub fn build_header_match_httproute<S: std::hash::BuildHasher>(
         })
         .collect();
 
+    let mut spec = serde_json::json!({
+        "parentRefs": [{
+            "name": gw.name,
+            "namespace": gw.namespace,
+        }],
+        "rules": [
+            {
+                "matches": [{
+                    "headers": header_matches,
+                }],
+                "backendRefs": [{
+                    "name": treatment_service,
+                    "port": 8080,
+                }]
+            },
+            {
+                "backendRefs": [{
+                    "name": control_service,
+                    "port": 8080,
+                }]
+            }
+        ]
+    });
+    if hostname != "*" {
+        spec["hostnames"] = json!([hostname]);
+    }
+
     json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "HTTPRoute",
@@ -85,53 +128,7 @@ pub fn build_header_match_httproute<S: std::hash::BuildHasher>(
                 "platform.io/managed-by": "platform-deployer"
             }
         },
-        "spec": {
-            "parentRefs": [{
-                "name": format!("{namespace}-gateway"),
-                "namespace": namespace,
-            }],
-            "hostnames": [hostname],
-            "rules": [
-                {
-                    "matches": [{
-                        "headers": header_matches,
-                    }],
-                    "backendRefs": [{
-                        "name": treatment_service,
-                        "port": 80,
-                    }]
-                },
-                {
-                    "backendRefs": [{
-                        "name": control_service,
-                        "port": 80,
-                    }]
-                }
-            ]
-        }
-    })
-}
-
-/// Build a Gateway resource for a project namespace.
-pub fn build_gateway(namespace: &str) -> serde_json::Value {
-    json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": {
-            "name": format!("{namespace}-gateway"),
-            "namespace": namespace,
-            "labels": {
-                "platform.io/managed-by": "platform-deployer"
-            }
-        },
-        "spec": {
-            "gatewayClassName": "envoy",
-            "listeners": [{
-                "name": "http",
-                "protocol": "HTTP",
-                "port": 80,
-            }]
-        }
+        "spec": spec
     })
 }
 
@@ -153,6 +150,10 @@ mod tests {
             "api-canary",
             80,
             20,
+            &GatewayRef {
+                name: "platform-gateway",
+                namespace: "envoy-gateway-system",
+            },
         );
 
         assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1");
@@ -160,13 +161,21 @@ mod tests {
         assert_eq!(route["metadata"]["name"], "api-canary");
         assert_eq!(route["metadata"]["namespace"], "myapp-prod");
 
+        // parentRefs should reference the shared gateway cross-namespace
+        let parent_refs = route["spec"]["parentRefs"].as_array().unwrap();
+        assert_eq!(parent_refs.len(), 1);
+        assert_eq!(parent_refs[0]["name"], "platform-gateway");
+        assert_eq!(parent_refs[0]["namespace"], "envoy-gateway-system");
+
         let rules = route["spec"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
         let backends = rules[0]["backendRefs"].as_array().unwrap();
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0]["name"], "api-stable");
+        assert_eq!(backends[0]["port"], 8080);
         assert_eq!(backends[0]["weight"], 80);
         assert_eq!(backends[1]["name"], "api-canary");
+        assert_eq!(backends[1]["port"], 8080);
         assert_eq!(backends[1]["weight"], 20);
     }
 
@@ -180,6 +189,10 @@ mod tests {
             "canary",
             100,
             0,
+            &GatewayRef {
+                name: "platform-gateway",
+                namespace: "envoy-gateway-system",
+            },
         );
 
         let backends = route["spec"]["rules"][0]["backendRefs"].as_array().unwrap();
@@ -201,9 +214,20 @@ mod tests {
             "checkout-control",
             "checkout-treatment",
             &headers,
+            &GatewayRef {
+                name: "platform-gateway",
+                namespace: "envoy-gateway-system",
+            },
         );
 
         assert_eq!(route["kind"], "HTTPRoute");
+
+        // parentRefs should reference the shared gateway cross-namespace
+        let parent_refs = route["spec"]["parentRefs"].as_array().unwrap();
+        assert_eq!(parent_refs.len(), 1);
+        assert_eq!(parent_refs[0]["name"], "platform-gateway");
+        assert_eq!(parent_refs[0]["namespace"], "envoy-gateway-system");
+
         let rules = route["spec"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 2);
 
@@ -212,20 +236,11 @@ mod tests {
         assert_eq!(matches[0]["name"], "x-experiment");
         assert_eq!(matches[0]["value"], "treatment");
         assert_eq!(rules[0]["backendRefs"][0]["name"], "checkout-treatment");
+        assert_eq!(rules[0]["backendRefs"][0]["port"], 8080);
 
         // Second rule: default → control
         assert!(rules[1]["matches"].is_null());
         assert_eq!(rules[1]["backendRefs"][0]["name"], "checkout-control");
-    }
-
-    #[test]
-    fn gateway_structure() {
-        let gw = build_gateway("myapp-prod");
-        assert_eq!(gw["kind"], "Gateway");
-        assert_eq!(gw["metadata"]["name"], "myapp-prod-gateway");
-        assert_eq!(gw["spec"]["gatewayClassName"], "envoy");
-        let listeners = gw["spec"]["listeners"].as_array().unwrap();
-        assert_eq!(listeners.len(), 1);
-        assert_eq!(listeners[0]["port"], 80);
+        assert_eq!(rules[1]["backendRefs"][0]["port"], 8080);
     }
 }

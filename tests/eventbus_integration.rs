@@ -125,7 +125,7 @@ async fn ops_repo_updated_marks_pending(pool: PgPool) {
 }
 
 /// `OpsRepoUpdated` reads `platform.yaml` from the ops repo, parses deploy specs
-/// for strategy/rollout_config, and creates a release with those values.
+/// for `strategy/rollout_config`, and creates a release with those values.
 #[sqlx::test(migrations = "./migrations")]
 async fn ops_repo_updated_reads_platform_yaml(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
@@ -455,8 +455,8 @@ async fn rollback_reverts_ops_repo(pool: PgPool) {
     let _ = tokio::fs::remove_dir_all(&tmp).await;
 }
 
-/// `ImageBuilt` then `OpsRepoUpdated` sequence: ImageBuilt is a no-op,
-/// only OpsRepoUpdated creates the release.
+/// `ImageBuilt` then `OpsRepoUpdated` sequence: `ImageBuilt` is a no-op,
+/// only `OpsRepoUpdated` creates the release.
 #[sqlx::test(migrations = "./migrations")]
 async fn image_built_then_ops_repo_updated(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
@@ -514,7 +514,7 @@ async fn image_built_then_ops_repo_updated(pool: PgPool) {
     assert_eq!(sha.as_deref(), Some("def456"));
 }
 
-/// Multiple OpsRepoUpdated events for different environments are independent.
+/// Multiple `OpsRepoUpdated` events for different environments are independent.
 #[sqlx::test(migrations = "./migrations")]
 async fn different_environments_independent(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;

@@ -36,6 +36,9 @@ pub enum DeployerError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("forbidden manifest: {0}")]
+    ForbiddenManifest(String),
+
     #[error("invalid phase transition: {0} -> {1}")]
     InvalidTransition(String, String),
 
@@ -64,6 +67,7 @@ impl From<DeployerError> for ApiError {
             DeployerError::NoPreviousDeployment
             | DeployerError::RenderFailed(_)
             | DeployerError::InvalidManifest(_)
+            | DeployerError::ForbiddenManifest(_)
             | DeployerError::ValuesNotFound(_)
             | DeployerError::InvalidTransition(_, _) => Self::BadRequest(err.to_string()),
             DeployerError::Db(e) => Self::from(e),
@@ -143,5 +147,12 @@ mod tests {
     fn analysis_failed_maps_to_internal() {
         let api: ApiError = DeployerError::AnalysisFailed("metric missing".into()).into();
         assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn forbidden_manifest_maps_to_bad_request() {
+        let api: ApiError =
+            DeployerError::ForbiddenManifest("privileged not allowed".into()).into();
+        assert!(matches!(api, ApiError::BadRequest(msg) if msg.contains("privileged not allowed")));
     }
 }

@@ -10,7 +10,7 @@ fn isolated_runner_state(state: &mut platform::store::AppState) -> std::path::Pa
     let dir = std::env::temp_dir().join(format!("agent-runner-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create isolated dir");
     let mut config = (*state.config).clone();
-    config.agent_runner_dir = dir.clone();
+    config.agent_runner_dir.clone_from(&dir);
     state.config = std::sync::Arc::new(config);
     dir
 }

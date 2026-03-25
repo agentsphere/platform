@@ -168,3 +168,39 @@ async fn onboarding_status_with_key_and_project(pool: PgPool) {
     assert_eq!(body["has_projects"], true);
     assert_eq!(body["needs_onboarding"], false);
 }
+
+// ---------------------------------------------------------------------------
+// A1: Dashboard stats require admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn dashboard_stats_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_uid, user_token) = create_user(&app, &admin_token, "normie", "normie@test.com").await;
+
+    // Non-admin should get 403
+    let (status, _) = helpers::get_json(&app, &user_token, "/api/dashboard/stats").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admin should still succeed
+    let (status, _) = helpers::get_json(&app, &admin_token, "/api/dashboard/stats").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn audit_log_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_uid, user_token) = create_user(&app, &admin_token, "normie2", "normie2@test.com").await;
+
+    // Non-admin should get 403
+    let (status, _) = helpers::get_json(&app, &user_token, "/api/audit-log").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admin should still succeed
+    let (status, _) = helpers::get_json(&app, &admin_token, "/api/audit-log").await;
+    assert_eq!(status, StatusCode::OK);
+}

@@ -217,11 +217,26 @@ fn write_secrets_env_file() {
         if name.is_empty() {
             continue;
         }
+        if RESERVED_ENV_VARS.contains(&name) {
+            eprintln!("[warn] skipping reserved env var '{name}' in PLATFORM_SECRET_NAMES");
+            continue;
+        }
         if let Ok(val) = std::env::var(name) {
             // Shell-safe quoting: single quotes, escape embedded single quotes
             let escaped = val.replace('\'', "'\\''");
             let _ = writeln!(file, "{name}='{escaped}'");
             count += 1;
+        }
+    }
+
+    // Ensure the file is closed before setting permissions
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("[warn] failed to set .env.dev permissions: {e}");
         }
     }
 

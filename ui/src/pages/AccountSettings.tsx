@@ -33,7 +33,7 @@ function ChangePassword() {
     if (newPw !== confirmPw) { setError('Passwords do not match'); return; }
     setSaving(true);
     try {
-      await api.patch(`/api/users/${user!.id}`, { password: newPw });
+      await api.patch(`/api/users/${user!.id}`, { password: newPw, current_password: currentPw });
       setCurrentPw('');
       setNewPw('');
       setConfirmPw('');
@@ -94,7 +94,7 @@ function PasskeySection() {
   const load = () => {
     api.get<PasskeyResponse[]>('/api/auth/passkeys')
       .then(setPasskeys)
-      .catch(() => {})
+      .catch(e => console.warn(e))
       .finally(() => setLoading(false));
   };
 

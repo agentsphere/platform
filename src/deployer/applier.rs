@@ -46,9 +46,9 @@ const ALLOWED_KINDS: &[&str] = &[
     "DaemonSet",
     "PersistentVolumeClaim",
     "NetworkPolicy",
-    // Gateway API (Envoy Gateway)
+    // Gateway API: only HTTPRoute (users reference existing Gateways via parentRefs,
+    // not create Gateways which could capture cross-tenant traffic)
     "HTTPRoute",
-    "Gateway",
 ];
 
 /// Apply manifests with optional deployment tracking.
@@ -70,6 +70,12 @@ pub async fn apply_with_tracking(
         let mut doc: serde_json::Value = serde_yaml::from_str(doc_str)
             .map_err(|e| DeployerError::InvalidManifest(e.to_string()))?;
 
+        // Skip non-manifest YAML docs (e.g. variables files without apiVersion/kind)
+        if doc.get("apiVersion").and_then(|v| v.as_str()).is_none() {
+            tracing::debug!(doc = %doc_str.chars().take(100).collect::<String>(), "skipping non-manifest YAML doc");
+            continue;
+        }
+
         // Inject managed-by labels when tracking is enabled
         if let Some(did) = deployment_id {
             inject_managed_labels(&mut doc, did);
@@ -84,6 +90,9 @@ pub async fn apply_with_tracking(
                 ar.kind
             )));
         }
+
+        // R3: Reject manifests with dangerous pod specs (S19 security hardening)
+        validate_pod_spec(&doc)?;
 
         let name = obj
             .metadata
@@ -119,6 +128,69 @@ pub async fn apply_with_tracking(
     }
 
     Ok(applied)
+}
+
+/// Extract the pod spec from a workload manifest (`Deployment`, `StatefulSet`, `DaemonSet`,
+/// `Job`, `CronJob`). Returns `None` for non-workload kinds (`Service`, `ConfigMap`, etc.).
+fn extract_pod_spec(manifest: &serde_json::Value) -> Option<&serde_json::Value> {
+    // Deployment, StatefulSet, DaemonSet, ReplicaSet → spec.template.spec
+    manifest
+        .pointer("/spec/template/spec")
+        // CronJob → spec.jobTemplate.spec.template.spec
+        .or_else(|| manifest.pointer("/spec/jobTemplate/spec/template/spec"))
+}
+
+/// Validate that a manifest's pod spec does not contain dangerous fields that would
+/// allow container escape or host-level access. Blocks: privileged containers,
+/// hostNetwork, hostPID, hostIPC, hostPath volumes.
+fn validate_pod_spec(manifest: &serde_json::Value) -> Result<(), DeployerError> {
+    let Some(spec) = extract_pod_spec(manifest) else {
+        return Ok(());
+    };
+
+    if spec.pointer("/hostNetwork") == Some(&serde_json::Value::Bool(true)) {
+        return Err(DeployerError::ForbiddenManifest(
+            "hostNetwork is not allowed".into(),
+        ));
+    }
+    if spec.pointer("/hostPID") == Some(&serde_json::Value::Bool(true)) {
+        return Err(DeployerError::ForbiddenManifest(
+            "hostPID is not allowed".into(),
+        ));
+    }
+    if spec.pointer("/hostIPC") == Some(&serde_json::Value::Bool(true)) {
+        return Err(DeployerError::ForbiddenManifest(
+            "hostIPC is not allowed".into(),
+        ));
+    }
+
+    // Check all containers (main + init) for privileged mode
+    for containers_key in ["/containers", "/initContainers"] {
+        if let Some(containers) = spec.pointer(containers_key).and_then(|c| c.as_array()) {
+            for container in containers {
+                if container.pointer("/securityContext/privileged")
+                    == Some(&serde_json::Value::Bool(true))
+                {
+                    return Err(DeployerError::ForbiddenManifest(
+                        "privileged containers are not allowed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Check for hostPath volumes
+    if let Some(volumes) = spec.pointer("/volumes").and_then(|v| v.as_array()) {
+        for vol in volumes {
+            if vol.get("hostPath").is_some() {
+                return Err(DeployerError::ForbiddenManifest(
+                    "hostPath volumes are not allowed".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a `TrackedResource` inventory from applied manifests.
@@ -330,7 +402,6 @@ pub async fn wait_healthy(
 }
 
 /// Scale a Deployment to the given number of replicas.
-#[allow(dead_code)]
 #[tracing::instrument(skip(kube_client), fields(%namespace, %deployment_name, %replicas), err)]
 pub async fn scale(
     kube_client: &kube::Client,
@@ -508,7 +579,6 @@ fn kind_to_plural(kind: &str) -> String {
         "PersistentVolumeClaim" => "persistentvolumeclaims".into(),
         "NetworkPolicy" => "networkpolicies".into(),
         "HTTPRoute" => "httproutes".into(),
-        "Gateway" => "gateways".into(),
         // Fallback: lowercase + "s" (works for most standard resources)
         other => format!("{}s", other.to_lowercase()),
     }
@@ -880,13 +950,21 @@ mod tests {
             "DaemonSet",
             "NetworkPolicy",
             "HTTPRoute",
-            "Gateway",
         ] {
             assert!(
                 ALLOWED_KINDS.contains(kind),
                 "{kind} should be in ALLOWED_KINDS"
             );
         }
+    }
+
+    #[test]
+    fn gateway_kind_not_allowed() {
+        // A18: Gateway removed to prevent cross-tenant traffic capture
+        assert!(
+            !ALLOWED_KINDS.contains(&"Gateway"),
+            "Gateway should NOT be in ALLOWED_KINDS"
+        );
     }
 
     #[test]
@@ -1135,5 +1213,147 @@ spec:
         let env_from =
             &doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["envFrom"];
         assert_eq!(env_from[0]["secretRef"]["name"], "backup-secrets");
+    }
+
+    // -- validate_pod_spec (S19 security hardening) --
+
+    #[test]
+    fn validate_pod_spec_rejects_privileged() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "containers": [{
+                    "name": "evil",
+                    "image": "alpine",
+                    "securityContext": { "privileged": true }
+                }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("privileged")));
+    }
+
+    #[test]
+    fn validate_pod_spec_rejects_host_network() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "hostNetwork": true,
+                "containers": [{ "name": "app", "image": "nginx" }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(
+            matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("hostNetwork"))
+        );
+    }
+
+    #[test]
+    fn validate_pod_spec_rejects_host_pid() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "spec": { "template": { "spec": {
+                "hostPID": true,
+                "containers": [{ "name": "app", "image": "nginx" }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("hostPID")));
+    }
+
+    #[test]
+    fn validate_pod_spec_rejects_host_ipc() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "hostIPC": true,
+                "containers": [{ "name": "app", "image": "nginx" }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("hostIPC")));
+    }
+
+    #[test]
+    fn validate_pod_spec_rejects_host_path() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "containers": [{ "name": "app", "image": "nginx" }],
+                "volumes": [{ "name": "root", "hostPath": { "path": "/" } }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("hostPath")));
+    }
+
+    #[test]
+    fn validate_pod_spec_rejects_privileged_init_container() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "initContainers": [{
+                    "name": "init-evil",
+                    "image": "alpine",
+                    "securityContext": { "privileged": true }
+                }],
+                "containers": [{ "name": "app", "image": "nginx" }]
+            }}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("privileged")));
+    }
+
+    #[test]
+    fn validate_pod_spec_allows_normal_deployment() {
+        let manifest = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": { "template": { "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx:1.25",
+                    "securityContext": { "readOnlyRootFilesystem": true }
+                }],
+                "volumes": [
+                    { "name": "config", "configMap": { "name": "app-config" } },
+                    { "name": "data", "secret": { "secretName": "app-secret" } }
+                ]
+            }}}
+        });
+        assert!(validate_pod_spec(&manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_pod_spec_allows_non_workload() {
+        // Service, ConfigMap, etc. have no pod spec — should pass
+        let manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "spec": { "ports": [{ "port": 80 }] }
+        });
+        assert!(validate_pod_spec(&manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_pod_spec_cronjob_nested() {
+        let manifest = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "spec": { "jobTemplate": { "spec": { "template": { "spec": {
+                "hostNetwork": true,
+                "containers": [{ "name": "cron", "image": "alpine" }]
+            }}}}}
+        });
+        let err = validate_pod_spec(&manifest).unwrap_err();
+        assert!(
+            matches!(err, DeployerError::ForbiddenManifest(msg) if msg.contains("hostNetwork"))
+        );
     }
 }

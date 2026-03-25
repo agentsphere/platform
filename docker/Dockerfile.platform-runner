@@ -5,7 +5,7 @@
 #   2. Assemble runtime image with all tools pre-installed
 
 # ── Stage 1: Build agent-runner ───────────────────────────────────────────
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release && cp target/release/agent-runner /usr/local/bin/agent-runner
 
 # ── Stage 2: Runtime image ────────────────────────────────────────────────
-FROM gcr.io/kaniko-project/executor:latest AS kaniko
+FROM gcr.io/kaniko-project/executor:v1.23.2 AS kaniko
 
 FROM node:22-slim
 
@@ -30,8 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
   && rm -rf /var/lib/apt/lists/* \
   && ARCH=$(dpkg --print-architecture) \
-  && curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
-  && chmod +x kubectl && mv kubectl /usr/local/bin/kubectl
+  && KUBECTL_VERSION=v1.32.3 \
+  && curl -sfSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o kubectl \
+  && curl -sfSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o kubectl.sha256 \
+  && echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - \
+  && chmod +x kubectl && mv kubectl /usr/local/bin/kubectl && rm -f kubectl.sha256
 
 # Kaniko executor + SSL certs from official image (no standalone binary releases)
 # chown to uid 1000 so the non-root agent user can write to /kaniko/ at runtime
@@ -45,11 +48,11 @@ RUN mkdir -p /kaniko/ssl/certs \
 COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
 
 # Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@1.0.16
 
 # MCP servers
 COPY mcp/ /usr/local/lib/mcp/
-RUN cd /usr/local/lib/mcp && npm install --production
+RUN cd /usr/local/lib/mcp && npm install --omit=dev
 
 # Non-root user with sudo access (for installing packages at runtime)
 RUN userdel -r node 2>/dev/null || true \

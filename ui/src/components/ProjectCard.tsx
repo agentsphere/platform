@@ -74,7 +74,7 @@ export function ProjectCard({ project }: Props) {
       {/* Left: preview */}
       <div class="project-card-preview">
         {previewUrl ? (
-          <iframe src={previewUrl} tabIndex={-1} loading="lazy" />
+          <iframe src={previewUrl} tabIndex={-1} loading="lazy" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
         ) : (
           <div class="project-card-preview-placeholder"
             style={`background: linear-gradient(135deg, ${gradientFor(displayName)})`}>

@@ -526,11 +526,24 @@ async fn start_claude_auth(
 }
 
 /// Check the status of a Claude CLI auth session.
+/// Only the session owner or an admin can check status.
 async fn claude_auth_status(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let owner_id = state
+        .cli_auth_manager
+        .get_owner(id)
+        .await
+        .ok_or_else(|| ApiError::NotFound("session".into()))?;
+
+    if owner_id != auth.user_id {
+        require_admin(&state, &auth)
+            .await
+            .map_err(|_| ApiError::NotFound("session".into()))?;
+    }
+
     let session_state = state
         .cli_auth_manager
         .get_state(id)
@@ -588,12 +601,41 @@ async fn submit_auth_code(
 }
 
 /// Cancel a Claude CLI auth session.
+/// Only the session owner or an admin can cancel.
 async fn cancel_claude_auth(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let owner_id = state
+        .cli_auth_manager
+        .get_owner(id)
+        .await
+        .ok_or_else(|| ApiError::NotFound("session".into()))?;
+
+    if owner_id != auth.user_id {
+        require_admin(&state, &auth)
+            .await
+            .map_err(|_| ApiError::NotFound("session".into()))?;
+    }
+
     state.cli_auth_manager.cancel(id).await;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "onboarding.claude_auth_cancelled",
+            resource: "cli_auth",
+            resource_id: Some(id),
+            project_id: None,
+            detail: None,
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

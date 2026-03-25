@@ -161,7 +161,7 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
     if (!projectId || !sessionId) return;
     api.get<IframePanel[]>(`/api/projects/${projectId}/sessions/${sessionId}/iframes`)
       .then(setIframes)
-      .catch(() => {});
+      .catch(e => console.warn(e));
   };
 
   useEffect(() => {
@@ -196,11 +196,11 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
         setEvents(mapped);
         if (lastProgress) setLatestProgress(lastProgress);
       }
-    }).catch(() => {});
+    }).catch(e => console.warn(e));
     // Also fetch progress from dedicated endpoint (works even for completed sessions)
     api.get<{ message: string }>(`/api/projects/${projectId}/sessions/${sessionId}/progress`)
       .then(r => { if (r.message) setLatestProgress(r.message); })
-      .catch(() => {}); // 404 if no progress stored
+      .catch(e => console.warn(e)); // 404 if no progress stored
     // Also fetch initial iframes
     refreshIframes();
   }, [projectId, sessionId]);
@@ -248,7 +248,7 @@ export function SessionDetail({ id: projectId, sessionId }: Props) {
         if (kind === 'Completed' || kind === 'Error') {
           // Refresh session to get updated status
           api.get<AgentSession>(`/api/projects/${projectId}/sessions/${sessionId}`)
-            .then(setSession).catch(() => {});
+            .then(setSession).catch(e => console.warn(e));
         }
       },
     });
@@ -424,7 +424,7 @@ function SessionLogs({ sessionId }: { sessionId: string }) {
     if (!open) return;
     api.get(`/api/observe/logs?session_id=${sessionId}&range=24h&limit=50`)
       .then((r: any) => setLogs(r.items || []))
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, [sessionId, open]);
 
   return (

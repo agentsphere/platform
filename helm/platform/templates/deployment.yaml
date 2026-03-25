@@ -31,8 +31,14 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsUser: {{ .Values.platform.securityContext.runAsUser | default 1000 }}
+        runAsGroup: {{ .Values.platform.securityContext.runAsGroup | default 1000 }}
+        fsGroup: {{ .Values.platform.securityContext.fsGroup | default 1000 }}
       initContainers:
         - name: init-data
+          securityContext:
+            runAsUser: 0
           image: "{{ .Values.platform.image.repository }}:{{ .Values.platform.image.tag }}"
           imagePullPolicy: {{ .Values.platform.image.pullPolicy }}
           command:

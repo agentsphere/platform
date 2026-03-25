@@ -26,17 +26,17 @@ export function ProjectDetail({ id, tab }: Props) {
   const currentTab = tab || 'files';
 
   useEffect(() => {
-    if (id) api.get<Project>(`/api/projects/${id}`).then(setProject).catch(() => {});
+    if (id) api.get<Project>(`/api/projects/${id}`).then(setProject).catch(e => console.warn(e));
   }, [id]);
 
   useEffect(() => {
     if (!id) return;
     api.get<ListResponse<AgentSession>>(`/api/projects/${id}/sessions?status=running&limit=1`)
       .then(r => { if (r.items.length > 0) setActiveSession(r.items[0]); })
-      .catch(() => {});
+      .catch(e => console.warn(e));
     api.get<ListResponse<Deployment>>(`/api/projects/${id}/deployments?limit=5`)
       .then(r => setDeployments(r.items))
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, [id]);
 
   // Fetch iframes + progress for active session
@@ -45,7 +45,7 @@ export function ProjectDetail({ id, tab }: Props) {
     api.get<IframePanel[]>(`/api/projects/${id}/sessions/${activeSession.id}/iframes`)
       .then(setIframes).catch(() => setIframes([]));
     api.get<{ message: string }>(`/api/projects/${id}/sessions/${activeSession.id}/progress`)
-      .then(r => setProgressText(r.message)).catch(() => {});
+      .then(r => setProgressText(r.message)).catch(e => console.warn(e));
   }, [activeSession, id]);
 
   // Fetch deploy iframes when no session iframes
@@ -100,7 +100,7 @@ export function ProjectDetail({ id, tab }: Props) {
       <div class="project-header-card">
         <div class="project-header-preview" style="position:relative">
           {previewUrl ? (
-            <iframe src={previewUrl} tabIndex={-1} loading="lazy" />
+            <iframe src={previewUrl} tabIndex={-1} loading="lazy" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
           ) : (
             <div class="project-header-preview-placeholder">{initial}</div>
           )}
@@ -183,7 +183,7 @@ function ProjectLogs({ projectId }: { projectId: string }) {
 
     api.get<ListResponse<LogEntry>>(`/api/projects/${projectId}/logs${qs(params)}`)
       .then(r => { setLogs(r.items); setTotal(r.total); })
-      .catch(() => {})
+      .catch(e => console.warn(e))
       .finally(() => setLoading(false));
   };
 
@@ -269,7 +269,7 @@ function FilesTab({ projectId, defaultBranch }: { projectId: string; defaultBran
   const [blob, setBlob] = useState<BlobResponse | null>(null);
 
   useEffect(() => {
-    api.get<BranchInfo[]>(`/api/projects/${projectId}/branches`).then(setBranches).catch(() => {});
+    api.get<BranchInfo[]>(`/api/projects/${projectId}/branches`).then(setBranches).catch(e => console.warn(e));
   }, [projectId]);
 
   useEffect(() => {
@@ -285,7 +285,7 @@ function FilesTab({ projectId, defaultBranch }: { projectId: string; defaultBran
     } else {
       const filePath = path ? `${path}/${entry.name}` : entry.name;
       api.get<BlobResponse>(`/api/projects/${projectId}/blob${qs({ ref: gitRef, path: filePath })}`)
-        .then(setBlob).catch(() => {});
+        .then(setBlob).catch(e => console.warn(e));
     }
   };
 
@@ -344,7 +344,7 @@ function IssuesTab({ projectId }: { projectId: string }) {
 
   const load = () => {
     api.get<ListResponse<Issue>>(`/api/projects/${projectId}/issues${qs({ limit: 20, offset, status })}`)
-      .then(r => { setIssues(r.items); setTotal(r.total); }).catch(() => {});
+      .then(r => { setIssues(r.items); setTotal(r.total); }).catch(e => console.warn(e));
   };
   useEffect(load, [projectId, offset, status]);
 
@@ -422,12 +422,12 @@ function MRsTab({ projectId }: { projectId: string }) {
 
   const load = () => {
     api.get<ListResponse<MergeRequest>>(`/api/projects/${projectId}/merge-requests${qs({ limit: 20, offset, status })}`)
-      .then(r => { setMrs(r.items); setTotal(r.total); }).catch(() => {});
+      .then(r => { setMrs(r.items); setTotal(r.total); }).catch(e => console.warn(e));
   };
   useEffect(load, [projectId, offset, status]);
 
   const openCreate = () => {
-    api.get<BranchInfo[]>(`/api/projects/${projectId}/branches`).then(setBranches).catch(() => {});
+    api.get<BranchInfo[]>(`/api/projects/${projectId}/branches`).then(setBranches).catch(e => console.warn(e));
     setShowCreate(true);
   };
 
@@ -516,7 +516,7 @@ function BuildsTab({ projectId }: { projectId: string }) {
 
   useEffect(() => {
     api.get<ListResponse<Pipeline>>(`/api/projects/${projectId}/pipelines${qs({ limit: 20, offset })}`)
-      .then(r => { setPipelines(r.items); setTotal(r.total); }).catch(() => {});
+      .then(r => { setPipelines(r.items); setTotal(r.total); }).catch(e => console.warn(e));
   }, [projectId, offset]);
 
   return (
@@ -550,7 +550,7 @@ function DeploymentsTab({ projectId }: { projectId: string }) {
 
   const load = () => {
     api.get<ListResponse<Deployment>>(`/api/projects/${projectId}/deployments?limit=50`)
-      .then(r => setDeployments(r.items)).catch(() => {});
+      .then(r => setDeployments(r.items)).catch(e => console.warn(e));
     api.get<ListResponse<PreviewDeployment>>(`/api/projects/${projectId}/previews?limit=50`)
       .then(r => setPreviews(r.items)).catch(() => setPreviews([]));
   };
@@ -724,7 +724,7 @@ function SkillsTab({ projectId }: { projectId: string }) {
 
   const load = () => {
     api.get<ResolvedCommand[]>(`/api/commands/resolved${qs({ project_id: projectId })}`)
-      .then(setResolved).catch(() => {});
+      .then(setResolved).catch(e => console.warn(e));
   };
   useEffect(load, [projectId]);
 
@@ -808,7 +808,7 @@ function WebhooksTab({ projectId }: { projectId: string }) {
 
   const load = () => {
     api.get<ListResponse<Webhook>>(`/api/projects/${projectId}/webhooks?limit=50`)
-      .then(r => setWebhooks(r.items)).catch(() => {});
+      .then(r => setWebhooks(r.items)).catch(e => console.warn(e));
   };
   useEffect(load, [projectId]);
 

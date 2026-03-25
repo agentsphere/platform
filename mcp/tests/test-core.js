@@ -30,6 +30,8 @@ describe("platform-core", () => {
     assert.ok(names.includes("get_session"), "missing get_session");
     assert.ok(names.includes("send_message_to_session"), "missing send_message_to_session");
     assert.ok(names.includes("ask_for_secret"), "missing ask_for_secret");
+    assert.ok(names.includes("get_worker_progress"), "missing get_worker_progress");
+    assert.ok(names.includes("read_secret"), "missing read_secret");
   });
 
   it("get_project sends GET /api/projects/:id", async () => {

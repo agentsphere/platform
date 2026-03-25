@@ -15,9 +15,9 @@ export function PipelineDetail({ id: projectId, pipelineId }: Props) {
   useEffect(() => {
     if (!projectId || !pipelineId) return;
     api.get<PipelineDetailType>(`/api/projects/${projectId}/pipelines/${pipelineId}`)
-      .then(setPipeline).catch(() => {});
+      .then(setPipeline).catch(e => console.warn(e));
     api.get<Artifact[]>(`/api/projects/${projectId}/pipelines/${pipelineId}/artifacts`)
-      .then(setArtifacts).catch(() => {});
+      .then(setArtifacts).catch(e => console.warn(e));
   }, [projectId, pipelineId]);
 
   const viewLogs = async (step: PipelineStep) => {

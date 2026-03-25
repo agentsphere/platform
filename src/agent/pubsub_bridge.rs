@@ -61,7 +61,7 @@ pub async fn publish_control(
     control_type: &str,
 ) -> Result<(), anyhow::Error> {
     let channel = valkey_acl::input_channel(session_id);
-    let msg = serde_json::json!({ "type": "control", "control_type": control_type });
+    let msg = serde_json::json!({ "type": "control", "control": { "type": control_type } });
     valkey
         .next()
         .publish::<(), _, _>(&channel, msg.to_string())

@@ -22,21 +22,21 @@ export function Alerts() {
   useEffect(() => {
     api.get<ListResponse<Project>>('/api/projects?limit=100')
       .then(r => setProjects(r.items))
-      .catch(() => {});
+      .catch(e => console.warn(e));
   }, []);
 
   const loadRules = () => {
     const params: Record<string, string | number> = { limit: 100 };
     if (selectedProject) params.project_id = selectedProject;
     api.get<ListResponse<AlertRule>>(`/api/observe/alerts${qs(params)}`)
-      .then(r => setRules(r.items)).catch(() => {});
+      .then(r => setRules(r.items)).catch(e => console.warn(e));
   };
 
   const loadEvents = () => {
     const params: Record<string, string | number> = { limit: 50 };
     if (selectedProject) params.project_id = selectedProject;
     api.get<ListResponse<AlertEvent>>(`/api/observe/alerts/events${qs(params)}`)
-      .then(r => setEvents(r.items)).catch(() => {});
+      .then(r => setEvents(r.items)).catch(e => console.warn(e));
   };
 
   useEffect(() => { loadRules(); loadEvents(); }, [selectedProject]);

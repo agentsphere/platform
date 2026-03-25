@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::helpers::require_project_read;
+use crate::audit::{AuditEntry, write_audit};
 use crate::auth::middleware::AuthUser;
 use crate::error::ApiError;
 use crate::rbac::{Permission, resolver};
@@ -169,6 +170,7 @@ async fn require_flag_manage(
     auth: &AuthUser,
     project_id: Uuid,
 ) -> Result<(), ApiError> {
+    auth.check_project_scope(project_id)?;
     let allowed = resolver::has_permission_scoped(
         &state.pool,
         &state.valkey,
@@ -180,7 +182,7 @@ async fn require_flag_manage(
     .await
     .map_err(ApiError::Internal)?;
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("project".into()));
     }
     Ok(())
 }
@@ -234,14 +236,30 @@ async fn create_flag(
         _ => ApiError::from(e),
     })?;
 
-    // Audit
+    let fid = flag_id(&row);
+
     record_flag_history(
         &state.pool,
-        flag_id(&row),
+        fid,
         "created",
         Some(auth.user_id),
         None,
         Some(&body.default_value),
+    )
+    .await;
+
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.create",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": body.key})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
     )
     .await;
 
@@ -347,8 +365,21 @@ async fn update_flag(
         Some(&new_value),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.update",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
-    // Invalidate cache
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
 
     Ok(Json(row_to_flag(&row)))
@@ -371,6 +402,20 @@ async fn delete_flag(
     if let Some(row) = result {
         let fid: Uuid = row.get("id");
         record_flag_history(&state.pool, fid, "deleted", Some(auth.user_id), None, None).await;
+        write_audit(
+            &state.pool,
+            &AuditEntry {
+                actor_id: auth.user_id,
+                actor_name: &auth.user_name,
+                action: "flag.delete",
+                resource: "feature_flag",
+                resource_id: Some(fid),
+                project_id: Some(project_id),
+                detail: Some(serde_json::json!({"key": key})),
+                ip_addr: auth.ip_addr.as_deref(),
+            },
+        )
+        .await;
         invalidate_flag_cache(&state.valkey, project_id, &key).await;
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
@@ -407,8 +452,21 @@ async fn toggle_flag(
         Some(&serde_json::json!({ "enabled": enabled })),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.toggle",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key, "enabled": enabled})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
 
-    // Immediate cache invalidation for instant effect
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
 
     Ok(Json(row_to_flag(&row)))
@@ -470,6 +528,20 @@ async fn add_rule(
         Some(&body.serve_value),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.rule.add",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key, "rule_type": body.rule_type})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
 
     Ok((axum::http::StatusCode::CREATED, Json(row_to_rule(&row))))
@@ -501,6 +573,20 @@ async fn delete_rule(
         Some(auth.user_id),
         None,
         None,
+    )
+    .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.rule.delete",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key, "rule_id": rule_id})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
     )
     .await;
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
@@ -542,6 +628,20 @@ async fn set_override(
         Some(&body.serve_value),
     )
     .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.override.set",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key, "target_user_id": target_user_id})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
+    )
+    .await;
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -574,6 +674,20 @@ async fn delete_override(
         Some(auth.user_id),
         None,
         None,
+    )
+    .await;
+    write_audit(
+        &state.pool,
+        &AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: &auth.user_name,
+            action: "flag.override.delete",
+            resource: "feature_flag",
+            resource_id: Some(fid),
+            project_id: Some(project_id),
+            detail: Some(serde_json::json!({"key": key, "target_user_id": target_user_id})),
+            ip_addr: auth.ip_addr.as_deref(),
+        },
     )
     .await;
     invalidate_flag_cache(&state.valkey, project_id, &key).await;
@@ -927,6 +1041,7 @@ mod tests {
             }
         }
         // Should be roughly 50% ± 5%
+        #[allow(clippy::cast_precision_loss)]
         let pct = (under_50 as f64 / total as f64) * 100.0;
         assert!(
             (45.0..=55.0).contains(&pct),

@@ -186,7 +186,7 @@ async fn require_agent_run(
     .map_err(ApiError::Internal)?;
 
     if !allowed {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound("project".into()));
     }
     Ok(())
 }

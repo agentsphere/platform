@@ -21,6 +21,9 @@ pub struct RenderVars {
     /// App image for testinfra/ rendering.
     #[serde(default)]
     pub app_image: Option<String>,
+    /// In-cluster URL for the shared Envoy Gateway proxy (e.g. `http://svc.ns.svc.cluster.local:80`).
+    #[serde(default)]
+    pub gateway_url: Option<String>,
 }
 
 /// Render a manifest template with the given variables using minijinja.
@@ -46,6 +49,7 @@ pub fn render(template_content: &str, vars: &RenderVars) -> Result<String, Deplo
         canary_image => &vars.canary_image,
         commit_sha => &vars.commit_sha,
         app_image => &vars.app_image,
+        gateway_url => &vars.gateway_url,
     })
     .map_err(|e| DeployerError::RenderFailed(e.to_string()))
 }
@@ -96,6 +100,7 @@ spec:
             canary_image: None,
             commit_sha: None,
             app_image: None,
+            gateway_url: None,
         };
 
         let result = render(template, &vars).unwrap();
@@ -117,6 +122,7 @@ spec:
             canary_image: None,
             commit_sha: None,
             app_image: None,
+            gateway_url: None,
         };
 
         let result = render(template, &vars).unwrap();
@@ -137,6 +143,7 @@ spec:
             canary_image: None,
             commit_sha: None,
             app_image: None,
+            gateway_url: None,
         };
 
         // minijinja renders undefined as empty string by default (not an error)
@@ -218,6 +225,7 @@ spec:
             canary_image: Some("registry/app:v2".into()),
             commit_sha: Some("abc123".into()),
             app_image: None,
+            gateway_url: None,
         };
         let result = render(template, &vars).unwrap();
         assert!(result.contains("stable: registry/app:v1"));
@@ -238,6 +246,7 @@ spec:
             canary_image: None,
             commit_sha: None,
             app_image: Some("registry/app:abc123".into()),
+            gateway_url: None,
         };
         let result = render(template, &vars).unwrap();
         assert!(result.contains("image: registry/app:abc123"));
@@ -256,6 +265,7 @@ spec:
             canary_image: None,
             commit_sha: None,
             app_image: None,
+            gateway_url: None,
         };
         assert!(render(template, &vars).is_err());
     }

@@ -204,6 +204,10 @@ pub async fn e2e_state_with_api_url(
             |_| "/tmp/mcp-servers.tar.gz".into(),
             std::path::PathBuf::from,
         ),
+        gateway_name: std::env::var("PLATFORM_GATEWAY_NAME")
+            .unwrap_or_else(|_| "platform-gateway".into()),
+        gateway_namespace: std::env::var("PLATFORM_GATEWAY_NAMESPACE")
+            .unwrap_or_else(|_| "envoy-gateway-system".into()),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)
@@ -963,12 +967,11 @@ pub async fn poll_session_messages(
     let url = format!("/api/projects/{project_id}/sessions/{session_id}");
     loop {
         let (status, detail) = get_json(app, token, &url).await;
-        if status == axum::http::StatusCode::OK {
-            if let Some(messages) = detail["messages"].as_array() {
-                if messages.len() >= expected_count {
-                    return detail;
-                }
-            }
+        if status == axum::http::StatusCode::OK
+            && let Some(messages) = detail["messages"].as_array()
+            && messages.len() >= expected_count
+        {
+            return detail;
         }
         assert!(
             start.elapsed().as_secs() <= timeout_secs,

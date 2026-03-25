@@ -18,7 +18,7 @@ export function Workspaces() {
   const load = () => {
     api.get<ListResponse<Workspace>>(`/api/workspaces${qs({ limit: LIMIT, offset })}`)
       .then(r => { setWorkspaces(r.items); setTotal(r.total); })
-      .catch(() => {});
+      .catch(e => console.warn(e));
   };
 
   useEffect(load, [offset]);

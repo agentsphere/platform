@@ -184,6 +184,11 @@ async fn create_role(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &auth).await?;
 
+    validation::check_name(&body.name)?;
+    if let Some(ref desc) = body.description {
+        validation::check_length("description", desc, 0, 10_000)?;
+    }
+
     let role = sqlx::query_as!(
         RoleResponse,
         r#"
@@ -247,6 +252,13 @@ async fn set_role_permissions(
     Json(body): Json<SetPermissionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state, &auth).await?;
+
+    if body.permissions.len() > 100 {
+        return Err(ApiError::BadRequest("too many permissions".into()));
+    }
+    for perm_name in &body.permissions {
+        validation::check_length("permission", perm_name, 1, 255)?;
+    }
 
     let role = sqlx::query!("SELECT is_system FROM roles WHERE id = $1", id)
         .fetch_optional(&state.pool)
@@ -395,6 +407,10 @@ async fn create_delegation_handler(
     Json(body): Json<CreateDelegationRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_delegate(&state, &auth).await?;
+
+    if let Some(ref reason) = body.reason {
+        validation::check_length("reason", reason, 0, 10_000)?;
+    }
 
     let perm: Permission = body
         .permission

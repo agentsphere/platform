@@ -541,8 +541,8 @@ async fn target_read_requires_permission(pool: PgPool) {
 
     let (status, _) =
         helpers::get_json(&app, &token, &format!("/api/projects/{project_id}/targets")).await;
-    // Private project with no access returns 403
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Private project with no access returns 404 to avoid leaking existence
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -561,7 +561,8 @@ async fn release_read_requires_permission(pool: PgPool) {
         &format!("/api/projects/{project_id}/deploy-releases"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Private project with no access returns 404 to avoid leaking existence
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1529,7 +1530,7 @@ async fn flags_registered_and_evaluable_from_ops_repo(pool: PgPool) {
         .await
         .unwrap();
 
-    let platform_yaml = r#"pipeline:
+    let platform_yaml = r"pipeline:
   steps:
     - name: build
       image: alpine
@@ -1540,7 +1541,7 @@ flags:
     default_value: true
   - key: new_checkout
     default_value: false
-"#;
+";
     platform::deployer::ops_repo::write_file_to_repo(
         &ops_path,
         "main",

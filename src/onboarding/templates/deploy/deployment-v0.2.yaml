@@ -1,24 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ project_name }}-app-canary
+  name: {{ project_name }}-app-v0-2
 spec:
-  replicas: 1
+  replicas: {{ values.replicas | default(1) }}
   selector:
     matchLabels:
       app: {{ project_name }}-app
-      variant: canary
+      version: v0-2
   template:
     metadata:
       labels:
         app: {{ project_name }}-app
-        variant: canary
+        version: v0-2
     spec:
       imagePullSecrets:
         - name: platform-registry-pull
       containers:
         - name: app
-          image: {{ canary_image | default(image_ref) }}
+          image: {{ image_ref }}
           ports:
             - containerPort: 8080
           env:
@@ -27,9 +27,7 @@ spec:
             - name: CACHE_URL
               value: "redis://{{ project_name }}-cache:6379"
             - name: APP_VERSION
-              value: canary
-            - name: THEME_COLOR
-              value: green
+              value: "0.2.0"
           readinessProbe:
             httpGet:
               path: /healthz
@@ -43,3 +41,15 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ project_name }}-app-v0-2
+spec:
+  selector:
+    app: {{ project_name }}-app
+    version: v0-2
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -145,14 +145,11 @@ async fn stream_turn_responses(
                 }
 
                 if let CliMessage::Result(ref r) = m {
-                    render::notify_desktop(
-                        "agent-runner",
-                        if r.is_error {
-                            "Agent completed with error"
-                        } else {
-                            "Agent turn completed"
-                        },
-                    );
+                    render::notify_desktop(if r.is_error {
+                        render::Notification::AgentError
+                    } else {
+                        render::Notification::AgentCompleted
+                    });
                     if r.is_error {
                         return Ok(false);
                     }
@@ -273,7 +270,8 @@ pub async fn run(
         transport.close_stdin().await;
 
         // Phase C: Read system init
-        let sys = match wait_for_init(&transport, 600).await {
+        let init_timeout = if has_pubsub { 180 } else { 600 };
+        let sys = match wait_for_init(&transport, init_timeout).await {
             Ok(sys) => sys,
             Err(e) => {
                 eprintln!("[error] CLI init failed: {e}");
