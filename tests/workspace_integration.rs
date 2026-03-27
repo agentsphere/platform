@@ -629,10 +629,12 @@ async fn update_nonexistent_workspace_returns_not_found(pool: PgPool) {
         serde_json::json!({ "display_name": "Ghost" }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Admin is not a member/admin of a non-existent workspace, so the
+    // require_workspace_admin check returns Forbidden (not NotFound).
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// Delete a non-existent workspace returns 404.
+/// Delete a non-existent workspace returns 403 (not a member/owner).
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_nonexistent_workspace_returns_not_found(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool).await;
@@ -641,7 +643,9 @@ async fn delete_nonexistent_workspace_returns_not_found(pool: PgPool) {
     let fake_id = Uuid::new_v4();
     let (status, _) =
         helpers::delete_json(&app, &admin_token, &format!("/api/workspaces/{fake_id}")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Admin is not the owner of a non-existent workspace, so is_owner returns
+    // false and the handler returns Forbidden.
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// Non-workspace-member cannot read private workspace projects.

@@ -514,8 +514,9 @@ async fn executor_step_condition_filtering(pool: PgPool) {
     let (project_id, _bare_path, work_path, _bd, _wd) =
         setup_pipeline_project(&state, &app, &admin_token, "exec-cond").await;
 
-    // YAML with step conditions: "deploy" only runs on push to main,
+    // YAML with step conditions: "deploy" only runs on push to production,
     // "test" runs on all branches and triggers.
+    // Per-step conditions use the `only:` field (not `on:` which is pipeline-level).
     update_pipeline_yaml(
         &work_path,
         "\
@@ -529,9 +530,9 @@ pipeline:
       image: alpine:3.19
       commands:
         - echo deploying
-      on:
-        push:
-          branches: [production]
+      only:
+        events: [push]
+        branches: [production]
 ",
     );
 

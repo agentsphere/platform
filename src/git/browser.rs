@@ -392,8 +392,11 @@ async fn commits(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("unknown revision") || stderr.contains("bad default revision") {
-            // Empty repo or invalid ref
+        if stderr.contains("unknown revision")
+            || stderr.contains("bad default revision")
+            || stderr.contains("bad revision")
+        {
+            // Empty repo or invalid ref (git says "bad revision 'HEAD'" on empty repos)
             return Ok(Json(Vec::new()));
         }
         return Err(ApiError::Internal(anyhow::anyhow!(

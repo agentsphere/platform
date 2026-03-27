@@ -248,7 +248,9 @@ async fn health_sse_admin_returns_sse_stream(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool).await;
     let app = helpers::test_router(state);
 
-    // SSE endpoint should return 200 with text/event-stream content type
+    // SSE endpoint should return 200 with text/event-stream content type.
+    // Wrap in a timeout because the handler subscribes to Valkey which may
+    // hang if the subscriber connection cannot be established in tests.
     let req = axum::http::Request::builder()
         .method("GET")
         .uri("/api/health/stream")
@@ -257,7 +259,13 @@ async fn health_sse_admin_returns_sse_stream(pool: PgPool) {
         .body(axum::body::Body::empty())
         .unwrap();
 
-    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tower::ServiceExt::oneshot(app, req),
+    )
+    .await
+    .expect("SSE handler should respond within 5s")
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let ct = resp

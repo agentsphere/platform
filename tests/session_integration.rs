@@ -2647,11 +2647,13 @@ async fn reap_idle_session_with_pod(pool: PgPool) {
 
     let project_id = create_project(&app, &admin_token, "reap-idle-pod", "private").await;
 
-    // Insert a running session created 2 hours ago (older than idle timeout=1800s)
+    // Insert a running session created 2 hours ago (older than idle timeout=1800s).
+    // Do NOT set pod_name — otherwise reap_terminated_sessions runs first and marks
+    // the session "failed" (pod 404) before reap_idle_sessions gets a chance.
     let session_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, pod_name, created_at, session_namespace)
-         VALUES ($1, $2, $3, 'idle pod session', 'running', 'claude-code', 'idle-pod', NOW() - INTERVAL '2 hours', 'test-idle-ns')",
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, created_at)
+         VALUES ($1, $2, $3, 'idle pod session', 'running', 'claude-code', NOW() - INTERVAL '2 hours')",
     )
     .bind(session_id)
     .bind(project_id)
@@ -3223,20 +3225,27 @@ async fn reap_idle_session_deletes_namespace(pool: PgPool) {
 
     let project_id = create_project(&app, &admin_token, "reap-ns-del", "private").await;
 
-    // Create a K8s namespace that will be cleaned up
+    // Create a K8s namespace that will be cleaned up.
+    // Must include the platform.io/managed-by=platform label — delete_namespace
+    // refuses to delete namespaces without it (S30 safety check).
     let ns_name = format!("reap-ns-test-{}", &Uuid::new_v4().to_string()[..8]);
     let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
         kube::Api::all(state.kube.clone());
     let ns = k8s_openapi::api::core::v1::Namespace {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(ns_name.clone()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "platform.io/managed-by".to_string(),
+                "platform".to_string(),
+            )])),
             ..Default::default()
         },
         ..Default::default()
     };
     let _ = ns_api.create(&kube::api::PostParams::default(), &ns).await;
 
-    // Insert an idle session with that namespace
+    // Insert an idle session with that namespace.
+    // Do NOT set pod_name — otherwise reap_terminated_sessions catches it first.
     let session_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, session_namespace, created_at)
@@ -3293,13 +3302,18 @@ async fn stop_session_deletes_session_namespace(pool: PgPool) {
 
     let project_id = create_project(&app, &admin_token, "stop-ns-del", "private").await;
 
-    // Create a K8s namespace
+    // Create a K8s namespace with the platform.io/managed-by=platform label —
+    // delete_namespace refuses to delete namespaces without it (S30 safety check).
     let ns_name = format!("stop-ns-test-{}", &Uuid::new_v4().to_string()[..8]);
     let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
         kube::Api::all(state.kube.clone());
     let ns = k8s_openapi::api::core::v1::Namespace {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(ns_name.clone()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "platform.io/managed-by".to_string(),
+                "platform".to_string(),
+            )])),
             ..Default::default()
         },
         ..Default::default()

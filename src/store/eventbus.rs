@@ -947,10 +947,16 @@ async fn handle_flags_registered_inner(
     flags: &[(String, serde_json::Value)],
 ) {
     for (key, default_value) in flags {
+        // Use WHERE NOT EXISTS instead of ON CONFLICT because the unique constraint
+        // (key, project_id, environment) treats NULL environment values as distinct
+        // in PostgreSQL, so ON CONFLICT DO NOTHING would create duplicates.
         let _ = sqlx::query(
             "INSERT INTO feature_flags (project_id, key, default_value, flag_type)
-             VALUES ($1, $2, $3, 'boolean')
-             ON CONFLICT (key, project_id, environment) DO NOTHING",
+             SELECT $1, $2, $3, 'boolean'
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM feature_flags
+                 WHERE project_id = $1 AND key = $2 AND environment IS NULL
+             )",
         )
         .bind(project_id)
         .bind(key)

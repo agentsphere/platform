@@ -933,13 +933,12 @@ async fn complete_wizard_exploring(pool: PgPool) {
 
     // Exploring should NOT create a team workspace (same as solo)
     let admin_id = helpers::admin_user_id(&pool).await;
-    let ws_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name != (SELECT name FROM users WHERE id = $1)",
-    )
-    .bind(admin_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let ws_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name = 'team'")
+            .bind(admin_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         ws_count.0, 0,
         "exploring org_type should not create team workspace"
@@ -1350,13 +1349,12 @@ async fn complete_wizard_all_options(pool: PgPool) {
     let admin_id = helpers::admin_user_id(&pool).await;
 
     // Verify team workspace created (startup)
-    let ws_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name != (SELECT name FROM users WHERE id = $1)",
-    )
-    .bind(admin_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let ws_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name = 'team'")
+            .bind(admin_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(ws_count.0 >= 1, "startup should create team workspace");
 
     // Verify passkey policy override
@@ -1417,13 +1415,12 @@ async fn update_settings_startup_creates_workspace(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "update to startup failed: {body}");
 
     // Verify team workspace was created
-    let ws_after: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name != (SELECT name FROM users WHERE id = $1)",
-    )
-    .bind(admin_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let ws_after: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name = 'team'")
+            .bind(admin_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(
         ws_after.0 >= 1,
         "upgrading to startup should create team workspace"

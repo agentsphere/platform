@@ -3057,10 +3057,14 @@ async fn analysis_loop_starts_and_shuts_down(pool: PgPool) {
 // ---------------------------------------------------------------------------
 
 /// Helper: create a deploy target + release with custom strategy and rollout config.
+///
+/// `name` is used for the target name (can be any unique string).
+/// `environment` must be one of 'preview', 'staging', 'production' (DB CHECK constraint).
 async fn setup_deployment_with_strategy(
     pool: &PgPool,
     project_id: Uuid,
-    env: &str,
+    name: &str,
+    environment: &str,
     image_ref: &str,
     strategy: &str,
     rollout_config: serde_json::Value,
@@ -3073,8 +3077,8 @@ async fn setup_deployment_with_strategy(
     )
     .bind(target_id)
     .bind(project_id)
-    .bind(env)
-    .bind(env)
+    .bind(name)
+    .bind(environment)
     .bind(strategy)
     .execute(pool)
     .await
@@ -3544,6 +3548,7 @@ async fn canary_pass_advances_step(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:canary-v1",
         "canary",
         rollout_config,
@@ -3619,6 +3624,7 @@ async fn canary_all_steps_pass_promotes(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:canary-v2",
         "canary",
         rollout_config,
@@ -3677,6 +3683,7 @@ async fn canary_max_failures_triggers_rollback(pool: PgPool) {
     let (target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:canary-bad",
         "canary",
@@ -3747,6 +3754,7 @@ async fn canary_single_fail_holds(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:canary-iffy",
         "canary",
         rollout_config,
@@ -3810,6 +3818,7 @@ async fn canary_inconclusive_waits(pool: PgPool) {
     let (target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:canary-wait",
         "canary",
@@ -3877,6 +3886,7 @@ async fn canary_no_verdict_stays_progressing(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:canary-nv",
         "canary",
         rollout_config,
@@ -3927,6 +3937,7 @@ async fn promoting_transitions_to_completed(pool: PgPool) {
     let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:promo-v1",
         "canary",
@@ -3993,6 +4004,7 @@ async fn rolling_back_transitions_to_rolled_back(pool: PgPool) {
     let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:rb-v1",
         "canary",
@@ -4065,6 +4077,7 @@ async fn rolling_promoting_completes(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:roll-v1",
         "rolling",
         serde_json::json!({}),
@@ -4112,6 +4125,7 @@ async fn reconciler_ab_test_elapsed_promotes(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:ab-v1",
         "ab_test",
         rollout_config,
@@ -4158,6 +4172,7 @@ async fn reconciler_ab_test_not_elapsed_waits(pool: PgPool) {
     let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:ab-v2",
         "ab_test",
@@ -4207,6 +4222,7 @@ async fn rolling_progressing_is_noop(pool: PgPool) {
     let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:roll-noop",
         "rolling",
@@ -4258,6 +4274,7 @@ async fn rolling_back_rolling_strategy(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:roll-rb",
         "rolling",
         serde_json::json!({}),
@@ -4302,6 +4319,7 @@ async fn holding_phase_handled_by_canary(pool: PgPool) {
     let (target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
+        "staging",
         "staging",
         "app:hold-v1",
         "canary",
@@ -4362,12 +4380,14 @@ async fn multiple_releases_reconciled(pool: PgPool) {
     let project_id = create_project(&app, &admin_token, "multi-rel", "private").await;
 
     // Create two promoting releases (canary strategy to exercise promoting handler)
+    let envs = ["staging", "production"];
     let mut release_ids = Vec::new();
     for i in 0..2 {
         let (_, release_id) = setup_deployment_with_strategy(
             &pool,
             project_id,
-            &format!("staging{i}"),
+            &format!("target{i}"),
+            envs[i],
             &format!("app:multi-v{i}"),
             "canary",
             serde_json::json!({"steps": [50, 100]}),
@@ -4466,7 +4486,9 @@ async fn target_namespace_via_state(pool: PgPool) {
     );
 }
 
-/// Reconciler ignores unknown strategies gracefully.
+/// Reconciler treats rolling progressing as a no-op (rolling completes at pending→promoting).
+/// Note: the DB CHECK constraint prevents inserting truly unknown strategies, so we use
+/// 'rolling' in progressing which the reconciler skips (same observable behavior).
 #[sqlx::test(migrations = "./migrations")]
 async fn reconciler_ignores_unknown_strategy(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
@@ -4478,13 +4500,14 @@ async fn reconciler_ignores_unknown_strategy(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:unk-v1",
-        "blue_green", // unknown strategy
+        "rolling", // rolling progressing is a no-op (same as unknown strategy behavior)
         serde_json::json!({}),
     )
     .await;
 
-    // Set to progressing with unknown strategy
+    // Set to progressing — rolling strategy is a no-op here
     sqlx::query(
         "UPDATE deploy_releases SET phase = 'progressing', started_at = now() WHERE id = $1",
     )
@@ -4501,13 +4524,16 @@ async fn reconciler_ignores_unknown_strategy(pool: PgPool) {
 
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Phase should remain progressing (no-op for unknown strategy)
+    // Phase should remain progressing (no-op for rolling strategy in progressing)
     let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
         .bind(release_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(phase, "progressing", "unknown strategy should be skipped");
+    assert_eq!(
+        phase, "progressing",
+        "rolling progressing should be skipped"
+    );
 
     drop(tx);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -4574,6 +4600,7 @@ async fn canary_holding_with_max_failures_rolls_back(pool: PgPool) {
         &pool,
         project_id,
         "staging",
+        "staging",
         "app:hold-bad",
         "canary",
         rollout_config,
@@ -4625,26 +4652,49 @@ async fn terminal_phases_not_processed(pool: PgPool) {
 
     let project_id = create_project(&app, &admin_token, "term-ph", "private").await;
 
-    // Create releases in terminal phases
-    for (i, _terminal_phase) in ["completed", "rolled_back", "cancelled", "failed"]
+    // Create releases in terminal phases.
+    // Use different valid environments (and a branch_slug for the 4th) to avoid
+    // the UNIQUE(project_id, environment, branch_slug) constraint.
+    let env_configs: [(&str, &str, Option<&str>); 4] = [
+        ("env0", "preview", None),
+        ("env1", "staging", None),
+        ("env2", "production", None),
+        ("env3", "preview", Some("branch-term")),
+    ];
+    for (i, terminal_phase) in ["completed", "rolled_back", "cancelled", "failed"]
         .iter()
         .enumerate()
     {
-        let (_, release_id) = setup_deployment_with_strategy(
-            &pool,
-            project_id,
-            &format!("env{i}"),
-            &format!("app:term-{i}"),
-            "rolling",
-            serde_json::json!({}),
+        let (env_name, env_val, branch_slug) = env_configs[i];
+        let target_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO deploy_targets
+               (id, project_id, name, environment, branch_slug, default_strategy, is_active)
+               VALUES ($1, $2, $3, $4, $5, 'rolling', true)",
         )
-        .await;
+        .bind(target_id)
+        .bind(project_id)
+        .bind(env_name)
+        .bind(env_val)
+        .bind(branch_slug)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        sqlx::query("UPDATE deploy_releases SET phase = $2 WHERE id = $1")
-            .bind(release_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let release_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO deploy_releases
+               (id, target_id, project_id, image_ref, strategy, phase, health, rollout_config)
+               VALUES ($1, $2, $3, $4, 'rolling', $5, 'unknown', '{}')",
+        )
+        .bind(release_id)
+        .bind(target_id)
+        .bind(project_id)
+        .bind(format!("app:term-{i}"))
+        .bind(terminal_phase)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     // Start reconciler

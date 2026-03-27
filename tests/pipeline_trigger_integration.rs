@@ -1722,7 +1722,7 @@ pipeline:
 
     // Verify a comment was posted on the MR
     let comment_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM comments WHERE merge_request_id = (
+        "SELECT COUNT(*) FROM comments WHERE mr_id = (
             SELECT id FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/test'
         )",
     )
