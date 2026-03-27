@@ -126,7 +126,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-      - uses: taiki-e/install-action@3cc20bedd2b76343154801759db06b5c6d6692eb  # cargo-llvm-cov
+      - uses: taiki-e/install-action@2a622d16d926f7a79275fe00a1d5ac0013dd3d39  # cargo-llvm-cov
       - uses: taiki-e/install-action@2a622d16d926f7a79275fe00a1d5ac0013dd3d39  # nextest
 
       - name: Create Kind cluster
