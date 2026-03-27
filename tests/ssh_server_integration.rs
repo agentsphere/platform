@@ -208,6 +208,154 @@ async fn test_check_access_for_user_scope_workspace_mismatch(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
+// SSH server lifecycle tests
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_server_shutdown_graceful(pool: PgPool) {
+    let (mut state, _admin_token) = helpers::test_state(pool).await;
+
+    // Use a unique temp dir so parallel tests don't collide
+    let tmp = tempfile::tempdir().unwrap();
+    let key_path = tmp.path().join("host_key");
+
+    let mut config = (*state.config).clone();
+    config.ssh_host_key_path = key_path.to_str().unwrap().to_string();
+    state.config = std::sync::Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _local_addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    let state_clone = state.clone();
+
+    let handle = tokio::spawn(async move {
+        platform::git::ssh_server::run_with_listener(state_clone, listener, &mut shutdown_rx).await
+    });
+
+    // Give the server a moment to start accepting
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Signal shutdown
+    shutdown_tx.send(()).unwrap();
+
+    // The server should exit cleanly within a reasonable timeout
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("server should shut down within 5s")
+        .expect("task should not panic");
+
+    assert!(
+        result.is_ok(),
+        "run_with_listener should return Ok on shutdown"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_server_generates_host_key(pool: PgPool) {
+    let (mut state, _admin_token) = helpers::test_state(pool).await;
+
+    // Use a unique temp dir with a non-existent key file
+    let tmp = tempfile::tempdir().unwrap();
+    let key_path = tmp.path().join("subdir").join("new_host_key");
+
+    // Key should not exist yet
+    assert!(
+        !key_path.exists(),
+        "key should not exist before server start"
+    );
+
+    let mut config = (*state.config).clone();
+    config.ssh_host_key_path = key_path.to_str().unwrap().to_string();
+    state.config = std::sync::Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    let state_clone = state.clone();
+
+    let handle = tokio::spawn(async move {
+        platform::git::ssh_server::run_with_listener(state_clone, listener, &mut shutdown_rx).await
+    });
+
+    // Let the server start (it generates the key during startup)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify the key file was created on disk
+    assert!(key_path.exists(), "host key should have been generated");
+
+    // Also verify the .pub companion file exists (ssh-keygen creates both).
+    // ssh-keygen appends ".pub" to the full path, e.g. "new_host_key" → "new_host_key.pub"
+    let pub_path = std::path::PathBuf::from(format!("{}.pub", key_path.to_str().unwrap()));
+    assert!(
+        pub_path.exists(),
+        "public key companion file should exist at {pub_path:?}"
+    );
+
+    // Clean shutdown
+    shutdown_tx.send(()).unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_server_loads_existing_host_key(pool: PgPool) {
+    let (mut state, _admin_token) = helpers::test_state(pool).await;
+
+    // Pre-generate an ED25519 key
+    let tmp = tempfile::tempdir().unwrap();
+    let key_path = tmp.path().join("existing_host_key");
+
+    let output = tokio::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .output()
+        .await
+        .expect("ssh-keygen should succeed");
+    assert!(
+        output.status.success(),
+        "ssh-keygen failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Record the key file's modification time
+    let meta_before = std::fs::metadata(&key_path).unwrap();
+    let mtime_before = meta_before.modified().unwrap();
+
+    let mut config = (*state.config).clone();
+    config.ssh_host_key_path = key_path.to_str().unwrap().to_string();
+    state.config = std::sync::Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    let state_clone = state.clone();
+
+    let handle = tokio::spawn(async move {
+        platform::git::ssh_server::run_with_listener(state_clone, listener, &mut shutdown_rx).await
+    });
+
+    // Let the server start
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify the key file was NOT regenerated (modification time unchanged)
+    let meta_after = std::fs::metadata(&key_path).unwrap();
+    let mtime_after = meta_after.modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "existing host key should not be regenerated"
+    );
+
+    // Clean shutdown
+    shutdown_tx.send(()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("server should shut down within 5s")
+        .expect("task should not panic");
+    assert!(result.is_ok(), "run_with_listener should return Ok");
+}
+
+// ---------------------------------------------------------------------------
 // SSH key fingerprint lookup tests
 // ---------------------------------------------------------------------------
 

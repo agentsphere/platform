@@ -1538,4 +1538,71 @@ mod tests {
     fn env_suffix_custom_unchanged() {
         assert_eq!(env_suffix("preview-feat-123"), "preview-feat-123");
     }
+
+    // -- injection prevention --
+
+    #[test]
+    fn basic_manifest_rejects_injection_semicolon() {
+        let mut r = sample_release();
+        r.image_ref = "nginx:latest; rm -rf /".into();
+        let result = generate_basic_manifest(&r);
+        assert!(result.is_err(), "semicolon in image_ref should be rejected");
+    }
+
+    #[test]
+    fn basic_manifest_rejects_injection_backtick() {
+        let mut r = sample_release();
+        r.image_ref = "nginx:`whoami`".into();
+        let result = generate_basic_manifest(&r);
+        assert!(result.is_err(), "backtick in image_ref should be rejected");
+    }
+
+    #[test]
+    fn basic_manifest_rejects_empty_image() {
+        let mut r = sample_release();
+        r.image_ref = String::new();
+        let result = generate_basic_manifest(&r);
+        assert!(result.is_err(), "empty image_ref should be rejected");
+    }
+
+    #[test]
+    fn basic_manifest_includes_image_pull_secret() {
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(
+            manifest.contains(REGISTRY_PULL_SECRET_NAME),
+            "manifest should reference the registry pull secret"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+        let secrets = &parsed["spec"]["template"]["spec"]["imagePullSecrets"];
+        assert!(secrets.is_sequence(), "imagePullSecrets should be an array");
+        assert_eq!(
+            secrets[0]["name"].as_str().unwrap(),
+            REGISTRY_PULL_SECRET_NAME
+        );
+    }
+
+    #[test]
+    fn build_docker_config_auth_is_base64() {
+        let config = build_deploy_docker_config("reg:5000", None, "admin", "tok123");
+        let auth_str = config["auths"]["reg:5000"]["auth"].as_str().unwrap();
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, auth_str)
+            .expect("auth should be valid base64");
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, "admin:tok123");
+    }
+
+    #[test]
+    fn env_suffix_development_unchanged() {
+        assert_eq!(env_suffix("development"), "development");
+    }
+
+    #[test]
+    fn target_namespace_development() {
+        let config = crate::config::Config::test_default();
+        assert_eq!(
+            target_namespace(&config, "my-app", "development"),
+            "my-app-development"
+        );
+    }
 }

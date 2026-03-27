@@ -270,3 +270,544 @@ async fn create_app_session_is_cli_subprocess(pool: PgPool) {
             .unwrap();
     assert_eq!(row.0, "cli_subprocess");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: execute_create_project tool tests
+// ---------------------------------------------------------------------------
+
+/// `execute_create_app_tool` with `create_project` creates a project + bare repo,
+/// sets namespace_slug, and links the session to the project.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_create_project_creates_project_and_repo(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) = create_user(&app, &admin_token, "ca-create", "cacreate@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    // Insert a session row to link
+    let session_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, provider, execution_mode)
+         VALUES ($1, $2, 'test', 'running', 'claude-code', 'cli_subprocess')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "create_project".into(),
+        parameters: serde_json::json!({
+            "name": "my-test-app",
+            "description": "A test application"
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, session_id, user_id, &tool)
+            .await;
+
+    assert!(result.is_ok(), "create_project tool failed: {result:?}");
+    let val = result.unwrap();
+    assert_eq!(val["name"].as_str(), Some("my-test-app"));
+    assert!(val["project_id"].as_str().is_some());
+    assert!(val["namespace_slug"].as_str().is_some());
+
+    // Verify project exists in DB
+    let project_id = uuid::Uuid::parse_str(val["project_id"].as_str().unwrap()).unwrap();
+    let row: (String,) = sqlx::query_as("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "my-test-app");
+
+    // Verify session is linked to the project
+    let sess_row: (Option<uuid::Uuid>,) =
+        sqlx::query_as("SELECT project_id FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sess_row.0, Some(project_id));
+}
+
+/// Creating a project with the same name twice should fail.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_create_project_duplicate_name_fails(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) = create_user(&app, &admin_token, "ca-dup", "cadup@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    // First create succeeds
+    let session_id_1 = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, provider, execution_mode)
+         VALUES ($1, $2, 'test', 'running', 'claude-code', 'cli_subprocess')",
+    )
+    .bind(session_id_1)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "create_project".into(),
+        parameters: serde_json::json!({ "name": "dup-app" }),
+    };
+
+    let result1 =
+        platform::agent::create_app::execute_create_app_tool(&state, session_id_1, user_id, &tool)
+            .await;
+    assert!(result1.is_ok(), "first create should succeed: {result1:?}");
+
+    // Second create with same name should fail
+    let session_id_2 = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, provider, execution_mode)
+         VALUES ($1, $2, 'test', 'running', 'claude-code', 'cli_subprocess')",
+    )
+    .bind(session_id_2)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result2 =
+        platform::agent::create_app::execute_create_app_tool(&state, session_id_2, user_id, &tool)
+            .await;
+    assert!(
+        result2.is_err(),
+        "second create with same name should fail: {result2:?}"
+    );
+    let err_msg = result2.unwrap_err();
+    assert!(
+        err_msg.contains("already exists"),
+        "error should mention 'already exists': {err_msg}"
+    );
+}
+
+/// Invalid project name (spaces) rejected by create_project tool.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_create_project_invalid_name_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-badname", "cabadname@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let session_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, provider, execution_mode)
+         VALUES ($1, $2, 'test', 'running', 'claude-code', 'cli_subprocess')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "create_project".into(),
+        parameters: serde_json::json!({ "name": "my bad name!" }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, session_id, user_id, &tool)
+            .await;
+    assert!(
+        result.is_err(),
+        "invalid name should be rejected: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: spawn_coding_agent tool tests
+// ---------------------------------------------------------------------------
+
+/// Missing prompt field in spawn_coding_agent should fail.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_spawn_agent_missing_prompt_fails(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-noprompt", "canoprompt@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let session_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, provider, execution_mode)
+         VALUES ($1, $2, 'test', 'running', 'claude-code', 'cli_subprocess')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "spawn_coding_agent".into(),
+        parameters: serde_json::json!({
+            "project_id": uuid::Uuid::new_v4().to_string()
+            // missing "prompt"
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, session_id, user_id, &tool)
+            .await;
+    assert!(
+        result.is_err(),
+        "missing prompt should be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("prompt"),
+        "error should mention 'prompt': {err_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: send_message_to_session tool tests
+// ---------------------------------------------------------------------------
+
+/// Send message from parent to a running child session should publish to Valkey.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_send_message_publishes_to_child(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-sendmsg", "casendmsg@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let project_id = helpers::create_project(&app, &_token, "send-msg-proj", "private").await;
+
+    // Create parent session
+    let parent_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent', 'running', 'claude-code')",
+    )
+    .bind(parent_id)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create child session linked to parent
+    let child_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, parent_session_id, spawn_depth)
+         VALUES ($1, $2, $3, 'child', 'running', 'claude-code', $4, 1)",
+    )
+    .bind(child_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(parent_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "send_message_to_session".into(),
+        parameters: serde_json::json!({
+            "session_id": child_id.to_string(),
+            "message": "hello from parent"
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, parent_id, user_id, &tool)
+            .await;
+    assert!(result.is_ok(), "send_message should succeed: {result:?}");
+    let val = result.unwrap();
+    assert_eq!(val["ok"].as_bool(), Some(true));
+}
+
+/// Wrong parent cannot send message to a child.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_send_message_wrong_parent_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-wrongpar", "cawrongpar@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let project_id = helpers::create_project(&app, &_token, "wrong-par-proj", "private").await;
+
+    // Create two parent sessions
+    let parent_a = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent-a', 'running', 'claude-code')",
+    )
+    .bind(parent_a)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let parent_b = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent-b', 'running', 'claude-code')",
+    )
+    .bind(parent_b)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create child linked to parent_a
+    let child_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, parent_session_id, spawn_depth)
+         VALUES ($1, $2, $3, 'child', 'running', 'claude-code', $4, 1)",
+    )
+    .bind(child_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(parent_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // parent_b tries to send to child (should fail — child belongs to parent_a)
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "send_message_to_session".into(),
+        parameters: serde_json::json!({
+            "session_id": child_id.to_string(),
+            "message": "from wrong parent"
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, parent_b, user_id, &tool)
+            .await;
+    assert!(
+        result.is_err(),
+        "wrong parent should be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("not a child"),
+        "error should mention 'not a child': {err_msg}"
+    );
+}
+
+/// Send message to a non-running child session should fail.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_send_message_not_running_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) = create_user(&app, &admin_token, "ca-notrun", "canotrun@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let project_id = helpers::create_project(&app, &_token, "notrun-proj", "private").await;
+
+    let parent_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent', 'running', 'claude-code')",
+    )
+    .bind(parent_id)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create a completed child
+    let child_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, parent_session_id, spawn_depth)
+         VALUES ($1, $2, $3, 'child', 'completed', 'claude-code', $4, 1)",
+    )
+    .bind(child_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(parent_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "send_message_to_session".into(),
+        parameters: serde_json::json!({
+            "session_id": child_id.to_string(),
+            "message": "too late"
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, parent_id, user_id, &tool)
+            .await;
+    assert!(
+        result.is_err(),
+        "sending to completed child should fail: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("not running"),
+        "error should mention 'not running': {err_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: check_session_progress tool tests
+// ---------------------------------------------------------------------------
+
+/// Check progress of a child session returns messages.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_check_progress_returns_messages(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-progress", "caprogress@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let project_id = helpers::create_project(&app, &_token, "progress-proj", "private").await;
+
+    let parent_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent', 'running', 'claude-code')",
+    )
+    .bind(parent_id)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let child_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, parent_session_id, spawn_depth)
+         VALUES ($1, $2, $3, 'child', 'running', 'claude-code', $4, 1)",
+    )
+    .bind(child_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(parent_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert some messages for the child
+    sqlx::query(
+        "INSERT INTO agent_messages (session_id, role, content) VALUES ($1, 'user', 'hello')",
+    )
+    .bind(child_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_messages (session_id, role, content) VALUES ($1, 'assistant', 'hi back')",
+    )
+    .bind(child_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "check_session_progress".into(),
+        parameters: serde_json::json!({
+            "session_id": child_id.to_string(),
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, parent_id, user_id, &tool)
+            .await;
+    assert!(result.is_ok(), "check_progress should succeed: {result:?}");
+    let val = result.unwrap();
+    assert_eq!(val["status"].as_str(), Some("running"));
+    let messages = val["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"].as_str(), Some("user"));
+    assert_eq!(messages[1]["role"].as_str(), Some("assistant"));
+}
+
+/// Wrong parent cannot check progress of someone else's child.
+#[sqlx::test(migrations = "./migrations")]
+async fn execute_check_progress_wrong_parent_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (user_id, _token) =
+        create_user(&app, &admin_token, "ca-chkwrong", "cachkwrong@test.com").await;
+    assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    let project_id = helpers::create_project(&app, &_token, "chk-wrong-proj", "private").await;
+
+    let parent_a = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent-a', 'running', 'claude-code')",
+    )
+    .bind(parent_a)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let parent_b = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider)
+         VALUES ($1, $2, $3, 'parent-b', 'running', 'claude-code')",
+    )
+    .bind(parent_b)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let child_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, parent_session_id, spawn_depth)
+         VALUES ($1, $2, $3, 'child', 'running', 'claude-code', $4, 1)",
+    )
+    .bind(child_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(parent_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // parent_b tries to check child (belongs to parent_a)
+    let tool = platform::agent::cli_invoke::ToolRequest {
+        name: "check_session_progress".into(),
+        parameters: serde_json::json!({
+            "session_id": child_id.to_string(),
+        }),
+    };
+
+    let result =
+        platform::agent::create_app::execute_create_app_tool(&state, parent_b, user_id, &tool)
+            .await;
+    assert!(
+        result.is_err(),
+        "wrong parent should be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("not a child"),
+        "error should mention 'not a child': {err_msg}"
+    );
+}

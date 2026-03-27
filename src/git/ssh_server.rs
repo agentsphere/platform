@@ -832,4 +832,175 @@ mod tests {
         buf.extend_from_slice(b"PACK\x00\x00\x00\x02"); // PACK header after flush
         assert_eq!(find_flush_pkt(&buf), Some(4));
     }
+
+    // -----------------------------------------------------------------------
+    // strip_quotes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_quotes_single_quotes() {
+        assert_eq!(strip_quotes("'hello'"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_double_quotes() {
+        assert_eq!(strip_quotes("\"hello\""), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_no_quotes() {
+        assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_mismatched_quotes() {
+        // Mismatched quotes should NOT be stripped
+        assert_eq!(strip_quotes("'hello\""), "'hello\"");
+    }
+
+    #[test]
+    fn strip_quotes_empty_string() {
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ssh_command injection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ssh_command_pipe_injection() {
+        let result = parse_ssh_command("git-upload-pack 'owner/repo|evil'");
+        assert!(
+            matches!(result, Err(SshError::PathTraversal)),
+            "pipe should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_backtick_injection() {
+        let result = parse_ssh_command("git-upload-pack 'owner/repo`id`'");
+        assert!(
+            matches!(result, Err(SshError::PathTraversal)),
+            "backtick should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_dollar_injection() {
+        let result = parse_ssh_command("git-upload-pack 'owner/$HOME'");
+        assert!(
+            matches!(result, Err(SshError::PathTraversal)),
+            "dollar should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_space_in_path() {
+        let result = parse_ssh_command("git-upload-pack 'owner/repo name'");
+        assert!(
+            matches!(result, Err(SshError::PathTraversal)),
+            "space in path should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_newline_injection() {
+        let result = parse_ssh_command("git-upload-pack 'owner/repo\nmalicious'");
+        assert!(
+            matches!(result, Err(SshError::PathTraversal)),
+            "newline should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_empty_owner() {
+        // "/repo.git" → after stripping leading /, becomes "repo.git" → no slash → InvalidCommand
+        let result = parse_ssh_command("git-upload-pack '/repo.git'");
+        assert!(
+            matches!(result, Err(SshError::InvalidCommand)),
+            "empty owner should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_empty_repo() {
+        // "owner/.git" → strip .git suffix → "owner/" → split → owner="owner", repo="" → InvalidCommand
+        let result = parse_ssh_command("git-upload-pack 'owner/.git'");
+        assert!(
+            matches!(result, Err(SshError::InvalidCommand)),
+            "empty repo should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_command_whitespace_trimmed() {
+        // Leading/trailing whitespace on the command should be trimmed
+        let result = parse_ssh_command("  git-upload-pack 'owner/repo.git'  ").unwrap();
+        assert_eq!(result.owner, "owner");
+        assert_eq!(result.repo, "repo");
+        assert!(result.is_read);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_flush_pkt edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_flush_pkt_invalid_utf8() {
+        // Non-UTF8 bytes where length hex would be → None
+        let buf: &[u8] = &[0xFF, 0xFE, 0xFD, 0xFC];
+        assert_eq!(find_flush_pkt(buf), None);
+    }
+
+    #[test]
+    fn find_flush_pkt_invalid_hex_length() {
+        // "zzzz" is not valid hex → None
+        assert_eq!(find_flush_pkt(b"zzzz"), None);
+    }
+
+    #[test]
+    fn find_flush_pkt_length_less_than_4() {
+        // "0003" is < 4 which is invalid for a non-flush pkt-line → None
+        assert_eq!(find_flush_pkt(b"0003xxx"), None);
+    }
+
+    #[test]
+    fn find_flush_pkt_three_bytes_only() {
+        // Buffer too short to contain even one pkt-line length prefix
+        assert_eq!(find_flush_pkt(b"000"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // SshError Display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ssh_error_display() {
+        assert_eq!(SshError::InvalidCommand.to_string(), "invalid command");
+        assert_eq!(
+            SshError::PathTraversal.to_string(),
+            "dangerous path rejected"
+        );
+        assert_eq!(
+            SshError::UnsupportedService("git-archive".into()).to_string(),
+            "unsupported service: git-archive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ParsedCommand fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parsed_command_fields() {
+        let cmd = parse_ssh_command("git-receive-pack 'myorg/myapp.git'").unwrap();
+        assert_eq!(cmd.owner, "myorg");
+        assert_eq!(cmd.repo, "myapp");
+        assert!(!cmd.is_read, "receive-pack should be a write operation");
+
+        let cmd2 = parse_ssh_command("git-upload-pack 'alice/tools'").unwrap();
+        assert_eq!(cmd2.owner, "alice");
+        assert_eq!(cmd2.repo, "tools");
+        assert!(cmd2.is_read, "upload-pack should be a read operation");
+    }
 }

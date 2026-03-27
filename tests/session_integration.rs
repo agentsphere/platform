@@ -1469,3 +1469,373 @@ async fn list_iframes_no_namespace_returns_404(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: Fetch session returns all fields
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn fetch_session_returns_all_fields(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "sess-allfields", "private").await;
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_id,
+        admin_id,
+        "all fields test",
+        "running",
+        Some("test-ns-dev"),
+    )
+    .await;
+
+    // Insert a message for the session
+    insert_message(&pool, session_id, "user", "hello").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify all key fields are present
+    assert_eq!(body["id"].as_str().unwrap(), session_id.to_string());
+    assert_eq!(body["project_id"].as_str().unwrap(), project_id.to_string());
+    assert_eq!(body["user_id"].as_str().unwrap(), admin_id.to_string());
+    assert_eq!(body["prompt"].as_str().unwrap(), "all fields test");
+    assert_eq!(body["status"].as_str().unwrap(), "running");
+    assert_eq!(body["provider"].as_str().unwrap(), "claude-code");
+    assert!(body["created_at"].as_str().is_some());
+    // Messages should be included
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn fetch_session_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "sess-notfound", "private").await;
+    let random_id = Uuid::new_v4();
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{random_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Stop session cleans up identity
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stop_session_cleans_up_identity(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "sess-cleanup", "private").await;
+
+    // Insert a session with a fake agent_user_id to verify cleanup
+    let session_id = Uuid::new_v4();
+    let agent_user_id = Uuid::new_v4();
+
+    // Create a fake agent user so cleanup can proceed
+    sqlx::query(
+        "INSERT INTO users (id, name, email, password_hash, user_type)
+         VALUES ($1, $2, $3, 'n/a', 'agent')",
+    )
+    .bind(agent_user_id)
+    .bind(format!("agent-{}", &session_id.to_string()[..8]))
+    .bind(format!("agent-{}@test.com", &session_id.to_string()[..8]))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, agent_user_id)
+         VALUES ($1, $2, $3, 'cleanup test', 'running', 'claude-code', $4)",
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(admin_id)
+    .bind(agent_user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/stop"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify session is stopped
+    let row: (String,) = sqlx::query_as("SELECT status FROM agent_sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "stopped");
+
+    // Verify agent user is deactivated (cleanup_agent_identity sets is_active=false)
+    let agent_row: (bool,) = sqlx::query_as("SELECT is_active FROM users WHERE id = $1")
+        .bind(agent_user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!agent_row.0, "agent user should be deactivated after stop");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Send message to non-running session rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn send_message_not_running_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "msg-completed", "private").await;
+
+    // Insert a completed session
+    let session_id = insert_session(
+        &pool,
+        project_id,
+        admin_id,
+        "completed session",
+        "completed",
+    )
+    .await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/message"),
+        serde_json::json!({ "content": "try sending" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Send message to pubsub session
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn send_message_pubsub_session(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "msg-pubsub", "private").await;
+
+    // Insert a running session with uses_pubsub=true and a pod_name
+    let session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, uses_pubsub, pod_name, session_namespace)
+         VALUES ($1, $2, $3, 'pubsub test', 'running', 'claude-code', true, 'agent-test-pod', 'test-ns')",
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(admin_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Send message — should publish to Valkey pub/sub (even though no subscriber is listening, it should succeed)
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}/message"),
+        serde_json::json!({ "content": "hello via pubsub" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Create global session without API key fails
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_global_session_no_api_key_fails(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (user_id, token) = create_user(&app, &admin_token, "no-llm-key", "nollmkey@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+    // Do NOT set any LLM provider key
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &token,
+        "/api/create-app",
+        serde_json::json!({ "description": "Build a REST API" }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 without LLM provider, got {status}: {body}"
+    );
+    let error_msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("LLM provider"),
+        "expected error about LLM provider, got: {error_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Reap idle sessions marks completed
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reap_idle_sessions_marks_completed(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "reap-idle", "private").await;
+
+    // Insert a running session that was created long ago (older than idle timeout)
+    let session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, created_at)
+         VALUES ($1, $2, $3, 'idle session', 'running', 'claude-code', NOW() - INTERVAL '2 hours')",
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(admin_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run the reaper
+    platform::agent::service::run_reaper_once(&state).await;
+
+    // Verify session is marked completed
+    let row: (String,) = sqlx::query_as("SELECT status FROM agent_sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.0, "completed",
+        "idle session should be reaped to 'completed'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Resolve session namespace
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resolve_session_namespace_prefers_session_ns(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "ns-prefer", "private").await;
+
+    // Insert session with explicit session_namespace
+    let session_id = insert_session_with_ns(
+        &pool,
+        project_id,
+        admin_id,
+        "namespace test",
+        "running",
+        Some("my-custom-ns"),
+    )
+    .await;
+
+    // Verify session_namespace is stored correctly in DB
+    let row: (Option<String>,) =
+        sqlx::query_as("SELECT session_namespace FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, Some("my-custom-ns".to_string()));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resolve_session_namespace_falls_back_to_project(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let admin_id = get_admin_id(&app, &admin_token).await;
+
+    let project_id = create_project(&app, &admin_token, "ns-fallback", "private").await;
+
+    // Insert session WITHOUT session_namespace (NULL)
+    let session_id =
+        insert_session(&pool, project_id, admin_id, "fallback ns test", "running").await;
+
+    // Fetch the session — session_namespace should be null (resolve will use project dev ns at runtime)
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/sessions/{session_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["session_namespace"].is_null(),
+        "session_namespace should be null when not set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Resolve active LLM provider — api_key mode
+// ---------------------------------------------------------------------------
+
+/// When a user has `active_llm_provider = 'api_key'` and a user key set,
+/// create-app should succeed (verifying the api_key provider resolution path).
+#[sqlx::test(migrations = "./migrations")]
+async fn resolve_active_llm_provider_api_key_mode(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (user_id, token) =
+        create_user(&app, &admin_token, "api-key-usr", "apikeyusr@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "developer", None, &pool).await;
+
+    // Set user's API key
+    helpers::set_user_api_key(&pool, user_id).await;
+
+    // Set active provider to "api_key"
+    sqlx::query("UPDATE users SET active_llm_provider = 'api_key' WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create-app should succeed because the api_key path resolves the user key
+    let (status, body) = helpers::post_json(
+        &app,
+        &token,
+        "/api/create-app",
+        serde_json::json!({ "description": "Test api_key provider" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create-app should succeed with api_key provider: {body}"
+    );
+    assert_eq!(body["status"].as_str(), Some("running"));
+}

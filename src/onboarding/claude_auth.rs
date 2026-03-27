@@ -897,6 +897,45 @@ mod tests {
     }
 
     // =====================================================================
+    // parse_validation_ndjson tests — pure function, no I/O
+    // =====================================================================
+
+    #[test]
+    fn parse_validation_ndjson_auth_success() {
+        // Valid init + result with is_error=false → true
+        let output = r#"{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"result","is_error":false,"result":"Hello!"}"#;
+        assert!(parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_auth_failed() {
+        // authentication_failed error → false
+        let output = r#"{"error":"authentication_failed","message":"Invalid token"}"#;
+        assert!(!parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_result_is_error() {
+        // result with is_error=true (no init) → false
+        let output = r#"{"type":"result","is_error":true,"result":"error"}"#;
+        assert!(!parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_empty_output() {
+        // Empty output → false
+        assert!(!parse_validation_ndjson(""));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_no_json_lines() {
+        // Non-JSON text → false
+        let output = "this is not json\nneither is this\n";
+        assert!(!parse_validation_ndjson(output));
+    }
+
+    // =====================================================================
     // PTY subprocess tests — spawn real processes + filesystem I/O.
     //
     // Tier exception: these tests spawn real subprocesses (mock CLI via

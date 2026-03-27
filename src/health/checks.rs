@@ -239,7 +239,7 @@ async fn query_pod_failures(pool: &sqlx::PgPool) -> PodFailureSummary {
         UNION ALL
         (
             SELECT pi.id, pi.project_id, p.name as project_name, NULL as pod_name,
-                   'pipeline' as kind, pi.error, pi.finished_at as failed_at
+                   'pipeline' as kind, NULL as error, pi.finished_at as failed_at
             FROM pipelines pi
             LEFT JOIN projects p ON p.id = pi.project_id
             WHERE pi.status = 'failure' AND pi.finished_at > now() - interval '24 hours'

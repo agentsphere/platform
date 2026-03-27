@@ -875,4 +875,50 @@ mod tests {
         let s = format!("{:?}", LoopOutcome::WaitingForInput);
         assert!(s.contains("WaitingForInput"));
     }
+
+    #[test]
+    fn parse_create_project_input_invalid_name() {
+        // Names with spaces are rejected by check_name (only ascii alphanumeric + -_.)
+        let input = serde_json::json!({"name": "my app with spaces"});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "spaces in name should be rejected");
+
+        // Special chars
+        let input = serde_json::json!({"name": "my@app!"});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "special chars should be rejected");
+    }
+
+    #[test]
+    fn parse_create_project_input_long_description() {
+        let long_desc = "x".repeat(10_001);
+        let input = serde_json::json!({
+            "name": "my-app",
+            "description": long_desc,
+        });
+        let result = parse_create_project_input(&input);
+        assert!(
+            result.is_err(),
+            "description >10000 chars should be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_uuid_field_null_value() {
+        let input = serde_json::json!({"project_id": null});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "null value should fail as_str()");
+    }
+
+    #[test]
+    fn prompt_truncation_over_2000() {
+        // Simulates the truncation logic in execute_spawn_agent
+        let raw_prompt = "a".repeat(3000);
+        let truncated = if raw_prompt.len() > 2000 {
+            &raw_prompt[..2000]
+        } else {
+            &raw_prompt
+        };
+        assert_eq!(truncated.len(), 2000);
+    }
 }

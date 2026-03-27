@@ -1590,3 +1590,424 @@ async fn delete_mr(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "closed", "MR should be closed after delete");
 }
+
+// ---------------------------------------------------------------------------
+// MR create with auto_merge
+// ---------------------------------------------------------------------------
+
+/// POST with auto_merge:true stores auto_merge=true in DB.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_create_with_auto_merge(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-auto-merge", "public").await;
+
+    let row: (Option<String>,) = sqlx::query_as("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_path = row.0.unwrap();
+
+    seed_bare_repo(&repo_path);
+
+    tokio::process::Command::new("git")
+        .args(["branch", "auto-branch", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests"),
+        serde_json::json!({
+            "source_branch": "auto-branch",
+            "target_branch": "main",
+            "title": "Auto Merge MR",
+            "auto_merge": true,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["number"], 1);
+
+    // Verify auto_merge is set in DB
+    let am: (bool,) = sqlx::query_as(
+        "SELECT auto_merge FROM merge_requests WHERE project_id = $1 AND number = 1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(am.0, "auto_merge should be true in DB");
+}
+
+// ---------------------------------------------------------------------------
+// Delete MR edge cases
+// ---------------------------------------------------------------------------
+
+/// Delete a merged MR returns 409 Conflict.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_already_merged_conflict(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-del-merged", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Set status to merged
+    sqlx::query("UPDATE merge_requests SET status = 'merged' WHERE project_id = $1 AND number = 1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Delete a nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_nonexistent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-del-404", "public").await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Viewer cannot delete an MR (requires project:write).
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_forbidden_viewer(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-del-viewer", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "del-viewer", "delviewer@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Get MR comment by ID
+// ---------------------------------------------------------------------------
+
+/// GET individual comment returns 200 with correct fields.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_mr_comment_by_id(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-get", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Insert comment directly
+    let comment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO comments (id, project_id, mr_id, author_id, body) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(comment_id)
+    .bind(project_id)
+    .bind(mr_id)
+    .bind(admin_id)
+    .bind("Test comment body")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], comment_id.to_string());
+    assert_eq!(body["body"], "Test comment body");
+    assert_eq!(body["author_id"], admin_id.to_string());
+    assert!(body["created_at"].is_string());
+    assert!(body["updated_at"].is_string());
+}
+
+/// GET nonexistent comment returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_mr_comment_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-get404", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Delete MR comment edge cases
+// ---------------------------------------------------------------------------
+
+/// Non-author (with project:write but not admin) cannot delete another user's comment.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_comment_non_author_forbidden(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmtdel-auth", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Admin creates a comment
+    let comment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO comments (id, project_id, mr_id, author_id, body) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(comment_id)
+    .bind(project_id)
+    .bind(mr_id)
+    .bind(admin_id)
+    .bind("admin's comment")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create a non-admin user with project:write (developer)
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmtdel-dev", "cmtdeldev@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    // Developer tries to delete admin's comment — should be forbidden
+    let (status, _) = helpers::delete_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Delete a nonexistent MR comment returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_comment_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmtdel-404", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// MR validation limits
+// ---------------------------------------------------------------------------
+
+/// MR title > 500 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_create_title_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-title-long", "public").await;
+
+    let row: (Option<String>,) = sqlx::query_as("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_path = row.0.unwrap();
+    seed_bare_repo(&repo_path);
+
+    tokio::process::Command::new("git")
+        .args(["branch", "title-long", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .unwrap();
+
+    let long_title = "a".repeat(501);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests"),
+        json!({
+            "source_branch": "title-long",
+            "target_branch": "main",
+            "title": long_title,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// MR body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_create_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-body-long", "public").await;
+
+    let row: (Option<String>,) = sqlx::query_as("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_path = row.0.unwrap();
+    seed_bare_repo(&repo_path);
+
+    tokio::process::Command::new("git")
+        .args(["branch", "body-long", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .unwrap();
+
+    let long_body = "b".repeat(100_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests"),
+        json!({
+            "source_branch": "body-long",
+            "target_branch": "main",
+            "title": "Valid title",
+            "body": long_body,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Update MR title > 500 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_update_title_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-upd-tlong", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let long_title = "a".repeat(501);
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+        json!({ "title": long_title }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Update nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_update_nonexistent_mr(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-upd-noexist", "public").await;
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999"),
+        json!({ "title": "New title" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Review body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_review_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-rev-blong", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let long_body = "c".repeat(100_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews"),
+        json!({ "verdict": "comment", "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Comment body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_comment_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-blong", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let long_body = "d".repeat(100_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments"),
+        json!({ "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -560,6 +560,9 @@ pub async fn run_reaper_once(state: &AppState) {
     if let Err(e) = reap_terminated_sessions(state).await {
         tracing::error!(error = %e, "error reaping agent sessions");
     }
+    if let Err(e) = reap_idle_sessions(state).await {
+        tracing::error!(error = %e, "error reaping idle agent sessions");
+    }
 }
 
 /// Background task that periodically checks for terminated agent pods and
@@ -1444,5 +1447,28 @@ mod tests {
             Err(other) => panic!("expected InvalidProvider, got: {other}"),
             Ok(_) => panic!("expected error for unknown provider"),
         }
+    }
+
+    #[test]
+    fn branch_name_defaults_to_agent_prefix() {
+        // Simulates the branch logic from create_session: None → "agent/{short_id}"
+        let session_id = Uuid::new_v4();
+        let short_id = &session_id.to_string()[..8];
+        let branch: Option<&str> = None;
+        let branch_name = branch.map_or_else(|| format!("agent/{short_id}"), String::from);
+        assert!(
+            branch_name.starts_with("agent/"),
+            "expected 'agent/' prefix, got: {branch_name}"
+        );
+        assert_eq!(branch_name, format!("agent/{short_id}"));
+    }
+
+    #[test]
+    fn branch_name_uses_provided_value() {
+        let session_id = Uuid::new_v4();
+        let short_id = &session_id.to_string()[..8];
+        let branch: Option<&str> = Some("feature/foo");
+        let branch_name = branch.map_or_else(|| format!("agent/{short_id}"), String::from);
+        assert_eq!(branch_name, "feature/foo");
     }
 }

@@ -708,4 +708,68 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].1, "value");
     }
+
+    #[test]
+    fn build_provider_extra_env_unknown_type() {
+        // Unknown provider types pass through all env vars without auto-injection
+        let vars = HashMap::from([
+            ("CUSTOM_VAR".into(), "custom_value".into()),
+            ("ANOTHER_VAR".into(), "another_value".into()),
+        ]);
+        let (api_key, extra) = build_provider_extra_env("some_unknown_provider", &vars);
+        assert!(api_key.is_none());
+        assert_eq!(extra.len(), 2);
+        assert!(
+            extra
+                .iter()
+                .any(|(k, v)| k == "CUSTOM_VAR" && v == "custom_value")
+        );
+        assert!(
+            extra
+                .iter()
+                .any(|(k, v)| k == "ANOTHER_VAR" && v == "another_value")
+        );
+        // No auto-injected vars
+        assert!(!extra.iter().any(|(k, _)| k == "DISABLE_PROMPT_CACHING"));
+        assert!(!extra.iter().any(|(k, _)| k == "CLAUDE_CODE_USE_VERTEX"));
+    }
+
+    #[test]
+    fn build_provider_extra_env_bedrock_does_not_override() {
+        // User-provided DISABLE_PROMPT_CACHING should be preserved
+        let vars = HashMap::from([
+            ("AWS_ACCESS_KEY_ID".into(), "AKIA123".into()),
+            ("DISABLE_PROMPT_CACHING".into(), "0".into()),
+        ]);
+        let (_, extra) = build_provider_extra_env("bedrock", &vars);
+        let caching_entries: Vec<_> = extra
+            .iter()
+            .filter(|(k, _)| k == "DISABLE_PROMPT_CACHING")
+            .collect();
+        assert_eq!(caching_entries.len(), 1);
+        assert_eq!(
+            caching_entries[0].1, "0",
+            "user's value should be preserved"
+        );
+    }
+
+    #[test]
+    fn validation_event_test_serialize() {
+        let event = ValidationEvent::Test(TestResult {
+            test: 2,
+            name: "output_format",
+            status: TestStatus::Passed,
+            detail: "Valid structured JSON".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"test\""));
+        assert!(json.contains("\"test\":2"));
+        assert!(json.contains("\"output_format\""));
+        assert!(json.contains("\"passed\""));
+    }
+
+    #[test]
+    fn validation_timeout_is_30s() {
+        assert_eq!(VALIDATION_TIMEOUT, Duration::from_secs(30));
+    }
 }

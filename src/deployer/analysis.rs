@@ -364,4 +364,40 @@ mod tests {
     fn inconclusive_verdict_as_str() {
         assert_eq!(AnalysisVerdict::Inconclusive.as_str(), "inconclusive");
     }
+
+    #[test]
+    fn invert_condition_unknown_returns_same() {
+        assert_eq!(invert_condition("eq"), "eq");
+        assert_eq!(invert_condition("absent"), "absent");
+        assert_eq!(invert_condition("unknown_op"), "unknown_op");
+    }
+
+    #[test]
+    fn pass_verdict_is_terminal() {
+        assert!(AnalysisVerdict::Pass.is_terminal());
+    }
+
+    #[test]
+    fn fail_verdict_is_terminal() {
+        assert!(AnalysisVerdict::Fail.is_terminal());
+    }
+
+    #[test]
+    fn running_verdict_is_not_terminal() {
+        assert!(!AnalysisVerdict::Running.is_terminal());
+    }
+
+    #[test]
+    fn cancelled_verdict_is_terminal() {
+        assert!(AnalysisVerdict::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn verdict_as_str_all_variants() {
+        assert_eq!(AnalysisVerdict::Running.as_str(), "running");
+        assert_eq!(AnalysisVerdict::Pass.as_str(), "pass");
+        assert_eq!(AnalysisVerdict::Fail.as_str(), "fail");
+        assert_eq!(AnalysisVerdict::Inconclusive.as_str(), "inconclusive");
+        assert_eq!(AnalysisVerdict::Cancelled.as_str(), "cancelled");
+    }
 }

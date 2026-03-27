@@ -854,3 +854,192 @@ async fn merge_already_merged_mr_returns_400(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// T4: require_up_to_date gate
+// ---------------------------------------------------------------------------
+
+/// Merge blocked when require_up_to_date is true and target has newer commits.
+#[sqlx::test(migrations = "./migrations")]
+async fn merge_blocked_require_up_to_date(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "gate-up-to-date", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+
+    // Set up real git repo
+    let (_bare_dir, bare_path) = helpers::create_bare_repo();
+    let (_work_dir, work_path) = helpers::create_working_copy(&bare_path);
+
+    // Create feature branch from current main
+    helpers::git_cmd(&work_path, &["checkout", "-b", "feat-stale"]);
+    std::fs::write(work_path.join("feature.txt"), "feature work").unwrap();
+    helpers::git_cmd(&work_path, &["add", "."]);
+    helpers::git_cmd(&work_path, &["commit", "-m", "feature commit"]);
+    helpers::git_cmd(&work_path, &["push", "origin", "feat-stale"]);
+
+    // Now add a commit to main (making feat-stale not up-to-date)
+    helpers::git_cmd(&work_path, &["checkout", "main"]);
+    std::fs::write(work_path.join("hotfix.txt"), "hotfix").unwrap();
+    helpers::git_cmd(&work_path, &["add", "."]);
+    helpers::git_cmd(&work_path, &["commit", "-m", "hotfix on main"]);
+    helpers::git_cmd(&work_path, &["push", "origin", "main"]);
+
+    // Point project repo_path to the bare repo
+    sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
+        .bind(bare_path.to_str().unwrap())
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let head_sha = helpers::git_cmd(&work_path, &["rev-parse", "feat-stale"])
+        .trim()
+        .to_string();
+
+    // Protection rule: require_up_to_date = true
+    helpers::insert_branch_protection(&pool, project_id, "main", 0, &["merge"], &[], true, false)
+        .await;
+
+    // Insert MR
+    let mr_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO merge_requests (id, project_id, number, author_id, source_branch, target_branch, title, status, head_sha)
+         VALUES ($1, $2, 1, $3, 'feat-stale', 'main', 'Stale MR', 'open', $4)",
+    )
+    .bind(mr_id)
+    .bind(project_id)
+    .bind(admin_id)
+    .bind(&head_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE projects SET next_mr_number = 2 WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Merge should be blocked because source is not up to date with target
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/merge"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "should block stale merge: {body}"
+    );
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.to_lowercase().contains("up to date"),
+        "error should mention up to date, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T5: Rebase merge strategy
+// ---------------------------------------------------------------------------
+
+/// Merge with rebase strategy (fast-forward) succeeds when source is on top of target.
+#[sqlx::test(migrations = "./migrations")]
+async fn merge_rebase_strategy(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "rebase-merge", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+
+    // Set up git repo — feature branch must be fast-forwardable onto main
+    let (_bare_dir, bare_path) = helpers::create_bare_repo();
+    let (_work_dir, work_path) = helpers::create_working_copy(&bare_path);
+
+    helpers::git_cmd(&work_path, &["checkout", "-b", "feat-rebase"]);
+    std::fs::write(work_path.join("rebase.txt"), "rebase feature").unwrap();
+    helpers::git_cmd(&work_path, &["add", "."]);
+    helpers::git_cmd(&work_path, &["commit", "-m", "rebase commit"]);
+    helpers::git_cmd(&work_path, &["push", "origin", "feat-rebase"]);
+
+    sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
+        .bind(bare_path.to_str().unwrap())
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let head_sha = helpers::git_cmd(&work_path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // Update protection rule to allow rebase merges
+    helpers::insert_branch_protection(
+        &pool,
+        project_id,
+        "main",
+        0,
+        &["merge", "rebase"],
+        &[],
+        false,
+        false,
+    )
+    .await;
+
+    // Insert MR
+    let mr_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO merge_requests (id, project_id, number, author_id, source_branch, target_branch, title, status, head_sha)
+         VALUES ($1, $2, 1, $3, 'feat-rebase', 'main', 'Rebase MR', 'open', $4)",
+    )
+    .bind(mr_id)
+    .bind(project_id)
+    .bind(admin_id)
+    .bind(&head_sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE projects SET next_mr_number = 2 WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/merge"),
+        serde_json::json!({ "merge_method": "rebase" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rebase merge should succeed: {body}"
+    );
+    assert_eq!(body["status"], "merged");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-merge on nonexistent MR
+// ---------------------------------------------------------------------------
+
+/// Disable auto-merge on a nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn auto_merge_nonexistent_mr_disable(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "auto-merge-noexist", "public").await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999/auto-merge"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

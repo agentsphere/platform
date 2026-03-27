@@ -1092,3 +1092,649 @@ async fn read_version_at_ref_missing_file(pool: PgPool) {
 
     drop(bare_dir);
 }
+
+// ===========================================================================
+// on_push — VERSION file triggers annotated git tag
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_with_version_creates_tag(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+
+    // Create repo with .platform.yaml AND a VERSION file
+    let bare_dir = TempDir::new().unwrap();
+    let bare_path = bare_dir.path().to_path_buf();
+    Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare_path)
+        .output()
+        .unwrap();
+
+    let work_dir = TempDir::new().unwrap();
+    let work_path = work_dir.path();
+    Command::new("git")
+        .args(["clone"])
+        .arg(&bare_path)
+        .arg(work_path)
+        .output()
+        .unwrap();
+
+    std::fs::write(work_path.join(".platform.yaml"), SIMPLE_YAML).unwrap();
+    std::fs::write(work_path.join("VERSION"), "app=1.0.0\n").unwrap();
+
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init with version",
+        ])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+
+    // Get the commit SHA for the push
+    let sha_output = Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let commit_sha = String::from_utf8(sha_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: Some(commit_sha),
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    assert!(result.is_some(), "on_push should create a pipeline");
+
+    let pipeline_id = result.unwrap();
+
+    // Verify the version was stored
+    let row: (Option<String>,) = sqlx::query_as("SELECT version FROM pipelines WHERE id = $1")
+        .bind(pipeline_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0.as_deref(), Some("app=1.0.0"));
+
+    // Verify annotated tag was created
+    let tag_check = Command::new("git")
+        .args(["-C"])
+        .arg(&bare_path)
+        .args(["tag", "-l", "v1.0.0"])
+        .output()
+        .unwrap();
+    let tag_output = String::from_utf8(tag_check.stdout).unwrap();
+    assert!(
+        tag_output.contains("v1.0.0"),
+        "annotated git tag v1.0.0 should be created"
+    );
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — imagebuild step type
+// ===========================================================================
+
+const IMAGEBUILD_YAML: &str = "\
+pipeline:
+  steps:
+    - name: build-image
+      type: imagebuild
+      imageName: myapp
+      dockerfile: Dockerfile
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_imagebuild_step_type(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(IMAGEBUILD_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: Some("abc12345".into()),
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    // Verify step was created with imagebuild type
+    let step: (String, String, Vec<String>, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT step_type, image, commands, step_config FROM pipeline_steps WHERE pipeline_id = $1",
+    )
+    .bind(pipeline_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(step.0, "imagebuild", "step_type should be imagebuild");
+    assert_eq!(
+        step.1, "gcr.io/kaniko-project/executor:v1.23.2-debug",
+        "image should be kaniko"
+    );
+    assert!(
+        !step.2.is_empty(),
+        "commands should contain kaniko executor command"
+    );
+    assert!(
+        step.2[0].contains("/kaniko/executor"),
+        "command should be a kaniko executor invocation"
+    );
+
+    // Verify step_config stores image_name and dockerfile
+    let config = step.3.unwrap();
+    assert_eq!(config["image_name"], "myapp");
+    assert_eq!(config["dockerfile"], "Dockerfile");
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — gitops_sync step type
+// ===========================================================================
+
+const GITOPS_SYNC_YAML: &str = "\
+pipeline:
+  steps:
+    - name: sync-ops
+      type: gitops_sync
+      gitops:
+        copy: [\"deploy/\"]
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_gitops_sync_step_type(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(GITOPS_SYNC_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: None,
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    let step: (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT step_type, step_config FROM pipeline_steps WHERE pipeline_id = $1")
+            .bind(pipeline_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(step.0, "gitops_sync");
+    let config = step.1.unwrap();
+    let copy = config["copy"].as_array().unwrap();
+    assert_eq!(copy.len(), 1);
+    assert_eq!(copy[0].as_str().unwrap(), "deploy/");
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — deploy_test step type
+// ===========================================================================
+
+const DEPLOY_TEST_YAML: &str = "\
+pipeline:
+  steps:
+    - name: integration-test
+      type: deploy_test
+      deploy_test:
+        test_image: myapp-test:latest
+        readiness_path: /health
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_deploy_test_step_type(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(DEPLOY_TEST_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: None,
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    let step: (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT step_type, deploy_test FROM pipeline_steps WHERE pipeline_id = $1")
+            .bind(pipeline_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(step.0, "deploy_test");
+    let dt = step.1.unwrap();
+    assert_eq!(dt["test_image"], "myapp-test:latest");
+    assert_eq!(dt["readiness_path"], "/health");
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — deploy_watch step type
+// ===========================================================================
+
+const DEPLOY_WATCH_YAML: &str = "\
+pipeline:
+  steps:
+    - name: watch-deploy
+      type: deploy_watch
+      deploy_watch:
+        environment: production
+        timeout: 600
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_deploy_watch_step_type(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(DEPLOY_WATCH_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: None,
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    let step: (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT step_type, step_config FROM pipeline_steps WHERE pipeline_id = $1")
+            .bind(pipeline_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(step.0, "deploy_watch");
+    let config = step.1.unwrap();
+    assert_eq!(config["environment"], "production");
+    assert_eq!(config["timeout"], 600);
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — step with depends_on stores dependency
+// ===========================================================================
+
+const DEPENDS_ON_YAML: &str = "\
+pipeline:
+  steps:
+    - name: first
+      image: alpine:3.19
+      commands:
+        - echo first
+    - name: second
+      image: alpine:3.19
+      depends_on: [first]
+      commands:
+        - echo second
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_step_with_depends_on(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(DEPENDS_ON_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: None,
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    let steps: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT name, depends_on FROM pipeline_steps WHERE pipeline_id = $1 ORDER BY step_order",
+    )
+    .bind(pipeline_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(steps.len(), 2);
+    assert!(
+        steps[0].1.is_empty(),
+        "first step should have no depends_on"
+    );
+    assert_eq!(
+        steps[1].1,
+        vec!["first"],
+        "second step should depend on first"
+    );
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_push — step with condition stores events and branches
+// ===========================================================================
+
+const CONDITION_STEP_YAML: &str = "\
+pipeline:
+  steps:
+    - name: mr-only-step
+      image: alpine:3.19
+      commands:
+        - echo test
+      only:
+        events: [mr, push]
+        branches: [main, develop]
+";
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_push_step_with_condition(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+    let (bare_dir, work_dir, bare_path) = create_test_repo_with_pipeline_yaml(CONDITION_STEP_YAML);
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    let params = PushTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        branch: "main".into(),
+        commit_sha: None,
+    };
+
+    let result = trigger::on_push(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    let pipeline_id = result.unwrap();
+
+    let step: (Vec<String>, Vec<String>) = sqlx::query_as(
+        "SELECT condition_events, condition_branches FROM pipeline_steps WHERE pipeline_id = $1",
+    )
+    .bind(pipeline_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(step.0, vec!["mr", "push"], "condition_events should match");
+    assert_eq!(
+        step.1,
+        vec!["main", "develop"],
+        "condition_branches should match"
+    );
+
+    drop(bare_dir);
+    drop(work_dir);
+}
+
+// ===========================================================================
+// on_mr — auto-bump VERSION when identical to main
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn on_mr_auto_bump_version(pool: PgPool) {
+    let _state = helpers::test_state(pool.clone()).await;
+
+    // Create a repo with the same VERSION on main and feature branch
+    let bare_dir = TempDir::new().unwrap();
+    let bare_path = bare_dir.path().to_path_buf();
+    Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare_path)
+        .output()
+        .unwrap();
+
+    let work_dir = TempDir::new().unwrap();
+    let work_path = work_dir.path();
+    Command::new("git")
+        .args(["clone"])
+        .arg(&bare_path)
+        .arg(work_path)
+        .output()
+        .unwrap();
+
+    let mr_yaml = "\
+pipeline:
+  steps:
+    - name: test
+      image: alpine:3.19
+      commands:
+        - echo test
+  on:
+    mr:
+      actions: [opened]
+";
+
+    std::fs::write(work_path.join(".platform.yaml"), mr_yaml).unwrap();
+    std::fs::write(work_path.join("VERSION"), "app=1.0.0\n").unwrap();
+
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+
+    // Create a feature branch with the SAME VERSION (agent forgot to bump)
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["checkout", "-b", "feature/test"])
+        .output()
+        .unwrap();
+    std::fs::write(work_path.join("README.md"), "# Feature\n").unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "feature work",
+        ])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["-C"])
+        .arg(work_path)
+        .args(["push", "origin", "feature/test"])
+        .output()
+        .unwrap();
+
+    let (project_id, user_id) = create_project_with_repo(&pool, bare_path.to_str().unwrap()).await;
+
+    // Create an MR so the auto-bump comment has a target
+    sqlx::query(
+        "INSERT INTO merge_requests (project_id, number, author_id, source_branch, target_branch, title, status, head_sha)
+         VALUES ($1, 1, $2, 'feature/test', 'main', 'Test MR', 'open', 'abc123')",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE projects SET next_mr_number = 2 WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let params = trigger::MrTriggerParams {
+        project_id,
+        user_id,
+        repo_path: bare_path.clone(),
+        source_branch: "feature/test".into(),
+        commit_sha: None,
+        action: "opened".into(),
+    };
+
+    let result = trigger::on_mr(
+        &pool,
+        &params,
+        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+    )
+    .await
+    .unwrap();
+    assert!(result.is_some(), "on_mr should create a pipeline");
+
+    let pipeline_id = result.unwrap();
+
+    // Verify the pipeline version was auto-bumped to 1.0.1
+    let row: (Option<String>,) = sqlx::query_as("SELECT version FROM pipelines WHERE id = $1")
+        .bind(pipeline_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.0.is_some(), "version should be set");
+    let version_str = row.0.unwrap();
+    assert!(
+        version_str.contains("1.0.1"),
+        "version should be auto-bumped to 1.0.1, got: {version_str}"
+    );
+
+    // Verify the VERSION file was updated on the feature branch
+    let ver_content = trigger::read_file_at_ref(&bare_path, "feature/test", "VERSION").await;
+    assert!(ver_content.is_some(), "VERSION should still exist");
+    let ver_text = ver_content.unwrap();
+    assert!(
+        ver_text.contains("1.0.1"),
+        "VERSION file should contain bumped version 1.0.1, got: {ver_text}"
+    );
+
+    // Verify a comment was posted on the MR
+    let comment_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM comments WHERE merge_request_id = (
+            SELECT id FROM merge_requests WHERE project_id = $1 AND source_branch = 'feature/test'
+        )",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        comment_count.0 > 0,
+        "auto-bump should post a comment on the MR"
+    );
+
+    drop(bare_dir);
+    drop(work_dir);
+}

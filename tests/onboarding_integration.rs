@@ -353,3 +353,286 @@ async fn create_demo_project_success(pool: PgPool) {
     assert!(body["project_id"].is_string());
     assert!(body["project_name"].is_string());
 }
+
+// ---------------------------------------------------------------------------
+// Claude auth — permission enforcement
+// ---------------------------------------------------------------------------
+
+/// Non-admin cannot start Claude auth flow.
+#[sqlx::test(migrations = "./migrations")]
+async fn start_claude_auth_non_admin_forbidden(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (_uid, user_token) =
+        helpers::create_user(&app, &admin_token, "noauth-start", "noauthstart@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        "/api/onboarding/claude-auth/start",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Submit auth code for nonexistent session returns error (403 because admin check comes first,
+/// but the actual session lookup triggers an internal error path).
+#[sqlx::test(migrations = "./migrations")]
+async fn submit_auth_code_nonexistent_session(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/onboarding/claude-auth/{fake_id}/code"),
+        serde_json::json!({ "code": "test-code-12345" }),
+    )
+    .await;
+    // Expect 500 (internal error from "session not found" in cli_auth_manager)
+    // or 400 ("master key not configured") if master_key handling fails first.
+    // The key point: it doesn't succeed.
+    assert!(
+        status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::BAD_REQUEST,
+        "expected error for nonexistent session, got {status}"
+    );
+}
+
+/// Non-admin cannot submit auth code.
+#[sqlx::test(migrations = "./migrations")]
+async fn submit_auth_code_non_admin_forbidden(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (_uid, user_token) =
+        helpers::create_user(&app, &admin_token, "noauth-code", "noauthcode@test.com").await;
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/onboarding/claude-auth/{fake_id}/code"),
+        serde_json::json!({ "code": "test-code" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Wizard with provider_key and cli_token
+// ---------------------------------------------------------------------------
+
+/// Complete wizard with provider_key saves encrypted key in DB.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_with_provider_key(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({
+            "org_type": "solo",
+            "provider_key": "sk-ant-api03-test-key-1234567890abcdef"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "wizard with provider_key failed: {body}"
+    );
+    assert_eq!(body["success"], true);
+
+    // Verify key was saved in user_provider_keys
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let key_row: Option<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT encrypted_key, key_suffix FROM user_provider_keys WHERE user_id = $1 AND provider = 'anthropic'",
+    )
+    .bind(admin_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    assert!(key_row.is_some(), "provider key should be saved in DB");
+    let (encrypted_key, suffix) = key_row.unwrap();
+    assert!(
+        !encrypted_key.is_empty(),
+        "encrypted key should not be empty"
+    );
+    assert_eq!(suffix, "cdef", "key_suffix should be last 4 chars");
+}
+
+/// Complete wizard with cli_token saves token in cli_credentials.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_with_cli_token(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({
+            "org_type": "solo",
+            "cli_token": {
+                "auth_type": "setup_token",
+                "token": "sk-ant-oat01-test-cli-token-abcdef1234567890"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "wizard with cli_token failed: {body}"
+    );
+    assert_eq!(body["success"], true);
+
+    // Verify cli_credentials row was created
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let cred_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM cli_credentials WHERE user_id = $1 AND auth_type = 'setup_token'",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        cred_count.0, 1,
+        "cli_credentials should have one setup_token row"
+    );
+}
+
+/// Saving provider key without master_key configured returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn save_provider_key_no_master_key(pool: PgPool) {
+    let (mut state, admin_token) = helpers::test_state(pool).await;
+
+    // Override config to remove master_key
+    let mut config = (*state.config).clone();
+    config.master_key = None;
+    state.config = std::sync::Arc::new(config);
+
+    let app = helpers::test_router(state);
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({
+            "org_type": "solo",
+            "provider_key": "sk-ant-api03-test-key-no-master"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "should fail without master key: {body}"
+    );
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.to_lowercase().contains("master key"),
+        "error should mention master key, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Update settings edge cases
+// ---------------------------------------------------------------------------
+
+/// PATCH settings with empty body is a no-op, returns 200 with unchanged settings.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_settings_empty_body_noop(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // First read current settings
+    let (status, before) = helpers::get_json(&app, &admin_token, "/api/onboarding/settings").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // PATCH with empty body (no org_type field)
+    let (status, after) = helpers::patch_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/settings",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Settings should be unchanged
+    assert_eq!(
+        before["onboarding_completed"], after["onboarding_completed"],
+        "settings should be unchanged after empty patch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Team workspace idempotency
+// ---------------------------------------------------------------------------
+
+/// Running wizard twice with startup only creates one team workspace.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_team_workspace_already_exists(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // First wizard run (creates team workspace)
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "startup" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first wizard failed: {body}");
+
+    // Count non-personal workspaces (team workspace)
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let ws_count_1: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name != (SELECT name FROM users WHERE id = $1)",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Reset wizard completed flag so we can run it again
+    sqlx::query(
+        "INSERT INTO platform_settings (key, value) VALUES ('onboarding_completed', 'false')
+         ON CONFLICT (key) DO UPDATE SET value = 'false'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Second wizard run with startup (should not create duplicate workspace)
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "startup" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second wizard failed: {body}");
+
+    // Count should be the same
+    let ws_count_2: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM workspaces WHERE owner_id = $1 AND name != (SELECT name FROM users WHERE id = $1)",
+    )
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ws_count_1.0, ws_count_2.0,
+        "second wizard run should not create duplicate workspace"
+    );
+}

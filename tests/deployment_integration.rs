@@ -1717,3 +1717,1337 @@ async fn demo_project_creates_mr_and_triggers_pipeline(pool: PgPool) {
         .unwrap();
     assert_eq!(issue_count, 4, "should have created 4 sample issues");
 }
+
+// ---------------------------------------------------------------------------
+// Reconciler integration tests
+// ---------------------------------------------------------------------------
+
+/// Spawn the reconciler loop and verify it shuts down cleanly.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconcile_loop_starts_and_shuts_down(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::deployer::reconciler::run(state.clone(), rx));
+
+    // Let it tick at least once
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Send shutdown
+    drop(tx);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "reconciler should shut down within 5s");
+}
+
+/// If a release's phase was changed between the query and the claim,
+/// the reconciler skips it (optimistic lock).
+#[sqlx::test(migrations = "./migrations")]
+async fn reconcile_skips_already_claimed(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "skip-claimed", "public").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "staging", "app:claimed").await;
+
+    // Set phase to progressing (so the reconciler query won't find it as 'pending')
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'completed', completed_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run a reconciler tick — it should find no releases to process
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(async move {
+        platform::deployer::reconciler::run(s, rx).await;
+    });
+    // Give it a tick
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Release should still be completed (not changed to anything else)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "completed");
+}
+
+/// Canary: pass verdict on non-final step advances current_step and updates traffic_weight.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_progress_pass_advances_step(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "canary-adv", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a 'pass' verdict for step 0
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}'::jsonb, 'pass', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Spawn reconciler, wake it, wait for processing
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Should have advanced to step 1 with weight 50
+    let (step, weight): (i32, i32) =
+        sqlx::query_as("SELECT current_step, traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(step, 1, "step should advance from 0 to 1");
+    assert_eq!(weight, 50, "weight should be step[1]=50");
+}
+
+/// Canary: pass verdict on final step transitions to promoting.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_progress_pass_final_step_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "canary-final", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50],
+    });
+    // Already at step 1 (final step index = steps.len()-1 = 1)
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at, traffic_weight)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 1, now(), 50)",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 'pass' verdict for final step
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 1, '{}'::jsonb, 'pass', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "promoting",
+        "final step pass should transition to promoting"
+    );
+}
+
+/// Canary: fail within threshold transitions to holding.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_progress_fail_within_threshold_holds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "canary-hold", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "max_failures": 3,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 1 fail verdict (below max_failures=3)
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}'::jsonb, 'fail', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "holding", "single fail should transition to holding");
+}
+
+/// Canary: fail count reaching max_failures triggers rolling_back.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_progress_fail_exceeds_max_failures_rolls_back(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "canary-rb", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "max_failures": 2,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 2 fail verdicts (== max_failures)
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+             VALUES ($1, 0, '{}'::jsonb, 'fail', now())",
+        )
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "rolling_back",
+        "exceeding max_failures should trigger rolling_back"
+    );
+}
+
+/// Canary: inconclusive verdict leaves state unchanged.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_progress_inconclusive_waits(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "canary-wait", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert inconclusive verdict
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}'::jsonb, 'inconclusive', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let (phase, step): (String, i32) =
+        sqlx::query_as("SELECT phase, current_step FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "progressing", "inconclusive should not change phase");
+    assert_eq!(step, 0, "inconclusive should not advance step");
+}
+
+/// AB test: elapsed duration transitions to promoting.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_duration_elapsed_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "ab-elapsed", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'ab_test')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "control_service": "app-control",
+        "treatment_service": "app-treatment",
+        "match": {"headers": {"x-exp": "treatment"}},
+        "success_metric": "conversion",
+        "success_condition": "gt",
+        "duration": 1,
+    });
+    // started_at = 10 seconds ago so duration (1s) is already elapsed
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'ab_test', 'progressing', $4, 0, now() - interval '10 seconds')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "promoting",
+        "elapsed AB test should transition to promoting"
+    );
+}
+
+/// AB test: duration not yet elapsed stays in progressing.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_duration_not_elapsed_waits(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "ab-wait", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'ab_test')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "control_service": "app-control",
+        "treatment_service": "app-treatment",
+        "match": {"headers": {}},
+        "success_metric": "conversion",
+        "success_condition": "gt",
+        "duration": 86400,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'ab_test', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "not-elapsed AB test should stay in progressing"
+    );
+}
+
+/// Promoting phase completes the release with phase=completed and creates history entry.
+#[sqlx::test(migrations = "./migrations")]
+async fn promoting_completes_release(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "promote-complete", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'staging', 'staging', 'rolling')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, started_at)
+         VALUES ($1, $2, $3, 'app:v3', 'rolling', 'promoting', now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let (phase, health): (String, String) =
+        sqlx::query_as("SELECT phase, health FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "completed");
+    assert_eq!(health, "healthy");
+
+    // Verify history entry exists
+    let hist_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'promoted'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(hist_count >= 1, "should have promoted history entry");
+}
+
+/// Rolling-back phase completes with phase=rolled_back and creates history entry.
+#[sqlx::test(migrations = "./migrations")]
+async fn rolling_back_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "rb-complete", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'staging', 'staging', 'rolling')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, started_at)
+         VALUES ($1, $2, $3, 'app:bad', 'rolling', 'rolling_back', now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let (phase, health): (String, String) =
+        sqlx::query_as("SELECT phase, health FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "rolled_back");
+    assert_eq!(health, "unhealthy");
+
+    let hist_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'rolled_back'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(hist_count >= 1, "should have rolled_back history entry");
+}
+
+/// Expired preview targets get deactivated and their releases cancelled.
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_expired_previews_deactivates(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "preview-expire", "public").await;
+
+    // Create an expired preview target
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at, default_strategy, is_active)
+         VALUES ($1, $2, 'feat-old', 'preview', 'feature/old', 'feat-old', 1, now() - interval '1 hour', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create a progressing release for this target
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, started_at)
+         VALUES ($1, $2, $3, 'app:preview', 'rolling', 'progressing', now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run reconciler (cleanup happens in the reconcile tick)
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Target should be deactivated
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_active, "expired preview target should be deactivated");
+
+    // Release should be cancelled
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "cancelled",
+        "release on expired target should be cancelled"
+    );
+}
+
+/// ensure_scoped_tokens creates OTEL + API tokens and a second call rotates them.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_creates_and_rotates(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "scoped-tok", "public").await;
+
+    // First call: creates tokens
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging").await;
+    assert!(
+        result.is_ok(),
+        "first ensure_scoped_tokens should succeed: {:?}",
+        result.err()
+    );
+    let (otel1, api1) = result.unwrap();
+    assert!(!otel1.is_empty());
+    assert!(!api1.is_empty());
+
+    // Second call: rotates tokens (creates new, deletes old)
+    let result2 =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging").await;
+    assert!(result2.is_ok());
+    let (otel2, api2) = result2.unwrap();
+    // New tokens should be different from old ones
+    assert_ne!(otel1, otel2, "OTEL token should be rotated");
+    assert_ne!(api1, api2, "API token should be rotated");
+}
+
+/// ensure_scoped_tokens fails when project has no owner.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_no_owner_fails(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    // Use a nonexistent project ID
+    let fake_project_id = Uuid::new_v4();
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, fake_project_id, "staging")
+            .await;
+    assert!(result.is_err(), "should fail for nonexistent project");
+}
+
+/// ensure_registry_pull_secret_for with no registry_url is a no-op.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_registry_pull_secret_no_url_noop(pool: PgPool) {
+    let (mut state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "no-reg-url", "public").await;
+
+    // Remove registry_url from config
+    let mut config = (*state.config).clone();
+    config.registry_url = None;
+    state.config = std::sync::Arc::new(config);
+
+    let release_id = Uuid::new_v4();
+    // Should return immediately without error
+    platform::deployer::reconciler::ensure_registry_pull_secret_for(
+        &state, project_id, release_id, "test-ns",
+    )
+    .await;
+    // No panic = success (early return when no registry_url)
+}
+
+/// fire_webhooks is called when a release completes (verified by creating a webhook).
+#[sqlx::test(migrations = "./migrations")]
+async fn fire_webhook_dispatches(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "webhook-fire", "public").await;
+
+    // Insert webhook directly in DB (SSRF blocks localhost in the API)
+    sqlx::query(
+        "INSERT INTO webhooks (project_id, url, events, active)
+         VALUES ($1, 'https://example.com/hook', ARRAY['deploy'], true)",
+    )
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'staging', 'staging', 'rolling')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, started_at)
+         VALUES ($1, $2, $3, 'app:hook', 'rolling', 'promoting', now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run reconciler — promoting should complete and fire webhook
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Verify release completed (webhook dispatch itself is fire-and-forget)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "completed",
+        "release should complete and fire webhook"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Analysis integration tests
+// ---------------------------------------------------------------------------
+
+/// Analysis tick creates a rollout_analyses record for a progressing canary release.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_tick_creates_record(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-tick", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 0,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Spawn analysis loop for one tick
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Verify analysis record was created
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rollout_analyses WHERE release_id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(count >= 1, "analysis tick should create a record");
+}
+
+/// A running analysis record is reused on subsequent ticks (no duplicate).
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_ensure_record_reuses_existing(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-reuse", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10],
+        "min_requests": 0,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Pre-create a running analysis record
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict)
+         VALUES ($1, 0, '{}'::jsonb, 'running')",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run analysis tick — should reuse the existing record, not create a new one
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // There should still be only 1 record with step_index=0 (the pre-created running one may
+    // have been completed, but no duplicate 'running' record should exist)
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rollout_analyses WHERE release_id = $1 AND step_index = 0",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // Should be exactly 1 (the original running record, possibly now completed)
+    assert_eq!(
+        total_count, 1,
+        "should not create duplicate analysis records"
+    );
+}
+
+/// Rollback trigger breached produces a fail verdict.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_rollback_trigger_breached(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-rb", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 0,
+        "rollback_triggers": [{
+            "metric": "error_rate",
+            "condition": "gt",
+            "threshold": 0.10,
+            "aggregation": "avg",
+            "window": 300
+        }],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed metric data: high error rate (0.90 > threshold 0.10)
+    let series_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO metric_series (id, name, labels) VALUES ($1, $2, $3)")
+        .bind(series_id)
+        .bind("error_rate")
+        .bind(serde_json::json!({"platform.project_id": project_id.to_string()}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metric_samples (series_id, timestamp, value) VALUES ($1, now(), $2)")
+        .bind(series_id)
+        .bind(0.90_f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run analysis loop
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    // Verify a 'fail' verdict was written
+    let verdict: Option<String> = sqlx::query_scalar(
+        "SELECT verdict FROM rollout_analyses WHERE release_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict.as_deref(),
+        Some("fail"),
+        "rollback trigger breach should produce fail verdict"
+    );
+}
+
+/// All progress gates pass produces a pass verdict.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_progress_gates_all_pass(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-pass", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 0,
+        "progress_gates": [{
+            "metric": "error_rate",
+            "condition": "lt",
+            "threshold": 0.05,
+            "aggregation": "avg",
+            "window": 300
+        }],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed metric: low error rate (0.01 < threshold 0.05)
+    let series_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO metric_series (id, name, labels) VALUES ($1, $2, $3)")
+        .bind(series_id)
+        .bind("error_rate")
+        .bind(serde_json::json!({"platform.project_id": project_id.to_string()}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metric_samples (series_id, timestamp, value) VALUES ($1, now(), $2)")
+        .bind(series_id)
+        .bind(0.01_f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run analysis
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let verdict: Option<String> = sqlx::query_scalar(
+        "SELECT verdict FROM rollout_analyses WHERE release_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict.as_deref(),
+        Some("pass"),
+        "all gates passing should produce pass verdict"
+    );
+}
+
+/// One failing progress gate produces a fail verdict.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_progress_gates_one_fails(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-gate-fail", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 0,
+        "progress_gates": [{
+            "metric": "error_rate",
+            "condition": "lt",
+            "threshold": 0.05,
+            "aggregation": "avg",
+            "window": 300
+        }],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed metric: high error rate (0.10 > threshold 0.05 — gate condition "lt" fails)
+    let series_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO metric_series (id, name, labels) VALUES ($1, $2, $3)")
+        .bind(series_id)
+        .bind("error_rate")
+        .bind(serde_json::json!({"platform.project_id": project_id.to_string()}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metric_samples (series_id, timestamp, value) VALUES ($1, now(), $2)")
+        .bind(series_id)
+        .bind(0.10_f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let verdict: Option<String> = sqlx::query_scalar(
+        "SELECT verdict FROM rollout_analyses WHERE release_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict.as_deref(),
+        Some("fail"),
+        "failing gate should produce fail verdict"
+    );
+}
+
+/// Insufficient traffic (count < min_requests) returns inconclusive.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_insufficient_traffic_inconclusive(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-lowtraffic", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 1000,
+        "progress_gates": [{
+            "metric": "error_rate",
+            "condition": "lt",
+            "threshold": 0.05,
+            "aggregation": "avg",
+            "window": 300
+        }],
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed very few requests (5 < min_requests 1000)
+    let series_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO metric_series (id, name, labels) VALUES ($1, $2, $3)")
+        .bind(series_id)
+        .bind("http_requests_total")
+        .bind(serde_json::json!({"platform.project_id": project_id.to_string()}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metric_samples (series_id, timestamp, value) VALUES ($1, now(), $2)")
+        .bind(series_id)
+        .bind(5.0_f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let verdict: Option<String> = sqlx::query_scalar(
+        "SELECT verdict FROM rollout_analyses WHERE release_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict.as_deref(),
+        Some("inconclusive"),
+        "low traffic should produce inconclusive verdict"
+    );
+}
+
+/// Empty progress gates returns pass verdict.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_no_progress_gates_returns_pass(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "analysis-empty", "public").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy)
+         VALUES ($1, $2, 'production', 'production', 'canary')",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    let rollout_config = serde_json::json!({
+        "stable_service": "app-stable",
+        "canary_service": "app-canary",
+        "steps": [10, 50, 100],
+        "min_requests": 0,
+    });
+    sqlx::query(
+        "INSERT INTO deploy_releases (id, target_id, project_id, image_ref, strategy, phase, rollout_config, current_step, started_at)
+         VALUES ($1, $2, $3, 'app:v2', 'canary', 'progressing', $4, 0, now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(&rollout_config)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::analysis::run(s, rx));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+    let verdict: Option<String> = sqlx::query_scalar(
+        "SELECT verdict FROM rollout_analyses WHERE release_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict.as_deref(),
+        Some("pass"),
+        "empty gates should produce pass verdict"
+    );
+}
+
+/// Spawn the analysis loop and verify it shuts down cleanly.
+#[sqlx::test(migrations = "./migrations")]
+async fn analysis_loop_starts_and_shuts_down(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::deployer::analysis::run(state.clone(), rx));
+
+    // Let it tick at least once
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Send shutdown
+    drop(tx);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "analysis loop should shut down within 5s");
+}
