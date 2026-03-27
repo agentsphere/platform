@@ -407,42 +407,73 @@ pub fn build_namespace_object(
 
 /// Build a `NetworkPolicy` for a session namespace.
 ///
-/// Same egress rules as `build_network_policy()` (platform API, DNS, internet) but
-/// additionally allows ingress from the platform namespace on port 8000 TCP for
-/// iframe preview proxying.
 /// Build a namespace-level `NetworkPolicy` allowing egress to platform API (8080),
-/// Valkey (6379), DNS, and public internet.
-fn build_namespace_network_policy(
-    ns_name: &str,
-    platform_namespace: &str,
-    services_namespace: &str,
-) -> serde_json::Value {
-    let mut egress_namespaces = vec![platform_namespace.to_owned()];
-    if services_namespace != platform_namespace {
-        egress_namespaces.push(services_namespace.to_owned());
-    }
-    let mut egress: Vec<serde_json::Value> = egress_namespaces
-        .iter()
-        .map(|ns| {
-            json!({
-                "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}}}],
-                "ports": [{"port": 8080, "protocol": "TCP"}, {"port": 6379, "protocol": "TCP"}]
-            })
-        })
-        .collect();
-    egress.push(json!({
-        "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}],
-        "ports": [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}]
-    }));
-    egress.push(json!({
-        "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16"]}}]
-    }));
+/// DNS, same-namespace, and public internet (blocking private ranges).
+fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
     json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
-        "metadata": {"name": "platform-managed", "namespace": ns_name},
-        "spec": {"podSelector": {}, "policyTypes": ["Egress"], "egress": egress}
+        "metadata": {
+            "name": "platform-managed",
+            "namespace": ns_name
+        },
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": ns_name
+                            }
+                        }
+                    }]
+                },
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": platform_namespace
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8080, "protocol": "TCP"}]
+                },
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": "kube-system"
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "k8s-app": "kube-dns"
+                            }
+                        }
+                    }],
+                    "ports": [
+                        {"port": 53, "protocol": "UDP"},
+                        {"port": 53, "protocol": "TCP"}
+                    ]
+                },
+                {
+                    "to": [{
+                        "ipBlock": {
+                            "cidr": "0.0.0.0/0",
+                            "except": [
+                                "10.0.0.0/8",
+                                "172.16.0.0/12",
+                                "192.168.0.0/16",
+                                "100.64.0.0/10",
+                                "169.254.0.0/16"
+                            ]
+                        }
+                    }]
+                }
+            ]
+        }
     })
 }
 
@@ -666,7 +697,7 @@ async fn ensure_namespace_inner(
     env: &str,
     project_id: &str,
     platform_namespace: &str,
-    services_namespace: Option<&str>,
+    _services_namespace: Option<&str>,
     dev_mode: bool,
 ) -> Result<(), super::error::DeployerError> {
     let ns_json = build_namespace_object(ns_name, env, project_id, dev_mode);
@@ -719,9 +750,7 @@ async fn ensure_namespace_inner(
     )
     .await?;
 
-    // S23/S24: NetworkPolicy — allow DNS + platform API + Valkey + internet.
-    let svc_ns = services_namespace.unwrap_or(platform_namespace);
-    let netpol = build_namespace_network_policy(ns_name, platform_namespace, svc_ns);
+    let netpol = build_namespace_network_policy(ns_name, platform_namespace);
 
     apply_namespaced_object(
         kube_client,
@@ -1246,33 +1275,16 @@ mod tests {
         );
     }
 
-    // -- build_namespace_network_policy with different services_namespace --
+    // -- build_namespace_network_policy --
 
     #[test]
-    fn namespace_network_policy_different_services_namespace() {
-        let np = build_namespace_network_policy("my-app", "platform", "svc-ns");
+    fn namespace_network_policy_has_four_egress_rules() {
+        let np = build_namespace_network_policy("my-app", "platform");
         let egress = np["spec"]["egress"].as_array().unwrap();
-        // First two rules should be for platform and svc-ns respectively
-        assert!(
-            egress.len() >= 4,
-            "should have 4 egress rules (2 ns + dns + internet)"
-        );
-        let first_to =
-            &egress[0]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
-        let second_to =
-            &egress[1]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
-        assert_eq!(first_to, "platform");
-        assert_eq!(second_to, "svc-ns");
-    }
-
-    #[test]
-    fn namespace_network_policy_same_services_namespace_no_duplicate() {
-        let np = build_namespace_network_policy("my-app", "platform", "platform");
-        let egress = np["spec"]["egress"].as_array().unwrap();
-        // Should have 3 rules: 1 platform + dns + internet (not 4)
+        // 4 rules: same-namespace + platform API + DNS + public internet
         assert_eq!(
             egress.len(),
-            3,
+            4,
             "same services_ns should not duplicate: got {}",
             egress.len()
         );

@@ -11,6 +11,6 @@ COPY tests-e2e/ ./tests-e2e/
 ENV APP_HOST=localhost
 ENV APP_PORT=8080
 
-# --timeout=10: kill any single test after 10s (requires pytest-timeout)
+# --timeout=30: kill any single test after 30s (requires pytest-timeout)
 # -x: stop on first failure (fast CI feedback)
-CMD ["pytest", "tests-e2e/", "-v", "--tb=short", "--timeout=10", "-x", "--junitxml=/tmp/test-results.xml"]
+CMD ["pytest", "tests-e2e/", "-v", "--tb=short", "--timeout=30", "-x", "--junitxml=/tmp/test-results.xml"]

@@ -2133,9 +2133,11 @@ async fn execute_deploy_test_step(
     };
 
     test_pods.create(&PostParams::default(), &test_pod).await?;
+    tracing::info!(%test_pod_name, namespace = %ns_name, "deploy_test: test pod created");
 
     // 7. Wait for test pod to complete
     let exit_code = wait_for_pod(&test_pods, &test_pod_name).await?;
+    tracing::info!(%test_pod_name, %exit_code, "deploy_test: test pod finished");
 
     // 8. Capture test pod logs
     let test_log_params = LogParams {
@@ -2143,15 +2145,44 @@ async fn execute_deploy_test_step(
         ..Default::default()
     };
     if let Ok(logs) = test_pods.logs(&test_pod_name, &test_log_params).await {
+        if exit_code != 0 {
+            tracing::error!(%test_pod_name, %logs, "deploy_test: test pod failed");
+        }
         let path = format!("logs/pipelines/{pipeline_id}/{}-test.log", step.name);
         if let Err(e) = state.minio.write(&path, logs.into_bytes()).await {
             tracing::error!(error = %e, %path, "failed to write test logs to MinIO");
         }
     }
 
-    // 9. Capture app logs for debugging (especially if tests failed)
+    // 9. Capture app pod logs when tests fail (for debugging app crashes)
     if exit_code != 0 {
-        capture_deployment_logs(state, &ns_name, pipeline_id, &step.name).await;
+        let app_pods: Api<Pod> = Api::namespaced(state.kube.clone(), &ns_name);
+        if let Ok(pod_list) = app_pods.list(&ListParams::default()).await {
+            for p in &pod_list.items {
+                let pname = p.metadata.name.as_deref().unwrap_or("?");
+                let phase = p
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_deref())
+                    .unwrap_or("?");
+                let restarts = p
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.container_statuses.as_ref())
+                    .and_then(|cs| cs.first())
+                    .map_or(0, |c| c.restart_count);
+                let lp = LogParams {
+                    tail_lines: Some(30),
+                    ..Default::default()
+                };
+                let pod_logs = app_pods.logs(pname, &lp).await.unwrap_or_default();
+                tracing::error!(
+                    namespace = %ns_name, pod = pname, %phase, %restarts,
+                    logs = %pod_logs,
+                    "deploy_test: app pod state when tests failed"
+                );
+            }
+        }
     }
 
     // Clean up test pod
@@ -2192,49 +2223,7 @@ async fn wait_for_deployment_ready(
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            // Log final state of all deployments before failing
-            if let Ok(dl) = deployments.list(&ListParams::default()).await {
-                for d in &dl.items {
-                    let name = d.metadata.name.as_deref().unwrap_or("?");
-                    let ready = d
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.ready_replicas)
-                        .unwrap_or(0);
-                    let desired = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
-                    tracing::error!(
-                        %namespace, deploy = name, ready, desired,
-                        "deployment not ready at timeout"
-                    );
-                }
-            }
-            // Also log pod statuses
-            let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
-            if let Ok(pl) = pods.list(&ListParams::default()).await {
-                for p in &pl.items {
-                    let pname = p.metadata.name.as_deref().unwrap_or("?");
-                    let phase = p
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.phase.as_deref())
-                        .unwrap_or("?");
-                    let conditions = p
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.conditions.as_ref())
-                        .map(|cs| {
-                            cs.iter()
-                                .map(|c| format!("{}={}", c.type_, c.status))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_default();
-                    tracing::error!(
-                        %namespace, pod = pname, phase, conditions,
-                        "pod state at timeout"
-                    );
-                }
-            }
+            log_deployment_timeout_diagnostics(kube, namespace, &deployments).await;
             return Err(PipelineError::Other(anyhow::anyhow!(
                 "deployment in {namespace} did not become ready within {timeout_secs}s"
             )));
@@ -2272,6 +2261,79 @@ async fn wait_for_deployment_ready(
             });
             if all_ready {
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// Log detailed pod/container state when a deployment readiness check times out.
+async fn log_deployment_timeout_diagnostics(
+    kube: &kube::Client,
+    namespace: &str,
+    deployments: &Api<k8s_openapi::api::apps::v1::Deployment>,
+) {
+    if let Ok(dl) = deployments.list(&ListParams::default()).await {
+        for d in &dl.items {
+            let name = d.metadata.name.as_deref().unwrap_or("?");
+            let ready = d
+                .status
+                .as_ref()
+                .and_then(|s| s.ready_replicas)
+                .unwrap_or(0);
+            let desired = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+            tracing::error!(%namespace, deploy = name, ready, desired, "deployment not ready at timeout");
+        }
+    }
+    let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+    if let Ok(pl) = pods.list(&ListParams::default()).await {
+        for p in &pl.items {
+            let pname = p.metadata.name.as_deref().unwrap_or("?");
+            let phase = p
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("?");
+            let conditions = p
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| format!("{}={}", c.type_, c.status))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let container_info = p
+                .status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_ref())
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| {
+                            let state_str = c
+                                .state
+                                .as_ref()
+                                .map(|s| format!("{s:?}"))
+                                .unwrap_or_default();
+                            format!(
+                                "{}(ready={}, restarts={}, state={state_str})",
+                                c.name, c.ready, c.restart_count
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            tracing::error!(%namespace, pod = pname, phase, conditions, containers = %container_info, "pod state at timeout");
+            if phase == "Running" && conditions.contains("Ready=False") {
+                let lp = kube::api::LogParams {
+                    tail_lines: Some(20),
+                    ..Default::default()
+                };
+                if let Ok(logs) = pods.logs(pname, &lp).await {
+                    tracing::error!(%namespace, pod = pname, %logs, "pod logs at timeout");
+                }
             }
         }
     }
@@ -2442,6 +2504,24 @@ async fn execute_gitops_sync_inner(
     let platform_file: Option<super::definition::PlatformFile> = platform_yaml
         .as_ref()
         .and_then(|y| serde_yaml::from_str(y).ok());
+
+    // Log deploy section of the YAML for debugging canary spec propagation
+    let deploy_section: String = platform_yaml
+        .as_ref()
+        .and_then(|y| {
+            y.find("deploy:")
+                .map(|idx| y[idx..].chars().take(400).collect())
+        })
+        .unwrap_or_default();
+    tracing::info!(
+        %project_id, %sha,
+        has_platform_yaml = platform_yaml.is_some(),
+        has_deploy = platform_file.as_ref().and_then(|p| p.deploy.as_ref()).is_some(),
+        deploy_specs = platform_file.as_ref().and_then(|p| p.deploy.as_ref()).map_or(0, |d| d.specs.len()),
+        yaml_len = platform_yaml.as_ref().map_or(0, String::len),
+        %deploy_section,
+        "gitops_sync: parsed platform.yaml from project repo"
+    );
 
     // Determine target branch from project setting (not platform.yaml)
     let (target_branch, environment) = if include_staging {

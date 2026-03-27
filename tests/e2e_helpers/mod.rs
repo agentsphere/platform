@@ -264,6 +264,9 @@ pub async fn e2e_state_with_api_url(
         runner_image: "platform-runner:v1".into(),
         git_clone_image: "alpine/git:2.47.2".into(),
         kaniko_image: "gcr.io/kaniko-project/executor:v1.23.2-debug".into(),
+        registry_proxy_blobs: std::env::var("REGISTRY_PROXY_BLOBS")
+            .ok()
+            .is_some_and(|v| v == "true"),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)

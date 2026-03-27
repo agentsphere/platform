@@ -670,8 +670,9 @@ async fn check_access(
     }
 
     let git_user = authenticate_basic(headers, &state.pool).await?;
-    // S52: rate-limit git basic auth
-    crate::auth::rate_limit::check_rate(&state.valkey, "git_auth", &git_user.user_name, 100, 300)
+    // S52: rate-limit git basic auth — high enough for concurrent pipeline
+    // clones (3 parallel steps × 2 calls each × multiple pipelines).
+    crate::auth::rate_limit::check_rate(&state.valkey, "git_auth", &git_user.user_name, 200, 300)
         .await?;
     check_access_for_user(state, &git_user, project, is_read).await?;
     Ok(Some(git_user))

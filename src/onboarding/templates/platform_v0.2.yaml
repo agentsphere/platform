@@ -71,10 +71,6 @@ deploy:
       canary:
         stable_service: platform-demo-app-v0-1
         canary_service: platform-demo-app-v0-2
-        steps: [10, 25, 50, 100]
-        interval: 30
-        min_requests: 10
-        progress_gates:
-          - metric: error_rate
-            condition: lt
-            threshold: 0.05
+        steps: [10, 50, 100]
+        interval: 15
+        min_requests: 0

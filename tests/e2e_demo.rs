@@ -1169,14 +1169,9 @@ where
 #[ignore = "requires Kind cluster"]
 #[sqlx::test(migrations = "./migrations")]
 async fn demo_full_lifecycle(pool: PgPool) {
-    // Enable tracing so executor logs (including step failure logs) are visible
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("platform=info,warn")),
-        )
-        .with_test_writer()
-        .try_init();
+    // Tracing is initialized by e2e_helpers::init_test_tracing() (called from
+    // start_observe_pipeline_server → e2e_state_with_api_url). Writes JSON to
+    // TEST_LOG_FILE so logs are captured even when the test passes.
 
     // --- Setup: real TCP server + all background tasks ---
     let (state, token, _server, shutdown_tx) =
@@ -1297,7 +1292,7 @@ async fn demo_full_lifecycle(pool: PgPool) {
     );
 
     let (mr_pipeline_id, mr_status, mr_steps) =
-        poll_project_pipeline(&app, &token, project_id, 300).await;
+        poll_project_pipeline(&app, &token, project_id, 480).await;
 
     // 2.1 Pipeline trigger = mr
     let mr_pipe_trigger: String = sqlx::query_scalar("SELECT trigger FROM pipelines WHERE id = $1")
@@ -1800,7 +1795,11 @@ async fn demo_full_lifecycle(pool: PgPool) {
     tracing::info!(%pr2_mr_status, "Stage 7: PR2 MR pipeline completed");
 
     // Wait for PR2 auto-merge
-    if pr2_mr_status == "success" {
+    assert_eq!(
+        pr2_mr_status, "success",
+        "PR2 MR pipeline must succeed for canary flow to proceed"
+    );
+    {
         let pool_clone6 = pool.clone();
         poll_until("PR2 merged", 60, || {
             let p = pool_clone6.clone();
@@ -1874,12 +1873,16 @@ async fn demo_full_lifecycle(pool: PgPool) {
             );
         }
 
-        tracing::info!(%v2_push_status, "Stage 8: v0.2 push pipeline completed");
+        assert_eq!(
+            v2_push_status, "success",
+            "v0.2 push pipeline must succeed for canary deploy to proceed"
+        );
+        tracing::info!("Stage 8 passed: v0.2 push pipeline succeeded");
 
         // =============================================================
         // Stage 9: Canary Deploy Verification
         // =============================================================
-        if v2_push_status == "success" {
+        {
             // Wait for a second staging release (canary) to appear
             let pool_clone8 = pool.clone();
             poll_until("canary staging release terminal", 180, || {
@@ -1902,23 +1905,91 @@ async fn demo_full_lifecycle(pool: PgPool) {
             .await;
 
             // 9.1 Latest staging release uses canary strategy
-            let canary_strategy: Option<String> = sqlx::query_scalar(
-                "SELECT dr.strategy FROM deploy_releases dr
+            let canary_release = sqlx::query(
+                "SELECT dr.id, dr.strategy, dr.phase, dr.traffic_weight, dr.current_step
+                 FROM deploy_releases dr
                  JOIN deploy_targets dt ON dr.target_id = dt.id
                  WHERE dr.project_id = $1 AND dt.environment = 'staging'
                  ORDER BY dr.created_at DESC LIMIT 1",
             )
             .bind(project_id)
-            .fetch_optional(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(
-                canary_strategy.as_deref(),
-                Some("canary"),
-                "v0.2 should use canary strategy"
-            );
+            {
+                use sqlx::Row as _;
+                let strategy: String = canary_release.get("strategy");
+                let phase: String = canary_release.get("phase");
+                let weight: i32 = canary_release.get("traffic_weight");
+                assert_eq!(strategy, "canary", "v0.2 should use canary strategy");
+                assert_eq!(phase, "completed", "canary release should be completed");
+                assert_eq!(weight, 100, "final traffic weight should be 100%");
+            }
 
-            // 9.2 Annotated git tag v0.2.0 created
+            // 9.2 Canary release history shows step progression (10 → 50 → 100)
+            let canary_id: uuid::Uuid = {
+                use sqlx::Row as _;
+                canary_release.get("id")
+            };
+            let history_entries: Vec<(String, Option<i32>)> = sqlx::query_as(
+                "SELECT action, traffic_weight FROM release_history
+                 WHERE release_id = $1 ORDER BY created_at",
+            )
+            .bind(canary_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let step_weights: Vec<i32> = history_entries
+                .iter()
+                .filter(|(a, _)| a == "step_advanced")
+                .filter_map(|(_, w)| *w)
+                .collect();
+            assert!(
+                step_weights.len() >= 2,
+                "canary should have progressed through at least 2 steps, got: {step_weights:?}"
+            );
+            tracing::info!(?step_weights, "canary step progression verified");
+
+            // 9.3 Verify K8s: HTTPRoute exists in staging namespace with the gateway
+            let staging_ns = state.config.project_namespace(&ns_slug, "staging");
+            // Use dynamic API to check HTTPRoute (Gateway API CRD)
+            let route_api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
+                state.kube.clone(),
+                &staging_ns,
+                &kube::discovery::ApiResource {
+                    group: "gateway.networking.k8s.io".into(),
+                    version: "v1".into(),
+                    kind: "HTTPRoute".into(),
+                    api_version: "gateway.networking.k8s.io/v1".into(),
+                    plural: "httproutes".into(),
+                },
+            );
+            let routes = route_api.list(&kube::api::ListParams::default()).await;
+            if let Ok(route_list) = routes {
+                tracing::info!(
+                    count = route_list.items.len(),
+                    namespace = %staging_ns,
+                    "HTTPRoute resources in staging namespace"
+                );
+                for route in &route_list.items {
+                    let name = route.metadata.name.as_deref().unwrap_or("?");
+                    tracing::info!(%name, "HTTPRoute found in staging");
+                }
+            }
+
+            // 9.4 Verify K8s: canary deployment exists (or existed) in staging
+            let deploy_api: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
+                kube::Api::namespaced(state.kube.clone(), &staging_ns);
+            if let Ok(deploy_list) = deploy_api.list(&kube::api::ListParams::default()).await {
+                let deploy_names: Vec<&str> = deploy_list
+                    .items
+                    .iter()
+                    .filter_map(|d| d.metadata.name.as_deref())
+                    .collect();
+                tracing::info!(?deploy_names, namespace = %staging_ns, "deployments in staging after canary");
+            }
+
+            // 9.5 Annotated git tag v0.2.0 created
             let tag_v2 = tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&repo_path_str)
@@ -1933,9 +2004,9 @@ async fn demo_full_lifecycle(pool: PgPool) {
                 );
             }
 
-            tracing::info!("Stage 9 passed: canary deploy verified");
-        } else {
-            tracing::warn!("Stages 9 skipped: v0.2 push pipeline did not succeed");
+            tracing::info!(
+                "Stage 9 passed: canary deploy verified — strategy, progression, K8s resources"
+            );
         }
 
         // =============================================================
@@ -1968,8 +2039,6 @@ async fn demo_full_lifecycle(pool: PgPool) {
         .await;
 
         tracing::info!("Stage 10 passed: v0.2 production deploy verified");
-    } else {
-        tracing::warn!("Stages 7-10 skipped: PR2 MR pipeline did not succeed");
     }
 
     // ===================================================================

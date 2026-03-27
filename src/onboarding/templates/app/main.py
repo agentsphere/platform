@@ -28,22 +28,24 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from app import cart, db, flags
 
 # ---------------------------------------------------------------------------
-# OpenTelemetry — always on; reads OTEL_* env vars injected by platform
+# OpenTelemetry — reads OTEL_* env vars injected by platform.
+# Disabled via OTEL_SDK_DISABLED=true (e.g. testinfra deploys).
 # ---------------------------------------------------------------------------
-resource = Resource.create()
+if os.getenv("OTEL_SDK_DISABLED", "").lower() != "true":
+    resource = Resource.create()
 
-_tp = TracerProvider(resource=resource)
-_tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-trace.set_tracer_provider(_tp)
+    _tp = TracerProvider(resource=resource)
+    _tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(_tp)
 
-_mr = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
-_mp = MeterProvider(resource=resource, metric_readers=[_mr])
-metrics.set_meter_provider(_mp)
+    _mr = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
+    _mp = MeterProvider(resource=resource, metric_readers=[_mr])
+    metrics.set_meter_provider(_mp)
 
-_lp = LoggerProvider(resource=resource)
-_lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
-otel_logs.set_logger_provider(_lp)
-logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_lp))
+    _lp = LoggerProvider(resource=resource)
+    _lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+    otel_logs.set_logger_provider(_lp)
+    logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_lp))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,14 +87,36 @@ async def lifespan(application: FastAPI):
     database_url = os.getenv("DATABASE_URL", "")
     cache_url = os.getenv("CACHE_URL", "")
 
-    # Postgres
+    # Postgres — retry with back-off so the app survives slow DB starts.
+    # Postgres init can take 5-15s on cold clusters; total retry window ~60s.
     pool = None
     if database_url:
-        pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
-        await db.init_schema(pool)
-        _stock_gauge_cache[0] = await db.get_total_stock(pool)
-        _db_pool_ref = pool
-        logger.info("database connected")
+        import asyncio
+        for attempt in range(15):
+            try:
+                # Probe with a single connection first (better error messages)
+                conn = await asyncpg.connect(database_url, timeout=3)
+                await conn.close()
+                # Probe succeeded — create the pool
+                pool = await asyncpg.create_pool(
+                    database_url, min_size=1, max_size=10,
+                    command_timeout=10, timeout=5,
+                )
+                await db.init_schema(pool)
+                _stock_gauge_cache[0] = await db.get_total_stock(pool)
+                _db_pool_ref = pool
+                logger.info("database connected on attempt %d", attempt + 1)
+                break
+            except Exception as exc:
+                logger.warning("DB connect attempt %d/%d failed: %s: %s",
+                               attempt + 1, 15, type(exc).__name__, exc)
+                if pool:
+                    await pool.close()
+                    pool = None
+                if attempt < 14:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error("giving up on DB after 15 attempts")
 
     # Valkey / Redis
     cart_backend: cart.Cart
@@ -124,7 +148,8 @@ THEME_COLOR = os.getenv("THEME_COLOR", "blue")
 APP_VERSION = os.getenv("APP_VERSION", "stable")
 
 app = FastAPI(title="Platform Demo Shop", lifespan=lifespan)
-FastAPIInstrumentor.instrument_app(app)
+if os.getenv("OTEL_SDK_DISABLED", "").lower() != "true":
+    FastAPIInstrumentor.instrument_app(app)
 
 # Default state for testing without lifespan (ASGI transport doesn't trigger it)
 app.state.pool = None

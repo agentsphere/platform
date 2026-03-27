@@ -323,6 +323,11 @@ async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<()
 
         // Apply gateway resources for traffic splitting
         apply_gateway_resources(state, release, &ns, initial_weight).await;
+        tracing::info!(
+            release_id = %release.id, strategy = %release.strategy,
+            %initial_weight, namespace = %ns,
+            "canary release started — initial traffic weight set"
+        );
 
         transition_phase(state, release, "progressing", Some(initial_weight), None).await?;
         record_history(
@@ -377,6 +382,10 @@ async fn handle_canary_progress(
             let next_step = release.current_step + 1;
             if usize::try_from(next_step).unwrap_or(usize::MAX) >= steps.len() {
                 // All steps passed — promote
+                tracing::info!(
+                    release_id = %release.id, step = next_step, total_steps = steps.len(),
+                    "canary all steps passed — promoting to stable"
+                );
                 transition_phase(state, release, "promoting", Some(100), None).await?;
                 record_history(state, release, "promoted", "promoting", Some(100)).await;
             } else {
@@ -394,6 +403,10 @@ async fn handle_canary_progress(
                 let ns =
                     target_namespace(&state.config, &release.namespace_slug, &release.environment);
                 apply_gateway_resources(state, release, &ns, weight).await;
+                tracing::info!(
+                    release_id = %release.id, step = next_step, %weight,
+                    "canary step advanced — traffic weight updated"
+                );
 
                 record_history(state, release, "step_advanced", "progressing", Some(weight)).await;
             }
@@ -488,6 +501,12 @@ async fn handle_promoting(state: &AppState, release: &PendingRelease) -> Result<
     {
         tracing::warn!(error = %e, %stable_svc, "failed to downscale old stable deployment after promotion");
     }
+
+    tracing::info!(
+        release_id = %release.id, strategy = %release.strategy,
+        image_ref = %release.image_ref,
+        "canary promotion complete — 100% traffic on new stable"
+    );
 
     transition_phase(state, release, "completed", Some(100), Some("healthy")).await?;
     record_history(state, release, "promoted", "completed", Some(100)).await;

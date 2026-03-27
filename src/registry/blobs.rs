@@ -79,17 +79,28 @@ pub async fn get_blob(
     .await?
     .ok_or(RegistryError::BlobUnknown)?;
 
-    // A21: Stream blobs via presigned URL redirect instead of loading into memory
-    let presigned = state
-        .minio
-        .presign_read(&blob.minio_path, Duration::from_secs(300))
-        .await?;
-
     let mut headers = HeaderMap::new();
     headers.insert("docker-content-digest", header_val(&digest.as_str()));
-    headers.insert("location", header_val(&presigned.uri().to_string()));
 
-    Ok((StatusCode::TEMPORARY_REDIRECT, headers).into_response())
+    if state.config.registry_proxy_blobs {
+        // Stream blob through the platform — needed when MinIO is not directly
+        // reachable from clients (e.g. kaniko pods in Kind clusters).
+        let data = state.minio.read(&blob.minio_path).await?;
+        headers.insert("content-length", HeaderValue::from(blob.size_bytes));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        Ok((StatusCode::OK, headers, data.to_vec()).into_response())
+    } else {
+        // A21: presigned URL redirect (default — avoids loading blobs into memory)
+        let presigned = state
+            .minio
+            .presign_read(&blob.minio_path, Duration::from_secs(300))
+            .await?;
+        headers.insert("location", header_val(&presigned.uri().to_string()));
+        Ok((StatusCode::TEMPORARY_REDIRECT, headers).into_response())
+    }
 }
 
 // ---------------------------------------------------------------------------

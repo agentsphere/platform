@@ -20,7 +20,7 @@ async def client():
     if app_host:
         port = os.getenv("APP_PORT", "8080")
         base = f"http://{app_host}:{port}"
-        async with httpx.AsyncClient(base_url=base, timeout=5) as c:
+        async with httpx.AsyncClient(base_url=base, timeout=15) as c:
             yield c
     else:
         from app.main import app

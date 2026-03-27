@@ -108,6 +108,9 @@ pub struct Config {
     pub git_clone_image: String,
     /// Kaniko image for imagebuild pipeline steps (A4). Pinned to avoid `:latest`.
     pub kaniko_image: String,
+    /// When true, stream registry blobs through the platform instead of redirecting to `MinIO`.
+    /// Needed when `MinIO` is not directly reachable from registry clients (e.g. kaniko in pods).
+    pub registry_proxy_blobs: bool,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -280,6 +283,9 @@ impl Config {
                 .unwrap_or_else(|_| "alpine/git:2.47.2".into()),
             kaniko_image: env::var("PLATFORM_KANIKO_IMAGE")
                 .unwrap_or_else(|_| "gcr.io/kaniko-project/executor:v1.23.2-debug".into()),
+            registry_proxy_blobs: env::var("REGISTRY_PROXY_BLOBS")
+                .ok()
+                .is_some_and(|v| v == "true"),
         }
     }
 
@@ -367,6 +373,7 @@ impl Config {
             runner_image: "platform-runner:v1".into(),
             git_clone_image: "alpine/git:2.47.2".into(),
             kaniko_image: "gcr.io/kaniko-project/executor:v1.23.2-debug".into(),
+            registry_proxy_blobs: false,
         }
     }
 }

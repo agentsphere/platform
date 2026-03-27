@@ -413,7 +413,11 @@ async fn handle_ops_repo_updated(
         };
         match crate::deployer::ops_repo::read_file_at_ref(&ops_path, branch, "platform.yaml").await
         {
-            Ok(content) => serde_yaml::from_str(&content).ok(),
+            Ok(content) => {
+                let preview: String = content.chars().take(300).collect();
+                tracing::debug!(%environment, %branch, yaml_preview = %preview, "eventbus: read platform.yaml from ops repo");
+                serde_yaml::from_str(&content).ok()
+            }
             Err(_) => None,
         }
     } else {
@@ -835,7 +839,8 @@ async fn handle_demo_auto_promote(state: &AppState, project_id: Uuid, release_id
 async fn demo_promote_staging_to_prod(state: &AppState, project_id: Uuid) {
     use sqlx::Row as _;
 
-    // Check we haven't already promoted
+    // Check we haven't already promoted — set flag immediately to prevent duplicate
+    // promotions from concurrent event deliveries (Valkey pub/sub can redeliver).
     let already = crate::onboarding::presets::get_setting(&state.pool, "demo_v1_prod_promoted")
         .await
         .ok()
@@ -843,6 +848,15 @@ async fn demo_promote_staging_to_prod(state: &AppState, project_id: Uuid) {
     if already.is_some() {
         return;
     }
+    // Set flag NOW (before publishing OpsRepoUpdated) to close the race window.
+    // Previously set only in demo_mark_prod_complete, which left a minutes-wide gap
+    // where redelivered events could create duplicate prod releases.
+    let _ = crate::onboarding::presets::upsert_setting_pub(
+        &state.pool,
+        "demo_v1_prod_promoted",
+        &serde_json::json!(true),
+    )
+    .await;
 
     tracing::info!(%project_id, "demo: auto-promoting v0.1 staging → production");
 
@@ -888,19 +902,21 @@ async fn demo_promote_staging_to_prod(state: &AppState, project_id: Uuid) {
     }
 }
 
-/// Production rolling completed → mark as promoted and spawn PR2 creation.
+/// Production rolling completed → spawn PR2 creation.
+/// The idempotency flag `demo_v1_prod_promoted` is already set by
+/// `demo_promote_staging_to_prod` to prevent duplicate promotions.
+/// We use `demo_v1_pr2_created` to guard PR2 creation specifically.
 async fn demo_mark_prod_complete(state: &AppState, project_id: Uuid) {
-    let already = crate::onboarding::presets::get_setting(&state.pool, "demo_v1_prod_promoted")
+    let already = crate::onboarding::presets::get_setting(&state.pool, "demo_v1_pr2_created")
         .await
         .ok()
         .flatten();
     if already.is_some() {
         return;
     }
-
     let _ = crate::onboarding::presets::upsert_setting_pub(
         &state.pool,
-        "demo_v1_prod_promoted",
+        "demo_v1_pr2_created",
         &serde_json::json!(true),
     )
     .await;

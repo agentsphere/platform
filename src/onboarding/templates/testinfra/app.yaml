@@ -22,6 +22,8 @@ spec:
           env:
             - name: DATABASE_URL
               value: "postgresql://app:changeme@{{ project_name }}-db:5432/app"
+            - name: OTEL_SDK_DISABLED
+              value: "true"
           readinessProbe:
             httpGet:
               path: /healthz
@@ -31,7 +33,7 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
