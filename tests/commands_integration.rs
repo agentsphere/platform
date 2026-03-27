@@ -585,3 +585,638 @@ async fn create_command_nonexistent_project_404(pool: PgPool) {
         "expected 404 or 403 for nonexistent project, got {status}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace + project both set — rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_command_both_workspace_and_project_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state.clone());
+
+    let (_, proj) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({ "name": "cmd-both-proj", "description": "t" }),
+    )
+    .await;
+    let project_id = proj["id"].as_str().unwrap();
+
+    let ws_id = uuid::Uuid::new_v4();
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "both-set",
+            "project_id": project_id,
+            "workspace_id": ws_id.to_string(),
+            "prompt_template": "t",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body["error"].as_str().unwrap().contains("cannot set both"));
+}
+
+// ---------------------------------------------------------------------------
+// Workspace via main endpoint — rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_command_workspace_via_main_endpoint_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let ws_id = uuid::Uuid::new_v4();
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "ws-via-main",
+            "workspace_id": ws_id.to_string(),
+            "prompt_template": "t",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("POST /api/workspaces")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Update template validation
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_command_empty_template_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "upd-tmpl-test",
+            "prompt_template": "Valid: $ARGUMENTS",
+        }),
+    )
+    .await;
+    let id = body["id"].as_str().unwrap();
+
+    // Update with empty template should be rejected
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands/{id}"),
+        serde_json::json!({
+            "prompt_template": "",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty template in update should be rejected"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_command_oversized_template_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "upd-big-tmpl",
+            "prompt_template": "Valid: $ARGUMENTS",
+        }),
+    )
+    .await;
+    let id = body["id"].as_str().unwrap();
+
+    let big_template = "x".repeat(102_401);
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands/{id}"),
+        serde_json::json!({
+            "prompt_template": big_template,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "oversized template in update should be rejected"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_command_oversized_description_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "upd-big-desc",
+            "prompt_template": "Valid: $ARGUMENTS",
+        }),
+    )
+    .await;
+    let id = body["id"].as_str().unwrap();
+
+    let big_desc = "x".repeat(10_001);
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands/{id}"),
+        serde_json::json!({
+            "description": big_desc,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "oversized description in update should be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped permission: user with project write can create command
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_project_command_requires_project_write(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a project
+    let (_, proj) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({ "name": "cmd-perm-proj", "description": "t" }),
+    )
+    .await;
+    let project_id = proj["id"].as_str().unwrap();
+    let project_uuid = uuid::Uuid::parse_str(project_id).unwrap();
+
+    // Create a user without any role on the project
+    let (_user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmd-nowrite", "cmd-nowrite@test.com").await;
+
+    // Should fail (no project write)
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "denied-cmd",
+            "project_id": project_id,
+            "prompt_template": "Do $ARGUMENTS",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "user without project write should not create project command"
+    );
+
+    // Grant the user project write
+    let (writer_id, writer_token) =
+        helpers::create_user(&app, &admin_token, "cmd-writer", "cmd-writer@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        writer_id,
+        "developer",
+        Some(project_uuid),
+        &pool,
+    )
+    .await;
+
+    // Now should succeed
+    let (status, _) = helpers::post_json(
+        &app,
+        &writer_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "allowed-cmd",
+            "project_id": project_id,
+            "prompt_template": "Do $ARGUMENTS",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "user with project write should create project command"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// List commands with project_id includes workspace and global
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_commands_project_includes_workspace_and_global(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a workspace
+    let (_, ws_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/workspaces",
+        serde_json::json!({ "name": "cmd-ws-list" }),
+    )
+    .await;
+    let ws_id = ws_body["id"].as_str().unwrap();
+
+    // Create a project in that workspace
+    let (_, proj) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({
+            "name": "cmd-list-proj",
+            "description": "t",
+            "workspace_id": ws_id,
+        }),
+    )
+    .await;
+    let project_id = proj["id"].as_str().unwrap();
+
+    // Create a global command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "global-for-list",
+            "prompt_template": "Global: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // Create a workspace command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+        serde_json::json!({
+            "name": "ws-for-list",
+            "prompt_template": "WS: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // Create a project command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "proj-for-list",
+            "project_id": project_id,
+            "prompt_template": "Proj: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // List with project_id should include all three scopes
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands?project_id={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body["items"].as_array().unwrap();
+    let names: Vec<&str> = items.iter().map(|i| i["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"global-for-list"),
+        "should include global: {names:?}"
+    );
+    assert!(
+        names.contains(&"ws-for-list"),
+        "should include workspace: {names:?}"
+    );
+    assert!(
+        names.contains(&"proj-for-list"),
+        "should include project: {names:?}"
+    );
+
+    // Project commands should appear first (ordering: project=0, workspace=1, global=2)
+    let proj_idx = names.iter().position(|n| *n == "proj-for-list").unwrap();
+    let ws_idx = names.iter().position(|n| *n == "ws-for-list").unwrap();
+    let global_idx = names.iter().position(|n| *n == "global-for-list").unwrap();
+    assert!(
+        proj_idx < ws_idx,
+        "project commands should appear before workspace: proj={proj_idx}, ws={ws_idx}"
+    );
+    assert!(
+        ws_idx < global_idx,
+        "workspace commands should appear before global: ws={ws_idx}, global={global_idx}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workspace commands CRUD via workspace route
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_command_crud(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a workspace
+    let (_, ws_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/workspaces",
+        serde_json::json!({ "name": "cmd-ws-crud" }),
+    )
+    .await;
+    let ws_id = ws_body["id"].as_str().unwrap();
+
+    // Create a workspace command
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+        serde_json::json!({
+            "name": "ws-cmd",
+            "prompt_template": "Workspace: $ARGUMENTS",
+            "description": "A workspace command",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["name"], "ws-cmd");
+    assert_eq!(body["workspace_id"], ws_id);
+    assert!(body["project_id"].is_null());
+    let cmd_id = body["id"].as_str().unwrap();
+
+    // List workspace commands should include it
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"ws-cmd"),
+        "should include ws-cmd: {names:?}"
+    );
+
+    // Delete the workspace command
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands/{cmd_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify it's gone from list
+    let (_, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+    )
+    .await;
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        !names.contains(&"ws-cmd"),
+        "should not include ws-cmd after delete: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workspace command requires admin membership
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_command_requires_admin(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a workspace
+    let (_, ws_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/workspaces",
+        serde_json::json!({ "name": "cmd-ws-perm" }),
+    )
+    .await;
+    let ws_id = ws_body["id"].as_str().unwrap();
+
+    // Create a user (not a workspace member)
+    let (_user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmd-wsnon", "cmd-wsnon@test.com").await;
+
+    // Non-member should be forbidden
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+        serde_json::json!({
+            "name": "denied-ws-cmd",
+            "prompt_template": "No: $ARGUMENTS",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// List commands with workspace_id
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_commands_workspace_includes_global(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a workspace
+    let (_, ws_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/workspaces",
+        serde_json::json!({ "name": "cmd-ws-list2" }),
+    )
+    .await;
+    let ws_id = ws_body["id"].as_str().unwrap();
+
+    // Create a global command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "global-wslist",
+            "prompt_template": "G: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // Create a workspace command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{ws_id}/commands"),
+        serde_json::json!({
+            "name": "ws-wslist",
+            "prompt_template": "WS: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // List with workspace_id -- should include workspace + global
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands?workspace_id={ws_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"global-wslist"),
+        "should include global: {names:?}"
+    );
+    assert!(
+        names.contains(&"ws-wslist"),
+        "should include workspace: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resolved commands endpoint
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resolved_commands_returns_merged_set(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a project
+    let (_, proj) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({ "name": "resolved-proj", "description": "t" }),
+    )
+    .await;
+    let project_id = proj["id"].as_str().unwrap();
+
+    // Create a global command
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "resolved-global",
+            "prompt_template": "Global: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // Create a project command that overrides
+    helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "resolved-global",
+            "project_id": project_id,
+            "prompt_template": "Project: $ARGUMENTS",
+        }),
+    )
+    .await;
+
+    // GET /api/commands/resolved?project_id=...
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/commands/resolved?project_id={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body.as_array().unwrap();
+    // Should only have one entry for "resolved-global" (project overrides global)
+    let matching: Vec<_> = items
+        .iter()
+        .filter(|i| i["name"].as_str() == Some("resolved-global"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "resolved should deduplicate by name: {items:?}"
+    );
+    // The scope should indicate it's project-level
+    assert_eq!(
+        matching[0]["scope"].as_str(),
+        Some("project"),
+        "resolved command should have project scope"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Description validation
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_command_oversized_description_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let big_desc = "x".repeat(10_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/commands",
+        serde_json::json!({
+            "name": "big-desc",
+            "prompt_template": "Do $ARGUMENTS",
+            "description": big_desc,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

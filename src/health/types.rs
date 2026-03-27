@@ -391,4 +391,150 @@ mod tests {
         assert!(snap.background_tasks.is_empty());
         assert_eq!(snap.pod_failures.total_failed_24h, 0);
     }
+
+    #[test]
+    fn health_snapshot_default_has_recent_checked_at() {
+        let snap = HealthSnapshot::default();
+        let age = Utc::now() - snap.checked_at;
+        assert!(age.num_seconds() < 2, "default checked_at should be recent");
+    }
+
+    #[test]
+    fn health_snapshot_default_uptime_is_zero() {
+        let snap = HealthSnapshot::default();
+        assert_eq!(snap.uptime_seconds, 0);
+    }
+
+    #[test]
+    fn subsystem_status_worst_symmetry() {
+        // worst(a, b) == worst(b, a)
+        let variants = [
+            SubsystemStatus::Healthy,
+            SubsystemStatus::Degraded,
+            SubsystemStatus::Unhealthy,
+            SubsystemStatus::Unknown,
+        ];
+        for a in &variants {
+            for b in &variants {
+                assert_eq!(
+                    a.worst(*b),
+                    b.worst(*a),
+                    "worst({a:?}, {b:?}) != worst({b:?}, {a:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subsystem_status_aggregate_single_unhealthy() {
+        assert_eq!(
+            SubsystemStatus::aggregate(&[SubsystemStatus::Unhealthy]),
+            SubsystemStatus::Unhealthy
+        );
+    }
+
+    #[test]
+    fn subsystem_status_aggregate_single_healthy() {
+        assert_eq!(
+            SubsystemStatus::aggregate(&[SubsystemStatus::Healthy]),
+            SubsystemStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn subsystem_status_aggregate_all_unknown() {
+        let statuses = vec![SubsystemStatus::Unknown, SubsystemStatus::Unknown];
+        assert_eq!(
+            SubsystemStatus::aggregate(&statuses),
+            SubsystemStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn task_registry_default_is_empty() {
+        let registry = TaskRegistry::default();
+        let snap = registry.snapshot();
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn task_registry_report_error_without_heartbeat_first() {
+        let registry = TaskRegistry::new();
+        registry.report_error("new-task", "first error");
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].success_count, 0);
+        assert_eq!(snap[0].failure_count, 1);
+        assert_eq!(snap[0].last_error.as_deref(), Some("first error"));
+    }
+
+    #[test]
+    fn task_registry_register_is_idempotent() {
+        let registry = TaskRegistry::new();
+        registry.register("task", 60);
+        registry.register("task", 120); // should not overwrite
+        registry.heartbeat("task");
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].success_count, 1);
+    }
+
+    #[test]
+    fn task_registry_snapshot_is_sorted_by_status_then_name() {
+        let registry = TaskRegistry::new();
+        registry.heartbeat("z-healthy");
+        registry.heartbeat("a-healthy");
+        registry.report_error("m-degraded", "err");
+        let snap = registry.snapshot();
+        // Degraded first, then healthy sorted by name
+        assert_eq!(snap[0].name, "m-degraded");
+        assert_eq!(snap[1].name, "a-healthy");
+        assert_eq!(snap[2].name, "z-healthy");
+    }
+
+    #[test]
+    fn task_registry_error_replaces_previous_error() {
+        let registry = TaskRegistry::new();
+        registry.report_error("task", "first error");
+        registry.report_error("task", "second error");
+        let snap = registry.snapshot();
+        assert_eq!(snap[0].failure_count, 2);
+        assert_eq!(snap[0].last_error.as_deref(), Some("second error"));
+    }
+
+    #[test]
+    fn subsystem_check_serialization() {
+        let check = SubsystemCheck {
+            name: "test".into(),
+            status: SubsystemStatus::Healthy,
+            latency_ms: 42,
+            message: Some("ok".into()),
+            checked_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["latency_ms"], 42);
+        assert_eq!(json["message"], "ok");
+    }
+
+    #[test]
+    fn subsystem_status_serialization() {
+        assert_eq!(
+            serde_json::to_string(&SubsystemStatus::Healthy).unwrap(),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SubsystemStatus::Degraded).unwrap(),
+            "\"degraded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SubsystemStatus::Unhealthy).unwrap(),
+            "\"unhealthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SubsystemStatus::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
 }

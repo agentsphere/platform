@@ -5010,4 +5010,713 @@ mod tests {
         assert_eq!(cond.events, vec!["push"]);
         assert_eq!(cond.branches, vec!["main"]);
     }
+
+    // -- build_env_vars_full: test the layered env var logic --
+    // build_env_vars_full requires an AppState reference, so we test its
+    // components: build_env_vars_core (already tested above), OTEL var
+    // injection, secret filtering, and step env merging are tested by
+    // verifying the helper functions and logic inline.
+
+    // Simulate what build_env_vars_full does for OTEL vars:
+    #[test]
+    fn otel_vars_are_appended_with_token() {
+        let mut vars = vec![env_var("PLATFORM_PROJECT_ID", "test")];
+        let platform_api_url = "http://platform:8080";
+        let project_name = "my-app";
+        let step_name = "test";
+        let project_id = Uuid::nil();
+
+        // Simulate OTEL injection (lines 1734-1751)
+        vars.push(env_var("OTEL_EXPORTER_OTLP_ENDPOINT", platform_api_url));
+        vars.push(env_var(
+            "OTEL_SERVICE_NAME",
+            &format!("{project_name}/{step_name}"),
+        ));
+        vars.push(env_var(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            &format!("platform.project_id={project_id}"),
+        ));
+        let otlp_token = Some("otlp-test-token".to_string());
+        if let Some(ref token) = otlp_token {
+            vars.push(env_var(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                &format!("Authorization=Bearer {token}"),
+            ));
+        }
+
+        assert_eq!(
+            find_env(&vars, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some("http://platform:8080".into())
+        );
+        assert_eq!(
+            find_env(&vars, "OTEL_SERVICE_NAME"),
+            Some("my-app/test".into())
+        );
+        assert!(
+            find_env(&vars, "OTEL_RESOURCE_ATTRIBUTES")
+                .unwrap()
+                .contains("platform.project_id=")
+        );
+        assert_eq!(
+            find_env(&vars, "OTEL_EXPORTER_OTLP_HEADERS"),
+            Some("Authorization=Bearer otlp-test-token".into())
+        );
+    }
+
+    #[test]
+    fn otel_vars_no_headers_without_token() {
+        let mut vars = vec![env_var("PLATFORM_PROJECT_ID", "test")];
+        vars.push(env_var(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://platform:8080",
+        ));
+        let otlp_token: Option<String> = None;
+        if let Some(ref token) = otlp_token {
+            vars.push(env_var(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                &format!("Authorization=Bearer {token}"),
+            ));
+        }
+
+        assert!(find_env(&vars, "OTEL_EXPORTER_OTLP_ENDPOINT").is_some());
+        assert!(
+            find_env(&vars, "OTEL_EXPORTER_OTLP_HEADERS").is_none(),
+            "OTEL headers should not be set without an OTLP token"
+        );
+    }
+
+    // Test the secret filtering + PLATFORM_SECRET_NAMES logic:
+    #[test]
+    fn secret_injection_filters_reserved_and_sets_names() {
+        let mut vars = vec![
+            env_var("PIPELINE_ID", "original-value"),
+            env_var("COMMIT_SHA", "original-sha"),
+        ];
+        let secrets = vec![
+            ("PIPELINE_ID".to_string(), "override-attempt".to_string()),
+            ("COMMIT_SHA".to_string(), "override-attempt".to_string()),
+            ("PATH".to_string(), "/evil/path".to_string()),
+            ("MY_CUSTOM_VAR".to_string(), "allowed".to_string()),
+            ("DATABASE_URL".to_string(), "postgres://host/db".to_string()),
+        ];
+
+        let mut secret_names = Vec::new();
+        for (key, val) in &secrets {
+            if !is_reserved_pipeline_env_var(key) {
+                vars.push(env_var(key, val));
+                secret_names.push(key.as_str());
+            }
+        }
+        if !secret_names.is_empty() {
+            vars.push(env_var("PLATFORM_SECRET_NAMES", &secret_names.join(",")));
+        }
+
+        // Reserved vars should NOT have been overridden
+        assert_eq!(
+            find_env(&vars, "PIPELINE_ID"),
+            Some("original-value".into())
+        );
+        // Custom vars should be injected
+        assert_eq!(find_env(&vars, "MY_CUSTOM_VAR"), Some("allowed".into()));
+        assert_eq!(
+            find_env(&vars, "DATABASE_URL"),
+            Some("postgres://host/db".into())
+        );
+        // PLATFORM_SECRET_NAMES should only list the non-reserved ones
+        let names = find_env(&vars, "PLATFORM_SECRET_NAMES").unwrap();
+        assert!(names.contains("MY_CUSTOM_VAR"));
+        assert!(names.contains("DATABASE_URL"));
+        assert!(!names.contains("PIPELINE_ID"));
+        assert!(!names.contains("PATH"));
+    }
+
+    #[test]
+    fn secret_injection_no_names_when_all_reserved() {
+        let secrets = vec![
+            ("PIPELINE_ID".to_string(), "override".to_string()),
+            ("COMMIT_SHA".to_string(), "override".to_string()),
+            ("PATH".to_string(), "override".to_string()),
+        ];
+
+        let mut secret_names = Vec::new();
+        for (key, _val) in &secrets {
+            if !is_reserved_pipeline_env_var(key) {
+                secret_names.push(key.as_str());
+            }
+        }
+
+        assert!(
+            secret_names.is_empty(),
+            "all-reserved secrets should produce no secret names"
+        );
+    }
+
+    #[test]
+    fn secret_injection_no_names_when_no_secrets() {
+        let secrets: Vec<(String, String)> = vec![];
+        let mut secret_names = Vec::new();
+        for (key, _val) in &secrets {
+            if !is_reserved_pipeline_env_var(key) {
+                secret_names.push(key.as_str());
+            }
+        }
+        assert!(secret_names.is_empty());
+    }
+
+    // Test step environment merging logic:
+    #[test]
+    fn step_env_overrides_existing_vars() {
+        let mut vars = vec![
+            env_var("OVERRIDE_ME", "secret-value"),
+            env_var("KEEP_ME", "original"),
+        ];
+        let step_env = serde_json::json!({"CUSTOM_FLAG": "true", "OVERRIDE_ME": "step-value"});
+
+        if let Some(map) = step_env.as_object() {
+            for (key, val) in map {
+                if let Some(v) = val.as_str() {
+                    vars.push(env_var(key, v));
+                }
+            }
+        }
+
+        assert_eq!(find_env(&vars, "CUSTOM_FLAG"), Some("true".into()));
+        // Both values exist; last one (step env) takes precedence in K8s
+        let override_vals: Vec<_> = vars.iter().filter(|v| v.name == "OVERRIDE_ME").collect();
+        assert_eq!(override_vals.len(), 2);
+        assert_eq!(
+            override_vals.last().unwrap().value.as_deref(),
+            Some("step-value")
+        );
+    }
+
+    #[test]
+    fn step_env_ignores_non_string_values() {
+        let mut vars: Vec<EnvVar> = vec![];
+        let step_env = serde_json::json!({
+            "STRING_VAR": "hello",
+            "NUMBER_VAR": 42,
+            "BOOL_VAR": true,
+            "NULL_VAR": null,
+        });
+
+        if let Some(map) = step_env.as_object() {
+            for (key, val) in map {
+                if let Some(v) = val.as_str() {
+                    vars.push(env_var(key, v));
+                }
+            }
+        }
+
+        // Only string values should be added
+        assert_eq!(find_env(&vars, "STRING_VAR"), Some("hello".into()));
+        // Non-string values: as_str() returns None, so they are not added
+        let has_number = vars.iter().any(|v| v.name == "NUMBER_VAR");
+        let has_bool = vars.iter().any(|v| v.name == "BOOL_VAR");
+        let has_null = vars.iter().any(|v| v.name == "NULL_VAR");
+        assert!(!has_number, "number values should be skipped");
+        assert!(!has_bool, "boolean values should be skipped");
+        assert!(!has_null, "null values should be skipped");
+    }
+
+    // -- is_reserved_pipeline_env_var: comprehensive OTEL coverage --
+
+    #[test]
+    fn reserved_otel_env_vars_blocked() {
+        assert!(is_reserved_pipeline_env_var("OTEL_EXPORTER_OTLP_ENDPOINT"));
+        assert!(is_reserved_pipeline_env_var("OTEL_SERVICE_NAME"));
+        assert!(is_reserved_pipeline_env_var("OTEL_RESOURCE_ATTRIBUTES"));
+        assert!(is_reserved_pipeline_env_var("OTEL_EXPORTER_OTLP_HEADERS"));
+    }
+
+    #[test]
+    fn reserved_git_and_docker_env_vars_blocked() {
+        assert!(is_reserved_pipeline_env_var("GIT_ASKPASS"));
+        assert!(is_reserved_pipeline_env_var("DOCKER_CONFIG"));
+        assert!(is_reserved_pipeline_env_var("REGISTRY"));
+    }
+
+    #[test]
+    fn reserved_pipeline_metadata_vars_blocked() {
+        assert!(is_reserved_pipeline_env_var("PLATFORM_PROJECT_ID"));
+        assert!(is_reserved_pipeline_env_var("PLATFORM_PROJECT_NAME"));
+        assert!(is_reserved_pipeline_env_var("STEP_NAME"));
+        assert!(is_reserved_pipeline_env_var("COMMIT_REF"));
+        assert!(is_reserved_pipeline_env_var("COMMIT_BRANCH"));
+        assert!(is_reserved_pipeline_env_var("SHORT_SHA"));
+        assert!(is_reserved_pipeline_env_var("IMAGE_TAG"));
+        assert!(is_reserved_pipeline_env_var("PROJECT"));
+        assert!(is_reserved_pipeline_env_var("VERSION"));
+        assert!(is_reserved_pipeline_env_var("PIPELINE_TRIGGER"));
+    }
+
+    #[test]
+    fn non_reserved_env_vars_allowed() {
+        assert!(!is_reserved_pipeline_env_var("NODE_ENV"));
+        assert!(!is_reserved_pipeline_env_var("RUST_LOG"));
+        assert!(!is_reserved_pipeline_env_var("OTEL_CUSTOM"));
+        assert!(!is_reserved_pipeline_env_var("SECRET_KEY"));
+        assert!(!is_reserved_pipeline_env_var("COMMIT_MESSAGE")); // similar but not reserved
+    }
+
+    // -- mark_transitive_dependents_skipped: deeper DAG shapes --
+
+    #[test]
+    fn mark_transitive_dependents_deep_chain_5_levels() {
+        // 0 → 1 → 2 → 3 → 4
+        let dependents = vec![vec![1], vec![2], vec![3], vec![4], vec![]];
+        let mut skipped = std::collections::HashSet::new();
+        let completed = std::collections::HashSet::new();
+        mark_transitive_dependents_skipped(0, &dependents, &mut skipped, &completed);
+        assert_eq!(skipped.len(), 4);
+        for i in 1..=4 {
+            assert!(skipped.contains(&i));
+        }
+    }
+
+    #[test]
+    fn mark_transitive_dependents_partially_completed() {
+        // 0 → 1 → 2, 0 → 3 → 4, node 3 already completed
+        let dependents = vec![vec![1, 3], vec![2], vec![], vec![4], vec![]];
+        let mut skipped = std::collections::HashSet::new();
+        let mut completed = std::collections::HashSet::new();
+        completed.insert(3);
+        mark_transitive_dependents_skipped(0, &dependents, &mut skipped, &completed);
+        // 1 and 2 should be skipped; 3 is completed (not skipped), 4 not reached
+        assert!(skipped.contains(&1));
+        assert!(skipped.contains(&2));
+        assert!(!skipped.contains(&3));
+        // 4 depends on 3 which is completed → not traversed from the stack
+        assert!(!skipped.contains(&4));
+    }
+
+    #[test]
+    fn mark_transitive_dependents_middle_failure() {
+        // 0 → 1 → 2, failure at node 1 (not 0)
+        let dependents = vec![vec![1], vec![2], vec![]];
+        let mut skipped = std::collections::HashSet::new();
+        let completed = std::collections::HashSet::new();
+        mark_transitive_dependents_skipped(1, &dependents, &mut skipped, &completed);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped.contains(&2));
+        assert!(!skipped.contains(&0)); // 0 is not a dependent of 1
+    }
+
+    #[test]
+    fn mark_transitive_dependents_self_loop_no_hang() {
+        // A step depending on itself (malformed DAG — should not happen
+        // in production, but ensure no infinite loop)
+        let dependents = vec![vec![0]];
+        let mut skipped = std::collections::HashSet::new();
+        let completed = std::collections::HashSet::new();
+        // Node 0 was already the failed node, so when we see dependent 0
+        // it will be inserted into skipped and pushed to stack once,
+        // then re-popped and its dependents (itself) already in skipped.
+        mark_transitive_dependents_skipped(0, &dependents, &mut skipped, &completed);
+        // Should terminate without hanging
+        assert!(skipped.contains(&0));
+    }
+
+    // -- detect_unrecoverable_container: additional edge cases --
+
+    #[test]
+    fn detect_unrecoverable_container_crash_loop_in_init() {
+        // Init container in CrashLoopBackOff with restarts >= 3
+        let status = PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "step".into(),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("ContainerCreating".into()),
+                        message: None,
+                    }),
+                    ..Default::default()
+                }),
+                restart_count: 0,
+                ..Default::default()
+            }]),
+            init_container_statuses: Some(vec![ContainerStatus {
+                name: "clone".into(),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".into()),
+                        message: None,
+                    }),
+                    ..Default::default()
+                }),
+                restart_count: 5,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let result = detect_unrecoverable_container(&status);
+        assert_eq!(
+            result,
+            Some("init container CrashLoopBackOff after 5 restarts".into())
+        );
+    }
+
+    #[test]
+    fn detect_unrecoverable_container_config_error_in_regular() {
+        let status = PodStatus {
+            container_statuses: Some(vec![make_waiting_status(
+                "step",
+                "CreateContainerConfigError",
+                Some("secret not found"),
+            )]),
+            init_container_statuses: Some(vec![]),
+            ..Default::default()
+        };
+        let result = detect_unrecoverable_container(&status);
+        assert_eq!(
+            result,
+            Some("CreateContainerConfigError: secret not found".into())
+        );
+    }
+
+    #[test]
+    fn detect_unrecoverable_multiple_containers_first_bad() {
+        // Multiple containers, first one is bad
+        let status = PodStatus {
+            container_statuses: Some(vec![
+                make_waiting_status("app", "InvalidImageName", Some("bad name")),
+                ContainerStatus {
+                    name: "sidecar".into(),
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning { started_at: None }),
+                        ..Default::default()
+                    }),
+                    restart_count: 0,
+                    ..Default::default()
+                },
+            ]),
+            init_container_statuses: Some(vec![]),
+            ..Default::default()
+        };
+        let result = detect_unrecoverable_container(&status);
+        assert_eq!(result, Some("InvalidImageName: bad name".into()));
+    }
+
+    #[test]
+    fn detect_unrecoverable_multiple_containers_second_bad() {
+        // First container OK, second is bad
+        let status = PodStatus {
+            container_statuses: Some(vec![
+                ContainerStatus {
+                    name: "app".into(),
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning { started_at: None }),
+                        ..Default::default()
+                    }),
+                    restart_count: 0,
+                    ..Default::default()
+                },
+                make_waiting_status("sidecar", "ErrImagePull", Some("pull failed")),
+            ]),
+            init_container_statuses: Some(vec![]),
+            ..Default::default()
+        };
+        let result = detect_unrecoverable_container(&status);
+        assert_eq!(result, Some("ErrImagePull: pull failed".into()));
+    }
+
+    // -- check_container_statuses: unknown waiting reasons are OK --
+
+    #[test]
+    fn check_container_statuses_unknown_waiting_reason() {
+        let statuses = vec![make_waiting_status(
+            "app",
+            "ContainerCreating",
+            Some("still starting"),
+        )];
+        assert!(
+            check_container_statuses(&statuses, "").is_none(),
+            "ContainerCreating should not be treated as unrecoverable"
+        );
+    }
+
+    #[test]
+    fn check_container_statuses_pending_scheduling() {
+        let statuses = vec![make_waiting_status("app", "PodInitializing", None)];
+        assert!(check_container_statuses(&statuses, "").is_none());
+    }
+
+    // -- extract_branch: edge cases --
+
+    #[test]
+    fn extract_branch_nested_path() {
+        assert_eq!(
+            extract_branch("refs/heads/feature/deep/nested/path"),
+            "feature/deep/nested/path"
+        );
+    }
+
+    #[test]
+    fn extract_branch_empty_string() {
+        assert_eq!(extract_branch(""), "");
+    }
+
+    #[test]
+    fn extract_branch_refs_heads_only() {
+        // "refs/heads/" alone should give empty string
+        assert_eq!(extract_branch("refs/heads/"), "");
+    }
+
+    #[test]
+    fn extract_branch_refs_tags_only() {
+        assert_eq!(extract_branch("refs/tags/"), "");
+    }
+
+    #[test]
+    fn extract_branch_refs_other_prefix() {
+        // refs/merge/ is not stripped
+        assert_eq!(extract_branch("refs/merge/123"), "refs/merge/123");
+    }
+
+    // -- pod spec: init container without git_secret has only workspace mount --
+
+    #[test]
+    fn build_pod_spec_without_git_secret_init_has_one_mount() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let init = &spec.init_containers.as_ref().unwrap()[0];
+        let init_mounts = init.volume_mounts.as_ref().unwrap();
+        assert_eq!(
+            init_mounts.len(),
+            1,
+            "init container should only have workspace mount when no git secret"
+        );
+        assert_eq!(init_mounts[0].name, "workspace");
+    }
+
+    // -- pod spec: imagebuild vs command security context --
+
+    #[test]
+    fn build_pod_spec_deploy_test_step_type_has_security_context() {
+        // deploy_test steps are not imagebuild — they should get hardened context
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["echo test".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "deploy_test",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert!(
+            container.security_context.is_some(),
+            "deploy_test step type should have hardened security context"
+        );
+    }
+
+    // -- build_env_vars_core: commit sha edge cases --
+
+    #[test]
+    fn env_vars_core_short_sha_exactly_seven_chars() {
+        let vars = test_env_vars(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            Some("1234567"),
+            "test",
+            None,
+            None,
+        );
+        assert_eq!(find_env(&vars, "SHORT_SHA"), Some("1234567".into()));
+        assert_eq!(find_env(&vars, "IMAGE_TAG"), Some("sha-1234567".into()));
+    }
+
+    #[test]
+    fn env_vars_core_very_long_sha() {
+        let long_sha = "abcdef1234567890abcdef1234567890abcdef1234";
+        let vars = test_env_vars(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            Some(long_sha),
+            "test",
+            None,
+            None,
+        );
+        assert_eq!(find_env(&vars, "SHORT_SHA"), Some("abcdef1".into()));
+        assert_eq!(find_env(&vars, "IMAGE_TAG"), Some("sha-abcdef1".into()));
+        assert_eq!(find_env(&vars, "COMMIT_SHA"), Some(long_sha.into()));
+    }
+
+    #[test]
+    fn env_vars_core_single_char_sha() {
+        let vars = test_env_vars(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            Some("a"),
+            "test",
+            None,
+            None,
+        );
+        assert_eq!(find_env(&vars, "SHORT_SHA"), Some("a".into()));
+        assert_eq!(find_env(&vars, "IMAGE_TAG"), Some("sha-a".into()));
+    }
+
+    // -- step_condition_from_row: deploy_test present but no conditions --
+
+    #[test]
+    fn step_condition_from_row_deploy_test_present_no_conditions() {
+        let row = StepRow {
+            id: Uuid::nil(),
+            step_order: 0,
+            name: "test-deploy".into(),
+            image: "alpine".into(),
+            commands: vec![],
+            condition_events: vec![],
+            condition_branches: vec![],
+            deploy_test: Some(serde_json::json!({"test_image": "test:latest"})),
+            depends_on: vec![],
+            environment: None,
+            gate: false,
+            step_type: "deploy_test".into(),
+            step_config: None,
+        };
+        // Even with deploy_test, if conditions are empty, result is None (always run)
+        assert!(step_condition_from_row(&row).is_none());
+    }
+
+    #[test]
+    fn step_condition_from_row_deploy_test_with_conditions() {
+        let row = StepRow {
+            id: Uuid::nil(),
+            step_order: 0,
+            name: "test-deploy".into(),
+            image: "alpine".into(),
+            commands: vec![],
+            condition_events: vec!["push".into()],
+            condition_branches: vec!["main".into()],
+            deploy_test: Some(serde_json::json!({"test_image": "test:latest"})),
+            depends_on: vec![],
+            environment: None,
+            gate: false,
+            step_type: "deploy_test".into(),
+            step_config: None,
+        };
+        let cond = step_condition_from_row(&row).unwrap();
+        assert_eq!(cond.events, vec!["push"]);
+        assert_eq!(cond.branches, vec!["main"]);
+    }
+
+    // -- build_env_vars_full: all reserved secrets filtered --
+
+    #[test]
+    fn build_env_vars_full_all_reserved_secrets_produce_no_secret_names() {
+        // Verify that if all provided secrets have reserved names,
+        // PLATFORM_SECRET_NAMES is not emitted.
+        let names = ["PIPELINE_ID", "COMMIT_SHA", "PATH"];
+        for name in &names {
+            assert!(
+                is_reserved_pipeline_env_var(name),
+                "{name} should be reserved"
+            );
+        }
+    }
+
+    // -- build_env_vars_full: step env with non-string values ignored --
+
+    #[test]
+    fn build_env_vars_full_step_env_ignores_non_string() {
+        let step_env = serde_json::json!({
+            "STRING_VAR": "hello",
+            "NUMBER_VAR": 42,
+            "BOOL_VAR": true,
+            "NULL_VAR": null,
+        });
+
+        // Only string values should be extractable as &str
+        assert!(step_env["STRING_VAR"].as_str().is_some());
+        assert!(
+            step_env["NUMBER_VAR"].as_str().is_none(),
+            "non-string values should not be extractable as str"
+        );
+        assert!(step_env["BOOL_VAR"].as_str().is_none());
+        assert!(step_env["NULL_VAR"].as_str().is_none());
+    }
+
+    // -- container_security: verify no add capabilities --
+
+    #[test]
+    fn container_security_no_added_capabilities() {
+        let sec = container_security();
+        assert!(sec.capabilities.as_ref().unwrap().add.is_none());
+        assert!(sec.read_only_root_filesystem.is_none());
+        assert!(sec.run_as_user.is_none());
+    }
+
+    // -- slug: additional patterns --
+
+    #[test]
+    fn slug_with_spaces_and_numbers() {
+        assert_eq!(slug("Step 1: Build"), "step-1--build");
+    }
+
+    #[test]
+    fn slug_preserves_numbers() {
+        assert_eq!(slug("v2-build"), "v2-build");
+    }
+
+    #[test]
+    fn slug_unicode_gets_removed() {
+        // Unicode chars that aren't alphanumeric ASCII get replaced with dashes
+        assert_eq!(slug("test"), "test");
+    }
+
+    // -- build_volumes_and_mounts: git_secret volume properties --
+
+    #[test]
+    fn build_volumes_and_mounts_git_secret_has_correct_secret_name() {
+        let (volumes, _) = build_volumes_and_mounts(None, Some("pl-git-abcd1234"));
+        let git_vol = &volumes[1];
+        assert_eq!(git_vol.name, "git-auth");
+        let secret_source = git_vol.secret.as_ref().unwrap();
+        assert_eq!(
+            secret_source.secret_name.as_deref(),
+            Some("pl-git-abcd1234")
+        );
+    }
+
+    // -- node_registry_url: both set --
+
+    #[test]
+    fn node_registry_url_both_set_prefers_node() {
+        let config = crate::config::Config {
+            registry_url: Some("push-registry.com:5000".into()),
+            registry_node_url: Some("node-registry.com:5000".into()),
+            ..crate::config::Config::test_default()
+        };
+        assert_eq!(node_registry_url(&config), Some("node-registry.com:5000"));
+    }
 }

@@ -222,3 +222,155 @@ async fn readyz_returns_503_when_unhealthy(pool: PgPool) {
     let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ---------------------------------------------------------------------------
+// Health SSE stream tests
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_sse_requires_admin(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state.clone());
+
+    // Non-admin user should be forbidden
+    let (_, user_token) =
+        helpers::create_user(&app, &admin_token, "sse-nonadmin", "sse-nonadmin@test.com").await;
+    let (status, _) = helpers::get_json(&app, &user_token, "/api/health/stream").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unauthenticated should be 401
+    let (status, _) = helpers::get_json(&app, "", "/api/health/stream").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_sse_admin_returns_sse_stream(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // SSE endpoint should return 200 with text/event-stream content type
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/health/stream")
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .header("Accept", "text/event-stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected text/event-stream, got: {ct}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health summary uptime and structure
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_summary_returns_correct_structure(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+
+    // Pre-populate health snapshot with known values
+    {
+        let mut snap = state.health.write().unwrap();
+        *snap = platform::health::HealthSnapshot {
+            overall: platform::health::SubsystemStatus::Healthy,
+            subsystems: vec![platform::health::SubsystemCheck {
+                name: "postgres".into(),
+                status: platform::health::SubsystemStatus::Healthy,
+                latency_ms: 2,
+                message: None,
+                checked_at: chrono::Utc::now(),
+            }],
+            background_tasks: vec![],
+            pod_failures: platform::health::PodFailureSummary {
+                total_failed_24h: 0,
+                agent_failures: 0,
+                pipeline_failures: 0,
+                recent_failures: vec![],
+            },
+            uptime_seconds: 1234,
+            checked_at: chrono::Utc::now(),
+        };
+    }
+
+    let app = helpers::test_router(state);
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["overall"].as_str().unwrap(), "healthy");
+    assert_eq!(body["uptime_seconds"].as_u64().unwrap(), 1234);
+    assert!(!body["subsystems"].as_array().unwrap().is_empty());
+    // Summary should not include pod_failures or background_tasks
+    assert!(body.get("pod_failures").is_none());
+    assert!(body.get("background_tasks").is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_details_includes_pod_failures_and_tasks(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+
+    // Pre-populate snapshot with pod failures
+    {
+        let mut snap = state.health.write().unwrap();
+        *snap = platform::health::HealthSnapshot {
+            overall: platform::health::SubsystemStatus::Healthy,
+            subsystems: vec![],
+            background_tasks: vec![platform::health::types::BackgroundTaskHealth {
+                name: "pipeline_executor".into(),
+                status: platform::health::SubsystemStatus::Healthy,
+                last_heartbeat: Some(chrono::Utc::now()),
+                success_count: 10,
+                failure_count: 0,
+                last_error: None,
+            }],
+            pod_failures: platform::health::PodFailureSummary {
+                total_failed_24h: 3,
+                agent_failures: 2,
+                pipeline_failures: 1,
+                recent_failures: vec![],
+            },
+            uptime_seconds: 5678,
+            checked_at: chrono::Utc::now(),
+        };
+    }
+
+    let app = helpers::test_router(state);
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/health/details").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Details should include pod_failures and background_tasks
+    assert_eq!(body["pod_failures"]["total_failed_24h"], 3);
+    assert_eq!(body["pod_failures"]["agent_failures"], 2);
+    assert_eq!(body["pod_failures"]["pipeline_failures"], 1);
+    assert_eq!(body["uptime_seconds"], 5678);
+
+    let tasks = body["background_tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["name"], "pipeline_executor");
+}
+
+// ---------------------------------------------------------------------------
+// healthz endpoint (unauthenticated liveness probe)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn healthz_returns_ok_without_auth(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let req = axum::http::Request::builder()
+        .uri("/healthz")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

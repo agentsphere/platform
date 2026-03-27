@@ -669,4 +669,258 @@ cccccccccccccccccccccccccccccccccccccccc ddddddddddddddddddddddddddddddddddddddd
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].refname, "refs/heads/main");
     }
+
+    // -- extract_pushed_branches: deletion filter and non-branch refs --
+
+    #[test]
+    fn extract_branches_skips_non_branch_refs() {
+        let updates = vec![
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/notes/commits".into(),
+            },
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/remotes/origin/main".into(),
+            },
+        ];
+        let branches = extract_pushed_branches(&updates);
+        assert!(
+            branches.is_empty(),
+            "non-branch refs should be skipped: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn extract_branches_mixed_deletions_and_creates() {
+        let updates = vec![
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "0".repeat(40), // deletion
+                refname: "refs/heads/deleted-branch".into(),
+            },
+            RefUpdate {
+                old_sha: "0".repeat(40), // creation
+                new_sha: "b".repeat(40),
+                refname: "refs/heads/new-branch".into(),
+            },
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/tags/v1.0.0".into(), // tag
+            },
+        ];
+        let branches = extract_pushed_branches(&updates);
+        assert_eq!(branches, vec!["new-branch"]);
+    }
+
+    #[test]
+    fn extract_branches_empty_updates() {
+        let branches = extract_pushed_branches(&[]);
+        assert!(branches.is_empty());
+    }
+
+    // -- extract_pushed_tags: dangerous character rejection --
+
+    #[test]
+    fn extract_tags_valid() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1.0.0".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert_eq!(tags, vec!["v1.0.0"]);
+    }
+
+    #[test]
+    fn extract_tags_skips_deletions() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "0".repeat(40),
+            refname: "refs/tags/v1.0.0".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn extract_tags_skips_non_tag_refs() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/heads/main".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn extract_tags_rejects_dotdot() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1..0".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with '..' should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_rejects_null_byte() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1\0evil".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with null byte should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_rejects_semicolon() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1;rm -rf".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with semicolon should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_rejects_pipe() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1|cat".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with pipe should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_rejects_dollar() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/$HOME".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with dollar should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_rejects_backtick() {
+        let updates = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/tags/v1`cmd`".into(),
+        }];
+        let tags = extract_pushed_tags(&updates);
+        assert!(tags.is_empty(), "tag with backtick should be rejected");
+    }
+
+    #[test]
+    fn extract_tags_allows_safe_special_chars() {
+        let updates = vec![
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/tags/v1.0.0-beta+build.123".into(),
+            },
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/tags/release/v2.0".into(),
+            },
+        ];
+        let tags = extract_pushed_tags(&updates);
+        assert_eq!(tags, vec!["v1.0.0-beta+build.123", "release/v2.0"]);
+    }
+
+    // -- parse_pack_commands: edge cases --
+
+    #[test]
+    fn parse_pack_incomplete_packet() {
+        // Packet length says 200 but data is only 20 bytes
+        let data = b"00c8short data";
+        let updates = parse_pack_commands(data);
+        assert!(updates.is_empty(), "incomplete packet should be skipped");
+    }
+
+    #[test]
+    fn parse_pack_invalid_hex_length() {
+        let data = b"zzzz some data here";
+        let updates = parse_pack_commands(data);
+        assert!(updates.is_empty(), "invalid hex length should be skipped");
+    }
+
+    #[test]
+    fn parse_pack_too_short_for_length_prefix() {
+        let data = b"00";
+        let updates = parse_pack_commands(data);
+        assert!(
+            updates.is_empty(),
+            "data shorter than 4 bytes should be skipped"
+        );
+    }
+
+    #[test]
+    fn parse_pack_capabilities_stripped() {
+        // Capabilities after NUL should be stripped, leaving only the refname
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let cmd = format!("{old} {new} refs/heads/main\0 report-status delete-refs ofs-delta\n");
+        let pkt_len = cmd.len() + 4;
+        let data = format!("{pkt_len:04x}{cmd}0000");
+        let updates = parse_pack_commands(data.as_bytes());
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].refname, "refs/heads/main",
+            "capabilities should be stripped"
+        );
+    }
+
+    #[test]
+    fn parse_pack_tag_ref() {
+        let old = "0".repeat(40);
+        let new = "b".repeat(40);
+        let cmd = format!("{old} {new} refs/tags/v2.0.0\n");
+        let pkt_len = cmd.len() + 4;
+        let data = format!("{pkt_len:04x}{cmd}0000");
+        let updates = parse_pack_commands(data.as_bytes());
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].refname, "refs/tags/v2.0.0");
+    }
+
+    #[test]
+    fn parse_pack_length_too_small() {
+        // pkt-len of 0003 is invalid (minimum is 4)
+        let data = b"0003x0000";
+        let updates = parse_pack_commands(data);
+        assert!(updates.is_empty(), "pkt-len < 4 should break parse loop");
+    }
+
+    #[test]
+    fn parse_pack_non_utf8_data() {
+        // Build a packet with valid hex length but non-UTF8 payload
+        let len = 8u16; // 4 bytes length + 4 bytes data
+        let hex = format!("{len:04x}");
+        let mut data = hex.into_bytes();
+        data.extend_from_slice(&[0xff, 0xfe, 0xfd, 0xfc]);
+        data.extend_from_slice(b"0000");
+        let updates = parse_pack_commands(&data);
+        assert!(updates.is_empty(), "non-UTF8 packet data should be skipped");
+    }
+
+    // -- get_tag_sha --
+
+    #[tokio::test]
+    async fn get_tag_sha_nonexistent_repo() {
+        let result = get_tag_sha(Path::new("/nonexistent/repo.git"), "v1.0.0").await;
+        assert!(result.is_none());
+    }
 }

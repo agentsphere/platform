@@ -1605,4 +1605,147 @@ mod tests {
             "my-app-development"
         );
     }
+
+    // -- generate_basic_manifest comprehensive tests --
+
+    #[test]
+    fn basic_manifest_replicas_one() {
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+        assert_eq!(parsed["spec"]["replicas"], 1);
+    }
+
+    #[test]
+    fn basic_manifest_api_version_apps_v1() {
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+        assert_eq!(parsed["apiVersion"].as_str().unwrap(), "apps/v1");
+    }
+
+    #[test]
+    fn basic_manifest_kind_deployment() {
+        let r = sample_release();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+        assert_eq!(parsed["kind"].as_str().unwrap(), "Deployment");
+    }
+
+    #[test]
+    fn basic_manifest_metadata_name_matches_project_env() {
+        let mut r = sample_release();
+        r.project_name = "cool-service".into();
+        r.environment = "staging".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+        assert_eq!(
+            parsed["metadata"]["name"].as_str().unwrap(),
+            "cool-service-staging"
+        );
+    }
+
+    #[test]
+    fn basic_manifest_rejects_injection_dollar() {
+        let mut r = sample_release();
+        r.image_ref = "nginx:$(id)".into();
+        let result = generate_basic_manifest(&r);
+        assert!(
+            result.is_err(),
+            "dollar sign in image_ref should be rejected"
+        );
+    }
+
+    #[test]
+    fn basic_manifest_rejects_newline_injection() {
+        let mut r = sample_release();
+        r.image_ref = "nginx:latest\nmalicious: true".into();
+        let result = generate_basic_manifest(&r);
+        assert!(result.is_err(), "newline in image_ref should be rejected");
+    }
+
+    #[test]
+    fn basic_manifest_with_registry_port() {
+        let mut r = sample_release();
+        r.image_ref = "registry.example.com:5000/myapp:v2.0".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains("image: registry.example.com:5000/myapp:v2.0"));
+    }
+
+    #[test]
+    fn basic_manifest_with_digest() {
+        let mut r = sample_release();
+        r.image_ref =
+            "nginx@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains(
+            "image: nginx@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        ));
+    }
+
+    // -- build_deploy_docker_config edge cases --
+
+    #[test]
+    fn build_docker_config_special_chars_in_password() {
+        let config = build_deploy_docker_config("reg:5000", None, "user", "p@ss:w0rd!");
+        let auth_str = config["auths"]["reg:5000"]["auth"].as_str().unwrap();
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, auth_str)
+            .expect("auth should be valid base64");
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, "user:p@ss:w0rd!");
+    }
+
+    #[test]
+    fn build_docker_config_node_url_different() {
+        let config = build_deploy_docker_config(
+            "registry.example.com",
+            Some("10.0.0.1:5000"),
+            "admin",
+            "tok",
+        );
+        let auths = config["auths"].as_object().unwrap();
+        assert_eq!(auths.len(), 2);
+        assert!(auths.contains_key("registry.example.com"));
+        assert!(auths.contains_key("10.0.0.1:5000"));
+    }
+
+    // -- env_suffix edge cases --
+
+    #[test]
+    fn env_suffix_empty_string() {
+        assert_eq!(env_suffix(""), "");
+    }
+
+    #[test]
+    fn env_suffix_preview_with_branch() {
+        assert_eq!(env_suffix("preview-my-feature"), "preview-my-feature");
+    }
+
+    // -- target_namespace edge cases --
+
+    #[test]
+    fn target_namespace_empty_environment() {
+        let config = crate::config::Config::test_default();
+        let ns = target_namespace(&config, "my-app", "");
+        assert_eq!(ns, "my-app-");
+    }
+
+    #[test]
+    fn target_namespace_preview_branch() {
+        let config = crate::config::Config::test_default();
+        let ns = target_namespace(&config, "app", "preview-feat-login");
+        assert_eq!(ns, "app-preview-feat-login");
+    }
+
+    #[test]
+    fn target_namespace_long_prefix() {
+        let config = crate::config::Config {
+            ns_prefix: Some("platform-test-very-long-prefix".into()),
+            ..crate::config::Config::test_default()
+        };
+        assert_eq!(
+            target_namespace(&config, "svc", "staging"),
+            "platform-test-very-long-prefix-svc-staging"
+        );
+    }
 }

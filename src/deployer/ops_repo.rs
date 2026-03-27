@@ -1219,4 +1219,479 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
+
+    // -- init_ops_repo --
+
+    #[tokio::test]
+    async fn init_ops_repo_rejects_forward_slash() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let result = init_ops_repo(&tmp, "evil/name", "main").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("path separators"),
+            "should mention path separators: {err_msg}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn init_ops_repo_rejects_backslash() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let result = init_ops_repo(&tmp, "evil\\name", "main").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("path separators"),
+            "should mention path separators: {err_msg}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn init_ops_repo_rejects_double_dot() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let result = init_ops_repo(&tmp, "evil..traversal", "main").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("'..'"),
+            "should mention directory traversal: {err_msg}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn init_ops_repo_creates_bare_repo() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let path = init_ops_repo(&tmp, "myapp", "main").await.unwrap();
+        assert!(path.exists());
+        assert_eq!(path, tmp.join("myapp.git"));
+        // Verify HEAD points to the correct branch
+        let head = tokio::fs::read_to_string(path.join("HEAD")).await.unwrap();
+        assert_eq!(head.trim(), "ref: refs/heads/main");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn init_ops_repo_custom_branch() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let path = init_ops_repo(&tmp, "myapp", "production").await.unwrap();
+        let head = tokio::fs::read_to_string(path.join("HEAD")).await.unwrap();
+        assert_eq!(head.trim(), "ref: refs/heads/production");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- validate_commit_sha edge cases --
+
+    #[test]
+    fn validate_commit_sha_too_long() {
+        // 65 hex chars — exceeds max 64
+        let long = "a".repeat(65);
+        assert!(validate_commit_sha(&long).is_err());
+    }
+
+    #[test]
+    fn validate_commit_sha_exactly_7() {
+        assert!(validate_commit_sha("abcdef1").is_ok());
+    }
+
+    #[test]
+    fn validate_commit_sha_exactly_64() {
+        let sha64 = "a".repeat(64);
+        assert!(validate_commit_sha(&sha64).is_ok());
+    }
+
+    #[test]
+    fn validate_commit_sha_mixed_case_hex() {
+        assert!(validate_commit_sha("AbCdEf1234567").is_ok());
+    }
+
+    #[test]
+    fn validate_commit_sha_with_spaces() {
+        assert!(validate_commit_sha("abc1234 ").is_err());
+    }
+
+    #[test]
+    fn validate_commit_sha_with_newline() {
+        assert!(validate_commit_sha("abc1234\n").is_err());
+    }
+
+    // -- ensure_branch_exists --
+
+    #[tokio::test]
+    async fn ensure_branch_exists_creates_orphan_if_missing() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = init_ops_repo(&tmp, "branch-test", "main").await.unwrap();
+
+        // Initially the branch doesn't exist (no commits yet)
+        ensure_branch_exists(&repo_path, "main").await.unwrap();
+
+        // Now the branch should exist with at least one commit
+        let sha = get_branch_sha(&repo_path, "main").await;
+        assert!(
+            sha.is_ok(),
+            "branch should exist after ensure_branch_exists"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn ensure_branch_exists_noop_if_already_exists() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let sha_before = get_branch_sha(&repo_path, "main").await.unwrap();
+        ensure_branch_exists(&repo_path, "main").await.unwrap();
+        let sha_after = get_branch_sha(&repo_path, "main").await.unwrap();
+
+        assert_eq!(sha_before, sha_after, "should not create extra commits");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- write_file_to_repo --
+
+    #[tokio::test]
+    async fn write_file_creates_commit() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let sha = write_file_to_repo(&repo_path, "main", "deploy/app.yaml", "kind: Deployment")
+            .await
+            .unwrap();
+        assert!(!sha.is_empty());
+
+        // Verify the file was committed
+        let content = read_file_at_ref(&repo_path, "main", "deploy/app.yaml")
+            .await
+            .unwrap();
+        assert_eq!(content, "kind: Deployment");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_multiple_updates_each_create_commit() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let sha1 = write_file_to_repo(&repo_path, "main", "test.txt", "version1")
+            .await
+            .unwrap();
+        let sha2 = write_file_to_repo(&repo_path, "main", "test.txt", "version2")
+            .await
+            .unwrap();
+
+        assert_ne!(
+            sha1, sha2,
+            "different content should create different commits"
+        );
+
+        let content = read_file_at_ref(&repo_path, "main", "test.txt")
+            .await
+            .unwrap();
+        assert_eq!(content, "version2");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_identical_content_no_new_commit() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let sha1 = write_file_to_repo(&repo_path, "main", "test.txt", "same content")
+            .await
+            .unwrap();
+        let sha2 = write_file_to_repo(&repo_path, "main", "test.txt", "same content")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sha1, sha2,
+            "identical content should not create a new commit"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- cleanup_worktree edge cases --
+
+    #[tokio::test]
+    async fn cleanup_worktree_missing_dir_is_noop() {
+        // Different from existing test: test with a completely non-existent repo_path
+        let fake_repo = std::env::temp_dir().join(format!("does-not-exist-{}", Uuid::new_v4()));
+        let fake_wt = fake_repo.join("fake_worktree");
+        cleanup_worktree(&fake_repo, &fake_wt).await;
+        // No panic = success
+    }
+
+    // -- sync_from_project_repo with empty deploy/ --
+
+    #[tokio::test]
+    async fn sync_empty_deploy_dir_is_noop() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+
+        // Create a project repo with NO deploy/ directory
+        let project_repo = tmp.join("proj-empty.git");
+        let _ = tokio::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&project_repo)
+            .output()
+            .await
+            .unwrap();
+
+        let wt = project_repo.join("_init");
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_repo)
+            .args(["worktree", "add", "--orphan", "-b", "main"])
+            .arg(&wt)
+            .output()
+            .await
+            .unwrap();
+        tokio::fs::write(wt.join("README.md"), "# No deploy dir\n")
+            .await
+            .unwrap();
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["add", "."])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .args(["commit", "-m", "no deploy dir"])
+            .output()
+            .await;
+        let sha = get_head_sha(&project_repo).await.unwrap();
+        cleanup_worktree(&project_repo, &wt).await;
+
+        let ops_repo = bootstrap_repo(&tmp.join("ops-empty")).await;
+        let ops_sha_before = get_head_sha(&ops_repo).await.unwrap();
+
+        // Sync should be a no-op (no deploy/ dir)
+        let ops_sha_after = sync_from_project_repo(&project_repo, &ops_repo, "main", &sha)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ops_sha_before, ops_sha_after,
+            "empty deploy dir should not create new commit"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- compare_branches --
+
+    #[tokio::test]
+    async fn compare_branches_same() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let (diverged, src, tgt) = compare_branches(&repo_path, "main", "main").await.unwrap();
+        assert!(!diverged);
+        assert_eq!(src, tgt);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn compare_branches_diverged() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        // Ensure staging branch exists then write to it
+        ensure_branch_exists(&repo_path, "staging").await.unwrap();
+        write_file_to_repo(&repo_path, "staging", "file.txt", "staging-content")
+            .await
+            .unwrap();
+
+        let (diverged, src, tgt) = compare_branches(&repo_path, "staging", "main")
+            .await
+            .unwrap();
+        assert!(diverged);
+        assert_ne!(src, tgt);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- commit_values --
+
+    #[tokio::test]
+    async fn commit_values_and_read_back() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let values = serde_json::json!({
+            "image_ref": "myapp:v1.2.3",
+            "replicas": 3
+        });
+
+        let sha = commit_values(&repo_path, "main", "production", &values)
+            .await
+            .unwrap();
+        assert!(!sha.is_empty());
+
+        // Read the committed values back
+        let read_back = read_values(&repo_path, "main", "production").await.unwrap();
+        assert_eq!(read_back["image_ref"], "myapp:v1.2.3");
+        assert_eq!(read_back["replicas"], 3);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- read_dir_yaml_at_ref --
+
+    #[tokio::test]
+    async fn read_dir_yaml_multiple_files() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let (project_repo, sha) = create_project_repo_with_deploy(
+            &tmp,
+            &[
+                ("deploy/app.yaml", "kind: Deployment\nname: app"),
+                ("deploy/svc.yaml", "kind: Service\nname: svc"),
+                ("deploy/not-yaml.txt", "should be excluded"),
+            ],
+        )
+        .await;
+
+        let result = read_dir_yaml_at_ref(&project_repo, &sha, "deploy")
+            .await
+            .unwrap();
+        assert!(result.contains("kind: Deployment"));
+        assert!(result.contains("kind: Service"));
+        assert!(!result.contains("should be excluded"));
+        // Files are separated by ---
+        assert!(result.contains("---"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn read_dir_yaml_no_yaml_files_errors() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let (project_repo, sha) =
+            create_project_repo_with_deploy(&tmp, &[("deploy/readme.txt", "not yaml")]).await;
+
+        let result = read_dir_yaml_at_ref(&project_repo, &sha, "deploy").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no YAML files"), "got: {err}");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- read_file_at_ref error --
+
+    #[tokio::test]
+    async fn read_file_at_ref_missing_file() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let result = read_file_at_ref(&repo_path, "main", "nonexistent.yaml").await;
+        assert!(result.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- revert_last_commit --
+
+    #[tokio::test]
+    async fn revert_last_commit_restores_previous_state() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        // Write initial content
+        write_file_to_repo(&repo_path, "main", "data.txt", "original")
+            .await
+            .unwrap();
+
+        // Write updated content
+        write_file_to_repo(&repo_path, "main", "data.txt", "modified")
+            .await
+            .unwrap();
+
+        // Revert should undo the last commit
+        let sha = revert_last_commit(&repo_path, "main").await.unwrap();
+        assert!(!sha.is_empty());
+
+        let content = read_file_at_ref(&repo_path, "main", "data.txt")
+            .await
+            .unwrap();
+        assert_eq!(
+            content, "original",
+            "revert should restore previous content"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- get_head_sha / get_branch_sha error paths --
+
+    #[tokio::test]
+    async fn get_branch_sha_nonexistent_branch() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        let result = get_branch_sha(&repo_path, "nonexistent-branch").await;
+        assert!(result.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -- repo_lock concurrency --
+
+    #[tokio::test]
+    async fn repo_lock_serializes_concurrent_operations() {
+        let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+        let repo_path = bootstrap_repo(&tmp).await;
+
+        // Run two concurrent write operations and verify neither fails
+        let repo1 = repo_path.clone();
+        let repo2 = repo_path.clone();
+
+        let (r1, r2) = tokio::join!(
+            write_file_to_repo(&repo1, "main", "file1.txt", "content1"),
+            write_file_to_repo(&repo2, "main", "file2.txt", "content2"),
+        );
+
+        assert!(r1.is_ok(), "first concurrent write should succeed");
+        assert!(r2.is_ok(), "second concurrent write should succeed");
+
+        // Both files should exist
+        let c1 = read_file_at_ref(&repo_path, "main", "file1.txt")
+            .await
+            .unwrap();
+        let c2 = read_file_at_ref(&repo_path, "main", "file2.txt")
+            .await
+            .unwrap();
+        assert_eq!(c1, "content1");
+        assert_eq!(c2, "content2");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
 }

@@ -549,11 +549,11 @@ pub async fn delete_json(app: &Router, token: &str, path: &str) -> (StatusCode, 
     (status, body)
 }
 
-/// Poll the audit_log table until at least one entry with the given action appears,
+/// Poll the `audit_log` table until at least one entry with the given action appears,
 /// or timeout after `max_ms` milliseconds. Returns the count found.
 ///
 /// Audit entries are written asynchronously via `tokio::spawn` in `send_audit()`,
-/// so tests that query audit_log immediately after an API call may see zero rows.
+/// so tests that query `audit_log` immediately after an API call may see zero rows.
 /// This helper avoids that race by polling with short sleeps.
 pub async fn wait_for_audit(pool: &PgPool, action: &str, max_ms: u64) -> i64 {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
@@ -821,6 +821,7 @@ pub async fn insert_mr(
 
 /// Insert a branch protection rule directly in the DB.
 /// Returns the rule's UUID.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_branch_protection(
     pool: &PgPool,
     project_id: Uuid,

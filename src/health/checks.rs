@@ -452,4 +452,77 @@ mod tests {
         assert_eq!(result.status, SubsystemStatus::Degraded);
         assert!(result.message.unwrap().contains("not configured"));
     }
+
+    // -- elapsed_ms edge cases --
+
+    #[test]
+    fn elapsed_ms_returns_zero_or_near_zero() {
+        let start = Instant::now();
+        let ms = elapsed_ms(start);
+        // Should be less than 10ms since we just created the instant
+        assert!(ms < 10, "elapsed_ms should be near zero, got {ms}");
+    }
+
+    // -- check_git_repos additional tests --
+
+    #[test]
+    fn check_git_repos_has_zero_latency_essentially() {
+        let result = check_git_repos(std::path::Path::new("/tmp"));
+        assert!(
+            result.latency_ms < 100,
+            "git_repos check should be fast, got {}ms",
+            result.latency_ms
+        );
+        assert!(result.checked_at <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn check_git_repos_missing_has_error_message() {
+        let result = check_git_repos(std::path::Path::new("/this/path/does/not/exist/abc123"));
+        assert_eq!(result.status, SubsystemStatus::Unhealthy);
+        let msg = result.message.unwrap();
+        assert!(
+            msg.contains("/this/path/does/not/exist/abc123"),
+            "error message should contain the path, got: {msg}"
+        );
+    }
+
+    // -- check_secrets_engine additional tests --
+
+    #[test]
+    fn check_secrets_engine_has_zero_latency() {
+        let key = "test-key".to_string();
+        let result = check_secrets_engine(Some(&key), false);
+        assert_eq!(
+            result.latency_ms, 0,
+            "secrets engine check is synchronous and should report 0 latency"
+        );
+    }
+
+    #[test]
+    fn check_secrets_engine_dev_mode_with_key_prefers_key() {
+        // When master key is present, dev_mode doesn't matter
+        let key = "test-key".to_string();
+        let result = check_secrets_engine(Some(&key), true);
+        assert_eq!(result.status, SubsystemStatus::Healthy);
+        assert!(
+            result.message.is_none(),
+            "should not show dev mode message when key is present"
+        );
+    }
+
+    // -- check_registry additional tests --
+
+    #[test]
+    fn check_registry_has_zero_latency() {
+        let url = "registry.example.com:5000".to_string();
+        let result = check_registry(Some(&url));
+        assert_eq!(result.latency_ms, 0);
+    }
+
+    #[test]
+    fn check_registry_not_configured_has_zero_latency() {
+        let result = check_registry(None);
+        assert_eq!(result.latency_ms, 0);
+    }
 }

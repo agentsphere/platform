@@ -2046,3 +2046,294 @@ async fn search_logs_by_session_id(pool: PgPool) {
     let expected_sid = session_id.to_string();
     assert_eq!(items[0]["session_id"].as_str(), Some(expected_sid.as_str()));
 }
+
+// ---------------------------------------------------------------------------
+// Log query — source filter
+// ---------------------------------------------------------------------------
+
+/// Filter logs by `source`.
+#[sqlx::test(migrations = "./migrations")]
+async fn search_logs_by_source(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let svc = format!("source-svc-{}", Uuid::new_v4().simple());
+    let log_external = platform::observe::store::LogEntryRecord {
+        timestamp: Utc::now(),
+        trace_id: None,
+        span_id: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+        service: svc.clone(),
+        level: "info".into(),
+        source: "external".into(),
+        message: "external log".into(),
+        attributes: None,
+    };
+    let log_session = platform::observe::store::LogEntryRecord {
+        timestamp: Utc::now(),
+        trace_id: None,
+        span_id: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+        service: svc.clone(),
+        level: "info".into(),
+        source: "session".into(),
+        message: "session log".into(),
+        attributes: None,
+    };
+    platform::observe::store::write_logs(&pool, &[log_external, log_session])
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/logs?service={svc}&source=session"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["source"], "session");
+}
+
+// ---------------------------------------------------------------------------
+// Log query — task_name filter via attributes
+// ---------------------------------------------------------------------------
+
+/// Filter logs by `task_name` stored in attributes JSON.
+#[sqlx::test(migrations = "./migrations")]
+async fn search_logs_by_task_name(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let svc = format!("task-svc-{}", Uuid::new_v4().simple());
+    let task = format!("deploy-{}", Uuid::new_v4().simple());
+    let log = platform::observe::store::LogEntryRecord {
+        timestamp: Utc::now(),
+        trace_id: None,
+        span_id: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+        service: svc.clone(),
+        level: "info".into(),
+        source: "system".into(),
+        message: "task log".into(),
+        attributes: Some(serde_json::json!({"task_name": task})),
+    };
+    platform::observe::store::write_logs(&pool, &[log])
+        .await
+        .unwrap();
+
+    // Also insert a log without that task_name
+    insert_test_log(&pool, &svc, "info", "no task").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/logs?service={svc}&task_name={task}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["message"], "task log");
+}
+
+// ---------------------------------------------------------------------------
+// Log query — range parameter
+// ---------------------------------------------------------------------------
+
+/// Filter logs using relative `range` parameter.
+#[sqlx::test(migrations = "./migrations")]
+async fn search_logs_with_range_param(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let svc = format!("range-svc-{}", Uuid::new_v4().simple());
+    insert_test_log(&pool, &svc, "info", "recent log").await;
+
+    // range=1h should find the just-inserted log
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/logs?service={svc}&range=1h"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["total"].as_i64().unwrap() >= 1,
+        "range=1h should find recent log"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped logs endpoint
+// ---------------------------------------------------------------------------
+
+/// GET /api/projects/{project_id}/logs returns logs for that project.
+#[sqlx::test(migrations = "./migrations")]
+async fn project_logs_endpoint(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "proj-logs-ep", "public").await;
+
+    let log = platform::observe::store::LogEntryRecord {
+        timestamp: Utc::now(),
+        trace_id: None,
+        span_id: None,
+        project_id: Some(project_id),
+        session_id: None,
+        user_id: None,
+        service: "proj-ep-svc".into(),
+        level: "info".into(),
+        source: "external".into(),
+        message: "project endpoint log".into(),
+        attributes: None,
+    };
+    platform::observe::store::write_logs(&pool, &[log])
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/logs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert!(
+        !items.is_empty(),
+        "project logs endpoint should return data"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|i| i["project_id"].as_str() == Some(&project_id.to_string())),
+        "all logs should belong to the project"
+    );
+}
+
+/// GET /api/projects/{project_id}/logs returns 404 for nonexistent project.
+#[sqlx::test(migrations = "./migrations")]
+async fn project_logs_nonexistent_project(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) =
+        helpers::get_json(&app, &admin_token, &format!("/api/projects/{fake_id}/logs")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Rotate no-op when no old data
+// ---------------------------------------------------------------------------
+
+/// Rotation with no old data returns 0 without error.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_logs_no_old_data(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    // Insert recent log (within 48h cutoff)
+    let log = platform::observe::store::LogEntryRecord {
+        timestamp: Utc::now(),
+        trace_id: None,
+        span_id: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+        service: "no-rotate-svc".into(),
+        level: "info".into(),
+        source: "external".into(),
+        message: "too recent to rotate".into(),
+        attributes: None,
+    };
+    platform::observe::store::write_logs(&pool, &[log])
+        .await
+        .unwrap();
+
+    let rotated = platform::observe::parquet::rotate_logs(&state)
+        .await
+        .unwrap();
+    // Recent logs should NOT be rotated
+    assert_eq!(rotated, 0, "recent logs should not be rotated");
+
+    // Verify the log is still in the DB
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM log_entries WHERE service = 'no-rotate-svc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(count.0 >= 1, "recent log should still exist");
+}
+
+/// Rotation for spans with no old data returns 0.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_spans_no_old_data(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let rotated = platform::observe::parquet::rotate_spans(&state)
+        .await
+        .unwrap();
+    assert_eq!(rotated, 0);
+}
+
+/// Rotation for metrics with no old data returns 0.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_metrics_no_old_data(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let rotated = platform::observe::parquet::rotate_metrics(&state)
+        .await
+        .unwrap();
+    assert_eq!(rotated, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Metric names — project scoped
+// ---------------------------------------------------------------------------
+
+/// List metric names scoped to a specific project.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_metric_names_project_scoped(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "metric-names-proj", "public").await;
+
+    // Insert metric with project_id
+    let metric = platform::observe::store::MetricRecord {
+        name: format!("proj_metric_{}", Uuid::new_v4().simple()),
+        labels: serde_json::json!({"host": "node1"}),
+        metric_type: "gauge".into(),
+        unit: Some("percent".into()),
+        project_id: Some(project_id),
+        timestamp: Utc::now(),
+        value: 55.0,
+    };
+    let metric_name = metric.name.clone();
+    platform::observe::store::write_metrics(&pool, &[metric])
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/metrics/names?project_id={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert!(
+        names
+            .iter()
+            .any(|n| n["name"].as_str() == Some(&metric_name)),
+        "project-scoped metric name should appear"
+    );
+}

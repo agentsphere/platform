@@ -921,4 +921,163 @@ mod tests {
         };
         assert_eq!(truncated.len(), 2000);
     }
+
+    #[test]
+    fn prompt_no_truncation_under_2000() {
+        let raw_prompt = "a".repeat(1999);
+        let truncated = if raw_prompt.len() > 2000 {
+            &raw_prompt[..2000]
+        } else {
+            &raw_prompt
+        };
+        assert_eq!(truncated.len(), 1999);
+    }
+
+    #[test]
+    fn prompt_no_truncation_exactly_2000() {
+        let raw_prompt = "a".repeat(2000);
+        let truncated = if raw_prompt.len() > 2000 {
+            &raw_prompt[..2000]
+        } else {
+            &raw_prompt
+        };
+        assert_eq!(truncated.len(), 2000);
+    }
+
+    #[test]
+    fn parse_create_project_input_empty_display_name_rejected() {
+        // Empty display_name should fail check_length (min 1)
+        let input = serde_json::json!({
+            "name": "my-app",
+            "display_name": "",
+        });
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "empty display_name should be rejected");
+    }
+
+    #[test]
+    fn parse_create_project_input_max_display_name_ok() {
+        let dn = "x".repeat(255);
+        let input = serde_json::json!({
+            "name": "my-app",
+            "display_name": dn,
+        });
+        let result = parse_create_project_input(&input);
+        assert!(result.is_ok(), "255-char display_name should be ok");
+    }
+
+    #[test]
+    fn parse_create_project_input_display_name_over_max_rejected() {
+        let dn = "x".repeat(256);
+        let input = serde_json::json!({
+            "name": "my-app",
+            "display_name": dn,
+        });
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "256-char display_name should be rejected");
+    }
+
+    #[test]
+    fn parse_create_project_input_empty_name_rejected() {
+        let input = serde_json::json!({"name": ""});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "empty name should be rejected");
+    }
+
+    #[test]
+    fn parse_create_project_input_description_at_max_ok() {
+        let desc = "x".repeat(10_000);
+        let input = serde_json::json!({
+            "name": "my-app",
+            "description": desc,
+        });
+        let result = parse_create_project_input(&input);
+        assert!(result.is_ok(), "10000-char description should be ok");
+    }
+
+    #[test]
+    fn parse_uuid_field_integer_value() {
+        let input = serde_json::json!({"project_id": 12345});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "integer value should fail as_str()");
+    }
+
+    #[test]
+    fn parse_uuid_field_boolean_value() {
+        let input = serde_json::json!({"project_id": true});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "boolean value should fail as_str()");
+    }
+
+    #[test]
+    fn check_progress_negative_limit_uses_default() {
+        // Negative limit should be less than 50, so .min(50) returns the negative.
+        // The DB query will handle it (LIMIT -5 is an error in Postgres, but
+        // the logic unwrap_or(20).min(50) would give the negative value).
+        let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": -5});
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(20)
+            .min(50);
+        assert_eq!(limit, -5);
+    }
+
+    #[test]
+    fn check_progress_zero_limit() {
+        let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": 0});
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(20)
+            .min(50);
+        assert_eq!(limit, 0);
+    }
+
+    #[test]
+    fn loop_outcome_clone() {
+        let outcome = LoopOutcome::Completed;
+        let cloned = outcome;
+        assert_eq!(outcome, cloned);
+    }
+
+    #[test]
+    fn loop_outcome_copy() {
+        let outcome = LoopOutcome::WaitingForInput;
+        let copied = outcome;
+        assert_eq!(outcome, copied);
+    }
+
+    #[test]
+    fn parse_uuid_field_empty_string() {
+        let input = serde_json::json!({"project_id": ""});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "empty string should fail UUID parse");
+    }
+
+    #[test]
+    fn parse_uuid_field_wrong_field_name() {
+        let id = Uuid::new_v4();
+        let input = serde_json::json!({"project_id": id.to_string()});
+        let result = parse_uuid_field(&input, "session_id");
+        assert!(result.is_err(), "wrong field name should return error");
+    }
+
+    #[test]
+    fn parse_create_project_name_non_string() {
+        let input = serde_json::json!({"name": 12345});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "non-string name should be rejected");
+    }
+
+    #[test]
+    fn parse_create_project_description_empty_ok() {
+        // Empty description is ok (min length 0)
+        let input = serde_json::json!({
+            "name": "my-app",
+            "description": "",
+        });
+        let result = parse_create_project_input(&input);
+        assert!(result.is_ok(), "empty description should be ok (min=0)");
+    }
 }

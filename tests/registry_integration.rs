@@ -1543,3 +1543,784 @@ async fn manifest_with_empty_layers(pool: PgPool) {
     let layers = pulled["layers"].as_array().unwrap();
     assert!(layers.is_empty(), "layers should be empty");
 }
+
+// ---------------------------------------------------------------------------
+// Tag list edge cases
+// ---------------------------------------------------------------------------
+
+/// Tag list with pagination cursor returns only tags after the cursor.
+#[sqlx::test(migrations = "./migrations")]
+async fn tag_list_pagination_cursor(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let admin_api_token = {
+        let (_, body) = helpers::post_json(
+            &app,
+            &admin_token,
+            "/api/tokens",
+            serde_json::json!({ "name": "admin-tag-cursor", "expires_in_days": 30 }),
+        )
+        .await;
+        body["token"].as_str().unwrap().to_owned()
+    };
+
+    let _proj_id = create_project(&app, &admin_token, "tag-cursor-test", "private").await;
+
+    let config_digest =
+        registry_upload_blob(&app, &admin_api_token, "tag-cursor-test", b"cfg").await;
+    let layer_digest =
+        registry_upload_blob(&app, &admin_api_token, "tag-cursor-test", b"lyr").await;
+
+    // Push with tags a, b, c, d
+    for tag in ["a", "b", "c", "d"] {
+        registry_push_manifest(
+            &app,
+            &admin_api_token,
+            "tag-cursor-test",
+            tag,
+            &config_digest,
+            &[&layer_digest],
+        )
+        .await;
+    }
+
+    // List with n=2
+    let (status, _, body) = registry_request(
+        &app,
+        &admin_api_token,
+        "GET",
+        "/v2/tag-cursor-test/tags/list?n=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags = resp["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2);
+    // Should be sorted alphabetically: a, b
+    assert_eq!(tags[0], "a");
+    assert_eq!(tags[1], "b");
+
+    // List with cursor "b" — should return c, d
+    let (status, _, body) = registry_request(
+        &app,
+        &admin_api_token,
+        "GET",
+        "/v2/tag-cursor-test/tags/list?last=b",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags = resp["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0], "c");
+    assert_eq!(tags[1], "d");
+}
+
+/// Tag list for a repo with no tags returns empty list.
+#[sqlx::test(migrations = "./migrations")]
+async fn tag_list_empty_repo(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let admin_api_token = {
+        let (_, body) = helpers::post_json(
+            &app,
+            &admin_token,
+            "/api/tokens",
+            serde_json::json!({ "name": "admin-tag-empty", "expires_in_days": 30 }),
+        )
+        .await;
+        body["token"].as_str().unwrap().to_owned()
+    };
+
+    let _proj_id = create_project(&app, &admin_token, "tag-empty-test", "private").await;
+
+    // Upload a blob to create the repo, but don't push any manifest/tag
+    registry_upload_blob(&app, &admin_api_token, "tag-empty-test", b"data").await;
+
+    let (status, _, body) = registry_request(
+        &app,
+        &admin_api_token,
+        "GET",
+        "/v2/tag-empty-test/tags/list",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp["name"], "tag-empty-test");
+    assert!(resp["tags"].as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Media type validation
+// ---------------------------------------------------------------------------
+
+/// PUT manifest with unsupported media type returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn manifest_unsupported_media_type_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "media-type-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "media-type-user", "mt@test.com", &pool)
+            .await;
+
+    let config_digest = registry_upload_blob(&app, &api_token, "media-type-proj", b"config").await;
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": 6,
+        },
+        "layers": [],
+    });
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/v2/media-type-proj/manifests/bad-ct")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/xml")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&manifest).unwrap(),
+        ))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unsupported media type should be rejected"
+    );
+}
+
+/// PUT manifest with Docker manifest media type is accepted.
+#[sqlx::test(migrations = "./migrations")]
+async fn manifest_docker_media_type_accepted(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "docker-mt-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "docker-mt-user", "dmt@test.com", &pool)
+            .await;
+
+    let config_digest =
+        registry_upload_blob(&app, &api_token, "docker-mt-proj", b"docker-config").await;
+    let layer_digest =
+        registry_upload_blob(&app, &api_token, "docker-mt-proj", b"docker-layer").await;
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": 13,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": layer_digest,
+            "size": 12,
+        }],
+    });
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/v2/docker-mt-proj/manifests/docker-tag")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header(
+            "Content-Type",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&manifest).unwrap(),
+        ))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "Docker manifest v2 media type should be accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Immutable tag policy (v* prefix)
+// ---------------------------------------------------------------------------
+
+/// Re-pushing the same digest to a v* tag is allowed (idempotent).
+#[sqlx::test(migrations = "./migrations")]
+async fn immutable_vtag_allows_same_digest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "vtag-same-proj", "private").await;
+    let (_, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "vtag-same-user",
+        "vtag-same@test.com",
+        &pool,
+    )
+    .await;
+
+    let config_digest = registry_upload_blob(&app, &api_token, "vtag-same-proj", b"vtag-cfg").await;
+    let layer_digest = registry_upload_blob(&app, &api_token, "vtag-same-proj", b"vtag-lyr").await;
+
+    // First push to v1
+    registry_push_manifest(
+        &app,
+        &api_token,
+        "vtag-same-proj",
+        "v1",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+
+    // Re-push the exact same content to v1 (same digest) — should succeed
+    let status = registry_push_manifest_status(
+        &app,
+        &api_token,
+        "vtag-same-proj",
+        "v1",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "re-pushing same digest to v* tag should succeed (idempotent)"
+    );
+}
+
+/// Re-pushing a different digest to a v* tag returns 409 (immutable).
+#[sqlx::test(migrations = "./migrations")]
+async fn immutable_vtag_rejects_different_digest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "vtag-diff-proj", "private").await;
+    let (_, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "vtag-diff-user",
+        "vtag-diff@test.com",
+        &pool,
+    )
+    .await;
+
+    let config_digest1 =
+        registry_upload_blob(&app, &api_token, "vtag-diff-proj", b"vtag-cfg-1").await;
+    let layer_digest1 =
+        registry_upload_blob(&app, &api_token, "vtag-diff-proj", b"vtag-lyr-1").await;
+
+    // First push to v1
+    registry_push_manifest(
+        &app,
+        &api_token,
+        "vtag-diff-proj",
+        "v1",
+        &config_digest1,
+        &[&layer_digest1],
+    )
+    .await;
+
+    // Push different content to v1 — should fail
+    let config_digest2 =
+        registry_upload_blob(&app, &api_token, "vtag-diff-proj", b"vtag-cfg-2-different").await;
+    let layer_digest2 =
+        registry_upload_blob(&app, &api_token, "vtag-diff-proj", b"vtag-lyr-2-different").await;
+
+    let status = registry_push_manifest_status(
+        &app,
+        &api_token,
+        "vtag-diff-proj",
+        "v1",
+        &config_digest2,
+        &[&layer_digest2],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "pushing different digest to immutable v* tag should return 409"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Namespaced routes (two-segment: {ns}/{repo})
+// ---------------------------------------------------------------------------
+
+/// Namespaced blob and manifest operations work.
+#[sqlx::test(migrations = "./migrations")]
+async fn namespaced_routes_work(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "ns-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "ns-user", "ns@test.com", &pool).await;
+
+    // Upload blob via namespaced route
+    let data = b"ns-blob-data";
+    let digest = {
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(data);
+        format!("sha256:{}", hex::encode(hash))
+    };
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v2/ns-proj/dev/blobs/uploads/?digest={digest}"))
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(data.to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // HEAD blob via namespaced route
+    let (status, _, _) = registry_request(
+        &app,
+        &api_token,
+        "HEAD",
+        &format!("/v2/ns-proj/dev/blobs/{digest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET blob via namespaced route
+    let (status, headers, _) = registry_request(
+        &app,
+        &api_token,
+        "GET",
+        &format!("/v2/ns-proj/dev/blobs/{digest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert!(headers.contains_key("location"));
+
+    // Push manifest via namespaced route
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": digest,
+            "size": data.len(),
+        },
+        "layers": [],
+    });
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/v2/ns-proj/dev/manifests/latest")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&manifest).unwrap(),
+        ))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // HEAD manifest via namespaced route
+    let (status, _, _) =
+        registry_request(&app, &api_token, "HEAD", "/v2/ns-proj/dev/manifests/latest").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET manifest via namespaced route
+    let (status, _, _) =
+        registry_request(&app, &api_token, "GET", "/v2/ns-proj/dev/manifests/latest").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Tag list via namespaced route
+    let (status, _, body) =
+        registry_request(&app, &api_token, "GET", "/v2/ns-proj/dev/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp["name"], "ns-proj/dev");
+    assert!(
+        resp["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("latest"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Repo resolution — name unknown
+// ---------------------------------------------------------------------------
+
+/// Pull from a nonexistent repository returns 404 (NAME_UNKNOWN).
+#[sqlx::test(migrations = "./migrations")]
+async fn pull_nonexistent_repo_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "noname-user", "noname@test.com", &pool)
+            .await;
+
+    let (status, _, _) = registry_request(
+        &app,
+        &api_token,
+        "GET",
+        "/v2/nonexistent-repo-xyz/manifests/latest",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Copy tag
+// ---------------------------------------------------------------------------
+
+/// `copy_tag` creates a new tag pointing to the same digest.
+#[sqlx::test(migrations = "./migrations")]
+async fn copy_tag_creates_alias(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "copy-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "copy-user", "copy@test.com", &pool).await;
+
+    let config_digest = registry_upload_blob(&app, &api_token, "copy-proj", b"copy-cfg").await;
+    let layer_digest = registry_upload_blob(&app, &api_token, "copy-proj", b"copy-lyr").await;
+
+    // Push manifest tagged as "source-tag"
+    let manifest_digest = registry_push_manifest(
+        &app,
+        &api_token,
+        "copy-proj",
+        "source-tag",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+
+    // Copy the tag
+    platform::registry::copy_tag(&pool, "copy-proj", "source-tag", "dest-tag")
+        .await
+        .expect("copy_tag should succeed");
+
+    // Verify dest-tag points to the same digest
+    let dest_digest: String =
+        sqlx::query_scalar("SELECT manifest_digest FROM registry_tags WHERE name = 'dest-tag'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let source_digest: String =
+        sqlx::query_scalar("SELECT manifest_digest FROM registry_tags WHERE name = 'source-tag'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dest_digest, source_digest);
+
+    // Verify we can GET the manifest by the new tag
+    let (status, _, _) =
+        registry_request(&app, &api_token, "GET", "/v2/copy-proj/manifests/dest-tag").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// `copy_tag` fails if dest_tag already exists.
+#[sqlx::test(migrations = "./migrations")]
+async fn copy_tag_rejects_existing_dest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "copy-dup-proj", "private").await;
+    let (_, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "copy-dup-user",
+        "copy-dup@test.com",
+        &pool,
+    )
+    .await;
+
+    let config_digest =
+        registry_upload_blob(&app, &api_token, "copy-dup-proj", b"copy-dup-cfg").await;
+    let layer_digest =
+        registry_upload_blob(&app, &api_token, "copy-dup-proj", b"copy-dup-lyr").await;
+
+    // Push two tags
+    registry_push_manifest(
+        &app,
+        &api_token,
+        "copy-dup-proj",
+        "tag-a",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+    registry_push_manifest(
+        &app,
+        &api_token,
+        "copy-dup-proj",
+        "tag-b",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+
+    // Try to copy tag-a to tag-b (tag-b already exists) — should fail
+    let result = platform::registry::copy_tag(&pool, "copy-dup-proj", "tag-a", "tag-b").await;
+    assert!(result.is_err(), "copy_tag to existing tag should fail");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("already exists"), "error: {err}");
+}
+
+/// `copy_tag` fails if source tag doesn't exist.
+#[sqlx::test(migrations = "./migrations")]
+async fn copy_tag_source_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "copy-nf-proj", "private").await;
+    let (_, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "copy-nf-user",
+        "copy-nf@test.com",
+        &pool,
+    )
+    .await;
+
+    // Upload a blob to create the repo
+    registry_upload_blob(&app, &api_token, "copy-nf-proj", b"data").await;
+
+    // Try to copy a nonexistent source tag
+    let result = platform::registry::copy_tag(&pool, "copy-nf-proj", "nonexistent", "dest").await;
+    assert!(
+        result.is_err(),
+        "copy_tag from nonexistent source should fail"
+    );
+}
+
+/// `copy_tag` fails if the repo doesn't exist.
+#[sqlx::test(migrations = "./migrations")]
+async fn copy_tag_repo_not_found(pool: PgPool) {
+    let (_state, _admin_token) = test_state(pool.clone()).await;
+
+    let result = platform::registry::copy_tag(&pool, "nonexistent-repo-xyz", "src", "dst").await;
+    assert!(result.is_err(), "copy_tag for nonexistent repo should fail");
+}
+
+// ---------------------------------------------------------------------------
+// System repo (project_id = NULL)
+// ---------------------------------------------------------------------------
+
+/// System repo allows pull but denies push.
+#[sqlx::test(migrations = "./migrations")]
+async fn system_repo_allows_pull_denies_push(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "sys-repo-user", "sys@test.com", &pool)
+            .await;
+
+    // platform-runner is a system repo (project_id = NULL) created by seed.
+    // Pulling tags list should work:
+    let (status, _, body) =
+        registry_request(&app, &api_token, "GET", "/v2/platform-runner/tags/list").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp["name"], "platform-runner");
+
+    // Push to system repo should be denied (FORBIDDEN)
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/platform-runner/blobs/uploads/")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "push to system repo should be denied"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Manifest deduplication (same content, different tag)
+// ---------------------------------------------------------------------------
+
+/// Pushing the same manifest content with different tags creates only one manifest row.
+#[sqlx::test(migrations = "./migrations")]
+async fn manifest_deduplication(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "dedup-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "dedup-user", "dedup@test.com", &pool).await;
+
+    let config_digest = registry_upload_blob(&app, &api_token, "dedup-proj", b"dedup-cfg").await;
+    let layer_digest = registry_upload_blob(&app, &api_token, "dedup-proj", b"dedup-lyr").await;
+
+    // Push same manifest with tag "alpha"
+    let digest1 = registry_push_manifest(
+        &app,
+        &api_token,
+        "dedup-proj",
+        "alpha",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+
+    // Push same manifest with tag "beta"
+    let digest2 = registry_push_manifest(
+        &app,
+        &api_token,
+        "dedup-proj",
+        "beta",
+        &config_digest,
+        &[&layer_digest],
+    )
+    .await;
+
+    // Same content should produce same digest
+    assert_eq!(digest1, digest2);
+
+    // There should be exactly 1 manifest row (ON CONFLICT DO UPDATE)
+    let repo_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM registry_repositories WHERE name = 'dedup-proj'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let manifest_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM registry_manifests WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        manifest_count, 1,
+        "same content should only have 1 manifest row"
+    );
+
+    // But there should be 2 tags
+    let tag_count: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM registry_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(tag_count, 2, "should have 2 tags pointing to same manifest");
+}
+
+// ---------------------------------------------------------------------------
+// Chunked upload — invalid upload UUID
+// ---------------------------------------------------------------------------
+
+/// PATCH with invalid upload UUID returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn chunked_upload_invalid_uuid(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "inv-uuid-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "inv-uuid-user", "inv@test.com", &pool)
+            .await;
+
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri("/v2/inv-uuid-proj/blobs/uploads/not-a-uuid")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(b"chunk-data".to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// PUT complete without digest query param returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_upload_missing_digest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "no-digest-proj", "private").await;
+    let (_, api_token) = create_user_with_api_token(
+        &app,
+        &admin_token,
+        "no-digest-user",
+        "nodig@test.com",
+        &pool,
+    )
+    .await;
+
+    // Start upload
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/no-digest-proj/blobs/uploads/")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // PUT complete WITHOUT digest param
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(&location)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "missing digest should return 400"
+    );
+}
+
+/// DELETE manifest for nonexistent reference returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_nonexistent_manifest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "del-nf-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "del-nf-user", "del-nf@test.com", &pool)
+            .await;
+
+    // Upload a blob to create the repo
+    registry_upload_blob(&app, &api_token, "del-nf-proj", b"data").await;
+
+    // Try to DELETE a tag that doesn't exist
+    let (status, _, _) = registry_request(
+        &app,
+        &api_token,
+        "DELETE",
+        "/v2/del-nf-proj/manifests/nonexistent-tag",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

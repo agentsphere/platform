@@ -857,4 +857,144 @@ mod tests {
                 .unwrap();
         assert!(query.verify_signatures);
     }
+
+    // -- extract_author_email_from_commit --
+
+    #[test]
+    fn extract_author_email_standard_format() {
+        let raw = b"tree abc123\nauthor Alice <alice@example.com> 1700000000 +0000\ncommitter Bob <bob@example.com> 1700000000 +0000\n\ncommit message\n";
+        let email = extract_author_email_from_commit(raw);
+        assert_eq!(email.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn extract_author_email_no_author_line() {
+        let raw =
+            b"tree abc123\ncommitter Bob <bob@example.com> 1700000000 +0000\n\ncommit message\n";
+        let email = extract_author_email_from_commit(raw);
+        assert!(email.is_none(), "no author line should return None");
+    }
+
+    #[test]
+    fn extract_author_email_no_angle_brackets() {
+        let raw = b"tree abc123\nauthor Alice 1700000000 +0000\n\ncommit message\n";
+        let email = extract_author_email_from_commit(raw);
+        assert!(email.is_none(), "malformed author should return None");
+    }
+
+    #[test]
+    fn extract_author_email_empty_input() {
+        let email = extract_author_email_from_commit(b"");
+        assert!(email.is_none());
+    }
+
+    #[test]
+    fn extract_author_email_complex_name() {
+        let raw =
+            b"tree abc123\nauthor John Q. Public Jr. <john.public@company.org> 1700000000 +0000\n";
+        let email = extract_author_email_from_commit(raw);
+        assert_eq!(email.as_deref(), Some("john.public@company.org"));
+    }
+
+    #[test]
+    fn extract_author_email_from_gpg_signed_commit() {
+        // GPG-signed commits have a gpgsig header between tree and author
+        let raw = b"tree abc123\ngpgsig -----BEGIN PGP SIGNATURE-----\n\n iQIzBAEB...\n -----END PGP SIGNATURE-----\nauthor Alice <alice@signed.com> 1700000000 +0000\n\nmessage\n";
+        let email = extract_author_email_from_commit(raw);
+        assert_eq!(email.as_deref(), Some("alice@signed.com"));
+    }
+
+    // -- parse_branches --
+
+    #[test]
+    fn parse_branches_empty() {
+        assert!(parse_branches("").is_empty());
+    }
+
+    #[test]
+    fn parse_branches_single() {
+        let output = "main\tabc1234\t2026-02-19T10:00:00+00:00\n";
+        let branches = parse_branches(output);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].sha, "abc1234");
+        assert_eq!(branches[0].updated_at, "2026-02-19T10:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_branches_missing_date() {
+        let output = "main\tabc1234\n";
+        let branches = parse_branches(output);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].updated_at, "");
+    }
+
+    // -- parse_log --
+
+    #[test]
+    fn parse_log_too_few_fields() {
+        // Only 5 fields instead of 8 — should be skipped
+        let output = "abc123\0msg\0alice\0alice@e.com\02026-01-01\n";
+        let commits = parse_log(output);
+        assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn parse_log_multiple_commits() {
+        let line1 = "aaa\0msg1\0a\0a@e.com\02026-01-01\0c\0c@e.com\02026-01-01";
+        let line2 = "bbb\0msg2\0b\0b@e.com\02026-01-02\0c\0c@e.com\02026-01-02";
+        let output = format!("{line1}\n{line2}\n");
+        let commits = parse_log(&output);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "aaa");
+        assert_eq!(commits[1].sha, "bbb");
+    }
+
+    // -- parse_ls_tree --
+
+    #[test]
+    fn parse_ls_tree_malformed_line() {
+        // Missing tab separator
+        let output = "100644 blob abc1234 1234 README.md\n";
+        let entries = parse_ls_tree(output);
+        assert!(entries.is_empty(), "line without tab should be skipped");
+    }
+
+    #[test]
+    fn parse_ls_tree_too_few_meta_parts() {
+        // Only 2 meta parts instead of 4
+        let output = "100644 blob\tREADME.md\n";
+        let entries = parse_ls_tree(output);
+        assert!(entries.is_empty());
+    }
+
+    // -- validate_git_ref --
+
+    #[test]
+    fn validate_ref_rejects_backtick() {
+        assert!(validate_git_ref("`cmd`").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_newline() {
+        assert!(validate_git_ref("foo\nbar").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_null_byte() {
+        assert!(validate_git_ref("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_space() {
+        assert!(validate_git_ref("foo bar").is_err());
+    }
+
+    // -- validate_path --
+
+    #[test]
+    fn validate_path_rejects_null() {
+        assert!(validate_path("src/\0main.rs").is_err());
+    }
 }

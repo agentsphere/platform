@@ -1443,6 +1443,297 @@ mod tests {
     }
 
     #[test]
+    fn resolve_deploy_ab_test_on_staging() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "ab_test",
+                    "ab_test": {
+                        "control_service": "web-control",
+                        "treatment_service": "web-treatment",
+                        "match": { "headers": {"x-experiment": "true"} },
+                        "success_metric": "conversion_rate",
+                        "success_condition": "treatment > control"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "staging");
+        // ab_test default stages = ["staging", "production"]
+        assert_eq!(strategy, Some("ab_test".into()));
+        assert!(config.get("control_service").is_some());
+        assert_eq!(config["control_service"], "web-control");
+    }
+
+    #[test]
+    fn resolve_deploy_ab_test_on_production() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "ab_test",
+                    "ab_test": {
+                        "control_service": "web-control",
+                        "treatment_service": "web-treatment",
+                        "match": { "headers": {} },
+                        "success_metric": "latency",
+                        "success_condition": "treatment < control"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "production");
+        assert_eq!(strategy, Some("ab_test".into()));
+        assert_eq!(config["treatment_service"], "web-treatment");
+    }
+
+    #[test]
+    fn resolve_deploy_custom_stages_includes_env() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "canary",
+                    "stages": ["production", "qa"],
+                    "canary": {
+                        "stable_service": "web-stable",
+                        "canary_service": "web-canary",
+                        "steps": [10, 50, 100]
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        // "production" is in custom stages → should use canary
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "production");
+        assert_eq!(strategy, Some("canary".into()));
+        assert!(config.get("stable_service").is_some());
+    }
+
+    #[test]
+    fn resolve_deploy_custom_stages_excludes_env() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "canary",
+                    "stages": ["qa"],
+                    "canary": {
+                        "stable_service": "web-stable",
+                        "canary_service": "web-canary",
+                        "steps": [10, 50, 100]
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        // "staging" not in custom stages → falls back to rolling
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "staging");
+        assert_eq!(strategy, Some("rolling".into()));
+        assert_eq!(config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolve_deploy_rolling_not_in_stages() {
+        // rolling with custom stages that exclude "staging"
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "rolling",
+                    "stages": ["production"]
+                }]
+            }))
+            .unwrap(),
+        );
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "staging");
+        // staging not in custom stages → rolling fallback
+        assert_eq!(strategy, Some("rolling".into()));
+        assert_eq!(config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolve_deploy_no_canary_or_ab_config() {
+        // Spec with type "canary" but no canary config struct → empty config
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "canary",
+                    "stages": ["staging"]
+                }]
+            }))
+            .unwrap(),
+        );
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "staging");
+        assert_eq!(strategy, Some("canary".into()));
+        // No canary config → empty object
+        assert_eq!(config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolve_deploy_rolling_on_staging() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "rolling"
+                }]
+            }))
+            .unwrap(),
+        );
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "staging");
+        // rolling default stages = ["staging", "production"] — staging included
+        assert_eq!(strategy, Some("rolling".into()));
+        assert_eq!(config, serde_json::json!({}));
+    }
+
+    // -- Additional event serialization tests --
+
+    #[test]
+    fn traffic_shifted_weights_roundtrip() {
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("stable".to_string(), 70u32);
+        weights.insert("canary".to_string(), 30u32);
+
+        let event = PlatformEvent::TrafficShifted {
+            release_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            weights: weights.clone(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::TrafficShifted {
+                weights: parsed_w, ..
+            } => {
+                assert_eq!(parsed_w.len(), 2);
+                assert_eq!(parsed_w["stable"], 70);
+                assert_eq!(parsed_w["canary"], 30);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn flags_registered_roundtrip() {
+        let event = PlatformEvent::FlagsRegistered {
+            project_id: Uuid::new_v4(),
+            flags: vec![
+                ("dark_mode".into(), serde_json::json!(false)),
+                ("max_retries".into(), serde_json::json!(5)),
+            ],
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::FlagsRegistered { flags, .. } => {
+                assert_eq!(flags.len(), 2);
+                assert_eq!(flags[0].0, "dark_mode");
+                assert_eq!(flags[0].1, serde_json::json!(false));
+                assert_eq!(flags[1].0, "max_retries");
+                assert_eq!(flags[1].1, serde_json::json!(5));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn release_promoted_roundtrip() {
+        let release_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let event = PlatformEvent::ReleasePromoted {
+            release_id,
+            project_id,
+            image_ref: "img:promoted".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::ReleasePromoted {
+                release_id: r,
+                project_id: p,
+                image_ref,
+            } => {
+                assert_eq!(r, release_id);
+                assert_eq!(p, project_id);
+                assert_eq!(image_ref, "img:promoted");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn release_rolled_back_roundtrip() {
+        let event = PlatformEvent::ReleaseRolledBack {
+            release_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            reason: "canary health check failure".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::ReleaseRolledBack { reason, .. } => {
+                assert_eq!(reason, "canary health check failure");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn release_created_roundtrip() {
+        let event = PlatformEvent::ReleaseCreated {
+            target_id: Uuid::new_v4(),
+            release_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            image_ref: "img:v1".into(),
+            strategy: "ab_test".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::ReleaseCreated {
+                strategy,
+                image_ref,
+                ..
+            } => {
+                assert_eq!(strategy, "ab_test");
+                assert_eq!(image_ref, "img:v1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn dev_image_built_roundtrip() {
+        let event = PlatformEvent::DevImageBuilt {
+            project_id: Uuid::new_v4(),
+            image_ref: "registry/app/dev:sha256".into(),
+            pipeline_id: Uuid::new_v4(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::DevImageBuilt { image_ref, .. } => {
+                assert_eq!(image_ref, "registry/app/dev:sha256");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn deploy_requested_roundtrip() {
         let event = PlatformEvent::DeployRequested {
             project_id: Uuid::new_v4(),

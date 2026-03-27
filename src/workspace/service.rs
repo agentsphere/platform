@@ -350,4 +350,34 @@ mod tests {
             "Administrator's workspace"
         );
     }
+
+    #[test]
+    fn default_workspace_name_with_special_chars() {
+        assert_eq!(
+            default_workspace_name("user-with-dashes"),
+            "user-with-dashes-personal"
+        );
+        assert_eq!(
+            default_workspace_name("user_underscore"),
+            "user_underscore-personal"
+        );
+    }
+
+    #[test]
+    fn default_workspace_display_name_empty() {
+        assert_eq!(default_workspace_display_name(""), "'s workspace");
+    }
+
+    #[test]
+    fn default_workspace_name_empty() {
+        assert_eq!(default_workspace_name(""), "-personal");
+    }
+
+    #[test]
+    fn default_workspace_display_name_with_apostrophe() {
+        assert_eq!(
+            default_workspace_display_name("O'Brien"),
+            "O'Brien's workspace"
+        );
+    }
 }

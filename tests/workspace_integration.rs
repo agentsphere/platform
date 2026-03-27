@@ -2,6 +2,7 @@ mod helpers;
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Workspace Integration Tests
@@ -569,6 +570,78 @@ async fn workspace_member_gets_implicit_project_read(pool: PgPool) {
         StatusCode::OK,
         "workspace member should have implicit ProjectRead on workspace projects"
     );
+}
+
+/// List user workspaces with pagination.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_user_workspaces_pagination(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Create 5 workspaces
+    for i in 0..5 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            "/api/workspaces",
+            serde_json::json!({ "name": format!("paginate-ws-{i}") }),
+        )
+        .await;
+    }
+
+    // Fetch first page (limit 2)
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/workspaces?limit=2&offset=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    let total = body["total"].as_i64().unwrap();
+    // At least 5 workspaces created (plus the admin's personal workspace from bootstrap)
+    assert!(total >= 5, "expected total >= 5, got {total}");
+
+    // Fetch second page
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/workspaces?limit=2&offset=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    // Fetch past the end
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces?limit=2&offset={total}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["items"].as_array().unwrap().is_empty());
+}
+
+/// Update a non-existent workspace returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_nonexistent_workspace_returns_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{fake_id}"),
+        serde_json::json!({ "display_name": "Ghost" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Delete a non-existent workspace returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_nonexistent_workspace_returns_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) =
+        helpers::delete_json(&app, &admin_token, &format!("/api/workspaces/{fake_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Non-workspace-member cannot read private workspace projects.

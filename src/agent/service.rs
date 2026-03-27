@@ -1188,7 +1188,7 @@ async fn resolve_cli_oauth_token(state: &AppState, user_id: Uuid) -> Option<Stri
 
 /// Try to resolve the user's Anthropic API key from `user_provider_keys`.
 /// Returns `None` if the user hasn't set one or if the secrets engine isn't configured.
-pub(crate) async fn resolve_user_api_key(state: &AppState, user_id: Uuid) -> Option<String> {
+pub async fn resolve_user_api_key(state: &AppState, user_id: Uuid) -> Option<String> {
     let master_key_hex = state.config.master_key.as_deref()?;
     let master_key = crate::secrets::engine::parse_master_key(master_key_hex).ok()?;
     match user_keys::get_user_key(&state.pool, &master_key, user_id, "anthropic").await {
@@ -1203,7 +1203,7 @@ pub(crate) async fn resolve_user_api_key(state: &AppState, user_id: Uuid) -> Opt
 /// Try to resolve a global `ANTHROPIC_API_KEY` from the platform secrets engine.
 /// Falls back to `None` if no global secret is configured or the secrets engine
 /// is unavailable.
-pub(crate) async fn resolve_global_api_key(state: &AppState) -> Option<String> {
+pub async fn resolve_global_api_key(state: &AppState) -> Option<String> {
     let master_key_hex = state.config.master_key.as_deref()?;
     let master_key = crate::secrets::engine::parse_master_key(master_key_hex).ok()?;
     match crate::secrets::engine::resolve_global_secret(
@@ -1230,7 +1230,7 @@ pub(crate) async fn resolve_global_api_key(state: &AppState) -> Option<String> {
 /// - `api_key`: Anthropic API key only
 /// - `custom:{id}`: decrypt custom config, split `ANTHROPIC_API_KEY` out of `env_vars`
 /// - `global`: platform shared key
-pub(crate) async fn resolve_active_llm_provider(
+pub async fn resolve_active_llm_provider(
     state: &AppState,
     user_id: Uuid,
 ) -> (

@@ -983,4 +983,45 @@ mod tests {
             &p
         ));
     }
+
+    // -- resolve_range --
+
+    #[test]
+    fn resolve_range_explicit_from_takes_precedence() {
+        let explicit = Utc::now();
+        let result = resolve_range(Some(explicit), Some("7d"));
+        assert_eq!(result, Some(explicit));
+    }
+
+    #[test]
+    fn resolve_range_known_ranges() {
+        let before = Utc::now();
+        for range in &["1h", "6h", "12h", "24h", "1d", "7d", "30d"] {
+            let result = resolve_range(None, Some(range));
+            assert!(result.is_some(), "range {range} should resolve");
+            let ts = result.unwrap();
+            assert!(ts < before, "resolved timestamp should be in the past");
+        }
+    }
+
+    #[test]
+    fn resolve_range_unknown_returns_none() {
+        assert!(resolve_range(None, Some("2h")).is_none());
+        assert!(resolve_range(None, Some("")).is_none());
+        assert!(resolve_range(None, Some("forever")).is_none());
+    }
+
+    #[test]
+    fn resolve_range_no_inputs_returns_none() {
+        assert!(resolve_range(None, None).is_none());
+    }
+
+    #[test]
+    fn resolve_range_1d_and_24h_are_equivalent() {
+        let r1 = resolve_range(None, Some("1d"));
+        let r2 = resolve_range(None, Some("24h"));
+        // Both should resolve to roughly the same time (within 1 second)
+        let diff = (r1.unwrap() - r2.unwrap()).num_seconds().abs();
+        assert!(diff < 2, "1d and 24h should be equivalent, diff={diff}s");
+    }
 }

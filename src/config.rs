@@ -650,4 +650,171 @@ mod tests {
             "dev_mode field should be visible"
         );
     }
+
+    #[test]
+    fn config_debug_shows_platform_namespace() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("platform_namespace"),
+            "platform_namespace field should be visible"
+        );
+        assert!(
+            debug.contains("test-platform"),
+            "platform_namespace value should be visible"
+        );
+    }
+
+    #[test]
+    fn config_debug_shows_runner_image() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("runner_image"),
+            "runner_image field should be visible"
+        );
+        assert!(
+            debug.contains("platform-runner:v1"),
+            "runner_image value should be visible"
+        );
+    }
+
+    #[test]
+    fn config_debug_shows_kaniko_image() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("kaniko_image"),
+            "kaniko_image field should be visible"
+        );
+    }
+
+    #[test]
+    fn config_debug_shows_git_clone_image() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("git_clone_image"),
+            "git_clone_image field should be visible"
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_master_key_none() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        // master_key is None, should show "None" not "[REDACTED]"
+        assert!(
+            debug.contains("master_key: None"),
+            "master_key None should be shown, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_smtp_password_none() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("smtp_password: None"),
+            "smtp_password None should be shown"
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_admin_password_none() {
+        let config = Config::test_default();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("admin_password: None"),
+            "admin_password None should be shown"
+        );
+    }
+
+    #[test]
+    fn parse_cors_origins_commas_only() {
+        let result = parse_cors_origins(",,,");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_cors_origins_mixed_empty_and_valid() {
+        let result = parse_cors_origins(",a.com,,b.com,");
+        assert_eq!(result, vec!["a.com", "b.com"]);
+    }
+
+    #[test]
+    fn parse_cors_origins_tabs_and_spaces() {
+        let result = parse_cors_origins("  a.com ,\tb.com\t");
+        assert_eq!(result, vec!["a.com", "b.com"]);
+    }
+
+    #[test]
+    fn derive_valkey_host_port_with_path() {
+        // Redis URLs can have /0, /1 etc. for database selection
+        assert_eq!(
+            derive_valkey_host_port("redis://myhost:6379/0"),
+            "myhost:6379"
+        );
+    }
+
+    #[test]
+    fn config_test_default_all_fields_populated() {
+        let config = Config::test_default();
+        assert!(!config.listen.is_empty());
+        assert!(!config.database_url.is_empty());
+        assert!(!config.valkey_url.is_empty());
+        assert!(!config.minio_endpoint.is_empty());
+        assert!(!config.minio_access_key.is_empty());
+        assert!(!config.minio_secret_key.is_empty());
+        assert!(!config.smtp_from.is_empty());
+        assert!(!config.pipeline_namespace.is_empty());
+        assert!(!config.agent_namespace.is_empty());
+        assert!(!config.webauthn_rp_id.is_empty());
+        assert!(!config.webauthn_rp_origin.is_empty());
+        assert!(!config.webauthn_rp_name.is_empty());
+        assert!(!config.platform_api_url.is_empty());
+        assert!(!config.platform_namespace.is_empty());
+        assert!(!config.ssh_host_key_path.is_empty());
+        assert!(config.max_cli_subprocesses > 0);
+        assert!(!config.valkey_agent_host.is_empty());
+        assert!(!config.claude_cli_version.is_empty());
+        assert!(!config.self_observe_level.is_empty());
+        assert!(config.session_idle_timeout_secs > 0);
+        assert!(config.pipeline_max_parallel > 0);
+        assert!(!config.gateway_name.is_empty());
+        assert!(!config.gateway_namespace.is_empty());
+        assert!(config.pipeline_timeout_secs > 0);
+        assert!(config.max_lfs_object_bytes > 0);
+        assert!(config.token_max_expiry_days > 0);
+        assert!(config.observe_retention_days > 0);
+        assert!(!config.runner_image.is_empty());
+        assert!(!config.git_clone_image.is_empty());
+        assert!(!config.kaniko_image.is_empty());
+    }
+
+    #[test]
+    fn config_test_default_optional_fields_none() {
+        let config = Config::test_default();
+        assert!(config.master_key.is_none());
+        assert!(config.smtp_host.is_none());
+        assert!(config.smtp_username.is_none());
+        assert!(config.smtp_password.is_none());
+        assert!(config.admin_password.is_none());
+        assert!(config.registry_url.is_none());
+        assert!(config.ssh_listen.is_none());
+        assert!(config.ns_prefix.is_none());
+        assert!(config.registry_node_url.is_none());
+        assert!(config.preview_proxy_url.is_none());
+        assert!(config.master_key_previous.is_none());
+    }
+
+    #[test]
+    fn config_test_default_bool_fields() {
+        let config = Config::test_default();
+        assert!(!config.minio_insecure);
+        assert!(!config.secure_cookies);
+        assert!(!config.trust_proxy_headers);
+        assert!(config.dev_mode);
+        assert!(config.cli_spawn_enabled);
+    }
 }

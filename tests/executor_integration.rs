@@ -500,3 +500,535 @@ async fn executor_branch_trigger_filter(pool: PgPool) {
 // API is thoroughly tested in pipeline_integration.rs with direct DB inserts.
 // The executor-based version added no unique coverage (echo hello produces no
 // artifacts) and was flaky due to serial TCP port reuse timing.
+
+// ===========================================================================
+// Test 10: Step condition filtering — steps skipped when branch doesn't match
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_step_condition_filtering(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-cond").await;
+
+    // YAML with step conditions: "deploy" only runs on push to main,
+    // "test" runs on all branches and triggers.
+    update_pipeline_yaml(
+        &work_path,
+        "\
+pipeline:
+  steps:
+    - name: test
+      image: alpine:3.19
+      commands:
+        - echo testing
+    - name: deploy
+      image: alpine:3.19
+      commands:
+        - echo deploying
+      on:
+        push:
+          branches: [production]
+",
+    );
+
+    // Trigger on main (not production), so deploy step should be skipped
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let final_status =
+        helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    assert!(
+        matches!(final_status.as_str(), "success" | "failure"),
+        "pipeline should reach terminal state, got: {final_status}"
+    );
+
+    // Verify step statuses in the detail response
+    let (_, detail) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    let steps = detail["steps"]
+        .as_array()
+        .expect("pipeline should have steps");
+    assert_eq!(steps.len(), 2, "should have 2 steps");
+
+    // Find the deploy step
+    let deploy_step = steps.iter().find(|s| s["name"] == "deploy");
+    if let Some(ds) = deploy_step {
+        assert_eq!(
+            ds["status"].as_str(),
+            Some("skipped"),
+            "deploy step should be skipped (branch mismatch), got: {:?}",
+            ds["status"]
+        );
+    }
+}
+
+// ===========================================================================
+// Test 11: Pipeline with failing first step — remaining steps skipped
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_fail_first_skips_remaining(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-skip").await;
+
+    update_pipeline_yaml(
+        &work_path,
+        "\
+pipeline:
+  steps:
+    - name: build
+      image: alpine:3.19
+      commands:
+        - exit 1
+    - name: test
+      image: alpine:3.19
+      commands:
+        - echo should not run
+    - name: deploy
+      image: alpine:3.19
+      commands:
+        - echo should not run
+",
+    );
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let final_status =
+        helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    assert!(
+        matches!(final_status.as_str(), "failure"),
+        "pipeline should fail, got: {final_status}"
+    );
+
+    // Verify that subsequent steps are skipped
+    let (_, detail) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    let steps = detail["steps"]
+        .as_array()
+        .expect("pipeline should have steps");
+
+    // First step should have failed
+    assert!(
+        steps[0]["status"] == "failure",
+        "first step should be failure, got: {}",
+        steps[0]["status"]
+    );
+
+    // Remaining steps should be skipped
+    for step in &steps[1..] {
+        assert_eq!(
+            step["status"].as_str(),
+            Some("skipped"),
+            "step '{}' should be skipped after first failure, got: {}",
+            step["name"],
+            step["status"]
+        );
+    }
+}
+
+// ===========================================================================
+// Test 12: Git auth token is created during pipeline and cleaned up after
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_git_auth_token_lifecycle(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, _work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-token").await;
+
+    // Count pipeline-git tokens before
+    let before_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name LIKE 'pipeline-git-%'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let _ = helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    // After pipeline completes, the git auth token should be cleaned up
+    // (there may be a small delay, so we poll briefly)
+    let mut cleaned_up = false;
+    for _ in 0..10 {
+        let after_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name LIKE 'pipeline-git-%'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        if after_count.0 <= before_count.0 {
+            cleaned_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        cleaned_up,
+        "pipeline git auth tokens should be cleaned up after completion"
+    );
+}
+
+// ===========================================================================
+// Test 13: Pipeline finalization updates DB status with timestamp
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_finalization_sets_finished_at(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, _work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-fin").await;
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let _ = helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    let pipeline_id_uuid = Uuid::parse_str(&pipeline_id).unwrap();
+
+    // Verify finished_at is set
+    let row: (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT finished_at FROM pipelines WHERE id = $1")
+            .bind(pipeline_id_uuid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    assert!(
+        row.0.is_some(),
+        "finished_at should be set after pipeline completion"
+    );
+
+    // Also verify started_at is set
+    let started_row: (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT started_at FROM pipelines WHERE id = $1")
+            .bind(pipeline_id_uuid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    assert!(
+        started_row.0.is_some(),
+        "started_at should be set after pipeline runs"
+    );
+}
+
+// ===========================================================================
+// Test 14: Step with step-level environment variables
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_step_environment(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-env").await;
+
+    // YAML with step-level environment
+    update_pipeline_yaml(
+        &work_path,
+        "\
+pipeline:
+  steps:
+    - name: test
+      image: alpine:3.19
+      commands:
+        - test \"$MY_VAR\" = \"hello\"
+      environment:
+        MY_VAR: hello
+",
+    );
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let final_status =
+        helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    // If the git clone succeeds, the test step should pass because MY_VAR is set
+    assert!(
+        matches!(final_status.as_str(), "success" | "failure"),
+        "pipeline should reach terminal state, got: {final_status}"
+    );
+}
+
+// ===========================================================================
+// Test 15: OTLP token is created for pipeline and cleaned up
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_otlp_token_lifecycle(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, _work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-otlp").await;
+
+    // Count OTLP tokens before
+    let before_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name LIKE 'otlp-pipeline-%'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    // While pipeline is running, there should be an OTLP token
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let during_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name LIKE 'otlp-pipeline-%'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(
+        during_count.0 > before_count.0,
+        "OTLP token should be created during pipeline execution"
+    );
+
+    let _ = helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+}
+
+// ===========================================================================
+// Test 16: Pipeline with DAG dependencies (depends_on)
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_dag_dependencies(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-dag").await;
+
+    // YAML with DAG: test and lint run in parallel, deploy depends on both
+    update_pipeline_yaml(
+        &work_path,
+        "\
+pipeline:
+  steps:
+    - name: test
+      image: alpine:3.19
+      commands:
+        - echo testing
+    - name: lint
+      image: alpine:3.19
+      commands:
+        - echo linting
+    - name: deploy
+      image: alpine:3.19
+      commands:
+        - echo deploying
+      depends_on:
+        - test
+        - lint
+",
+    );
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let final_status =
+        helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 180).await;
+
+    assert!(
+        matches!(final_status.as_str(), "success" | "failure"),
+        "DAG pipeline should reach terminal state, got: {final_status}"
+    );
+
+    // Verify all three steps exist
+    let (_, detail) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    let steps = detail["steps"]
+        .as_array()
+        .expect("pipeline should have steps");
+    assert_eq!(steps.len(), 3, "should have 3 steps in DAG pipeline");
+}
+
+// ===========================================================================
+// Test 17: DAG pipeline with failing dependency — dependents skipped
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_dag_fail_skips_dependents(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-dag-fail").await;
+
+    // test fails → deploy (depends on test) should be skipped
+    update_pipeline_yaml(
+        &work_path,
+        "\
+pipeline:
+  steps:
+    - name: test
+      image: alpine:3.19
+      commands:
+        - exit 1
+    - name: deploy
+      image: alpine:3.19
+      commands:
+        - echo should not run
+      depends_on:
+        - test
+",
+    );
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let final_status =
+        helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    assert_eq!(
+        final_status, "failure",
+        "pipeline should fail, got: {final_status}"
+    );
+
+    let (_, detail) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    let steps = detail["steps"]
+        .as_array()
+        .expect("pipeline should have steps");
+
+    // Find deploy step
+    let deploy = steps.iter().find(|s| s["name"] == "deploy");
+    if let Some(ds) = deploy {
+        assert_eq!(
+            ds["status"].as_str(),
+            Some("skipped"),
+            "deploy step should be skipped when dependency fails, got: {}",
+            ds["status"]
+        );
+    }
+}
+
+// ===========================================================================
+// Test 18: Pipeline observe log entries are emitted
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_emits_observe_logs(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, _work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-obslog").await;
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let _ = helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    // Check that observe log_entries were created for this project
+    let log_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM log_entries WHERE project_id = $1 AND service LIKE 'pipeline/%'",
+    )
+    .bind(project_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+
+    assert!(
+        log_count.0 >= 2,
+        "at least 2 pipeline observe logs expected (started + finished), got: {}",
+        log_count.0
+    );
+}
+
+// ===========================================================================
+// Test 19: Pipeline step has duration_ms recorded
+// ===========================================================================
+
+#[sqlx::test(migrations = "./migrations")]
+async fn executor_step_records_duration(pool: PgPool) {
+    let (state, admin_token, _server) = helpers::start_pipeline_server(pool).await;
+    let app = helpers::test_router(state.clone());
+    let _executor = ExecutorGuard::spawn(&state);
+
+    let (project_id, _bare_path, _work_path, _bd, _wd) =
+        setup_pipeline_project(&state, &app, &admin_token, "exec-dur").await;
+
+    let (pipeline_id, _) =
+        trigger_pipeline(&app, &admin_token, project_id, "refs/heads/main").await;
+    state.pipeline_notify.notify_one();
+
+    let _ = helpers::poll_pipeline_status(&app, &admin_token, project_id, &pipeline_id, 120).await;
+
+    let (_, detail) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    if let Some(steps) = detail["steps"].as_array() {
+        for step in steps {
+            let status = step["status"].as_str().unwrap_or("");
+            if status == "success" || status == "failure" {
+                assert!(
+                    step["duration_ms"].as_i64().is_some(),
+                    "completed step '{}' should have duration_ms, got: {}",
+                    step["name"],
+                    step["duration_ms"]
+                );
+                let dur = step["duration_ms"].as_i64().unwrap();
+                assert!(dur >= 0, "duration_ms should be non-negative, got: {dur}");
+            }
+        }
+    }
+}

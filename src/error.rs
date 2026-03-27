@@ -343,6 +343,108 @@ mod tests {
         assert_eq!(json["error"], "upstream timeout");
     }
 
+    #[tokio::test]
+    async fn service_unavailable_body_contains_message() {
+        let resp = ApiError::ServiceUnavailable("maintenance window".into()).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "maintenance window");
+    }
+
+    #[tokio::test]
+    async fn bad_request_body_contains_message() {
+        let resp = ApiError::BadRequest("missing field: name".into()).into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "missing field: name");
+    }
+
+    #[tokio::test]
+    async fn validation_empty_fields() {
+        let resp = ApiError::Validation(vec![]).into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "validation error");
+        assert!(json["fields"].is_array());
+        assert_eq!(json["fields"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sqlx_db_error_no_code_maps_to_500() {
+        let db_err = sqlx::Error::Database(Box::new(TestDbError {
+            code: None,
+            message: "some database error".into(),
+        }));
+        let err: ApiError = db_err.into();
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn api_error_display_not_found() {
+        let err = ApiError::NotFound("widget".into());
+        assert_eq!(err.to_string(), "not found: widget");
+    }
+
+    #[test]
+    fn api_error_display_conflict() {
+        let err = ApiError::Conflict("duplicate".into());
+        assert_eq!(err.to_string(), "conflict: duplicate");
+    }
+
+    #[test]
+    fn api_error_display_bad_gateway() {
+        let err = ApiError::BadGateway("upstream".into());
+        assert_eq!(err.to_string(), "bad gateway: upstream");
+    }
+
+    #[test]
+    fn api_error_display_service_unavailable() {
+        let err = ApiError::ServiceUnavailable("down".into());
+        assert_eq!(err.to_string(), "service unavailable: down");
+    }
+
+    #[test]
+    fn api_error_display_validation() {
+        let err = ApiError::Validation(vec!["field".into()]);
+        assert_eq!(err.to_string(), "validation error");
+    }
+
+    #[test]
+    fn api_error_display_unauthorized() {
+        let err = ApiError::Unauthorized;
+        assert_eq!(err.to_string(), "unauthorized");
+    }
+
+    #[test]
+    fn api_error_display_forbidden() {
+        let err = ApiError::Forbidden;
+        assert_eq!(err.to_string(), "forbidden");
+    }
+
+    #[test]
+    fn api_error_display_too_many_requests() {
+        let err = ApiError::TooManyRequests;
+        assert_eq!(err.to_string(), "too many requests");
+    }
+
+    #[test]
+    fn api_error_from_anyhow() {
+        let anyhow_err = anyhow::anyhow!("something broke");
+        let api_err: ApiError = anyhow_err.into();
+        assert!(matches!(api_err, ApiError::Internal(_)));
+        assert_eq!(
+            api_err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     /// Minimal implementation of `sqlx::DatabaseError` for testing From<sqlx::Error>.
     #[derive(Debug)]
     struct TestDbError {

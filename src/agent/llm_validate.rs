@@ -772,4 +772,189 @@ mod tests {
     fn validation_timeout_is_30s() {
         assert_eq!(VALIDATION_TIMEOUT, Duration::from_secs(30));
     }
+
+    // -- TestResult field access --
+
+    #[test]
+    fn test_result_fields() {
+        let r = TestResult {
+            test: 3,
+            name: "session_memory",
+            status: TestStatus::Failed,
+            detail: "Turn 1 failed: timeout".into(),
+        };
+        assert_eq!(r.test, 3);
+        assert_eq!(r.name, "session_memory");
+        assert!(matches!(r.status, TestStatus::Failed));
+        assert!(r.detail.contains("Turn 1 failed"));
+    }
+
+    // -- TestResult with Running status --
+
+    #[test]
+    fn test_result_running_serialize() {
+        let r = TestResult {
+            test: 1,
+            name: "connection",
+            status: TestStatus::Running,
+            detail: String::new(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"running\""));
+        assert!(json.contains("\"detail\":\"\""));
+    }
+
+    // -- ValidationEvent::Done with all_passed = false --
+
+    #[test]
+    fn validation_event_done_false_serialize() {
+        let event = ValidationEvent::Done { all_passed: false };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"all_passed\":false"));
+        assert!(json.contains("\"type\":\"done\""));
+    }
+
+    // -- ValidationEvent::Test with all test numbers --
+
+    #[test]
+    fn validation_event_test3_serialize() {
+        let event = ValidationEvent::Test(TestResult {
+            test: 3,
+            name: "session_memory",
+            status: TestStatus::Failed,
+            detail: "Turn 2: expected answer=13, got None".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"test\":3"));
+        assert!(json.contains("\"session_memory\""));
+        assert!(json.contains("\"failed\""));
+        assert!(json.contains("Turn 2"));
+    }
+
+    // -- build_provider_extra_env: empty HashMap --
+
+    #[test]
+    fn build_provider_extra_env_empty_vars() {
+        let vars: HashMap<String, String> = HashMap::new();
+        let (api_key, extra) = build_provider_extra_env("bedrock", &vars);
+        assert!(api_key.is_none());
+        // Auto-inject still happens
+        assert!(
+            extra
+                .iter()
+                .any(|(k, v)| k == "DISABLE_PROMPT_CACHING" && v == "1")
+        );
+    }
+
+    #[test]
+    fn build_provider_extra_env_vertex_empty() {
+        let vars: HashMap<String, String> = HashMap::new();
+        let (_, extra) = build_provider_extra_env("vertex", &vars);
+        assert_eq!(extra.len(), 2); // CLAUDE_CODE_USE_VERTEX + CLOUD_ML_REGION
+    }
+
+    #[test]
+    fn build_provider_extra_env_custom_endpoint_no_key() {
+        // custom_endpoint without ANTHROPIC_API_KEY
+        let vars = HashMap::from([("ANTHROPIC_BASE_URL".into(), "https://proxy.local".into())]);
+        let (api_key, extra) = build_provider_extra_env("custom_endpoint", &vars);
+        assert!(api_key.is_none(), "no ANTHROPIC_API_KEY provided");
+        assert_eq!(extra.len(), 1);
+    }
+
+    // -- TestStatus Clone + Debug --
+
+    #[test]
+    fn test_status_clone_debug() {
+        let s = TestStatus::Passed;
+        let s2 = s.clone();
+        assert!(format!("{s2:?}").contains("Passed"));
+    }
+
+    // -- TestResult Clone --
+
+    #[test]
+    fn test_result_clone() {
+        let r = TestResult {
+            test: 1,
+            name: "connection",
+            status: TestStatus::Passed,
+            detail: "ok".into(),
+        };
+        let r2 = r.clone();
+        assert_eq!(r2.test, 1);
+        assert_eq!(r2.name, "connection");
+    }
+
+    // -- ValidationEvent Clone --
+
+    #[test]
+    fn validation_event_clone() {
+        let e = ValidationEvent::Done { all_passed: true };
+        let e2 = e.clone();
+        if let ValidationEvent::Done { all_passed } = e2 {
+            assert!(all_passed);
+        } else {
+            panic!("expected Done");
+        }
+    }
+
+    // -- push_if_missing with multiple existing keys --
+
+    #[test]
+    fn push_if_missing_multiple_keys() {
+        let mut env = vec![("A".into(), "1".into()), ("B".into(), "2".into())];
+        push_if_missing(&mut env, "C", "3");
+        assert_eq!(env.len(), 3);
+        push_if_missing(&mut env, "A", "new_value");
+        assert_eq!(env.len(), 3); // A not duplicated
+        assert_eq!(env[0].1, "1"); // original value preserved
+    }
+
+    // -- build_provider_extra_env with ANTHROPIC_API_KEY alongside other vars --
+
+    #[test]
+    fn build_provider_extra_env_api_key_split() {
+        let vars = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-key-123".into()),
+            ("CUSTOM_VAR".into(), "value".into()),
+            ("ANOTHER".into(), "val2".into()),
+        ]);
+        let (api_key, extra) = build_provider_extra_env("custom_endpoint", &vars);
+        assert_eq!(api_key, Some("sk-key-123".into()));
+        assert_eq!(extra.len(), 2); // CUSTOM_VAR + ANOTHER
+        assert!(!extra.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+    }
+
+    // -- TestResult with long detail string --
+
+    #[test]
+    fn test_result_long_detail() {
+        let detail = "x".repeat(10000);
+        let r = TestResult {
+            test: 2,
+            name: "output_format",
+            status: TestStatus::Failed,
+            detail: detail.clone(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(&detail));
+    }
+
+    // -- Validate all 3 test names match expectations --
+
+    #[test]
+    fn test_names_are_static() {
+        // The test names used in run_validation's test_defs
+        let expected = ["connection", "output_format", "session_memory"];
+        for name in expected {
+            let r = TestResult {
+                test: 1,
+                name,
+                status: TestStatus::Passed,
+                detail: String::new(),
+            };
+            assert_eq!(r.name, name);
+        }
+    }
 }

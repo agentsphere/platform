@@ -117,4 +117,85 @@ mod tests {
         .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn reject_cr_in_to() {
+        let mut config = test_config();
+        config.smtp_host = Some("localhost".into());
+        let result = send(
+            &config,
+            "user@example.com\rBcc: evil@attacker.com",
+            "test",
+            "body",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid characters"),
+            "should mention invalid characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_lf_only_in_subject() {
+        let mut config = test_config();
+        config.smtp_host = Some("localhost".into());
+        let result = send(
+            &config,
+            "user@example.com",
+            "test\nBcc: evil@attacker.com",
+            "body",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid characters"),
+            "should mention invalid characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_from_address_returns_error() {
+        let mut config = test_config();
+        config.smtp_host = Some("localhost".into());
+        config.smtp_from = "not-an-email".into();
+        let result = send(&config, "user@example.com", "test", "body").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid smtp_from"),
+            "should report invalid smtp_from"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_to_address_returns_error() {
+        let mut config = test_config();
+        config.smtp_host = Some("localhost".into());
+        let result = send(&config, "not-an-email", "test", "body").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid recipient"),
+            "should report invalid recipient address"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_without_smtp_host_is_noop_regardless_of_inputs() {
+        // Even with invalid addresses, no-op when SMTP is not configured
+        let config = test_config();
+        let result = send(&config, "not-valid", "subject", "body").await;
+        assert!(result.is_ok(), "should be noop when SMTP is not configured");
+    }
 }

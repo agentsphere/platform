@@ -668,4 +668,238 @@ mod tests {
         // Parquet magic number: PAR1
         assert_eq!(&bytes[..4], b"PAR1");
     }
+
+    // -- write_parquet_buffer additional coverage --
+
+    #[test]
+    fn write_parquet_span_batch_magic() {
+        let batch = build_span_batch(&[sample_span_row()]).unwrap();
+        let bytes = write_parquet_buffer(&batch).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+        // Parquet footer also ends with PAR1
+        assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+    }
+
+    #[test]
+    fn write_parquet_metric_batch_magic() {
+        let batch = build_metric_batch(&[sample_metric_row()]).unwrap();
+        let bytes = write_parquet_buffer(&batch).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+        assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+    }
+
+    // -- build_log_batch with all optional fields set --
+
+    #[test]
+    fn build_log_batch_all_fields_populated() {
+        let row = LogQueryRow {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            trace_id: Some("trace-xyz".into()),
+            span_id: Some("span-xyz".into()),
+            project_id: Some(Uuid::new_v4()),
+            session_id: Some(Uuid::new_v4()),
+            service: "full-svc".into(),
+            level: "debug".into(),
+            message: "all fields".into(),
+            attributes: Some(serde_json::json!({"nested": {"key": "val"}})),
+        };
+        let batch = build_log_batch(&[row]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 10);
+        // Verify non-nullable columns have no nulls
+        assert_eq!(batch.column(0).null_count(), 0); // id
+        assert_eq!(batch.column(6).null_count(), 0); // service
+    }
+
+    // -- build_span_batch with all optional fields None --
+
+    #[test]
+    fn build_span_batch_all_optionals_none() {
+        let row = SpanQueryRow {
+            trace_id: "t1".into(),
+            span_id: "s1".into(),
+            parent_span_id: None,
+            name: "root".into(),
+            service: "svc".into(),
+            kind: "client".into(),
+            status: "error".into(),
+            duration_ms: None,
+            started_at: Utc::now(),
+            attributes: None,
+        };
+        let batch = build_span_batch(&[row]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // parent_span_id (col 2) should have 1 null
+        assert_eq!(batch.column(2).null_count(), 1);
+        // duration_ms (col 7) should have 1 null
+        assert_eq!(batch.column(7).null_count(), 1);
+        // attributes (col 9) should have 1 null
+        assert_eq!(batch.column(9).null_count(), 1);
+    }
+
+    // -- build_metric_batch multiple rows --
+
+    #[test]
+    fn build_metric_batch_multiple_rows() {
+        let rows: Vec<MetricSampleRow> = (0..5)
+            .map(|i| MetricSampleRow {
+                name: format!("metric_{i}"),
+                labels: serde_json::json!({"instance": format!("node{i}")}),
+                series_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                value: i as f64 * 10.0,
+            })
+            .collect();
+        let batch = build_metric_batch(&rows).unwrap();
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(batch.num_columns(), 4);
+    }
+
+    // -- build_log_batch empty input --
+
+    #[test]
+    fn build_log_batch_empty_input() {
+        let batch = build_log_batch(&[]).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 10);
+    }
+
+    #[test]
+    fn build_span_batch_empty_input() {
+        let batch = build_span_batch(&[]).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 10);
+    }
+
+    #[test]
+    fn build_metric_batch_empty_input() {
+        let batch = build_metric_batch(&[]).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 4);
+    }
+
+    // -- build_log_batch large batch --
+
+    #[test]
+    fn build_log_batch_large() {
+        let rows: Vec<LogQueryRow> = (0..100)
+            .map(|i| LogQueryRow {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                trace_id: if i % 2 == 0 {
+                    Some(format!("trace-{i}"))
+                } else {
+                    None
+                },
+                span_id: None,
+                project_id: if i % 3 == 0 {
+                    Some(Uuid::new_v4())
+                } else {
+                    None
+                },
+                session_id: None,
+                service: format!("svc-{}", i % 5),
+                level: if i % 2 == 0 { "info" } else { "error" }.into(),
+                message: format!("msg {i}"),
+                attributes: None,
+            })
+            .collect();
+        let batch = build_log_batch(&rows).unwrap();
+        assert_eq!(batch.num_rows(), 100);
+        // Write to parquet and verify magic
+        let bytes = write_parquet_buffer(&batch).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+    }
+
+    // -- Verify schema field names and types exactly --
+
+    #[test]
+    fn log_schema_field_names() {
+        let schema = log_schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "timestamp",
+                "trace_id",
+                "span_id",
+                "project_id",
+                "session_id",
+                "service",
+                "level",
+                "message",
+                "attributes"
+            ]
+        );
+    }
+
+    #[test]
+    fn span_schema_field_names() {
+        let schema = span_schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "trace_id",
+                "span_id",
+                "parent_span_id",
+                "name",
+                "service",
+                "kind",
+                "status",
+                "duration_ms",
+                "started_at",
+                "attributes"
+            ]
+        );
+    }
+
+    #[test]
+    fn metric_schema_field_names() {
+        let schema = metric_schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["name", "labels", "timestamp", "value"]);
+    }
+
+    // -- Verify timestamps in built batch --
+
+    #[test]
+    fn build_log_batch_preserves_timestamp() {
+        let ts = Utc::now();
+        let row = LogQueryRow {
+            id: Uuid::new_v4(),
+            timestamp: ts,
+            trace_id: None,
+            span_id: None,
+            project_id: None,
+            session_id: None,
+            service: "ts-svc".into(),
+            level: "info".into(),
+            message: "ts-msg".into(),
+            attributes: None,
+        };
+        let batch = build_log_batch(&[row]).unwrap();
+        let col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), ts.timestamp_micros());
+    }
+
+    #[test]
+    fn build_span_batch_preserves_started_at() {
+        let ts = Utc::now();
+        let mut row = sample_span_row();
+        row.started_at = ts;
+        let batch = build_span_batch(&[row]).unwrap();
+        let col = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), ts.timestamp_micros());
+    }
 }

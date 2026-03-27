@@ -1595,7 +1595,7 @@ async fn delete_mr(pool: PgPool) {
 // MR create with auto_merge
 // ---------------------------------------------------------------------------
 
-/// POST with auto_merge:true stores auto_merge=true in DB.
+/// POST with `auto_merge:true` stores `auto_merge=true` in DB.
 #[sqlx::test(migrations = "./migrations")]
 async fn mr_create_with_auto_merge(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
@@ -2010,4 +2010,1371 @@ async fn mr_comment_body_too_long_rejected(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// Issues: create with labels
+// ===========================================================================
+
+/// Create an issue with labels and verify they are returned.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_issue_with_labels(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-labels", "public").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({
+            "title": "Labeled issue",
+            "body": "Has labels",
+            "labels": ["bug", "urgent", "frontend"],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let labels = body["labels"].as_array().unwrap();
+    assert_eq!(labels.len(), 3);
+    assert!(labels.iter().any(|l| l == "bug"));
+    assert!(labels.iter().any(|l| l == "urgent"));
+    assert!(labels.iter().any(|l| l == "frontend"));
+}
+
+// ===========================================================================
+// Issues: update by non-author non-admin forbidden
+// ===========================================================================
+
+/// Non-author with project:write but without admin cannot update another user's issue.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_non_author_non_admin_forbidden(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-upd-noauth", "public").await;
+
+    // Admin creates an issue
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Admin's issue" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Create a non-admin developer user
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "issue-dev", "issuedev@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    // Developer (non-author, not admin) tries to update admin's issue
+    let (status, _) = helpers::patch_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "title": "Hijacked title" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Admin can update another user's issue.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_by_admin_on_other_user_issue(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-admin-upd", "public").await;
+
+    // Create a developer user who creates the issue
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "issue-author", "issueauthor@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "User's issue" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Admin updates user's issue
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "title": "Admin edited title" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["title"], "Admin edited title");
+}
+
+// ===========================================================================
+// Issues: update with invalid status
+// ===========================================================================
+
+/// Updating an issue with an invalid status returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_invalid_status(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-bad-status", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Status test" }),
+    )
+    .await;
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "status": "invalid_status" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+/// Updating an issue status to "merged" (not valid for issues) returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_status_merged_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-merged-st", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Status test merged" }),
+    )
+    .await;
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "status": "merged" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// Issues: create comment with project:read only
+// ===========================================================================
+
+/// A user with project:read (not write) can create comments on issues.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_comment_with_read_only_permission(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Public project — anyone authenticated can read
+    let project_id = helpers::create_project(&app, &admin_token, "issue-cmt-read", "public").await;
+
+    // Admin creates an issue
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Commentable issue" }),
+    )
+    .await;
+
+    // Create a viewer (read-only) user
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmt-reader", "cmtreader@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
+
+    // Viewer should be able to comment (create_comment requires project_read only)
+    let (status, body) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Viewer's comment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["body"], "Viewer's comment");
+}
+
+// ===========================================================================
+// Issues: update/delete comment by non-author (non-admin)
+// ===========================================================================
+
+/// Non-author with project:write cannot update another user's issue comment.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_update_comment_non_author_forbidden(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-upd-na", "public").await;
+
+    // Admin creates issue and comment
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Comment auth test" }),
+    )
+    .await;
+
+    let (_, comment_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Admin's comment" }),
+    )
+    .await;
+    let comment_id = comment_body["id"].as_str().unwrap();
+
+    // Create a non-admin developer
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmt-upd-dev", "cmtupddev@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    // Developer tries to update admin's comment — forbidden
+    let (status, _) = helpers::patch_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{comment_id}"),
+        json!({ "body": "Hijacked comment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Admin can update another user's issue comment.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_update_comment_by_admin(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-admin-upd", "public").await;
+
+    // Admin creates issue
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Admin comment edit" }),
+    )
+    .await;
+
+    // Create developer user who posts a comment
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmt-dev-usr", "cmtdevusr@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    let (_, comment_body) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Developer's comment" }),
+    )
+    .await;
+    let comment_id = comment_body["id"].as_str().unwrap();
+
+    // Admin updates developer's comment — should succeed
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{comment_id}"),
+        json!({ "body": "Edited by admin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["body"], "Edited by admin");
+}
+
+// ===========================================================================
+// Issues: list with status filter
+// ===========================================================================
+
+/// List issues filtered by status.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_issues_filter_by_status(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-filt-status", "public").await;
+
+    // Create 3 issues
+    for i in 1..=3 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/issues"),
+            json!({ "title": format!("Issue {i}") }),
+        )
+        .await;
+    }
+
+    // Close issue #2
+    helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/2"),
+        json!({ "status": "closed" }),
+    )
+    .await;
+
+    // Filter by status=open
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?status=open"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 2);
+    let items = body["items"].as_array().unwrap();
+    assert!(items.iter().all(|i| i["status"] == "open"));
+
+    // Filter by status=closed
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?status=closed"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["number"], 2);
+}
+
+/// List issues filtered by `assignee_id`.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_issues_filter_by_assignee(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-filt-assign", "public").await;
+
+    let admin_id = helpers::admin_user_id(&pool).await;
+
+    // Create a developer user
+    let (dev_id, _dev_token) =
+        helpers::create_user(&app, &admin_token, "issue-assignee", "assignee@test.com").await;
+
+    // Create issue assigned to dev
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Assigned issue", "assignee_id": dev_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Create issue without assignee
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Unassigned issue" }),
+    )
+    .await;
+
+    // Filter by assignee_id
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?assignee_id={dev_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["title"], "Assigned issue");
+
+    // Filter by admin_id (no issues assigned to admin)
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?assignee_id={admin_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 0);
+}
+
+// ===========================================================================
+// Issues: list/get comments
+// ===========================================================================
+
+/// List comments on an issue.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_list_comments(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-list-cmt", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "List comments test" }),
+    )
+    .await;
+
+    // Add 3 comments
+    for i in 1..=3 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/issues/1/comments"),
+            json!({ "body": format!("Comment {i}") }),
+        )
+        .await;
+    }
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 3);
+}
+
+/// List comments on an issue with pagination.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_list_comments_pagination(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-cmt-page", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Paginated comments" }),
+    )
+    .await;
+
+    for i in 1..=5 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/issues/1/comments"),
+            json!({ "body": format!("Comment {i}") }),
+        )
+        .await;
+    }
+
+    // Page 1: limit=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments?limit=2&offset=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    // Last page
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments?limit=2&offset=4"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+/// Get a single issue comment by ID.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_get_comment_by_id(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-cmt-getid", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Get comment test" }),
+    )
+    .await;
+
+    let (_, comment_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Specific comment" }),
+    )
+    .await;
+    let comment_id = comment_body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], comment_id);
+    assert_eq!(body["body"], "Specific comment");
+    assert!(body["created_at"].is_string());
+    assert!(body["updated_at"].is_string());
+}
+
+/// Get nonexistent issue comment returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_get_comment_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-cmt-404", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "No comment here" }),
+    )
+    .await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Comment on nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_comment_on_nonexistent_issue(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-noissue", "public").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999/comments"),
+        json!({ "body": "Ghost comment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// List comments on nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_list_comments_nonexistent_issue(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-list404", "public").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999/comments"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// Issues: delete (close) edge cases
+// ===========================================================================
+
+/// Delete (close) an issue via DELETE endpoint.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_issue_closes_it(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-del-close", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Delete me" }),
+    )
+    .await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify it's closed
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "closed");
+}
+
+/// Delete already-closed issue is idempotent (returns 204).
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_issue_already_closed_idempotent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-del-idem", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Close me twice" }),
+    )
+    .await;
+
+    // Close via PATCH first
+    helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "status": "closed" }),
+    )
+    .await;
+
+    // Delete already-closed issue — should still return 204
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// Get nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_issue_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-get-404", "public").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Update nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-upd-404", "public").await;
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999"),
+        json!({ "title": "Ghost update" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issue comment body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_comment_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-toolong", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Long comment test" }),
+    )
+    .await;
+
+    let long_body = "x".repeat(100_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Update issue comment body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_update_comment_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-upd-long", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Update comment long" }),
+    )
+    .await;
+
+    let (_, comment_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Short" }),
+    )
+    .await;
+    let comment_id = comment_body["id"].as_str().unwrap();
+
+    let long_body = "y".repeat(100_001);
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{comment_id}"),
+        json!({ "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Update issue comment on nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_update_comment_nonexistent_issue(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-upd-ni", "public").await;
+
+    let fake_comment_id = Uuid::new_v4();
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999/comments/{fake_comment_id}"),
+        json!({ "body": "update nothing" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Delete issue comment on nonexistent issue returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_delete_comment_nonexistent_issue(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-del-ni", "public").await;
+
+    let fake_comment_id = Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/999/comments/{fake_comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Delete issue comment by non-author admin succeeds.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_delete_comment_by_admin(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-del-adm", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Admin delete cmt" }),
+    )
+    .await;
+
+    // Create developer who makes a comment
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "cmt-del-dev", "cmtdeldev@test.com").await;
+    helpers::assign_role(
+        &app,
+        &admin_token,
+        user_id,
+        "developer",
+        Some(project_id),
+        &pool,
+    )
+    .await;
+
+    let (_, comment_body) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Dev's comment" }),
+    )
+    .await;
+    let comment_id = comment_body["id"].as_str().unwrap();
+
+    // Admin deletes developer's comment
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// Delete nonexistent issue comment returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_delete_comment_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-cmt-del-404", "public").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Delete missing comment" }),
+    )
+    .await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1/comments/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issues list with pagination.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_issues_pagination(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-pagination", "public").await;
+
+    for i in 1..=5 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/issues"),
+            json!({ "title": format!("Issue {i}") }),
+        )
+        .await;
+    }
+
+    // Page 1
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?limit=2&offset=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    // Last page
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues?limit=2&offset=4"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+/// Issue body > 100000 chars on create is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_issue_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-body-long", "public").await;
+
+    let long_body = "z".repeat(100_001);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Long body issue", "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// MR: Delete already-closed MR is idempotent
+// ===========================================================================
+
+/// Delete an already-closed MR returns 204 (idempotent).
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_already_closed_idempotent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-del-closed", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Close via PATCH
+    helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+        json!({ "status": "closed" }),
+    )
+    .await;
+
+    // Delete already-closed MR — should still return 204
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// ===========================================================================
+// MR: Get review not found
+// ===========================================================================
+
+/// GET nonexistent review returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_mr_review_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-rev-get404", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let fake_review_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews/{fake_review_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// MR: Admin can delete another user's comment
+// ===========================================================================
+
+/// Admin can delete another user's MR comment.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_comment_by_admin(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-del-adm", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Create developer user who posts a comment
+    let (user_id, _user_token) =
+        helpers::create_user(&app, &admin_token, "mr-cmt-devdel", "mrcmtdevdel@test.com").await;
+
+    // Insert comment from developer directly
+    let comment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO comments (id, project_id, mr_id, author_id, body) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(comment_id)
+    .bind(project_id)
+    .bind(mr_id)
+    .bind(user_id)
+    .bind("developer comment")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Admin deletes developer's comment
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify deletion
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM comments WHERE id = $1")
+        .bind(comment_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+// ===========================================================================
+// MR: Review without body (optional field)
+// ===========================================================================
+
+/// Create a review without body field.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_create_review_without_body(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-rev-nobody", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews"),
+        json!({ "verdict": "approve" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["verdict"], "approve");
+    assert!(body["body"].is_null());
+}
+
+// ===========================================================================
+// MR: Update comment body too long
+// ===========================================================================
+
+/// Update MR comment body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_update_comment_body_too_long(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-upd-long", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Insert comment
+    let comment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO comments (id, project_id, mr_id, author_id, body) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(comment_id)
+    .bind(project_id)
+    .bind(mr_id)
+    .bind(admin_id)
+    .bind("short")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let long_body = "w".repeat(100_001);
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+        json!({ "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// MR: Update MR body too long
+// ===========================================================================
+
+/// Update MR body > 100000 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_update_body_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "mr-upd-body-long", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let long_body = "e".repeat(100_001);
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+        json!({ "body": long_body }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// Issue: create with assignee
+// ===========================================================================
+
+/// Create an issue with an `assignee_id`.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_issue_with_assignee(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-assignee", "public").await;
+
+    let (dev_id, _) =
+        helpers::create_user(&app, &admin_token, "assign-user", "assignuser@test.com").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({
+            "title": "Assigned issue",
+            "assignee_id": dev_id,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["assignee_id"], dev_id.to_string());
+}
+
+// ===========================================================================
+// Issue: update with assignee
+// ===========================================================================
+
+/// Update issue `assignee_id`.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_issue_assignee(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-upd-assign", "public").await;
+
+    let (dev_id, _) =
+        helpers::create_user(&app, &admin_token, "assign-upd-u", "assignupdu@test.com").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "No assignee" }),
+    )
+    .await;
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues/1"),
+        json!({ "assignee_id": dev_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["assignee_id"], dev_id.to_string());
+}
+
+// ===========================================================================
+// MR: Comment/review on private project by non-member
+// ===========================================================================
+
+/// Comment on MR in private project by non-member returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_comment_private_project_non_member(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmt-priv", "private").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (_, user_token) =
+        helpers::create_user(&app, &admin_token, "mr-cmt-nopriv", "mrcmtnopriv@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments"),
+        json!({ "body": "Unauthorized comment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Review on MR in private project by non-member returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_review_private_project_non_member(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-rev-priv", "private").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (_, user_token) =
+        helpers::create_user(&app, &admin_token, "mr-rev-nopriv", "mrrevnopriv@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews"),
+        json!({ "verdict": "approve" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issue comment on private project by non-member returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn issue_comment_private_project_non_member(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "issue-cmt-priv", "private").await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Private issue" }),
+    )
+    .await;
+
+    let (_, user_token) =
+        helpers::create_user(&app, &admin_token, "cmt-nopriv", "cmtnopriv@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues/1/comments"),
+        json!({ "body": "Unauthorized comment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Create issue on private project by non-member returns 403.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_issue_private_project_non_member(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-create-priv", "private").await;
+
+    let (_, user_token) =
+        helpers::create_user(&app, &admin_token, "issue-nopriv", "issuenopriv@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Unauthorized issue" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Create issue with too many labels (51) is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_issue_too_many_labels_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "issue-label-over", "public").await;
+
+    let labels: Vec<String> = (0..51).map(|i| format!("label-{i}")).collect();
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/issues"),
+        json!({ "title": "Too many labels", "labels": labels }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "51 labels on create should be rejected, got {status}"
+    );
 }

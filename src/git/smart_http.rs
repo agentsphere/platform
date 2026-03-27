@@ -810,4 +810,63 @@ mod tests {
         assert_eq!(user, "alice");
         assert_eq!(pass, "pass:word");
     }
+
+    #[test]
+    fn extract_basic_credentials_empty_username_rejected() {
+        let mut headers = HeaderMap::new();
+        // base64(":password") = "OnBhc3N3b3Jk"
+        headers.insert(AUTHORIZATION, "Basic OnBhc3N3b3Jk".parse().unwrap());
+        assert!(
+            extract_basic_credentials(&headers).is_err(),
+            "empty username should be rejected"
+        );
+    }
+
+    #[test]
+    fn extract_basic_credentials_empty_password_accepted() {
+        let mut headers = HeaderMap::new();
+        // base64("alice:") = "YWxpY2U6"
+        headers.insert(AUTHORIZATION, "Basic YWxpY2U6".parse().unwrap());
+        let (user, pass) = extract_basic_credentials(&headers).unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "");
+    }
+
+    #[test]
+    fn extract_basic_credentials_no_colon_rejected() {
+        let mut headers = HeaderMap::new();
+        // base64("justausername") = "anVzdGF1c2VybmFtZQ=="
+        headers.insert(AUTHORIZATION, "Basic anVzdGF1c2VybmFtZQ==".parse().unwrap());
+        assert!(
+            extract_basic_credentials(&headers).is_err(),
+            "credentials without colon should be rejected"
+        );
+    }
+
+    #[test]
+    fn extract_basic_credentials_invalid_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Basic !!!invalid!!!".parse().unwrap());
+        assert!(extract_basic_credentials(&headers).is_err());
+    }
+
+    #[test]
+    fn validate_ref_accepts_complex_names() {
+        assert!(validate_ref("refs/heads/feature/my-branch").is_ok());
+        assert!(validate_ref("refs/tags/v1.0.0-rc.1").is_ok());
+        assert!(validate_ref("HEAD").is_ok());
+        assert!(validate_ref("abc123def456").is_ok());
+    }
+
+    #[test]
+    fn validate_ref_rejects_all_dangerous_chars() {
+        let dangerous = &["..", ";", "|", "$", "`", "\n", "\0", " "];
+        for ch in dangerous {
+            let test_ref = format!("foo{ch}bar");
+            assert!(
+                validate_ref(&test_ref).is_err(),
+                "should reject ref containing {ch:?}"
+            );
+        }
+    }
 }

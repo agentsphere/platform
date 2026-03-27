@@ -3051,3 +3051,5617 @@ async fn analysis_loop_starts_and_shuts_down(pool: PgPool) {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     assert!(result.is_ok(), "analysis loop should shut down within 5s");
 }
+
+// ---------------------------------------------------------------------------
+// Reconciler integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a deploy target + release with custom strategy and rollout config.
+async fn setup_deployment_with_strategy(
+    pool: &PgPool,
+    project_id: Uuid,
+    env: &str,
+    image_ref: &str,
+    strategy: &str,
+    rollout_config: serde_json::Value,
+) -> (Uuid, Uuid) {
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, default_strategy, is_active)
+           VALUES ($1, $2, $3, $4, $5, true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .bind(env)
+    .bind(env)
+    .bind(strategy)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_releases
+           (id, target_id, project_id, image_ref, strategy, phase, health, rollout_config)
+           VALUES ($1, $2, $3, $4, $5, 'pending', 'unknown', $6)",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(image_ref)
+    .bind(strategy)
+    .bind(&rollout_config)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    (target_id, release_id)
+}
+
+/// Helper: poll DB for a release's phase until it matches or times out.
+async fn poll_release_phase(
+    pool: &PgPool,
+    release_id: Uuid,
+    expected: &str,
+    timeout_ms: u64,
+) -> String {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    loop {
+        let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        if phase == expected {
+            return phase;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return phase;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// `record_history` inserts a correct history row when called from the reconciler.
+#[sqlx::test(migrations = "./migrations")]
+async fn record_history_creates_entry(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "rec-hist", "private").await;
+    let (target_id, release_id) = setup_deployment(&pool, project_id, "staging", "app:v1").await;
+
+    let release = platform::deployer::reconciler::PendingRelease {
+        id: release_id,
+        target_id,
+        project_id,
+        image_ref: "app:v1".into(),
+        commit_sha: Some("abc123".into()),
+        strategy: "rolling".into(),
+        phase: "pending".into(),
+        traffic_weight: 0,
+        current_step: 0,
+        rollout_config: serde_json::json!({}),
+        values_override: None,
+        deployed_by: None,
+        pipeline_id: None,
+        environment: "staging".into(),
+        ops_repo_id: None,
+        manifest_path: None,
+        branch_slug: None,
+        project_name: "rec-hist".into(),
+        namespace_slug: "rec-hist".into(),
+        tracked_resources: Vec::new(),
+        skip_prune: false,
+    };
+
+    // mark_failed creates history, but let us also explicitly test mark_failed
+    // with a different message to verify the detail JSON
+    platform::deployer::reconciler::mark_failed(&state, &release, "timeout exceeded").await;
+
+    // Verify detail JSON in history
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM release_history WHERE release_id = $1 AND action = 'failed'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(detail["error"], "timeout exceeded");
+}
+
+/// `mark_failed` sets `completed_at` timestamp.
+#[sqlx::test(migrations = "./migrations")]
+async fn mark_failed_sets_completed_at(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "fail-ts", "private").await;
+    let (target_id, release_id) =
+        setup_deployment(&pool, project_id, "staging", "app:broken").await;
+
+    let release = platform::deployer::reconciler::PendingRelease {
+        id: release_id,
+        target_id,
+        project_id,
+        image_ref: "app:broken".into(),
+        commit_sha: None,
+        strategy: "rolling".into(),
+        phase: "pending".into(),
+        traffic_weight: 0,
+        current_step: 0,
+        rollout_config: serde_json::json!({}),
+        values_override: None,
+        deployed_by: None,
+        pipeline_id: None,
+        environment: "staging".into(),
+        ops_repo_id: None,
+        manifest_path: None,
+        branch_slug: None,
+        project_name: "fail-ts".into(),
+        namespace_slug: "fail-ts".into(),
+        tracked_resources: Vec::new(),
+        skip_prune: false,
+    };
+
+    platform::deployer::reconciler::mark_failed(&state, &release, "bad manifest").await;
+
+    // Verify completed_at is set
+    let completed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT completed_at FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        completed.is_some(),
+        "completed_at should be set after mark_failed"
+    );
+}
+
+/// `mark_failed` with an already-failed release is idempotent.
+#[sqlx::test(migrations = "./migrations")]
+async fn mark_failed_idempotent(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "fail-idem", "private").await;
+    let (target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:broken").await;
+
+    let release = platform::deployer::reconciler::PendingRelease {
+        id: release_id,
+        target_id,
+        project_id,
+        image_ref: "app:broken".into(),
+        commit_sha: None,
+        strategy: "rolling".into(),
+        phase: "pending".into(),
+        traffic_weight: 0,
+        current_step: 0,
+        rollout_config: serde_json::json!({}),
+        values_override: None,
+        deployed_by: None,
+        pipeline_id: None,
+        environment: "production".into(),
+        ops_repo_id: None,
+        manifest_path: None,
+        branch_slug: None,
+        project_name: "fail-idem".into(),
+        namespace_slug: "fail-idem".into(),
+        tracked_resources: Vec::new(),
+        skip_prune: false,
+    };
+
+    platform::deployer::reconciler::mark_failed(&state, &release, "first failure").await;
+    platform::deployer::reconciler::mark_failed(&state, &release, "second failure").await;
+
+    // Should have 2 history entries
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'failed'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 2);
+}
+
+/// `ensure_scoped_tokens` creates OTEL and API tokens.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_creates_tokens(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "scoped-tok", "private").await;
+
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging").await;
+    assert!(
+        result.is_ok(),
+        "ensure_scoped_tokens should succeed: {result:?}"
+    );
+
+    let (otel_token, api_token) = result.unwrap();
+    assert!(!otel_token.is_empty(), "OTEL token should not be empty");
+    assert!(!api_token.is_empty(), "API token should not be empty");
+
+    // Verify tokens exist in DB
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-staging-{proj8}");
+    let api_name = format!("api-staging-{proj8}");
+
+    let otel_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name = $1 AND project_id = $2")
+            .bind(&otel_name)
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(otel_count.0, 1, "OTEL token should exist in DB");
+
+    let api_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name = $1 AND project_id = $2")
+            .bind(&api_name)
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(api_count.0, 1, "API token should exist in DB");
+}
+
+/// `ensure_scoped_tokens` rotates old tokens.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_rotates_existing(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "tok-rotate", "private").await;
+
+    // Create tokens first time
+    let (first_otel, first_api) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "prod")
+            .await
+            .unwrap();
+
+    // Rotate tokens
+    let (second_otel, second_api) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "prod")
+            .await
+            .unwrap();
+
+    // New tokens should be different
+    assert_ne!(first_otel, second_otel, "OTEL token should rotate");
+    assert_ne!(first_api, second_api, "API token should rotate");
+
+    // Old tokens should be deleted — only 1 of each name should exist
+    let proj8 = &project_id.to_string()[..8];
+    let otel_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name = $1 AND project_id = $2")
+            .bind(format!("otlp-prod-{proj8}"))
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        otel_count.0, 1,
+        "only one OTEL token should remain after rotation"
+    );
+}
+
+/// `ensure_scoped_tokens` fails for non-existent project.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_fails_for_missing_project(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, Uuid::new_v4(), "staging")
+            .await;
+    assert!(result.is_err(), "should fail for non-existent project");
+}
+
+/// `ensure_registry_pull_secret_for` runs without error (no registry URL = no-op).
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_registry_pull_secret_no_registry_url(pool: PgPool) {
+    let (mut state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    // Override config to have no registry URL
+    let mut config = (*state.config).clone();
+    config.registry_url = None;
+    state.config = std::sync::Arc::new(config);
+
+    let project_id = create_project(&app, &admin_token, "no-reg", "private").await;
+    let (_target_id, release_id) = setup_deployment(&pool, project_id, "staging", "app:v1").await;
+
+    // Should be a no-op when registry_url is None
+    platform::deployer::reconciler::ensure_registry_pull_secret_for(
+        &state, project_id, release_id, "test-ns",
+    )
+    .await;
+    // If we get here without panic, the no-op path works
+}
+
+/// Reconciler loop starts and shuts down cleanly.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_loop_starts_and_shuts_down(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::deployer::reconciler::run(state.clone(), rx));
+
+    // Let it tick at least once
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Send shutdown
+    drop(tx);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "reconciler loop should shut down within 5s");
+}
+
+/// Reconciler loop can be woken via `deploy_notify`.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_wakes_on_notify(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::deployer::reconciler::run(state.clone(), rx));
+
+    // Wake the reconciler via notify
+    state.deploy_notify.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Send shutdown
+    drop(tx);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    assert!(
+        result.is_ok(),
+        "reconciler should shut down after being notified"
+    );
+}
+
+/// Optimistic locking: reconciler skips releases whose phase changed.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_skips_phase_changed_release(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "opt-lock", "private").await;
+    let (_target_id, release_id) = setup_deployment(&pool, project_id, "staging", "app:v1").await;
+
+    // Change release to completed before reconciler picks it up
+    sqlx::query("UPDATE deploy_releases SET phase = 'completed', health = 'healthy' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Start reconciler — it should skip this release (optimistic lock fails)
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Phase should still be completed (not re-processed)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "completed",
+        "completed release should not be re-processed"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Cleanup expired previews: marks target inactive and cancels active releases.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_cleanup_expired_previews(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "preview-exp", "private").await;
+
+    // Create a preview target that expired 1 hour ago
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, branch, branch_slug, ttl_hours,
+            expires_at, default_strategy, is_active)
+           VALUES ($1, $2, 'exp-feat', 'preview', 'feature/exp', 'exp', 24,
+                   now() - interval '1 hour', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create a progressing release for this target
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_releases
+           (id, target_id, project_id, image_ref, strategy, phase, health)
+           VALUES ($1, $2, $3, 'app:preview', 'rolling', 'progressing', 'unknown')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run reconciler — should clean up expired preview
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for cleanup
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Verify target is inactive
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_active, "expired preview target should be deactivated");
+
+    // Verify release was cancelled
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "cancelled",
+        "active release should be cancelled on expired preview"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: progressing with "pass" verdict advances to next step.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_pass_advances_step(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-adv", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-v1",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move release to progressing at step 0 (simulating initial deploy done)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a "pass" analysis verdict for step 0
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+         VALUES ($1, $2, 0, 'pass', 1.0, '{}')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for canary step advancement
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Verify step advanced: current_step should be 1, weight should be 50
+    let (step, weight): (i32, i32) =
+        sqlx::query_as("SELECT current_step, traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(step, 1, "current_step should advance to 1");
+    assert_eq!(weight, 50, "traffic_weight should be 50 at step 1");
+
+    // Verify history entry
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'step_advanced'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(count >= 1, "step_advanced history should exist");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: all steps pass transitions to promoting.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_all_steps_pass_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-promo", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [50],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-v2",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing at last step (step 0, only 1 step)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 50, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert pass verdict for the last step
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+         VALUES ($1, (SELECT target_id FROM deploy_releases WHERE id = $1), 0, 'pass', 1.0, '{}')",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for promotion
+    let phase = poll_release_phase(&pool, release_id, "promoting", 5000).await;
+    assert_eq!(
+        phase, "promoting",
+        "release should transition to promoting after all steps pass"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: max failures reached triggers rollback.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_max_failures_triggers_rollback(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-rb", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 2
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-bad",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 2 "fail" verdicts (meets max_failures = 2)
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+             VALUES ($1, $2, 0, 'fail', 0.0, '{}')",
+        )
+        .bind(release_id)
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for rollback
+    let phase = poll_release_phase(&pool, release_id, "rolling_back", 5000).await;
+    assert_eq!(
+        phase, "rolling_back",
+        "should transition to rolling_back after max failures"
+    );
+
+    // Verify health is unhealthy
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "unhealthy");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: single fail transitions from progressing to holding.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_single_fail_holds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-hold", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-iffy",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a single "fail" verdict (below max_failures)
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+         VALUES ($1, $2, 0, 'fail', 0.3, '{}')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for holding state
+    let phase = poll_release_phase(&pool, release_id, "holding", 5000).await;
+    assert_eq!(phase, "holding", "single fail should transition to holding");
+
+    // Verify health is degraded
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "degraded");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: inconclusive verdict leaves release unchanged.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_inconclusive_waits(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-inc", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-wait",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert an inconclusive verdict
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+         VALUES ($1, $2, 0, 'inconclusive', 0.5, '{}')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait a bit
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be progressing
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "inconclusive verdict should not change phase"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release: no verdict yet leaves release in progressing.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_no_verdict_stays_progressing(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-nv", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:canary-nv",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing (no analysis verdicts inserted)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be progressing
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "progressing");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Promoting phase: transitions to completed with healthy status.
+#[sqlx::test(migrations = "./migrations")]
+async fn promoting_transitions_to_completed(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "promo-done", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [50, 100]
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:promo-v1",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Set release to promoting
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for completion
+    let phase = poll_release_phase(&pool, release_id, "completed", 10000).await;
+    assert_eq!(
+        phase, "completed",
+        "promoting should transition to completed"
+    );
+
+    // Verify health
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "healthy");
+
+    // Verify history
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'promoted'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(count >= 1, "promoted history should exist");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Rolling back phase: transitions to `rolled_back` with unhealthy status.
+#[sqlx::test(migrations = "./migrations")]
+async fn rolling_back_transitions_to_rolled_back(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "rb-done", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100]
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:rb-v1",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Set release to rolling_back
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'rolling_back', traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Wait for rolled_back
+    let phase = poll_release_phase(&pool, release_id, "rolled_back", 10000).await;
+    assert_eq!(
+        phase, "rolled_back",
+        "rolling_back should transition to rolled_back"
+    );
+
+    // Verify health
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "unhealthy");
+
+    // Verify traffic weight
+    let weight: i32 =
+        sqlx::query_scalar("SELECT traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(weight, 0, "traffic weight should be 0 after rollback");
+
+    // Verify history
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'rolled_back'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(count >= 1, "rolled_back history should exist");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Rolling strategy: promoting phase for a rolling release completes.
+#[sqlx::test(migrations = "./migrations")]
+async fn rolling_promoting_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "roll-promo", "private").await;
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:roll-v1",
+        "rolling",
+        serde_json::json!({}),
+    )
+    .await;
+
+    // Set to promoting (rolling strategy)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "completed", 10000).await;
+    assert_eq!(phase, "completed");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// A/B test via reconciler: duration elapsed transitions to promoting.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_ab_test_elapsed_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-elapsed", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "duration": 0,  // 0 seconds = immediately elapsed
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": { "headers": { "X-AB": "treatment" } }
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:ab-v1",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Set to progressing with started_at in the past
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "promoting", 5000).await;
+    assert_eq!(
+        phase, "promoting",
+        "A/B test with elapsed duration should promote"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// A/B test via reconciler: duration not elapsed stays in progressing.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_ab_test_not_elapsed_waits(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-wait", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "duration": 86400,  // 24 hours — will not elapse during test
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:ab-v2",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Set to progressing with started_at = now
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "A/B test with remaining duration should stay progressing"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Rolling progress handler is a no-op (rolling completes in pending).
+#[sqlx::test(migrations = "./migrations")]
+async fn rolling_progressing_is_noop(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "roll-noop", "private").await;
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:roll-noop",
+        "rolling",
+        serde_json::json!({}),
+    )
+    .await;
+
+    // Set to progressing (rolling strategy — shouldn't normally be here)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should remain progressing — rolling progress is a no-op
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "rolling progressing should be a no-op"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Rolling back for rolling strategy transitions to `rolled_back`.
+#[sqlx::test(migrations = "./migrations")]
+async fn rolling_back_rolling_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "roll-rb", "private").await;
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:roll-rb",
+        "rolling",
+        serde_json::json!({}),
+    )
+    .await;
+
+    // Set to rolling_back
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'rolling_back', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolled_back", 10000).await;
+    assert_eq!(phase, "rolled_back");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Holding phase treated as progressing by canary handler.
+#[sqlx::test(migrations = "./migrations")]
+async fn holding_phase_handled_by_canary(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "hold-canary", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:hold-v1",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Set to holding
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'holding', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert pass verdict for current step — should advance
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+         VALUES ($1, $2, 0, 'pass', 1.0, '{}')",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Should advance step (holding is treated like progressing for canary)
+    let (step, weight): (i32, i32) =
+        sqlx::query_as("SELECT current_step, traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        step, 1,
+        "holding release with pass verdict should advance step"
+    );
+    assert_eq!(weight, 50);
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Multiple releases reconciled in same cycle.
+#[sqlx::test(migrations = "./migrations")]
+async fn multiple_releases_reconciled(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "multi-rel", "private").await;
+
+    // Create two promoting releases (canary strategy to exercise promoting handler)
+    let mut release_ids = Vec::new();
+    for i in 0..2 {
+        let (_, release_id) = setup_deployment_with_strategy(
+            &pool,
+            project_id,
+            &format!("staging{i}"),
+            &format!("app:multi-v{i}"),
+            "canary",
+            serde_json::json!({"steps": [50, 100]}),
+        )
+        .await;
+
+        sqlx::query(
+            "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100, started_at = now() WHERE id = $1",
+        )
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        release_ids.push(release_id);
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Both should complete
+    for rid in &release_ids {
+        let phase = poll_release_phase(&pool, *rid, "completed", 10000).await;
+        assert_eq!(phase, "completed", "release {rid} should complete");
+    }
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Non-expired preview targets are not cleaned up.
+#[sqlx::test(migrations = "./migrations")]
+async fn non_expired_preview_not_cleaned(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "preview-ok", "private").await;
+
+    // Create a preview target that expires in 24 hours
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, branch, branch_slug, ttl_hours,
+            expires_at, default_strategy, is_active)
+           VALUES ($1, $2, 'active-feat', 'preview', 'feature/active', 'active', 24,
+                   now() + interval '24 hours', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Verify target is still active
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(is_active, "non-expired preview target should remain active");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// `target_namespace` function produces correct namespaces.
+#[sqlx::test(migrations = "./migrations")]
+async fn target_namespace_via_state(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let ns_staging =
+        platform::deployer::reconciler::target_namespace(&state.config, "my-app", "staging");
+    assert!(ns_staging.contains("my-app") && ns_staging.contains("staging"));
+
+    let ns_prod =
+        platform::deployer::reconciler::target_namespace(&state.config, "my-app", "production");
+    // Production should be shortened to "prod"
+    assert!(
+        ns_prod.contains("prod"),
+        "production should map to prod suffix"
+    );
+    assert!(
+        !ns_prod.contains("production"),
+        "should not contain full 'production'"
+    );
+}
+
+/// Reconciler ignores unknown strategies gracefully.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_ignores_unknown_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "unk-strat", "private").await;
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:unk-v1",
+        "blue_green", // unknown strategy
+        serde_json::json!({}),
+    )
+    .await;
+
+    // Set to progressing with unknown strategy
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler — should not crash
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should remain progressing (no-op for unknown strategy)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "progressing", "unknown strategy should be skipped");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// `ensure_scoped_tokens` creates tokens with correct scopes.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_correct_scopes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "tok-scope", "private").await;
+
+    let (_, _) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging")
+            .await
+            .unwrap();
+
+    let proj8 = &project_id.to_string()[..8];
+
+    // Verify OTEL token has observe:write scope
+    let otel_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(scopes) FROM api_tokens WHERE name = $1 AND project_id = $2",
+    )
+    .bind(format!("otlp-staging-{proj8}"))
+    .bind(project_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        otel_scopes.contains(&"observe:write".to_string()),
+        "OTEL token should have observe:write scope"
+    );
+
+    // Verify API token has project:read scope
+    let api_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(scopes) FROM api_tokens WHERE name = $1 AND project_id = $2",
+    )
+    .bind(format!("api-staging-{proj8}"))
+    .bind(project_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        api_scopes.contains(&"project:read".to_string()),
+        "API token should have project:read scope"
+    );
+}
+
+/// Canary: holding phase with max failures triggers rollback.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_holding_with_max_failures_rolls_back(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "hold-rb", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 2
+    });
+
+    let (target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "app:hold-bad",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Set to holding (after a first fail)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'holding', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 2 fail verdicts (hits max_failures)
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO rollout_analyses (release_id, target_id, step_index, verdict, score, raw_data)
+             VALUES ($1, $2, 0, 'fail', 0.0, '{}')",
+        )
+        .bind(release_id)
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolling_back", 5000).await;
+    assert_eq!(
+        phase, "rolling_back",
+        "holding with max failures should trigger rollback"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Verified terminal phases are not processed.
+#[sqlx::test(migrations = "./migrations")]
+async fn terminal_phases_not_processed(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "term-ph", "private").await;
+
+    // Create releases in terminal phases
+    for (i, _terminal_phase) in ["completed", "rolled_back", "cancelled", "failed"]
+        .iter()
+        .enumerate()
+    {
+        let (_, release_id) = setup_deployment_with_strategy(
+            &pool,
+            project_id,
+            &format!("env{i}"),
+            &format!("app:term-{i}"),
+            "rolling",
+            serde_json::json!({}),
+        )
+        .await;
+
+        sqlx::query("UPDATE deploy_releases SET phase = $2 WHERE id = $1")
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // No history entries should be created for terminal phases
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history rh
+             JOIN deploy_releases dr ON rh.release_id = dr.id
+             WHERE dr.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "terminal phases should not produce history entries"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Bad `tracked_resources` JSON is handled gracefully (`skip_prune=true`).
+#[sqlx::test(migrations = "./migrations")]
+async fn bad_tracked_resources_json_handled(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "bad-tr", "private").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, default_strategy, is_active)
+           VALUES ($1, $2, 'staging', 'staging', 'canary', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    // Insert with invalid tracked_resources JSON (not an array of TrackedResource)
+    sqlx::query(
+        r#"INSERT INTO deploy_releases
+           (id, target_id, project_id, image_ref, strategy, phase, health,
+            rollout_config, tracked_resources)
+           VALUES ($1, $2, $3, 'app:v1', 'canary', 'promoting', 'unknown',
+                   '{"steps": [50]}', '"not-an-array"')"#,
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler — should not crash with bad tracked_resources
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    // Should still complete (promoting → completed)
+    let phase = poll_release_phase(&pool, release_id, "completed", 10000).await;
+    assert_eq!(
+        phase, "completed",
+        "bad tracked_resources should not prevent promotion"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+// ===========================================================================
+// NEW COVERAGE TESTS — Deployment API gaps
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// create_target: with canary strategy
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_canary_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-canary", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "canary-prod",
+            "environment": "production",
+            "default_strategy": "canary",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create canary target failed: {body}"
+    );
+    assert_eq!(body["default_strategy"], "canary");
+    assert_eq!(body["environment"], "production");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: with ab_test strategy
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_ab_test_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-ab", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "ab-staging",
+            "environment": "staging",
+            "default_strategy": "ab_test",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create ab_test target failed: {body}"
+    );
+    assert_eq!(body["default_strategy"], "ab_test");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: invalid strategy is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_invalid_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-badstr", "private").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "bad-strategy",
+            "environment": "production",
+            "default_strategy": "blue_green",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_target: with ops_repo_id and manifest_path
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_with_ops_repo_and_manifest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-ops", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "ops-target",
+            "environment": "staging",
+            "manifest_path": "/k8s/overlays/staging",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create target with manifest failed: {body}"
+    );
+    assert_eq!(body["manifest_path"], "/k8s/overlays/staging");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: duplicate environment returns conflict
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_duplicate_returns_conflict(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-dup", "private").await;
+
+    // Create first target
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "staging",
+            "environment": "staging",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Try to create duplicate (same project+name)
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "staging",
+            "environment": "staging",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
+// create_target: requires deploy:promote permission
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_requires_deploy_promote(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "target-perm", "private").await;
+
+    let (uid, user_token) =
+        create_user(&app, &admin_token, "viewer-target", "viewertarget@test.com").await;
+    assign_role(&app, &admin_token, uid, "viewer", Some(project_id), &pool).await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "viewer-target",
+            "environment": "staging",
+        }),
+    )
+    .await;
+    // Security pattern: return 404 to avoid leaking resource existence
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// create_release: with custom strategy and rollout_config
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_with_strategy_and_config(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-strat", "private").await;
+
+    // Create production target (required for create_release)
+    setup_deployment(&pool, project_id, "production", "app:base").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": "app:v2",
+            "strategy": "canary",
+            "rollout_config": { "steps": [10, 50, 100] },
+            "commit_sha": "abc123def456",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create release with strategy failed: {body}"
+    );
+    assert_eq!(body["strategy"], "canary");
+    assert_eq!(body["commit_sha"], "abc123def456");
+    assert_eq!(body["phase"], "pending");
+}
+
+// ---------------------------------------------------------------------------
+// create_release: with values_override and pipeline_id
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_with_values_and_pipeline(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-vals", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:base").await;
+
+    let pipeline_id = Uuid::new_v4();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": "app:v3",
+            "values_override": { "replicas": 3 },
+            "pipeline_id": pipeline_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create release with values failed: {body}"
+    );
+    assert!(body["values_override"].is_object());
+}
+
+// ---------------------------------------------------------------------------
+// create_release: empty image_ref is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_empty_image_ref_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-empty", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:base").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_release: image_ref too long is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_image_ref_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-long", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:base").await;
+
+    let long_ref = "a".repeat(2049);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": long_ref,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: valid weight updates release
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_valid_weight(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-ok", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Move to progressing so traffic can be adjusted
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "adjust traffic failed: {body}");
+    assert_eq!(body["traffic_weight"], 50);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: weight below 0 is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_negative_weight_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-neg", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": -1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: weight above 100 is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_over_100_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-over", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 101 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: completed release returns 404 (not updatable)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_completed_release_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-done", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'completed' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: requires deploy:promote
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_requires_deploy_promote(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-perm", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (uid, user_token) =
+        create_user(&app, &admin_token, "viewer-traf", "viewertraf@test.com").await;
+    assign_role(&app, &admin_token, uid, "viewer", Some(project_id), &pool).await;
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: pending phase is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_pending_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-pending", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Release is in 'pending' phase (default)
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: progressing phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_progressing_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-prog", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "promote failed: {body}");
+    assert_eq!(body["phase"], "promoting");
+    assert_eq!(body["traffic_weight"], 100);
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: holding phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_holding_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-hold", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'holding' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "promote from holding failed: {body}"
+    );
+    assert_eq!(body["phase"], "promoting");
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: paused phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_paused_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-paused", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'paused' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "promote from paused failed: {body}");
+    assert_eq!(body["phase"], "promoting");
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: requires deploy:promote
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-perm", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (uid, user_token) =
+        create_user(&app, &admin_token, "viewer-prom", "viewerprom@test.com").await;
+    assign_role(&app, &admin_token, uid, "viewer", Some(project_id), &pool).await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: holding phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_holding_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rb-hold", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'holding' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rollback from holding failed: {body}"
+    );
+    assert_eq!(body["phase"], "rolling_back");
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: paused phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_paused_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rb-paused", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'paused' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rollback from paused failed: {body}"
+    );
+    assert_eq!(body["phase"], "rolling_back");
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: completed phase is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_completed_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rb-done", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'completed' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// pause_release: progressing phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn pause_release_progressing_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "pause-prog", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pause failed: {body}");
+    assert_eq!(body["phase"], "paused");
+}
+
+// ---------------------------------------------------------------------------
+// pause_release: non-progressing phase is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn pause_release_pending_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "pause-pend", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Release is in 'pending' phase (default) — not progressing
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// pause_release: requires deploy:promote
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn pause_release_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "pause-perm", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (uid, user_token) =
+        create_user(&app, &admin_token, "viewer-pause", "viewerpause@test.com").await;
+    assign_role(&app, &admin_token, uid, "viewer", Some(project_id), &pool).await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// resume_release: paused phase succeeds
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resume_release_paused_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "resume-ok", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'paused' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resume failed: {body}");
+    assert_eq!(body["phase"], "progressing");
+}
+
+// ---------------------------------------------------------------------------
+// resume_release: non-paused phase is rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resume_release_progressing_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "resume-bad", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// resume_release: requires deploy:promote
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resume_release_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "resume-perm", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'paused' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (uid, user_token) =
+        create_user(&app, &admin_token, "viewer-res", "viewerres@test.com").await;
+    assign_role(&app, &admin_token, uid, "viewer", Some(project_id), &pool).await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// release_history: returns history entries for a release
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_returns_entries(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-ok", "private").await;
+    let (target_id, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Insert some history entries
+    setup_history(&pool, release_id, target_id, "app:v1", "created").await;
+    setup_history(&pool, release_id, target_id, "app:v1", "promoted").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 2);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// release_history: empty history returns empty list
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_empty_returns_empty(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-empty", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// release_history: pagination works
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_pagination(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-page", "private").await;
+    let (target_id, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Insert 3 history entries
+    for action in &["created", "traffic_shifted", "promoted"] {
+        setup_history(&pool, release_id, target_id, "app:v1", action).await;
+    }
+
+    // Fetch with limit=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history?limit=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    // Fetch with offset=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!(
+            "/api/projects/{project_id}/deploy-releases/{release_id}/history?limit=2&offset=2"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// release_history: requires deploy:read
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-perm", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (_uid, user_token) = create_user(&app, &admin_token, "nohist", "nohist@test.com").await;
+    // No role assigned — no permissions
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// staging_status: requires deploy:read
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn staging_status_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "staging-perm", "private").await;
+
+    let (_uid, user_token) =
+        create_user(&app, &admin_token, "nostaging", "nostaging@test.com").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/staging-status"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: returns empty for project with no namespace slug
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_no_slug_returns_empty(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-noslug", "public").await;
+
+    // Ensure namespace_slug is empty
+    sqlx::query("UPDATE projects SET namespace_slug = '' WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: requires project:read
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_requires_permission(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-perm", "private").await;
+
+    let (_uid, user_token) = create_user(&app, &admin_token, "noiframe", "noiframe@test.com").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: with env query parameter
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_with_env_param(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-env", "public").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes?env=staging"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Returns empty array (no services in the namespace)
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: updates branch and path
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    // Create an ops repo first
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({
+            "name": "update-repo",
+            "branch": "main",
+            "path": "/",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = body["id"].as_str().unwrap();
+
+    // Update branch and path
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({
+            "branch": "develop",
+            "path": "/k8s/overlays",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update ops repo failed: {body}");
+    assert_eq!(body["branch"], "develop");
+    assert_eq!(body["path"], "/k8s/overlays");
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: partial update (branch only)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_partial(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({
+            "name": "partial-repo",
+            "branch": "main",
+            "path": "/k8s",
+        }),
+    )
+    .await;
+    let repo_id = body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({
+            "branch": "staging",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["branch"], "staging");
+    assert_eq!(body["path"], "/k8s"); // unchanged
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: not found
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{fake_id}"),
+        serde_json::json!({ "branch": "develop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: requires admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "admin-repo" }),
+    )
+    .await;
+    let repo_id = body["id"].as_str().unwrap();
+
+    let (_uid, user_token) =
+        create_user(&app, &admin_token, "nonadmin-ops", "nonadminops@test.com").await;
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &user_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "branch": "develop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// delete_ops_repo: successful deletion
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_ops_repo_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "delete-repo" }),
+    )
+    .await;
+    let repo_id = body["id"].as_str().unwrap();
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify it's gone
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// delete_ops_repo: not found
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_ops_repo_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// delete_ops_repo: with active deploy target reference returns conflict
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_ops_repo_with_targets_returns_conflict(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "del-ops-ref", "private").await;
+
+    // Create ops repo
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "referenced-repo" }),
+    )
+    .await;
+    let repo_id = body["id"].as_str().unwrap();
+    let repo_uuid = Uuid::parse_str(repo_id).unwrap();
+
+    // Create a deploy target that references this ops repo
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (project_id, name, environment, default_strategy, is_active, ops_repo_id)
+           VALUES ($1, 'target-with-ops', 'production', 'rolling', true, $2)",
+    )
+    .bind(project_id)
+    .bind(repo_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Try to delete — should fail with conflict
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
+// delete_ops_repo: requires admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_ops_repo_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "del-admin-repo" }),
+    )
+    .await;
+    let repo_id = body["id"].as_str().unwrap();
+
+    let (_uid, user_token) =
+        create_user(&app, &admin_token, "nonadmin-del", "nonadmindel@test.com").await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &user_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// create_ops_repo: invalid name rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_ops_repo_invalid_name(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_ops_repo: invalid branch rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_ops_repo_invalid_branch(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({
+            "name": "bad-branch-repo",
+            "branch": "feat..double-dot",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_ops_repo: requires admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_ops_repo_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_uid, user_token) =
+        create_user(&app, &admin_token, "nonadmin-cr", "nonadmincr@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &user_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "user-repo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// promote_staging: successful promotion with ops repo
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_staging_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "prom-stag-ok", "public").await;
+
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "prom-ops", "main")
+        .await
+        .unwrap();
+
+    // Bootstrap with initial commit
+    platform::deployer::ops_repo::write_file_to_repo(&ops_path, "main", "README.md", "# Ops")
+        .await
+        .unwrap();
+
+    // Write staging values with an image_ref
+    platform::deployer::ops_repo::write_file_to_repo(
+        &ops_path,
+        "staging",
+        "staging/values.yaml",
+        "image_ref: app:v2\nreplicas: 3\n",
+    )
+    .await
+    .unwrap();
+
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id)
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind("prom-ops")
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/promote-staging"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "promote staging should succeed: {body}"
+    );
+    assert_eq!(body["status"], "promoted");
+    assert_eq!(body["image_ref"], "app:v2");
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+// ---------------------------------------------------------------------------
+// staging_status: with ops repo returns comparison
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn staging_status_with_ops_repo(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "stag-status", "public").await;
+
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "status-ops", "main")
+        .await
+        .unwrap();
+
+    // Bootstrap with initial commit
+    platform::deployer::ops_repo::write_file_to_repo(&ops_path, "main", "README.md", "# Ops")
+        .await
+        .unwrap();
+
+    // Create staging branch with same commit (not diverged)
+    platform::deployer::ops_repo::write_file_to_repo(&ops_path, "staging", "README.md", "# Ops")
+        .await
+        .unwrap();
+
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id)
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind("status-ops")
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/staging-status"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "staging status failed: {body}");
+    // Should have staging_sha and prod_sha
+    assert!(body["staging_sha"].is_string());
+    assert!(body["prod_sha"].is_string());
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: weight at boundaries (0 and 100) accepted
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_boundary_values(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-bnd", "private").await;
+    let (_target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Weight = 0
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "weight 0 should work: {body}");
+    assert_eq!(body["traffic_weight"], 0);
+
+    // Weight = 100
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 100 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "weight 100 should work: {body}");
+    assert_eq!(body["traffic_weight"], 100);
+}
+
+// ---------------------------------------------------------------------------
+// create_release: creates release history entry
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_creates_history(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-hist", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:base").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({ "image_ref": "app:v2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let release_id = body["id"].as_str().unwrap();
+
+    // Check that a history entry was created
+    let (status, hist_body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        hist_body["total"].as_i64().unwrap() >= 1,
+        "release should have at least 1 history entry"
+    );
+    let first = &hist_body["items"][0];
+    assert_eq!(first["action"], "created");
+}
+
+// ---------------------------------------------------------------------------
+// Namespace integration tests (K8s API)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_namespace_creates_ns_with_labels(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-ens-{}", &Uuid::new_v4().to_string()[..8]);
+
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &Uuid::new_v4().to_string(),
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Verify namespace exists with correct labels
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let ns = ns_api.get(&ns_name).await.unwrap();
+    let labels = ns.metadata.labels.as_ref().unwrap();
+    assert_eq!(labels.get("platform.io/managed-by").unwrap(), "platform");
+    assert_eq!(labels.get("platform.io/env").unwrap(), "dev");
+
+    // Cleanup
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_namespace_is_idempotent(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-idem-{}", &Uuid::new_v4().to_string()[..8]);
+    let project_id = Uuid::new_v4().to_string();
+
+    // Call twice — should not error
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &project_id,
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &project_id,
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Cleanup
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_namespace_requires_managed_label(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-unm-{}", &Uuid::new_v4().to_string()[..8]);
+
+    // Create namespace without platform.io/managed-by label
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let ns = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": ns_name,
+            "labels": {"test-label": "true"}
+        }
+    }))
+    .unwrap();
+    ns_api
+        .create(&kube::api::PostParams::default(), &ns)
+        .await
+        .unwrap();
+
+    // Attempting to delete should fail because it's not managed
+    let result = platform::deployer::namespace::delete_namespace(&state.kube, &ns_name).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("platform.io/managed-by"),
+        "error should mention managed-by label: {err_msg}"
+    );
+
+    // Manually clean up since delete_namespace refused
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_namespace_ok_when_managed(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-del-{}", &Uuid::new_v4().to_string()[..8]);
+
+    // Create a managed namespace
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &Uuid::new_v4().to_string(),
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Delete should succeed
+    platform::deployer::namespace::delete_namespace(&state.kube, &ns_name)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_namespace_404_is_ok(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("nonexistent-ns-{}", &Uuid::new_v4().to_string()[..8]);
+
+    // Should succeed (treated as already deleted)
+    platform::deployer::namespace::delete_namespace(&state.kube, &ns_name)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_session_namespace_creates_all_objects(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-sess-{}", &Uuid::new_v4().to_string()[..8]);
+    let session_id = Uuid::new_v4().to_string();
+    let project_id = Uuid::new_v4().to_string();
+
+    platform::deployer::namespace::ensure_session_namespace(
+        &state.kube,
+        &ns_name,
+        &session_id,
+        &project_id,
+        &state.config.platform_namespace,
+        None, // services_namespace
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // 1. Verify namespace exists
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let ns = ns_api.get(&ns_name).await.unwrap();
+    let labels = ns.metadata.labels.as_ref().unwrap();
+    assert_eq!(labels.get("platform.io/managed-by").unwrap(), "platform");
+
+    // 2. Verify ServiceAccount
+    let sa_api: kube::Api<k8s_openapi::api::core::v1::ServiceAccount> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let sa = sa_api.get("agent-sa").await.unwrap();
+    assert_eq!(sa.metadata.name.as_deref(), Some("agent-sa"));
+
+    // 3. Verify Role
+    let role_api: kube::Api<k8s_openapi::api::rbac::v1::Role> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let role = role_api.get("agent-edit").await.unwrap();
+    assert_eq!(role.metadata.name.as_deref(), Some("agent-edit"));
+    // Verify role rules exclude networking.k8s.io
+    if let Some(rules) = &role.rules {
+        for rule in rules {
+            if let Some(groups) = &rule.api_groups {
+                assert!(
+                    !groups.contains(&"networking.k8s.io".to_string()),
+                    "role should not include networking.k8s.io"
+                );
+            }
+        }
+    }
+
+    // 4. Verify RoleBinding
+    let rb_api: kube::Api<k8s_openapi::api::rbac::v1::RoleBinding> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let rb = rb_api.get("agent-edit-binding").await.unwrap();
+    assert_eq!(rb.role_ref.name, "agent-edit");
+
+    // 5. Verify ResourceQuota
+    let quota_api: kube::Api<k8s_openapi::api::core::v1::ResourceQuota> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let quota = quota_api.get("session-quota").await.unwrap();
+    assert!(quota.spec.is_some());
+    let hard = quota.spec.as_ref().unwrap().hard.as_ref().unwrap();
+    assert!(hard.contains_key("pods"));
+    assert!(hard.contains_key("requests.cpu"));
+
+    // 6. Verify LimitRange
+    let lr_api: kube::Api<k8s_openapi::api::core::v1::LimitRange> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let lr = lr_api.get("session-limits").await.unwrap();
+    assert!(lr.spec.is_some());
+
+    // Cleanup
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_session_namespace_with_different_services_ns(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-svc-{}", &Uuid::new_v4().to_string()[..8]);
+    let session_id = Uuid::new_v4().to_string();
+    let project_id = Uuid::new_v4().to_string();
+
+    // Use a services_namespace different from platform_namespace
+    platform::deployer::namespace::ensure_session_namespace(
+        &state.kube,
+        &ns_name,
+        &session_id,
+        &project_id,
+        &state.config.platform_namespace,
+        Some("other-services-ns"),
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Verify namespace was created
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let ns = ns_api.get(&ns_name).await.unwrap();
+    assert!(ns.metadata.labels.is_some());
+
+    // Cleanup
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_namespace_with_services_ns_creates_network_policy(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-snp-{}", &Uuid::new_v4().to_string()[..8]);
+
+    platform::deployer::namespace::ensure_namespace_with_services_ns(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &Uuid::new_v4().to_string(),
+        &state.config.platform_namespace,
+        "services-ns",
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Verify RoleBinding for secrets access exists
+    let rb_api: kube::Api<k8s_openapi::api::rbac::v1::RoleBinding> =
+        kube::Api::namespaced(state.kube.clone(), &ns_name);
+    let rb = rb_api.get("platform-secrets-access").await.unwrap();
+    assert_eq!(rb.role_ref.kind, "ClusterRole");
+
+    // Cleanup
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_network_policy_standalone(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-np-{}", &Uuid::new_v4().to_string()[..8]);
+
+    // First create the namespace
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "dev",
+        &Uuid::new_v4().to_string(),
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Then apply network policy separately
+    platform::deployer::namespace::ensure_network_policy(
+        &state.kube,
+        &ns_name,
+        &state.config.platform_namespace,
+    )
+    .await
+    .unwrap();
+
+    // Cleanup
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_session_network_policy_standalone(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let ns_name = format!("test-snp2-{}", &Uuid::new_v4().to_string()[..8]);
+
+    // First create the namespace
+    platform::deployer::namespace::ensure_namespace(
+        &state.kube,
+        &ns_name,
+        "session",
+        &Uuid::new_v4().to_string(),
+        &state.config.platform_namespace,
+        state.config.dev_mode,
+    )
+    .await
+    .unwrap();
+
+    // Apply session network policy separately
+    platform::deployer::namespace::ensure_session_network_policy(
+        &state.kube,
+        &ns_name,
+        &state.config.platform_namespace,
+        &state.config.platform_namespace,
+    )
+    .await
+    .unwrap();
+
+    // Cleanup
+    let ns_api: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(state.kube.clone());
+    let _ = ns_api
+        .delete(&ns_name, &kube::api::DeleteParams::default())
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Ops repo integration tests (git operations)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_init_and_write_file(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let repo_path = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "intg-test-repo",
+        "main",
+    )
+    .await
+    .unwrap();
+
+    assert!(repo_path.exists());
+
+    // Write a file
+    let sha = platform::deployer::ops_repo::write_file_to_repo(
+        &repo_path,
+        "main",
+        "deploy/app.yaml",
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: test-app",
+    )
+    .await
+    .unwrap();
+    assert!(!sha.is_empty());
+
+    // Read back
+    let content =
+        platform::deployer::ops_repo::read_file_at_ref(&repo_path, "main", "deploy/app.yaml")
+            .await
+            .unwrap();
+    assert!(content.contains("test-app"));
+
+    let _ = tokio::fs::remove_dir_all(&state.config.ops_repos_path).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_commit_values_roundtrip(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let repo_path = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "intg-vals-repo",
+        "main",
+    )
+    .await
+    .unwrap();
+
+    let values = serde_json::json!({
+        "image_ref": "myapp:v2.0.0",
+        "replicas": 5,
+        "env": "production"
+    });
+
+    let sha =
+        platform::deployer::ops_repo::commit_values(&repo_path, "main", "production", &values)
+            .await
+            .unwrap();
+    assert!(!sha.is_empty());
+
+    // Read values back
+    let read_back = platform::deployer::ops_repo::read_values(&repo_path, "main", "production")
+        .await
+        .unwrap();
+    assert_eq!(read_back["image_ref"], "myapp:v2.0.0");
+    assert_eq!(read_back["replicas"], 5);
+    assert_eq!(read_back["env"], "production");
+
+    let _ = tokio::fs::remove_dir_all(&state.config.ops_repos_path).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_write_file_identical_content_noop(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let repo_path = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "intg-noop-repo",
+        "main",
+    )
+    .await
+    .unwrap();
+
+    let sha1 = platform::deployer::ops_repo::write_file_to_repo(
+        &repo_path,
+        "main",
+        "config.yaml",
+        "key: value",
+    )
+    .await
+    .unwrap();
+
+    let sha2 = platform::deployer::ops_repo::write_file_to_repo(
+        &repo_path,
+        "main",
+        "config.yaml",
+        "key: value",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sha1, sha2,
+        "identical content should not create a new commit"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&state.config.ops_repos_path).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_merge_branches(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let repo_path = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "intg-merge-repo",
+        "main",
+    )
+    .await
+    .unwrap();
+
+    // Write a file on main
+    platform::deployer::ops_repo::write_file_to_repo(
+        &repo_path,
+        "main",
+        "base.txt",
+        "base content",
+    )
+    .await
+    .unwrap();
+
+    // Write a file on staging branch
+    platform::deployer::ops_repo::write_file_to_repo(
+        &repo_path,
+        "staging",
+        "staging.txt",
+        "staging content",
+    )
+    .await
+    .unwrap();
+
+    // Verify branches diverged
+    let (diverged, _, _) =
+        platform::deployer::ops_repo::compare_branches(&repo_path, "staging", "main")
+            .await
+            .unwrap();
+    assert!(diverged);
+
+    // Merge staging into main
+    let sha = platform::deployer::ops_repo::merge_branch(&repo_path, "staging", "main")
+        .await
+        .unwrap();
+    assert!(!sha.is_empty());
+
+    // Main should now have the staging file
+    let content = platform::deployer::ops_repo::read_file_at_ref(&repo_path, "main", "staging.txt")
+        .await
+        .unwrap();
+    assert_eq!(content, "staging content");
+
+    let _ = tokio::fs::remove_dir_all(&state.config.ops_repos_path).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_revert_last_commit(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let repo_path = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "intg-revert-repo",
+        "main",
+    )
+    .await
+    .unwrap();
+
+    // Write original
+    platform::deployer::ops_repo::write_file_to_repo(&repo_path, "main", "data.txt", "original")
+        .await
+        .unwrap();
+
+    // Write modified
+    platform::deployer::ops_repo::write_file_to_repo(&repo_path, "main", "data.txt", "modified")
+        .await
+        .unwrap();
+
+    // Revert
+    let sha = platform::deployer::ops_repo::revert_last_commit(&repo_path, "main")
+        .await
+        .unwrap();
+    assert!(!sha.is_empty());
+
+    // Should be back to original
+    let content = platform::deployer::ops_repo::read_file_at_ref(&repo_path, "main", "data.txt")
+        .await
+        .unwrap();
+    assert_eq!(content, "original");
+
+    let _ = tokio::fs::remove_dir_all(&state.config.ops_repos_path).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ops_repo_init_rejects_path_traversal(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let result = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "../escape",
+        "main",
+    )
+    .await;
+    assert!(result.is_err());
+
+    let result = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "evil/name",
+        "main",
+    )
+    .await;
+    assert!(result.is_err());
+
+    let result = platform::deployer::ops_repo::init_ops_repo(
+        &state.config.ops_repos_path,
+        "evil\\name",
+        "main",
+    )
+    .await;
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// create_target: staging environment accepted
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_staging_environment(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-staging", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "staging-target",
+            "environment": "staging",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "staging target creation failed: {body}"
+    );
+    assert_eq!(body["environment"], "staging");
+    assert_eq!(body["default_strategy"], "rolling");
+    assert_eq!(body["is_active"], true);
+}
+
+// ---------------------------------------------------------------------------
+// create_target: preview environment accepted
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_preview_environment(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-preview", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "preview-target",
+            "environment": "preview",
+            "default_strategy": "rolling",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "preview target creation failed: {body}"
+    );
+    assert_eq!(body["environment"], "preview");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-audit", "private").await;
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "audit-target",
+            "environment": "production",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let count = helpers::wait_for_audit(&pool, "deploy.target.create", 2000).await;
+    assert!(count > 0, "audit entry should exist for target creation");
+}
+
+// ---------------------------------------------------------------------------
+// create_release: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-audit", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({ "image_ref": "app:v2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let count = helpers::wait_for_audit(&pool, "deploy.release.create", 2000).await;
+    assert!(count > 0, "audit entry should exist for release creation");
+}
+
+// ---------------------------------------------------------------------------
+// create_release: image_ref validation — minimum 1 char
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_empty_image_ref_returns_400(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-empty-img", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({ "image_ref": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: exactly 0 is valid
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_zero_weight_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-zero", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Transition to progressing so traffic adjustment is allowed
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 0 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "traffic weight 0 should be valid: {body}"
+    );
+    assert_eq!(body["traffic_weight"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: exactly 100 is valid
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_100_weight_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-100", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 100 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "traffic weight 100 should be valid: {body}"
+    );
+    assert_eq!(body["traffic_weight"], 100);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-audit", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let count = helpers::wait_for_audit(&pool, "deploy.traffic.adjust", 2000).await;
+    assert!(count > 0, "audit entry should exist for traffic adjustment");
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: creates history entry
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_creates_history(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-hist", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 75 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, hist) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(hist["total"].as_i64().unwrap() >= 1);
+
+    // Find the traffic_shifted entry
+    let items = hist["items"].as_array().unwrap();
+    let traffic_entry = items.iter().find(|e| e["action"] == "traffic_shifted");
+    assert!(
+        traffic_entry.is_some(),
+        "traffic_shifted history entry should exist"
+    );
+    assert_eq!(traffic_entry.unwrap()["traffic_weight"], 75);
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: creates history entry
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_creates_history(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "promote-hist", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "promote failed: {body}");
+    assert_eq!(body["phase"], "promoting");
+    assert_eq!(body["traffic_weight"], 100);
+
+    let (_, hist) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    let items = hist["items"].as_array().unwrap();
+    let promote_entry = items.iter().find(|e| e["action"] == "promoted");
+    assert!(
+        promote_entry.is_some(),
+        "promoted history entry should exist"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "promote-audit", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let count = helpers::wait_for_audit(&pool, "deploy.release.promote", 2000).await;
+    assert!(count > 0, "audit entry should exist for promote");
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: creates history entry and fires audit
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_creates_history_and_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "roll-hist", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rollback failed: {body}");
+    assert_eq!(body["phase"], "rolling_back");
+
+    // Check history
+    let (_, hist) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    let items = hist["items"].as_array().unwrap();
+    let rollback_entry = items.iter().find(|e| e["action"] == "rolled_back");
+    assert!(
+        rollback_entry.is_some(),
+        "rolled_back history entry should exist"
+    );
+
+    // Check audit
+    let count = helpers::wait_for_audit(&pool, "deploy.release.rollback", 2000).await;
+    assert!(count > 0, "audit entry should exist for rollback");
+}
+
+// ---------------------------------------------------------------------------
+// pause_release: fires audit + creates history
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn pause_release_creates_history_and_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "pause-hist", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pause failed: {body}");
+    assert_eq!(body["phase"], "paused");
+
+    // Check history
+    let (_, hist) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    let items = hist["items"].as_array().unwrap();
+    let pause_entry = items.iter().find(|e| e["action"] == "paused");
+    assert!(pause_entry.is_some(), "paused history entry should exist");
+
+    // Check audit
+    let count = helpers::wait_for_audit(&pool, "deploy.release.pause", 2000).await;
+    assert!(count > 0, "audit entry should exist for pause");
+}
+
+// ---------------------------------------------------------------------------
+// resume_release: fires audit + creates history
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resume_release_creates_history_and_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "resume-hist", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Must be in paused state first
+    sqlx::query("UPDATE deploy_releases SET phase = 'paused' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resume failed: {body}");
+    assert_eq!(body["phase"], "progressing");
+
+    // Check history
+    let (_, hist) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    let items = hist["items"].as_array().unwrap();
+    let resume_entry = items.iter().find(|e| e["action"] == "resumed");
+    assert!(resume_entry.is_some(), "resumed history entry should exist");
+
+    // Check audit
+    let count = helpers::wait_for_audit(&pool, "deploy.release.resume", 2000).await;
+    assert!(count > 0, "audit entry should exist for resume");
+}
+
+// ---------------------------------------------------------------------------
+// release_history: requires deploy_read permission
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_requires_deploy_read(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-perm", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // User with no deploy permissions
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "histuser", "histuser@example.com").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// release_history: history for nonexistent release returns empty
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_history_nonexistent_release_returns_empty(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "hist-norel", "private").await;
+    let fake_release = Uuid::new_v4();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{fake_release}/history"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 0);
+    assert!(body["items"].as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// staging_status: requires deploy_read permission
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn staging_status_requires_deploy_read(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "stag-perm", "private").await;
+
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "staguser", "staguser@example.com").await;
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/staging-status"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// promote_staging: no ops repo returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_staging_no_ops_repo_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-no-ops", "private").await;
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/promote-staging"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: requires project_read
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_no_permission_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-noperm", "private").await;
+
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "iframeuser", "iframeuser@example.com").await;
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: empty namespace slug returns empty
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_empty_slug_returns_empty(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-empty-slug", "public").await;
+
+    // Set namespace_slug to empty string
+    sqlx::query("UPDATE projects SET namespace_slug = '' WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: valid partial update (branch only)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_branch_only(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    // Create ops repo via API
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "upd-branch" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "branch": "develop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update branch only failed: {body}");
+    assert_eq!(body["branch"], "develop");
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: valid partial update (path only)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_path_only(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "upd-path" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "path": "/deploy/k8s" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update path only failed: {body}");
+    assert_eq!(body["path"], "/deploy/k8s");
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "upd-audit" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "branch": "release" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let count = helpers::wait_for_audit(&pool, "ops_repo.update", 2000).await;
+    assert!(count > 0, "audit entry should exist for ops repo update");
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: invalid branch name rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_invalid_branch_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "upd-badbranch" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "branch": "bad..branch" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// update_ops_repo: invalid path (too long) rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn update_ops_repo_path_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "upd-longpath" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let long_path = "/".to_string() + &"a".repeat(500);
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+        serde_json::json!({ "path": long_path }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// delete_ops_repo: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_ops_repo_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "del-audit" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let count = helpers::wait_for_audit(&pool, "ops_repo.delete", 2000).await;
+    assert!(count > 0, "audit entry should exist for ops repo delete");
+}
+
+// ---------------------------------------------------------------------------
+// create_ops_repo: with custom branch and path
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_ops_repo_with_branch_and_path(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({
+            "name": "custom-ops",
+            "branch": "release",
+            "path": "/deploy"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create ops repo failed: {body}"
+    );
+    assert_eq!(body["branch"], "release");
+    assert_eq!(body["path"], "/deploy");
+}
+
+// ---------------------------------------------------------------------------
+// create_ops_repo: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_ops_repo_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "audit-ops" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let count = helpers::wait_for_audit(&pool, "ops_repo.create", 2000).await;
+    assert!(count > 0, "audit entry should exist for ops repo create");
+}
+
+// ---------------------------------------------------------------------------
+// list_ops_repos: returns created repos
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_ops_repos_returns_all(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    // Create two repos
+    let (s1, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "list-ops-a" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    let (s2, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "list-ops-b" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CREATED);
+
+    let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/ops-repos").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().len() >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// list_ops_repos: requires admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_ops_repos_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "opslistuser", "opslistuser@example.com").await;
+
+    let (status, _body) = helpers::get_json(&app, &user_token, "/api/admin/ops-repos").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// get_ops_repo: by ID
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_ops_repo_by_id(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (status, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "get-ops" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"], "get-ops");
+    assert_eq!(body["id"], repo_id);
+}
+
+// ---------------------------------------------------------------------------
+// get_ops_repo: nonexistent returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_ops_repo_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/ops-repos/{}", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// get_ops_repo: requires admin
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_ops_repo_requires_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let (_, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "get-ops-admin" }),
+    )
+    .await;
+    let repo_id = create_body["id"].as_str().unwrap();
+
+    let (_user_id, user_token) =
+        create_user(&app, &admin_token, "opsgetuser", "opsgetuser@example.com").await;
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/api/admin/ops-repos/{repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// create_release: default strategy comes from target
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_inherits_target_strategy(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-inherit", "private").await;
+
+    // Create target with canary strategy
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, default_strategy, is_active)
+           VALUES ($1, $2, 'prod', 'production', 'canary', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({ "image_ref": "app:canary" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create release failed: {body}");
+    assert_eq!(body["strategy"], "canary");
+}
+
+// ---------------------------------------------------------------------------
+// create_release: explicit strategy overrides target default
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_explicit_strategy_overrides_default(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-override", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": "app:v2",
+            "strategy": "canary"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create release with explicit strategy failed: {body}"
+    );
+    assert_eq!(body["strategy"], "canary");
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: -1 rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_negative_one_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-neg1", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": -1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: 101 rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_101_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-101", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 101 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// promote_release: completed release rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_release_completed_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "prom-done", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'completed' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/promote"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: completed release rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_completed_release_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "roll-done", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'completed' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// pause_release: holding phase rejected (only progressing allowed)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn pause_release_holding_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "pause-hold", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'holding' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// resume_release: holding phase rejected (only paused allowed)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resume_release_holding_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "resume-hold", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'holding' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_target: with ops_repo_id and manifest_path — returns them
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_returns_ops_repo_and_manifest(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "tgt-ops-man", "private").await;
+
+    // Create an ops repo first
+    let (_, create_body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/ops-repos",
+        serde_json::json!({ "name": "tgt-ops-repo" }),
+    )
+    .await;
+    let ops_repo_id = create_body["id"].as_str().unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "ops-target",
+            "environment": "production",
+            "ops_repo_id": ops_repo_id,
+            "manifest_path": "k8s/production"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create target with ops repo failed: {body}"
+    );
+    assert_eq!(body["ops_repo_id"], ops_repo_id);
+    assert_eq!(body["manifest_path"], "k8s/production");
+}
+
+// ---------------------------------------------------------------------------
+// list targets: no auth returns 401
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_targets_no_auth_returns_401(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        "",
+        &format!("/api/projects/{}/targets", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// list releases: no auth returns 401
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_releases_no_auth_returns_401(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        "",
+        &format!("/api/projects/{}/deploy-releases", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// create_target: name validation — empty name rejected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_empty_name_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-empty-name", "private").await;
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({
+            "name": "",
+            "environment": "production",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// create_release: commit_sha stored
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_stores_commit_sha(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-sha", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let sha = "abc123def456";
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({
+            "image_ref": "app:v2",
+            "commit_sha": sha
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create release failed: {body}");
+    assert_eq!(body["commit_sha"], sha);
+}
+
+// ---------------------------------------------------------------------------
+// promote_staging: fires audit log
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn promote_staging_fires_audit(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+    let project_id = create_project(&app, &admin_token, "prom-stag-aud", "public").await;
+
+    // Create ops repo on disk
+    let tmp = std::env::temp_dir().join(format!("platform-test-{}", Uuid::new_v4()));
+    let ops_path = platform::deployer::ops_repo::init_ops_repo(&tmp, "prom-aud-ops", "main")
+        .await
+        .unwrap();
+
+    platform::deployer::ops_repo::write_file_to_repo(&ops_path, "main", "README.md", "# Ops")
+        .await
+        .unwrap();
+
+    platform::deployer::ops_repo::write_file_to_repo(
+        &ops_path,
+        "staging",
+        "staging/values.yaml",
+        "image_ref: app:v3\nreplicas: 2\n",
+    )
+    .await
+    .unwrap();
+
+    let ops_repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ops_repos (id, name, repo_path, branch, path, project_id)
+         VALUES ($1, $2, $3, 'main', '/', $4)",
+    )
+    .bind(ops_repo_id)
+    .bind("prom-aud-ops")
+    .bind(ops_path.to_string_lossy().to_string())
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/promote-staging"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let count = helpers::wait_for_audit(&pool, "deploy.promote_staging", 2000).await;
+    assert!(count > 0, "audit entry should exist for promote staging");
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+}
+
+// ---------------------------------------------------------------------------
+// list_targets: pagination
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_targets_pagination(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-page", "private").await;
+
+    // Create 3 targets with unique environments (can't duplicate env for same project)
+    for env in &["production", "staging", "preview"] {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/targets"),
+            serde_json::json!({
+                "name": format!("target-{env}"),
+                "environment": env,
+            }),
+        )
+        .await;
+    }
+
+    // Request with limit=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets?limit=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    assert_eq!(body["total"], 3);
+
+    // Request with offset=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets?limit=2&offset=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// list_releases: pagination
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_releases_pagination(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-page", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    // Create 3 releases
+    for i in 2..=4 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{project_id}/deploy-releases"),
+            serde_json::json!({ "image_ref": format!("app:v{i}") }),
+        )
+        .await;
+    }
+
+    // Expect 4 total (1 from setup + 3 created)
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases?limit=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    assert!(body["total"].as_i64().unwrap() >= 4);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: completed release returns 404 (not found because WHERE excludes terminal phases)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_rolled_back_release_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-rb", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'rolled_back' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: cancelled release returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_cancelled_release_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-canc", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'cancelled' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_traffic: failed release returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn adjust_traffic_failed_release_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "traffic-fail", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'failed' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/traffic"),
+        serde_json::json!({ "traffic_weight": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// rollback_release: progressing release transitions to rolling_back
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rollback_release_progressing_sets_rolling_back(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "roll-prog", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    sqlx::query("UPDATE deploy_releases SET phase = 'progressing' WHERE id = $1")
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases/{release_id}/rollback"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rollback failed: {body}");
+    assert_eq!(body["phase"], "rolling_back");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: default environment is production
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_default_environment_is_production(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-default-env", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({ "name": "default-env-target" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create target failed: {body}");
+    assert_eq!(body["environment"], "production");
+}
+
+// ---------------------------------------------------------------------------
+// create_target: default strategy is rolling
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_target_default_strategy_is_rolling(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tgt-default-strat", "private").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/targets"),
+        serde_json::json!({ "name": "default-strat-target" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create target failed: {body}");
+    assert_eq!(body["default_strategy"], "rolling");
+}
+
+// ---------------------------------------------------------------------------
+// create_release: default phase is pending
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_release_default_phase_is_pending(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "rel-phase", "private").await;
+    setup_deployment(&pool, project_id, "production", "app:v1").await;
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-releases"),
+        serde_json::json!({ "image_ref": "app:v2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["phase"], "pending");
+    assert_eq!(body["traffic_weight"], 0);
+    assert_eq!(body["health"], "unknown");
+}
+
+// ---------------------------------------------------------------------------
+// list_deploy_iframes: with env query parameter
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn list_deploy_iframes_staging_env(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "iframe-stag", "public").await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/deploy-preview/iframes?env=staging"),
+    )
+    .await;
+    // Should succeed (even if empty) — validates the env param is accepted
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// get_release: wrong project returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_release_wrong_project_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_a = create_project(&app, &admin_token, "rel-proj-a", "private").await;
+    let project_b = create_project(&app, &admin_token, "rel-proj-b", "private").await;
+    let (_, release_id) = setup_deployment(&pool, project_a, "production", "app:v1").await;
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_b}/deploy-releases/{release_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// get_target: wrong project returns 404
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_target_wrong_project_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let project_a = create_project(&app, &admin_token, "tgt-proj-a", "private").await;
+    let project_b = create_project(&app, &admin_token, "tgt-proj-b", "private").await;
+    let (target_id, _) = setup_deployment(&pool, project_a, "production", "app:v1").await;
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_b}/targets/{target_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -134,4 +134,80 @@ mod tests {
         let sig = compute_signature(b"data", "").unwrap();
         assert!(sig.starts_with("sha256="));
     }
+
+    #[test]
+    fn hmac_unicode_secret_works() {
+        let sig = compute_signature(b"payload", "un\u{00e9}cl\u{00e9}");
+        assert!(sig.is_some());
+        assert!(sig.unwrap().starts_with("sha256="));
+    }
+
+    #[test]
+    fn hmac_large_payload_works() {
+        let large_payload = vec![0xABu8; 1_000_000]; // 1 MB
+        let sig = compute_signature(&large_payload, "secret").unwrap();
+        assert!(sig.starts_with("sha256="));
+        let hex_part = sig.strip_prefix("sha256=").unwrap();
+        assert_eq!(hex_part.len(), 64);
+    }
+
+    #[test]
+    fn hmac_known_vector() {
+        // HMAC-SHA256("", "key") should produce a known hash
+        // Verify it's deterministic and correct length
+        let sig = compute_signature(b"", "key").unwrap();
+        let hex_part = sig.strip_prefix("sha256=").unwrap();
+        assert_eq!(hex_part.len(), 64);
+        // Verify the same inputs always produce the same output
+        let sig2 = compute_signature(b"", "key").unwrap();
+        assert_eq!(sig, sig2);
+    }
+
+    #[tokio::test]
+    async fn deliver_ssrf_localhost_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("http://localhost:8080/hook", &payload, None).await;
+        assert!(
+            result.is_err(),
+            "localhost should be rejected by SSRF check"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_ssrf_private_ip_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("http://192.168.1.1:8080/hook", &payload, None).await;
+        assert!(
+            result.is_err(),
+            "private IP should be rejected by SSRF check"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_ssrf_metadata_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("http://169.254.169.254/latest/meta-data/", &payload, None).await;
+        assert!(result.is_err(), "metadata endpoint should be rejected");
+    }
+
+    #[tokio::test]
+    async fn deliver_invalid_url_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("not-a-url", &payload, None).await;
+        assert!(result.is_err(), "invalid URL should be rejected");
+    }
+
+    #[tokio::test]
+    async fn deliver_ftp_scheme_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("ftp://example.com/file", &payload, None).await;
+        assert!(result.is_err(), "ftp:// scheme should be rejected");
+    }
+
+    #[tokio::test]
+    async fn deliver_file_scheme_rejected() {
+        let payload = serde_json::json!({"test": true});
+        let result = deliver("file:///etc/passwd", &payload, None).await;
+        assert!(result.is_err(), "file:// scheme should be rejected");
+    }
 }

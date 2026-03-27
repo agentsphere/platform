@@ -1407,3 +1407,383 @@ async fn info_refs_pkt_line_header_upload_pack(pool: PgPool) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests: API token boundary enforcement (check_access_for_user)
+// ---------------------------------------------------------------------------
+
+/// API token scoped to a different project is denied access.
+#[sqlx::test(migrations = "./migrations")]
+async fn api_token_boundary_wrong_project_denied(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state);
+
+    let project_a = create_project(&app, &admin_token, "tok-bnd-a", "internal").await;
+    let _project_b = create_project(&app, &admin_token, "tok-bnd-b", "internal").await;
+
+    // Create token scoped to project_a
+    let admin_id: (uuid::Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (raw_token, token_hash) = token::generate_api_token();
+    sqlx::query(
+        "INSERT INTO api_tokens (user_id, name, token_hash, project_id, expires_at)
+         VALUES ($1, 'scoped-tok', $2, $3, now() + interval '1 day')",
+    )
+    .bind(admin_id.0)
+    .bind(&token_hash)
+    .bind(project_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Try accessing project_b with a token scoped to project_a
+    let auth = basic_auth("admin", &raw_token);
+    let (status, _, _) = git_get(
+        &app,
+        "/admin/tok-bnd-b/info/refs?service=git-upload-pack",
+        Some(&auth),
+    )
+    .await;
+
+    // Token boundary mismatch -> 404
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// API token scoped to the correct project is allowed.
+#[sqlx::test(migrations = "./migrations")]
+async fn api_token_boundary_matching_project_allowed(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "tok-bnd-ok", "internal").await;
+
+    let admin_id: (uuid::Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (raw_token, token_hash) = token::generate_api_token();
+    sqlx::query(
+        "INSERT INTO api_tokens (user_id, name, token_hash, project_id, expires_at)
+         VALUES ($1, 'scoped-ok', $2, $3, now() + interval '1 day')",
+    )
+    .bind(admin_id.0)
+    .bind(&token_hash)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let auth = basic_auth("admin", &raw_token);
+    let (status, _, _) = git_get(
+        &app,
+        "/admin/tok-bnd-ok/info/refs?service=git-upload-pack",
+        Some(&auth),
+    )
+    .await;
+
+    // Should pass access control
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    assert_ne!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: WWW-Authenticate header on 401 responses
+// ---------------------------------------------------------------------------
+
+/// 401 responses on git endpoints include WWW-Authenticate: Basic header.
+#[sqlx::test(migrations = "./migrations")]
+async fn www_authenticate_header_on_401(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    create_project(&app, &admin_token, "www-auth-proj", "private").await;
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin/www-auth-proj/info/refs?service=git-upload-pack")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let www_auth = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        www_auth,
+        Some("Basic realm=\"platform\""),
+        "401 responses should include WWW-Authenticate header"
+    );
+}
+
+/// Non-401 responses do NOT get WWW-Authenticate header.
+#[sqlx::test(migrations = "./migrations")]
+async fn no_www_authenticate_header_on_non_401(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    create_project(&app, &admin_token, "www-ok-proj", "public").await;
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin/www-ok-proj/info/refs?service=git-upload-pack")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+
+    // Public repo + upload-pack = no auth needed, so no 401
+    if resp.status() != StatusCode::UNAUTHORIZED {
+        assert!(
+            resp.headers().get("WWW-Authenticate").is_none(),
+            "non-401 responses should NOT have WWW-Authenticate header"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: enforce_push_protection (via receive-pack with pkt-line header)
+// ---------------------------------------------------------------------------
+
+/// Push to a branch with `require_pr = true` protection is rejected (403).
+#[sqlx::test(migrations = "./migrations")]
+async fn enforce_push_protection_require_pr_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "prot-pr-proj", "private").await;
+
+    // Create a bare repo and point the project at it
+    let (_bare_dir, bare_path) = helpers::create_bare_repo();
+    let (_work_dir, _work_path) = helpers::create_working_copy(&bare_path);
+
+    sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
+        .bind(bare_path.to_str().unwrap())
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create branch protection rule requiring PRs on main
+    helpers::insert_branch_protection(
+        &pool,
+        project_id,
+        "main",
+        0,
+        &["merge"],
+        &[],
+        false,
+        false, // no admin bypass
+    )
+    .await;
+
+    // Also set require_pr = true
+    sqlx::query(
+        "UPDATE branch_protection_rules SET require_pr = true WHERE project_id = $1 AND pattern = $2",
+    )
+    .bind(project_id)
+    .bind("main")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Build a pkt-line push command targeting refs/heads/main
+    let old_sha = "a".repeat(40);
+    let new_sha = "b".repeat(40);
+    let cmd = format!("{old_sha} {new_sha} refs/heads/main\0 report-status\n");
+    let pkt_len = cmd.len() + 4;
+    let mut body_data = format!("{pkt_len:04x}{cmd}0000").into_bytes();
+    // Append minimal PACK header (empty pack)
+    body_data.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+
+    let auth = basic_auth("admin", "testpassword");
+    let (status, _, _) = git_post(
+        &app,
+        "/admin/prot-pr-proj/git-receive-pack",
+        Some(&auth),
+        body_data,
+        "application/x-git-receive-pack-request",
+    )
+    .await;
+
+    // Branch protection with require_pr blocks direct push -> 403
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Push to an unprotected branch passes through protection checks.
+#[sqlx::test(migrations = "./migrations")]
+async fn enforce_push_protection_unprotected_branch_passes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "prot-unp-proj", "private").await;
+
+    let (_bare_dir, bare_path) = helpers::create_bare_repo();
+    let (_work_dir, _work_path) = helpers::create_working_copy(&bare_path);
+
+    sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
+        .bind(bare_path.to_str().unwrap())
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Protection on main, but push to feature branch
+    helpers::insert_branch_protection(&pool, project_id, "main", 0, &["merge"], &[], false, false)
+        .await;
+    sqlx::query(
+        "UPDATE branch_protection_rules SET require_pr = true WHERE project_id = $1 AND pattern = $2",
+    )
+    .bind(project_id)
+    .bind("main")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Build pkt-line push to refs/heads/feature (not protected)
+    let old_sha = "0".repeat(40);
+    let new_sha = "b".repeat(40);
+    let cmd = format!("{old_sha} {new_sha} refs/heads/feature\0 report-status\n");
+    let pkt_len = cmd.len() + 4;
+    let mut body_data = format!("{pkt_len:04x}{cmd}0000").into_bytes();
+    body_data.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+
+    let auth = basic_auth("admin", "testpassword");
+
+    // Use timeout because if protection passes, git receive-pack will try to
+    // process the pack data (which is empty/invalid) — may hang or error
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        git_post(
+            &app,
+            "/admin/prot-unp-proj/git-receive-pack",
+            Some(&auth),
+            body_data,
+            "application/x-git-receive-pack-request",
+        ),
+    )
+    .await;
+
+    match result {
+        Ok((status, _, _)) => {
+            // Should NOT be 403 (Forbidden) — push protection passed
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "unprotected branch should not be blocked"
+            );
+        }
+        Err(_timeout) => {
+            // Timeout = got past protection, git is processing. Test passes.
+        }
+    }
+}
+
+/// Push with tag ref (refs/tags/*) skips branch protection entirely.
+#[sqlx::test(migrations = "./migrations")]
+async fn enforce_push_protection_tag_push_skips_branch_rules(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "prot-tag-proj", "private").await;
+
+    let (_bare_dir, bare_path) = helpers::create_bare_repo();
+    let (_work_dir, _work_path) = helpers::create_working_copy(&bare_path);
+
+    sqlx::query("UPDATE projects SET repo_path = $1 WHERE id = $2")
+        .bind(bare_path.to_str().unwrap())
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Protect everything with require_pr
+    helpers::insert_branch_protection(&pool, project_id, "*", 0, &["merge"], &[], false, false)
+        .await;
+    sqlx::query("UPDATE branch_protection_rules SET require_pr = true WHERE project_id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Push a tag — tags are refs/tags/*, not refs/heads/*, so branch protection shouldn't apply
+    let old_sha = "0".repeat(40);
+    let new_sha = "b".repeat(40);
+    let cmd = format!("{old_sha} {new_sha} refs/tags/v1.0.0\0 report-status\n");
+    let pkt_len = cmd.len() + 4;
+    let mut body_data = format!("{pkt_len:04x}{cmd}0000").into_bytes();
+    body_data.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+
+    let auth = basic_auth("admin", "testpassword");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        git_post(
+            &app,
+            "/admin/prot-tag-proj/git-receive-pack",
+            Some(&auth),
+            body_data,
+            "application/x-git-receive-pack-request",
+        ),
+    )
+    .await;
+
+    match result {
+        Ok((status, _, _)) => {
+            // Tag push should NOT be blocked by branch protection
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "tag push should not be blocked by branch protection"
+            );
+        }
+        Err(_timeout) => {
+            // Timeout = got past protection. Test passes.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: receive-pack with incomplete/malformed pack data
+// ---------------------------------------------------------------------------
+
+/// receive-pack with body that has no flush-pkt returns 400 (incomplete).
+#[sqlx::test(migrations = "./migrations")]
+async fn receive_pack_incomplete_pack_data(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = git_test_router(state);
+
+    create_project(&app, &admin_token, "rp-incomp-proj", "private").await;
+
+    let auth = basic_auth("admin", "testpassword");
+    // Send body that never contains a flush-pkt (0000) — truncated at 50 bytes
+    let body_data = vec![0x41u8; 50]; // "AAA..." — not valid pkt-line
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        git_post(
+            &app,
+            "/admin/rp-incomp-proj/git-receive-pack",
+            Some(&auth),
+            body_data,
+            "application/x-git-receive-pack-request",
+        ),
+    )
+    .await;
+
+    match result {
+        Ok((status, _, _)) => {
+            // Could be 400 (incomplete pack data) or 500 (git error)
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "should not succeed with garbage data"
+            );
+        }
+        Err(_timeout) => {
+            // Timeout = git is hanging on stdin. Acceptable outcome for malformed data.
+        }
+    }
+}

@@ -1130,4 +1130,240 @@ mod tests {
         assert_eq!(subjects[0]["kind"], "ServiceAccount");
         assert_eq!(subjects[0]["namespace"], "test-ns");
     }
+
+    // -- session namespace name DNS label limit --
+
+    #[test]
+    fn session_namespace_name_always_under_63_chars() {
+        let config = Config::test_default();
+        // 40-char slug (max from slugify_namespace) + "-s-" + 8-char ID = 51 chars
+        let slug = "a".repeat(40);
+        let short_id = "12345678";
+        let name = session_namespace_name(&config, &slug, short_id);
+        assert!(
+            name.len() <= 63,
+            "session namespace name must be <= 63 chars (DNS label limit), got {} chars: {name}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn session_namespace_name_with_prefix_under_63_chars() {
+        let mut config = Config::test_default();
+        // Short prefix
+        config.ns_prefix = Some("pf".into());
+        let slug = "a".repeat(40);
+        let short_id = "12345678";
+        let name = session_namespace_name(&config, &slug, short_id);
+        // pf- + 40 + -s- + 8 = 54 chars
+        assert!(
+            name.len() <= 63,
+            "with prefix, session namespace should be <= 63 chars, got {} chars: {name}",
+            name.len()
+        );
+    }
+
+    // -- build_namespace_object: pod security admission for session --
+
+    #[test]
+    fn namespace_object_session_has_pod_security_labels() {
+        let ns = build_namespace_object("myapp-s-abc123", "session", "proj-1", false);
+        let labels = ns["metadata"]["labels"].as_object().unwrap();
+        assert_eq!(
+            labels.get("pod-security.kubernetes.io/enforce"),
+            Some(&serde_json::Value::String("baseline".into())),
+            "session namespace should enforce baseline PSA"
+        );
+        assert_eq!(
+            labels.get("pod-security.kubernetes.io/enforce-version"),
+            Some(&serde_json::Value::String("latest".into())),
+        );
+        assert_eq!(
+            labels.get("pod-security.kubernetes.io/warn"),
+            Some(&serde_json::Value::String("restricted".into())),
+            "session namespace should warn on restricted PSA"
+        );
+        assert_eq!(
+            labels.get("pod-security.kubernetes.io/warn-version"),
+            Some(&serde_json::Value::String("latest".into())),
+        );
+    }
+
+    #[test]
+    fn namespace_object_session_dev_mode_skips_psa() {
+        let ns = build_namespace_object("myapp-s-abc123", "session", "proj-1", true);
+        let labels = ns["metadata"]["labels"].as_object().unwrap();
+        assert!(
+            labels.get("pod-security.kubernetes.io/enforce").is_none(),
+            "dev mode session should not have PSA labels"
+        );
+        assert!(
+            labels.get("pod-security.kubernetes.io/warn").is_none(),
+            "dev mode session should not have PSA warn labels"
+        );
+    }
+
+    #[test]
+    fn namespace_object_non_session_env_no_psa() {
+        let ns = build_namespace_object("myapp-dev", "dev", "proj-1", false);
+        let labels = ns["metadata"]["labels"].as_object().unwrap();
+        assert!(
+            labels.get("pod-security.kubernetes.io/enforce").is_none(),
+            "non-session env should not have PSA labels"
+        );
+    }
+
+    // -- build_session_network_policy with different services_namespace --
+
+    #[test]
+    fn session_network_policy_different_services_namespace() {
+        let np = build_session_network_policy("my-app", "platform", "services-ns");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        // First egress rule should have 2 namespace selectors (platform + services-ns)
+        let platform_rule = &egress[0];
+        let to = platform_rule["to"].as_array().unwrap();
+        assert_eq!(
+            to.len(),
+            2,
+            "should have two namespace selectors when services_namespace differs"
+        );
+        let ns1 = &to[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
+        let ns2 = &to[1]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
+        assert_eq!(ns1, "platform");
+        assert_eq!(ns2, "services-ns");
+    }
+
+    #[test]
+    fn session_network_policy_same_services_namespace_deduplicates() {
+        let np = build_session_network_policy("my-app", "platform", "platform");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        let platform_rule = &egress[0];
+        let to = platform_rule["to"].as_array().unwrap();
+        assert_eq!(
+            to.len(),
+            1,
+            "should have one selector when services_namespace == platform_namespace"
+        );
+    }
+
+    // -- build_namespace_network_policy with different services_namespace --
+
+    #[test]
+    fn namespace_network_policy_different_services_namespace() {
+        let np = build_namespace_network_policy("my-app", "platform", "svc-ns");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        // First two rules should be for platform and svc-ns respectively
+        assert!(
+            egress.len() >= 4,
+            "should have 4 egress rules (2 ns + dns + internet)"
+        );
+        let first_to =
+            &egress[0]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
+        let second_to =
+            &egress[1]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
+        assert_eq!(first_to, "platform");
+        assert_eq!(second_to, "svc-ns");
+    }
+
+    #[test]
+    fn namespace_network_policy_same_services_namespace_no_duplicate() {
+        let np = build_namespace_network_policy("my-app", "platform", "platform");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        // Should have 3 rules: 1 platform + dns + internet (not 4)
+        assert_eq!(
+            egress.len(),
+            3,
+            "same services_ns should not duplicate: got {}",
+            egress.len()
+        );
+    }
+
+    // -- build_session_rbac: all 3 rules, no networking.k8s.io --
+
+    #[test]
+    fn build_session_rbac_has_exactly_3_rules() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        let rules = role["rules"].as_array().unwrap();
+        assert_eq!(
+            rules.len(),
+            3,
+            "should have core, apps, batch (no networking.k8s.io)"
+        );
+    }
+
+    #[test]
+    fn build_session_rbac_role_all_verbs_wildcard() {
+        let (_, role, _) = build_session_rbac("test-ns");
+        let rules = role["rules"].as_array().unwrap();
+        for rule in rules {
+            let verbs = rule["verbs"].as_array().unwrap();
+            assert_eq!(verbs.len(), 1);
+            assert_eq!(verbs[0], "*");
+        }
+    }
+
+    // -- build_network_policy: agent-session selector --
+
+    #[test]
+    fn build_network_policy_targets_agent_session_pods() {
+        let np = build_network_policy("my-ns", "platform");
+        let selector = &np["spec"]["podSelector"]["matchLabels"]["platform.io/component"];
+        assert_eq!(selector, "agent-session");
+    }
+
+    // -- namespace_object general --
+
+    #[test]
+    fn namespace_object_has_managed_by_label() {
+        let ns = build_namespace_object("test-ns", "dev", "proj-123", false);
+        let labels = ns["metadata"]["labels"].as_object().unwrap();
+        assert_eq!(labels["platform.io/managed-by"], "platform");
+    }
+
+    #[test]
+    fn namespace_object_kind_and_api_version() {
+        let ns = build_namespace_object("test-ns", "dev", "proj-123", false);
+        assert_eq!(ns["apiVersion"], "v1");
+        assert_eq!(ns["kind"], "Namespace");
+    }
+
+    // -- session_namespace_name: format variants --
+
+    #[test]
+    fn session_namespace_name_format_no_prefix() {
+        let config = Config::test_default();
+        let name = session_namespace_name(&config, "my-app", "abcd1234");
+        assert_eq!(name, "my-app-s-abcd1234");
+    }
+
+    #[test]
+    fn session_namespace_name_format_with_prefix() {
+        let mut config = Config::test_default();
+        config.ns_prefix = Some("prod".into());
+        let name = session_namespace_name(&config, "my-app", "abcd1234");
+        assert_eq!(name, "prod-my-app-s-abcd1234");
+    }
+
+    // -- slugify_namespace: additional edge cases --
+
+    #[test]
+    fn slugify_namespace_single_char() {
+        assert_eq!(slugify_namespace("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn slugify_namespace_numeric_only() {
+        assert_eq!(slugify_namespace("12345").unwrap(), "12345");
+    }
+
+    #[test]
+    fn slugify_namespace_mixed_special_at_truncation_boundary() {
+        // Create a name that would have a hyphen right at char 40 after conversion
+        let mut name = "a".repeat(39);
+        name.push('-');
+        name.push('b');
+        let slug = slugify_namespace(&name).unwrap();
+        assert!(slug.len() <= 40);
+        assert!(!slug.ends_with('-'));
+    }
 }

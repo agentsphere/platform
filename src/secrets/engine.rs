@@ -972,4 +972,194 @@ mod tests {
         assert_eq!(patterns[0].2, "A");
         assert_eq!(patterns[1].2, "B");
     }
+
+    // -- Additional encrypt/decrypt tests --
+
+    #[test]
+    fn encrypt_binary_data_roundtrip() {
+        let key = [42u8; 32];
+        // Binary data with null bytes, high bytes, etc.
+        let plaintext: Vec<u8> = (0..=255u8).collect();
+        let encrypted = encrypt(&plaintext, &key).unwrap();
+        let decrypted = decrypt(&encrypted, &key, None).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_version_byte_only_fails() {
+        let key = [42u8; 32];
+        // Just the version byte and nothing else
+        let err = decrypt(&[ENCRYPTION_VERSION], &key, None).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "single version byte should fail with 'too short', got: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_empty_input_fails() {
+        let key = [42u8; 32];
+        let err = decrypt(&[], &key, None).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "empty input should fail with 'too short', got: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_version_byte_plus_short_nonce_fails() {
+        let key = [42u8; 32];
+        // Version byte + 5 bytes (not enough for 12-byte nonce)
+        let err = decrypt(&[ENCRYPTION_VERSION, 1, 2, 3, 4, 5], &key, None).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "version + short nonce should fail with 'too short', got: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_with_previous_key_both_wrong_fails() {
+        let key1 = [10u8; 32];
+        let key2 = [20u8; 32];
+        let key3 = [30u8; 32];
+        let encrypted = encrypt(b"test data", &key1).unwrap();
+        let err = decrypt(&encrypted, &key2, Some(&key3)).unwrap_err();
+        assert!(
+            err.to_string().contains("decryption failed"),
+            "both wrong keys should fail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_previous_key_none_uses_only_current() {
+        let key = [42u8; 32];
+        let encrypted = encrypt(b"test", &key).unwrap();
+        let decrypted = decrypt(&encrypted, &key, None).unwrap();
+        assert_eq!(decrypted, b"test");
+    }
+
+    #[test]
+    fn dev_master_key_is_deterministic() {
+        let key1 = dev_master_key();
+        let key2 = dev_master_key();
+        assert_eq!(key1, key2, "dev_master_key should be deterministic");
+    }
+
+    #[test]
+    fn parse_master_key_empty_string_fails() {
+        let err = parse_master_key("").unwrap_err();
+        assert!(
+            err.to_string().contains("32 bytes") || err.to_string().contains("hex"),
+            "empty string should fail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_master_key_with_leading_trailing_whitespace() {
+        let hex_key = format!("\t{}\n", "bb".repeat(32));
+        let key = parse_master_key(&hex_key).unwrap();
+        assert_eq!(key, [0xbb; 32]);
+    }
+
+    #[test]
+    fn parse_master_key_uppercase_hex() {
+        let hex_key = "AA".repeat(32);
+        let key = parse_master_key(&hex_key).unwrap();
+        assert_eq!(key, [0xaa; 32]);
+    }
+
+    #[test]
+    fn parse_master_key_mixed_case_hex() {
+        // 64 hex chars (32 bytes) with mixed case — should succeed
+        let hex_key = "aAbBcCdDeEfF0011".repeat(4);
+        assert_eq!(hex_key.len(), 64);
+        let result = parse_master_key(&hex_key);
+        assert!(result.is_ok(), "mixed case hex should parse: {result:?}");
+    }
+
+    // -- Additional extract_secret_patterns tests --
+
+    #[test]
+    fn secret_pattern_special_chars_in_name_rejected() {
+        let patterns = extract_secret_patterns("${{ secrets.MY.SECRET }}");
+        assert!(
+            patterns.is_empty(),
+            "dots in secret name should be rejected"
+        );
+    }
+
+    #[test]
+    fn secret_pattern_with_extra_spaces() {
+        // The pattern requires exact match: "${{ secrets." ... " }}"
+        let patterns = extract_secret_patterns("${{  secrets.KEY  }}");
+        assert!(
+            patterns.is_empty(),
+            "extra spaces should not match the pattern"
+        );
+    }
+
+    #[test]
+    fn secret_pattern_nested_braces() {
+        // Nested braces produce unpredictable matches — just verify no panic
+        let patterns = extract_secret_patterns("${{ secrets.${{ secrets.A }} }}");
+        // The regex may match "A " or nothing depending on greedy/lazy — just check no panic
+        let _ = patterns;
+    }
+
+    #[test]
+    fn secret_pattern_numeric_name() {
+        let patterns = extract_secret_patterns("${{ secrets.12345 }}");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].2, "12345");
+    }
+
+    #[test]
+    fn secret_pattern_single_char_name() {
+        let patterns = extract_secret_patterns("${{ secrets.X }}");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].2, "X");
+    }
+
+    // -- Key rotation simulation --
+
+    #[test]
+    fn key_rotation_old_data_decryptable_after_rotation() {
+        let old_key = [11u8; 32];
+        let new_key = [22u8; 32];
+
+        // Encrypt multiple values with old key
+        let enc1 = encrypt(b"secret-1", &old_key).unwrap();
+        let enc2 = encrypt(b"secret-2", &old_key).unwrap();
+
+        // After rotation, new_key is current, old_key is previous
+        let dec1 = decrypt(&enc1, &new_key, Some(&old_key)).unwrap();
+        let dec2 = decrypt(&enc2, &new_key, Some(&old_key)).unwrap();
+        assert_eq!(dec1, b"secret-1");
+        assert_eq!(dec2, b"secret-2");
+
+        // New data encrypted with new key
+        let enc3 = encrypt(b"secret-3", &new_key).unwrap();
+        let dec3 = decrypt(&enc3, &new_key, Some(&old_key)).unwrap();
+        assert_eq!(dec3, b"secret-3");
+    }
+
+    #[test]
+    fn key_rotation_re_encrypt_with_new_key() {
+        let old_key = [11u8; 32];
+        let new_key = [22u8; 32];
+
+        // Original encryption with old key
+        let encrypted_old = encrypt(b"rotating-secret", &old_key).unwrap();
+
+        // Decrypt with old key as fallback
+        let plaintext = decrypt(&encrypted_old, &new_key, Some(&old_key)).unwrap();
+        assert_eq!(plaintext, b"rotating-secret");
+
+        // Re-encrypt with new key
+        let encrypted_new = encrypt(&plaintext, &new_key).unwrap();
+
+        // Now decryptable with new key only (no previous key needed)
+        let decrypted = decrypt(&encrypted_new, &new_key, None).unwrap();
+        assert_eq!(decrypted, b"rotating-secret");
+    }
 }

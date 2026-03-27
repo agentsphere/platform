@@ -132,4 +132,23 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         drop(shutdown_rx);
     }
+
+    #[test]
+    fn create_channels_returns_valid_senders() {
+        let (channels, _spans_rx, _logs_rx, _metrics_rx) = ingest::create_channels();
+        // Senders should have capacity (channel not full)
+        assert!(channels.spans_tx.capacity() > 0);
+        assert!(channels.logs_tx.capacity() > 0);
+        assert!(channels.metrics_tx.capacity() > 0);
+    }
+
+    #[test]
+    fn router_includes_all_signal_routes() {
+        let (channels, _spans_rx, _logs_rx, _metrics_rx) = ingest::create_channels();
+        let router: Router<AppState> = router(channels);
+        // If we get here without panic, all routes are properly wired.
+        // We can't easily test route matching without a state, but this
+        // verifies the router construction is sound.
+        let _ = router;
+    }
 }

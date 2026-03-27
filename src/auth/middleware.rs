@@ -754,4 +754,152 @@ mod tests {
         assert_eq!(auth.boundary_workspace_id, Some(ws_id));
         assert!(auth.boundary_project_id.is_none());
     }
+
+    // -- parse_user_type tests --
+
+    #[test]
+    fn parse_user_type_human() {
+        let ut = parse_user_type("human").unwrap();
+        assert_eq!(ut, UserType::Human);
+    }
+
+    #[test]
+    fn parse_user_type_agent() {
+        let ut = parse_user_type("agent").unwrap();
+        assert_eq!(ut, UserType::Agent);
+    }
+
+    #[test]
+    fn parse_user_type_service_account() {
+        let ut = parse_user_type("service_account").unwrap();
+        assert_eq!(ut, UserType::ServiceAccount);
+    }
+
+    #[test]
+    fn parse_user_type_unknown_returns_internal_error() {
+        let err = parse_user_type("robot");
+        assert!(matches!(err, Err(ApiError::Internal(_))));
+    }
+
+    // -- Additional extract_bearer_token edge cases --
+
+    #[test]
+    fn bearer_token_with_non_ascii_header_returns_none() {
+        // Non-ASCII bytes in the Authorization header
+        let mut builder = Request::builder().uri("/test");
+        builder = builder.header("authorization", &b"Bearer \xff\xfe"[..]);
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        // to_str() will fail on non-UTF8, returning None
+        assert_eq!(extract_bearer_token(&parts), None);
+    }
+
+    // -- Additional extract_session_cookie tests --
+
+    #[test]
+    fn session_cookie_first_of_multiple_session_keys() {
+        let parts = make_parts(&[("cookie", "session=first; session=second")]);
+        assert_eq!(extract_session_cookie(&parts), Some("first"));
+    }
+
+    #[test]
+    fn session_cookie_with_path() {
+        let parts = make_parts(&[("cookie", "other=val; session=abc123; path=/api")]);
+        assert_eq!(extract_session_cookie(&parts), Some("abc123"));
+    }
+
+    // -- Additional extract_ip tests --
+
+    #[test]
+    fn ip_forwarded_for_single_ip_with_spaces() {
+        let parts = make_parts(&[("x-forwarded-for", "  9.8.7.6  ")]);
+        assert_eq!(extract_ip(&parts, true, &[]), Some("9.8.7.6".into()));
+    }
+
+    #[test]
+    fn ip_cidr_no_connect_info_trusts_header() {
+        // When CIDRs are configured but no ConnectInfo is available,
+        // the header is trusted (can't enforce CIDRs without connecting IP)
+        let cidrs = vec!["10.0.0.0/8".to_string()];
+        let parts = make_parts(&[("x-forwarded-for", "1.2.3.4")]);
+        // No ConnectInfo inserted — no extensions
+        assert_eq!(extract_ip(&parts, true, &cidrs), Some("1.2.3.4".into()));
+    }
+
+    // -- Additional cidr_matches tests --
+
+    #[test]
+    fn cidr_matches_ipv6() {
+        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(cidr_matches(ip, &["2001:db8::/32".to_string()]));
+    }
+
+    #[test]
+    fn cidr_matches_ipv6_outside_range() {
+        let ip: std::net::IpAddr = "2001:db9::1".parse().unwrap();
+        assert!(!cidr_matches(ip, &["2001:db8::/32".to_string()]));
+    }
+
+    #[test]
+    fn cidr_matches_empty_list() {
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!cidr_matches(ip, &[]));
+    }
+
+    // -- AuthUser record_to_span --
+
+    #[test]
+    fn record_to_span_does_not_panic_outside_span() {
+        // Calling record_to_span when there's no active span should not panic
+        let auth = AuthUser::test_human(Uuid::new_v4());
+        auth.record_to_span(); // Should be a no-op, not panic
+    }
+
+    #[test]
+    fn record_to_span_with_session_id() {
+        let mut auth = AuthUser::test_human(Uuid::new_v4());
+        auth.session_id = Some(Uuid::new_v4());
+        auth.record_to_span(); // Should not panic
+    }
+
+    // -- AuthUser debug impl --
+
+    #[test]
+    fn auth_user_debug_format() {
+        let auth = AuthUser::test_human(Uuid::new_v4());
+        let debug = format!("{auth:?}");
+        assert!(
+            debug.contains("AuthUser"),
+            "debug should contain struct name"
+        );
+        assert!(
+            debug.contains("test_user"),
+            "debug should contain user_name"
+        );
+    }
+
+    // -- AuthUser clone --
+
+    #[test]
+    fn auth_user_clone_preserves_all_fields() {
+        let project_id = Uuid::new_v4();
+        let ws_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let mut auth = AuthUser::test_human(user_id);
+        auth.token_scopes = Some(vec!["project:read".into()]);
+        auth.boundary_workspace_id = Some(ws_id);
+        auth.boundary_project_id = Some(project_id);
+        auth.session_id = Some(session_id);
+        auth.session_token_hash = Some("hash123".into());
+
+        let cloned = auth.clone();
+        assert_eq!(cloned.user_id, user_id);
+        assert_eq!(cloned.user_name, "test_user");
+        assert_eq!(cloned.user_type, UserType::Human);
+        assert_eq!(cloned.boundary_workspace_id, Some(ws_id));
+        assert_eq!(cloned.boundary_project_id, Some(project_id));
+        assert_eq!(cloned.session_id, Some(session_id));
+        assert_eq!(cloned.session_token_hash, Some("hash123".into()));
+        assert_eq!(cloned.token_scopes, Some(vec!["project:read".to_string()]));
+    }
 }

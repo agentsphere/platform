@@ -283,3 +283,92 @@ async fn proxy_invalid_namespace_returns_400(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("namespace"));
 }
+
+// ---------------------------------------------------------------------------
+// Deploy preview proxy tests
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_project_not_found_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_project = Uuid::new_v4();
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{fake_project}/my-svc"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("project"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_invalid_service_name_returns_400(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-badsvc", "private").await;
+
+    // Service name with uppercase chars -- fails validation
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/INVALID_SVC"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("service name"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_auth_required(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_project = Uuid::new_v4();
+    let (status, _body) =
+        helpers::get_json(&app, "", &format!("/deploy-preview/{fake_project}/my-svc")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_non_reader_returns_404(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "dp-denied", "private").await;
+
+    // Create a user with no role on the project
+    let (_other_id, other_token) =
+        create_user(&app, &admin_token, "dpother1", "dpother1@test.com").await;
+
+    let (status, _body) = helpers::get_json(
+        &app,
+        &other_token,
+        &format!("/deploy-preview/{project_id}/my-svc"),
+    )
+    .await;
+    // Private project, no access -> 404 (not 403)
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_service_not_found_in_k8s(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-nosvc", "public").await;
+
+    // The K8s namespace for this project likely doesn't exist, so the Service won't be found
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/nonexistent-svc"),
+    )
+    .await;
+    // Should get 404 for the service (K8s API returns 404)
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}

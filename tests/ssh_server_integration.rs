@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 mod helpers;
 
 use axum::http::StatusCode;
@@ -431,5 +433,356 @@ async fn test_ssh_key_inactive_user_rejected(pool: PgPool) {
     assert!(
         row.is_none(),
         "deactivated user should not be found by fingerprint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resolve_project integration tests
+// ---------------------------------------------------------------------------
+
+/// resolve_project returns the correct project for owner/repo.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_resolve_project_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let (_project_id, _admin_id) = setup_project(&state, &admin_token, &app, "public").await;
+
+    // Look up the admin user's name
+    let admin_name: String = sqlx::query_scalar("SELECT name FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // List the project we just created
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM projects WHERE owner_id = (SELECT id FROM users WHERE name = 'admin') AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let (project_id, project_name) = row.unwrap();
+
+    let resolved = platform::git::smart_http::resolve_project(
+        &state.pool,
+        &state.config,
+        &admin_name,
+        &project_name,
+    )
+    .await
+    .expect("resolve_project should succeed");
+    assert_eq!(resolved.project_id, project_id);
+    assert_eq!(resolved.visibility, "public");
+}
+
+/// resolve_project returns error for non-existent owner/repo.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_resolve_project_not_found(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    let result = platform::git::smart_http::resolve_project(
+        &state.pool,
+        &state.config,
+        "nonexistent-owner",
+        "nonexistent-repo",
+    )
+    .await;
+    assert!(result.is_err(), "should fail for nonexistent project");
+}
+
+/// resolve_project returns error for deactivated (soft-deleted) project.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_resolve_project_soft_deleted(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let (project_id, _admin_id) = setup_project(&state, &admin_token, &app, "public").await;
+
+    let admin_name: String = sqlx::query_scalar("SELECT name FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let project_name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Soft-delete the project
+    sqlx::query("UPDATE projects SET is_active = false WHERE id = $1")
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = platform::git::smart_http::resolve_project(
+        &state.pool,
+        &state.config,
+        &admin_name,
+        &project_name,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "soft-deleted project should not be resolved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSH key last_used_at update test
+// ---------------------------------------------------------------------------
+
+/// After a fingerprint lookup, last_used_at should be set.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_key_last_used_at_updated(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/users/me/ssh-keys",
+        serde_json::json!({
+            "name": "last-used-test",
+            "public_key": TEST_ED25519_KEY,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "add key: {body}");
+    let fingerprint = body["fingerprint"].as_str().unwrap().to_string();
+
+    // Initially last_used_at should be NULL
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_used_at FROM user_ssh_keys WHERE fingerprint = $1")
+            .bind(&fingerprint)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(before.is_none(), "last_used_at should be NULL initially");
+
+    // Simulate the SSH server's last_used_at update (fire-and-forget)
+    sqlx::query("UPDATE user_ssh_keys SET last_used_at = now() WHERE fingerprint = $1")
+        .bind(&fingerprint)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Now last_used_at should be set
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_used_at FROM user_ssh_keys WHERE fingerprint = $1")
+            .bind(&fingerprint)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(after.is_some(), "last_used_at should be set after update");
+}
+
+// ---------------------------------------------------------------------------
+// Unknown fingerprint test
+// ---------------------------------------------------------------------------
+
+/// Fingerprint not in DB returns no match.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_key_unknown_fingerprint_returns_none(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT k.user_id FROM user_ssh_keys k JOIN users u ON u.id = k.user_id AND u.is_active = true WHERE k.fingerprint = $1",
+    )
+    .bind("SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=")
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap();
+
+    assert!(
+        row.is_none(),
+        "unknown fingerprint should return no results"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSH server run() with ssh_listen = None
+// ---------------------------------------------------------------------------
+
+/// `run()` returns Ok immediately when `ssh_listen` is None.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_server_run_no_listen(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+    // state.config.ssh_listen is already None from test_state()
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    let result = platform::git::ssh_server::run(state, shutdown_rx).await;
+    assert!(
+        result.is_ok(),
+        "run() with ssh_listen=None should return Ok immediately"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Host key permission tests
+// ---------------------------------------------------------------------------
+
+/// Generated host key should have 0600 permissions on Unix.
+#[cfg(unix)]
+#[sqlx::test(migrations = "./migrations")]
+async fn test_ssh_host_key_permissions(pool: PgPool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut state, _admin_token) = helpers::test_state(pool).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let key_path = tmp.path().join("perm-test-key");
+
+    let mut config = (*state.config).clone();
+    config.ssh_host_key_path = key_path.to_str().unwrap().to_string();
+    state.config = std::sync::Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    let state_clone = state.clone();
+
+    let handle = tokio::spawn(async move {
+        platform::git::ssh_server::run_with_listener(state_clone, listener, &mut shutdown_rx).await
+    });
+
+    // Let the server start and generate the key
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(key_path.exists(), "host key should have been generated");
+    let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "host key should have 0600 permissions, got {:04o}",
+        mode & 0o777
+    );
+
+    shutdown_tx.send(()).unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// Token-scoped SSH user with matching project boundary
+// ---------------------------------------------------------------------------
+
+/// Token-scoped to a matching project should allow access.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_check_access_for_user_scope_project_match(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state.clone());
+    let (project_id, admin_id) = setup_project(&state, &admin_token, &app, "public").await;
+
+    // Token scoped to the SAME project
+    let git_user = GitUser {
+        user_id: admin_id,
+        user_name: "admin".into(),
+        ip_addr: None,
+        boundary_project_id: Some(project_id),
+        boundary_workspace_id: None,
+        token_scopes: None,
+    };
+    let project = make_resolved_project(project_id, "public");
+
+    let result = check_access_for_user(&state, &git_user, &project, true).await;
+    assert!(
+        result.is_ok(),
+        "project scope match should allow access: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Owner can always read their own project
+// ---------------------------------------------------------------------------
+
+/// Owner of a private project should be able to read it, even without explicit roles.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_check_access_owner_private_read(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+
+    // Create a non-admin user who will own the project
+    let (owner_id, owner_token) =
+        helpers::create_user(&app, &admin_token, "proj-owner", "projowner@example.com").await;
+    helpers::assign_role(&app, &admin_token, owner_id, "developer", None, &pool).await;
+
+    // Create a private project owned by this user
+    let project_id = helpers::create_project(&app, &owner_token, "owned-proj", "private").await;
+
+    let git_user = make_git_user(owner_id);
+    let project = ResolvedProject {
+        project_id,
+        repo_disk_path: std::path::PathBuf::from("/tmp/nonexistent"),
+        default_branch: "main".into(),
+        visibility: "private".into(),
+        owner_id,
+    };
+
+    let result = check_access_for_user(&state, &git_user, &project, true).await;
+    assert!(
+        result.is_ok(),
+        "owner should be able to read own private project: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// enforce_push_protection integration test
+// ---------------------------------------------------------------------------
+
+/// Push to an unprotected branch should succeed.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_enforce_push_protection_unprotected_branch(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let (project_id, admin_id) = setup_project(&state, &admin_token, &app, "public").await;
+
+    let git_user = make_git_user(admin_id);
+    let project = make_resolved_project(project_id, "public");
+
+    // Push to an unprotected branch (no protection rules exist)
+    let ref_updates = vec![platform::git::hooks::RefUpdate {
+        old_sha: "0000000000000000000000000000000000000000".into(),
+        new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        refname: "refs/heads/feature/my-feature".into(),
+    }];
+
+    let result = platform::git::smart_http::enforce_push_protection(
+        &state,
+        &project,
+        &git_user,
+        &ref_updates,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "push to unprotected branch should succeed: {result:?}"
+    );
+}
+
+/// Push to a tag ref should pass protection (protection only covers branches).
+#[sqlx::test(migrations = "./migrations")]
+async fn test_enforce_push_protection_tag_ref_passes(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let (project_id, admin_id) = setup_project(&state, &admin_token, &app, "public").await;
+
+    let git_user = make_git_user(admin_id);
+    let project = make_resolved_project(project_id, "public");
+
+    let ref_updates = vec![platform::git::hooks::RefUpdate {
+        old_sha: "0000000000000000000000000000000000000000".into(),
+        new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        refname: "refs/tags/v1.0.0".into(),
+    }];
+
+    let result = platform::git::smart_http::enforce_push_protection(
+        &state,
+        &project,
+        &git_user,
+        &ref_updates,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "push to tag ref should pass protection: {result:?}"
     );
 }

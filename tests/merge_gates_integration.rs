@@ -13,7 +13,7 @@ use uuid::Uuid;
 // T2: enforce_merge_gates() — rejection tests (no git repo needed)
 // ---------------------------------------------------------------------------
 
-/// Merge blocked when merge_method doesn't match protection rule.
+/// Merge blocked when `merge_method` doesn't match protection rule.
 #[sqlx::test(migrations = "./migrations")]
 async fn merge_blocked_wrong_method(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;
@@ -859,7 +859,7 @@ async fn merge_already_merged_mr_returns_400(pool: PgPool) {
 // T4: require_up_to_date gate
 // ---------------------------------------------------------------------------
 
-/// Merge blocked when require_up_to_date is true and target has newer commits.
+/// Merge blocked when `require_up_to_date` is true and target has newer commits.
 #[sqlx::test(migrations = "./migrations")]
 async fn merge_blocked_require_up_to_date(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool.clone()).await;

@@ -454,3 +454,157 @@ async fn health_run_publishes_to_valkey(pool: PgPool) {
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
 }
+
+// ---------------------------------------------------------------------------
+// 9. health_is_ready_with_recent_healthy_snapshot
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_is_ready_with_recent_healthy_snapshot(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    // Inject a recent snapshot with both postgres and valkey healthy
+    {
+        let mut snap = state.health.write().unwrap();
+        snap.checked_at = Utc::now(); // recent
+        snap.subsystems = vec![
+            SubsystemCheck {
+                name: "postgres".into(),
+                status: SubsystemStatus::Healthy,
+                latency_ms: 2,
+                message: None,
+                checked_at: Utc::now(),
+            },
+            SubsystemCheck {
+                name: "valkey".into(),
+                status: SubsystemStatus::Healthy,
+                latency_ms: 1,
+                message: None,
+                checked_at: Utc::now(),
+            },
+        ];
+    }
+
+    let ready = platform::health::checks::is_ready(&state).await;
+    assert!(
+        ready,
+        "is_ready should return true when cached snapshot shows healthy"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. health_is_ready_postgres_unhealthy
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_is_ready_postgres_unhealthy(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    // Inject a recent snapshot where postgres is unhealthy
+    {
+        let mut snap = state.health.write().unwrap();
+        snap.checked_at = Utc::now();
+        snap.subsystems = vec![
+            SubsystemCheck {
+                name: "postgres".into(),
+                status: SubsystemStatus::Unhealthy,
+                latency_ms: 0,
+                message: Some("connection refused".into()),
+                checked_at: Utc::now(),
+            },
+            SubsystemCheck {
+                name: "valkey".into(),
+                status: SubsystemStatus::Healthy,
+                latency_ms: 1,
+                message: None,
+                checked_at: Utc::now(),
+            },
+        ];
+    }
+
+    let ready = platform::health::checks::is_ready(&state).await;
+    assert!(
+        !ready,
+        "is_ready should return false when postgres is unhealthy"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. health_is_ready_degraded_counts_as_not_ready
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_is_ready_degraded_counts_as_not_ready(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    // Degraded is NOT Healthy, so is_ready should return false
+    {
+        let mut snap = state.health.write().unwrap();
+        snap.checked_at = Utc::now();
+        snap.subsystems = vec![
+            SubsystemCheck {
+                name: "postgres".into(),
+                status: SubsystemStatus::Degraded,
+                latency_ms: 55,
+                message: None,
+                checked_at: Utc::now(),
+            },
+            SubsystemCheck {
+                name: "valkey".into(),
+                status: SubsystemStatus::Healthy,
+                latency_ms: 1,
+                message: None,
+                checked_at: Utc::now(),
+            },
+        ];
+    }
+
+    let ready = platform::health::checks::is_ready(&state).await;
+    assert!(
+        !ready,
+        "is_ready should return false when postgres is degraded (not Healthy)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. health_snapshot_includes_background_tasks
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn health_snapshot_includes_background_tasks(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+
+    // Register a background task
+    state.task_registry.register("test-task", 60);
+    state.task_registry.heartbeat("test-task");
+
+    // Override interval for fast tick
+    let mut config = (*state.config).clone();
+    config.health_check_interval_secs = 1;
+    let mut state = state;
+    state.config = Arc::new(config);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let run_state = state.clone();
+    let handle = tokio::spawn(async move {
+        platform::health::checks::run(run_state, shutdown_rx).await;
+    });
+
+    // Wait for a tick
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let snapshot = state.health.read().unwrap().clone();
+
+    // Should have our registered task
+    assert!(
+        snapshot
+            .background_tasks
+            .iter()
+            .any(|t| t.name == "test-task"),
+        "snapshot should include registered background tasks: {:?}",
+        snapshot.background_tasks
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}

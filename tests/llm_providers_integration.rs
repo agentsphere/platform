@@ -12,7 +12,7 @@ use helpers::{create_user, test_router, test_state};
 // Create provider
 // ---------------------------------------------------------------------------
 
-/// POST creates a provider config and returns the ID. No env_vars in response.
+/// POST creates a provider config and returns the ID. No `env_vars` in response.
 #[sqlx::test(migrations = "./migrations")]
 async fn create_provider(pool: PgPool) {
     let (state, admin_token) = test_state(pool).await;
@@ -52,7 +52,7 @@ async fn create_provider(pool: PgPool) {
 // Input validation
 // ---------------------------------------------------------------------------
 
-/// Oversized label and invalid provider_type are rejected.
+/// Oversized label and invalid `provider_type` are rejected.
 #[sqlx::test(migrations = "./migrations")]
 async fn create_provider_validates_input(pool: PgPool) {
     let (state, admin_token) = test_state(pool).await;
@@ -191,7 +191,7 @@ async fn list_providers(pool: PgPool) {
 // Update provider
 // ---------------------------------------------------------------------------
 
-/// PUT updates a provider's label and env_vars.
+/// PUT updates a provider's label and `env_vars`.
 #[sqlx::test(migrations = "./migrations")]
 async fn update_provider(pool: PgPool) {
     let (state, admin_token) = test_state(pool).await;
@@ -544,7 +544,7 @@ async fn set_active_custom_requires_validation(pool: PgPool) {
 // Delete provider reverts active to "auto"
 // ---------------------------------------------------------------------------
 
-/// Deleting the active custom provider reverts active_llm_provider to "auto".
+/// Deleting the active custom provider reverts `active_llm_provider` to "auto".
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_active_provider_reverts_to_auto(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
@@ -699,4 +699,367 @@ async fn unauthenticated_returns_401(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Too many env vars
+// ---------------------------------------------------------------------------
+
+/// Creating a provider with more than 50 env vars returns 400.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_provider_too_many_env_vars(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) =
+        create_user(&app, &admin_token, "llmenvmax", "llmenvmax@test.com").await;
+
+    // Build 51 env vars
+    let mut env_vars = serde_json::Map::new();
+    for i in 0..51 {
+        env_vars.insert(format!("ENV_VAR_{i}"), serde_json::json!(format!("val{i}")));
+    }
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "bedrock",
+            "label": "too many vars",
+            "env_vars": env_vars,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "too many env vars should be rejected: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("too many env vars"),
+        "error should mention too many env vars: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Get single provider
+// ---------------------------------------------------------------------------
+
+/// GET single provider returns metadata.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_single_provider(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) = create_user(&app, &admin_token, "llmget1", "llmget1@test.com").await;
+
+    // Create a provider
+    let (_, create_body) = helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "bedrock",
+            "label": "Get Me",
+            "env_vars": {
+                "AWS_ACCESS_KEY_ID": "AKIA5555555555555555",
+                "AWS_SECRET_ACCESS_KEY": "secret5555555555555555555555555555555555",
+            },
+            "model": "claude-sonnet-4-20250514",
+        }),
+    )
+    .await;
+    let provider_id = create_body["id"].as_str().unwrap();
+
+    // Get single provider
+    let (status, body) = helpers::get_json(
+        &app,
+        &token,
+        &format!("/api/users/me/llm-providers/{provider_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get provider failed: {body}");
+    assert_eq!(body["id"], provider_id);
+    assert_eq!(body["provider_type"], "bedrock");
+    assert_eq!(body["label"], "Get Me");
+    assert_eq!(body["model"], "claude-sonnet-4-20250514");
+    assert_eq!(body["validation_status"], "untested");
+    // env_vars must not leak
+    assert!(
+        body.get("env_vars").is_none(),
+        "env_vars must not be in get response"
+    );
+}
+
+/// GET single provider for nonexistent id returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_single_provider_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) =
+        create_user(&app, &admin_token, "llmget404", "llmget404@test.com").await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &token,
+        &format!("/api/users/me/llm-providers/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET single provider owned by another user returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_single_provider_wrong_user(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_a_id, token_a) =
+        create_user(&app, &admin_token, "llmget-a", "llmget-a@test.com").await;
+    let (_user_b_id, token_b) =
+        create_user(&app, &admin_token, "llmget-b", "llmget-b@test.com").await;
+
+    // User A creates a provider
+    let (_, create_body) = helpers::post_json(
+        &app,
+        &token_a,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "vertex",
+            "label": "A's provider",
+            "env_vars": {
+                "ANTHROPIC_VERTEX_PROJECT_ID": "my-project",
+            },
+        }),
+    )
+    .await;
+    let provider_id = create_body["id"].as_str().unwrap();
+
+    // User B tries to get it
+    let (status, _) = helpers::get_json(
+        &app,
+        &token_b,
+        &format!("/api/users/me/llm-providers/{provider_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Set active to custom — validated config
+// ---------------------------------------------------------------------------
+
+/// Setting active to a custom config that has been validated succeeds.
+#[sqlx::test(migrations = "./migrations")]
+async fn set_active_custom_validated_config_succeeds(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_user_id, token) =
+        create_user(&app, &admin_token, "llmcustok", "llmcustok@test.com").await;
+
+    // Create a provider config
+    let (_, create_body) = helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "custom_endpoint",
+            "label": "Validated Custom",
+            "env_vars": {
+                "ANTHROPIC_BASE_URL": "https://custom.example.com",
+                "ANTHROPIC_API_KEY": "sk-custom-validated-key",
+            },
+        }),
+    )
+    .await;
+    let config_id = create_body["id"].as_str().unwrap();
+    let config_uuid = Uuid::parse_str(config_id).unwrap();
+
+    // Mark as validated
+    sqlx::query("UPDATE llm_provider_configs SET validation_status = 'valid' WHERE id = $1")
+        .bind(config_uuid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Set as active — should succeed
+    let (status, _) = helpers::put_json(
+        &app,
+        &token,
+        "/api/users/me/active-provider",
+        serde_json::json!({ "provider": format!("custom:{config_id}") }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "validated custom config should be activatable"
+    );
+
+    // Verify it is now active and includes provider_type and label
+    let (status, body) = helpers::get_json(&app, &token, "/api/users/me/active-provider").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["provider"], format!("custom:{config_id}"));
+    assert_eq!(body["provider_type"], "custom_endpoint");
+    assert_eq!(body["label"], "Validated Custom");
+}
+
+// ---------------------------------------------------------------------------
+// Active provider response structure
+// ---------------------------------------------------------------------------
+
+/// GET active-provider includes `has_oauth` and `has_api_key` flags.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_active_provider_includes_flags(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) = create_user(&app, &admin_token, "llmflags", "llmflags@test.com").await;
+
+    let (status, body) = helpers::get_json(&app, &token, "/api/users/me/active-provider").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // By default, new user has no OAuth or API key
+    assert_eq!(body["has_oauth"], false);
+    assert_eq!(body["has_api_key"], false);
+    assert!(body["custom_configs"].as_array().unwrap().is_empty());
+}
+
+/// GET active-provider after creating a custom config includes it.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_active_provider_includes_custom_configs(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) = create_user(&app, &admin_token, "llmcust2", "llmcust2@test.com").await;
+
+    // Create a provider config
+    helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "bedrock",
+            "label": "My Bedrock Config",
+            "env_vars": {
+                "AWS_ACCESS_KEY_ID": "AKIA6666666666666666",
+                "AWS_SECRET_ACCESS_KEY": "secret6666666666666666666666666666666666",
+            },
+        }),
+    )
+    .await;
+
+    let (status, body) = helpers::get_json(&app, &token, "/api/users/me/active-provider").await;
+    assert_eq!(status, StatusCode::OK);
+    let configs = body["custom_configs"].as_array().unwrap();
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0]["provider_type"], "bedrock");
+    assert_eq!(configs[0]["label"], "My Bedrock Config");
+}
+
+// ---------------------------------------------------------------------------
+// Set active with api_key after configuring key
+// ---------------------------------------------------------------------------
+
+/// Setting active to `api_key` after configuring an Anthropic API key succeeds.
+#[sqlx::test(migrations = "./migrations")]
+async fn set_active_api_key_with_configured_key(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (user_id, token) = create_user(&app, &admin_token, "llmapi1", "llmapi1@test.com").await;
+
+    // Set an Anthropic API key for the user
+    helpers::set_user_api_key(&pool, user_id).await;
+
+    // Now setting to api_key should succeed
+    let (status, _) = helpers::put_json(
+        &app,
+        &token,
+        "/api/users/me/active-provider",
+        serde_json::json!({ "provider": "api_key" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "api_key with configured key should succeed"
+    );
+
+    // Verify via get
+    let (_, body) = helpers::get_json(&app, &token, "/api/users/me/active-provider").await;
+    assert_eq!(body["provider"], "api_key");
+    assert_eq!(body["has_api_key"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Provider type validation for empty string
+// ---------------------------------------------------------------------------
+
+/// Empty `provider_type` is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_provider_empty_type_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) = create_user(&app, &admin_token, "llmempty", "llmempty@test.com").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "",
+            "label": "empty type",
+            "env_vars": {},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty provider_type should be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Model validation
+// ---------------------------------------------------------------------------
+
+/// Model field too long is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_provider_model_too_long(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (_user_id, token) = create_user(&app, &admin_token, "llmmodel", "llmmodel@test.com").await;
+
+    let long_model = "x".repeat(256);
+    let (status, _) = helpers::post_json(
+        &app,
+        &token,
+        "/api/users/me/llm-providers",
+        serde_json::json!({
+            "provider_type": "bedrock",
+            "label": "long model",
+            "env_vars": {
+                "AWS_ACCESS_KEY_ID": "AKIA7777777777777777",
+                "AWS_SECRET_ACCESS_KEY": "secret7777777777777777777777777777777777",
+            },
+            "model": long_model,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "model too long should be rejected"
+    );
 }
