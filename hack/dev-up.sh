@@ -135,6 +135,11 @@ WEBAUTHN_RP_NAME=Platform
 
 PLATFORM_MCP_SERVERS_TARBALL=/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz
 PLATFORM_SEED_COMMANDS_PATH=${PROJECT_DIR}/seed-commands
+
+# --- Registry ---
+# Stream blobs through the platform instead of redirecting to MinIO.
+# Required in Kind — kaniko pods can't reach MinIO's NodePort directly.
+REGISTRY_PROXY_BLOBS=true
 EOF
 
 # ── Summary ──────────────────────────────────────────────────────────────

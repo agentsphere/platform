@@ -161,9 +161,18 @@ echo $((COUNT + 1)) > "$COUNT_FILE"
 # Record invocation for test assertions
 echo "$COUNT $PROMPT" >> "$STATE_DIR/invocations.log"
 
-# Check for simulated auth failure
+# Check for simulated auth failure — two mechanisms:
+# 1. Explicit env var (for tests that can set env before spawn)
+# 2. Token-based detection: if CLAUDE_CODE_OAUTH_TOKEN is set but doesn't
+#    look like a valid token (sk-ant-oat*), simulate auth failure.
+#    This mirrors real Claude CLI behavior and works through env_clear()
+#    since run_cli_validation forwards CLAUDE_CODE_OAUTH_TOKEN.
 if [[ "${MOCK_CLI_AUTH_FAIL:-}" == "true" ]]; then
     echo "{\"type\":\"error\",\"error\":{\"type\":\"authentication_failed\",\"message\":\"Invalid OAuth token\"}}"
+    exit 1
+fi
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && [[ ! "${CLAUDE_CODE_OAUTH_TOKEN}" == sk-ant-oat* ]]; then
+    echo "{\"type\":\"error\",\"error\":{\"type\":\"authentication_failed\",\"message\":\"Invalid or expired OAuth token\"}}"
     exit 1
 fi
 

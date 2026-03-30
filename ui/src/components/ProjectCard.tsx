@@ -1,7 +1,19 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { api, type ListResponse } from '../lib/api';
-import type { Project, AgentSession, Deployment, IframePanel } from '../lib/types';
+import type { Project, AgentSession, Pipeline, IframePanel } from '../lib/types';
 import { timeAgo } from '../lib/format';
+import { StagingPromoteBar } from './StagingPromoteBar';
+import { FeatureFlagsPanel } from './FeatureFlagsPanel';
+
+interface DeployRelease {
+  id: string;
+  target_id: string;
+  phase: string;
+  health: string;
+  strategy: string;
+  image_ref: string;
+  environment: string;
+}
 
 interface Props {
   project: Project;
@@ -9,14 +21,15 @@ interface Props {
 
 export function ProjectCard({ project }: Props) {
   const [session, setSession] = useState<AgentSession | null>(null);
-  const [deployment, setDeployment] = useState<Deployment | null>(null);
+  const [releases, setReleases] = useState<DeployRelease[]>([]);
+  const [pipeline, setPipeline] = useState<Pipeline | null>(null);
   const [progressText, setProgressText] = useState<string | null>(null);
-  const [deployIframes, setDeployIframes] = useState<IframePanel[]>([]);
+  const [deployIframes, setDeployIframes] = useState<(IframePanel & { env?: string })[]>([]);
   const [activePreviewIdx, setActivePreviewIdx] = useState(0);
+  const [errorCount, setErrorCount] = useState<number | null>(null);
   const [visible, setVisible] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
 
-  // IntersectionObserver — only fetch data when card is visible
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
@@ -28,45 +41,68 @@ export function ProjectCard({ project }: Props) {
     return () => observer.disconnect();
   }, []);
 
-  // Fetch per-card data when visible
   useEffect(() => {
     if (!visible) return;
     api.get<ListResponse<AgentSession>>(`/api/projects/${project.id}/sessions?status=running&limit=1`)
       .then(r => { if (r.items.length > 0) setSession(r.items[0]); })
-      .catch(e => console.warn('project card:', e));
-    api.get<ListResponse<Deployment>>(`/api/projects/${project.id}/deployments?limit=1`)
-      .then(r => { if (r.items.length > 0) setDeployment(r.items[0]); })
-      .catch(e => console.warn('project card:', e));
+      .catch(() => {});
+    api.get<ListResponse<DeployRelease>>(`/api/projects/${project.id}/deploy-releases?limit=5`)
+      .then(r => setReleases(r.items))
+      .catch(() => {});
+    api.get<ListResponse<Pipeline>>(`/api/projects/${project.id}/pipelines?limit=1`)
+      .then(r => { if (r.items.length > 0) setPipeline(r.items[0]); })
+      .catch(() => {});
+    api.get<ListResponse<unknown>>(`/api/observe/logs?project_id=${project.id}&level=error&range=1h&limit=0`)
+      .then(r => setErrorCount(r.total))
+      .catch(() => {});
   }, [visible, project.id]);
 
-  // Fetch progress if running session exists
   useEffect(() => {
     if (!session) return;
     api.get<{ message: string }>(`/api/projects/${project.id}/sessions/${session.id}/progress`)
       .then(r => setProgressText(r.message))
-      .catch(e => console.warn('project card:', e));
+      .catch(() => {});
   }, [session, project.id]);
 
-  // Dashboard shows prod deploy previews only (session previews live on SessionDetail)
+  // Fetch previews from both staging and production
   useEffect(() => {
     if (!visible) return;
-    api.get<IframePanel[]>(`/api/projects/${project.id}/deploy-preview/iframes`)
-      .then(setDeployIframes)
-      .catch(e => { console.warn('project card:', e); setDeployIframes([]); });
+    Promise.all([
+      api.get<IframePanel[]>(`/api/projects/${project.id}/deploy-preview/iframes?env=production`).catch(() => [] as IframePanel[]),
+      api.get<IframePanel[]>(`/api/projects/${project.id}/deploy-preview/iframes?env=staging`).catch(() => [] as IframePanel[]),
+    ]).then(([prod, staging]) => {
+      setDeployIframes([
+        ...prod.map(p => ({ ...p, env: 'prod' as const })),
+        ...staging.map(s => ({ ...s, env: 'staging' as const })),
+      ]);
+    });
   }, [visible, project.id]);
 
-  const activeIframes = deployIframes;
-  const clampedIdx = Math.min(activePreviewIdx, Math.max(0, activeIframes.length - 1));
-  const currentIframe = activeIframes[clampedIdx];
+  const clampedIdx = Math.min(activePreviewIdx, Math.max(0, deployIframes.length - 1));
+  const currentIframe = deployIframes[clampedIdx];
   const previewUrl = currentIframe?.preview_url ?? null;
   const displayName = project.display_name || project.name;
   const initial = displayName.charAt(0).toUpperCase();
 
+  // Derive deployment summary from releases
+  const latestByEnv = new Map<string, DeployRelease>();
+  for (const r of releases) {
+    if (!latestByEnv.has(r.environment)) latestByEnv.set(r.environment, r);
+  }
+  const hasDeployment = latestByEnv.size > 0;
+
   const statusColor = (s: string): string => {
-    if (s === 'healthy' || s === 'success' || s === 'running') return 'var(--success)';
-    if (s === 'degraded' || s === 'syncing' || s === 'pending') return 'var(--warning)';
-    if (s === 'failure' || s === 'failed' || s === 'error') return 'var(--danger)';
+    if (s === 'healthy' || s === 'success' || s === 'running' || s === 'completed') return 'var(--success)';
+    if (s === 'degraded' || s === 'syncing' || s === 'pending' || s === 'progressing' || s === 'promoting') return 'var(--warning)';
+    if (s === 'failure' || s === 'failed' || s === 'error' || s === 'cancelled' || s === 'rolled_back') return 'var(--danger)';
     return 'var(--text-muted)';
+  };
+
+  const pipelineIcon = (status: string) => {
+    if (status === 'success') return '\u2713';
+    if (status === 'running' || status === 'pending') return '\u21BB';
+    if (status === 'failure' || status === 'cancelled') return '\u2717';
+    return '\u00B7';
   };
 
   return (
@@ -81,18 +117,23 @@ export function ProjectCard({ project }: Props) {
             {initial}
           </div>
         )}
-        {activeIframes.length > 1 && (
+        {deployIframes.length > 1 && (
           <div class="project-card-preview-dots">
-            {activeIframes.map((_, i) => (
-              <button key={i} class={`preview-dot ${i === clampedIdx ? 'active' : ''}`}
+            {deployIframes.map((f, i) => (
+              <button key={i}
+                class={`preview-dot ${i === clampedIdx ? 'active' : ''}`}
+                title={f.env || ''}
                 onClick={(e: Event) => { e.stopPropagation(); setActivePreviewIdx(i); }} />
             ))}
           </div>
         )}
+        {currentIframe?.env && (
+          <div class="preview-env-badge">{currentIframe.env}</div>
+        )}
         <div class="project-card-preview-overlay">
-          {activeIframes.length > 1 && (
+          {deployIframes.length > 1 && (
             <button class="preview-arrow preview-arrow-left"
-              onClick={(e: Event) => { e.stopPropagation(); setActivePreviewIdx((clampedIdx - 1 + activeIframes.length) % activeIframes.length); }}>
+              onClick={(e: Event) => { e.stopPropagation(); setActivePreviewIdx((clampedIdx - 1 + deployIframes.length) % deployIframes.length); }}>
               &#8249;
             </button>
           )}
@@ -108,51 +149,79 @@ export function ProjectCard({ project }: Props) {
               </button>
             )}
           </div>
-          {activeIframes.length > 1 && (
+          {deployIframes.length > 1 && (
             <button class="preview-arrow preview-arrow-right"
-              onClick={(e: Event) => { e.stopPropagation(); setActivePreviewIdx((clampedIdx + 1) % activeIframes.length); }}>
+              onClick={(e: Event) => { e.stopPropagation(); setActivePreviewIdx((clampedIdx + 1) % deployIframes.length); }}>
               &#8250;
             </button>
           )}
         </div>
       </div>
 
-      {/* Right: info */}
+      {/* Center: status */}
       <div class="project-card-info">
         <div class="project-card-name">
           <a href={`/projects/${project.id}`} onClick={(e: Event) => e.stopPropagation()}>
             {displayName}
           </a>
-        </div>
-
-        {/* Session status */}
-        <div class="project-card-row" title={session && progressText ? progressText : undefined}>
-          {session ? (
-            <>
-              <span class="project-card-spinner" />
-              <span style="color:var(--text-primary);cursor:help">{progressText || 'Running...'}</span>
-            </>
-          ) : (
-            <span style="color:var(--text-muted)">No active session</span>
+          {errorCount != null && errorCount > 0 && (
+            <span class="badge badge-danger" title={`${errorCount} errors in last hour`}>
+              {errorCount} err
+            </span>
           )}
         </div>
 
-        {/* Deployment health */}
-        <div class="project-card-row">
-          {deployment ? (
-            <>
-              <span class="status-dot" style={`background:${statusColor(deployment.current_status)}`} />
-              <span>{deployment.environment}: {deployment.current_status}</span>
-            </>
-          ) : (
-            <span style="color:var(--text-muted)">Not deployed</span>
-          )}
+        <div class="project-card-status-grid">
+          {/* Session */}
+          <div class="project-card-row" title={session && progressText ? progressText : undefined}>
+            {session ? (
+              <>
+                <span class="project-card-spinner" />
+                <span style="color:var(--text-primary)">{progressText || 'Agent running...'}</span>
+              </>
+            ) : (
+              <span style="color:var(--text-muted)">No active session</span>
+            )}
+          </div>
+
+          {/* Pipeline */}
+          <div class="project-card-row">
+            {pipeline ? (
+              <>
+                <span style={`color:${statusColor(pipeline.status)};font-weight:600`}>
+                  {pipelineIcon(pipeline.status)}
+                </span>
+                <span>Build: {pipeline.status}</span>
+                <span class="text-muted" style="margin-left:auto;font-size:0.75rem">{timeAgo(pipeline.created_at)}</span>
+              </>
+            ) : (
+              <span style="color:var(--text-muted)">No builds</span>
+            )}
+          </div>
+
+          {/* Deployments */}
+          <div class="project-card-row">
+            {hasDeployment ? (
+              <div class="deploy-envs">
+                {Array.from(latestByEnv.entries()).map(([env, r]) => (
+                  <span key={env} class="deploy-env-tag">
+                    <span class="status-dot" style={`background:${statusColor(r.health || r.phase)}`} />
+                    {env}: {r.phase}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <span style="color:var(--text-muted)">Not deployed</span>
+            )}
+          </div>
         </div>
 
-        {/* Metrics placeholder */}
-        <div class="project-card-metrics">
-          -- req/s | -- ms p99
-        </div>
+        <StagingPromoteBar projectId={project.id} />
+      </div>
+
+      {/* Right: feature flags */}
+      <div class="project-card-flags" onClick={(e: Event) => e.stopPropagation()}>
+        <FeatureFlagsPanel projectId={project.id} projectName="" />
       </div>
     </div>
   );

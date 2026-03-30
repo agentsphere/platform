@@ -44,9 +44,9 @@ spec:
         - containerPort: 5432
       readinessProbe:
         exec:
-          command: ["pg_isready", "-U", "platform"]
-        initialDelaySeconds: 2
-        periodSeconds: 1
+          command: ["pg_isready", "-U", "platform", "-d", "platform_dev"]
+        initialDelaySeconds: 10
+        periodSeconds: 2
       volumeMounts:
         - name: certs
           mountPath: /certs

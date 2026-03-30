@@ -119,7 +119,35 @@ Plan 43 redefined integration vs E2E boundaries. ~50 E2E tests are actually sing
 **Tasks:**
 1. Add periodic call to `evict_stale()` in `main.rs` background loop (e.g., every 5 minutes alongside session cleanup)
 
-### 8. Nextest test-groups for Valkey isolation (Plan 30)
+### 8. Pipeline semantic validation step (pre-build)
+
+**Status:** TODO
+
+Currently canary service ref validation runs inside `execute_gitops_sync_step` (post-merge push pipeline), where it reads raw minijinja templates from the ops repo. The `{{ project_name }}` placeholders aren't rendered yet, so Service names don't match and the check always warns with `available: (empty)`.
+
+Broader issue: semantic validation (canary refs, manifest schema, deploy config consistency) should run **early** — ideally as a parallel "check" step alongside image builds, or as a gate on the MR pipeline before merge. Catching config errors after merge into main defeats the purpose.
+
+**Tasks:**
+1. Add a lightweight `validate` pipeline step type that runs semantic checks without K8s
+2. Run it in parallel with `build-app` (no depends_on), so it doesn't add latency
+3. Render templates before validation (use the same minijinja renderer as the deployer)
+4. Make it a `gate: true` step on MR pipelines — block merge if canary refs are invalid
+5. Move `validate_canary_service_refs` call from gitops_sync into this new step
+6. Consider additional checks: manifest schema validation, required labels, resource limits
+
+### 9. Gateway proxy discovery for canary traffic routing
+
+**Status:** FIXED (test infra) — reconciler logic correct, test setup was wrong
+
+The reconciler's `resolve_gateway_url()` correctly looks in `PLATFORM_GATEWAY_NAMESPACE` for the Envoy proxy Service. The issue was the test Gateway didn't have an `EnvoyProxy` `infrastructure.parametersRef`, so Envoy Gateway provisioned the proxy in `envoy-gateway-system` instead of the test services namespace.
+
+**Fix applied:** `hack/test-in-cluster.sh` now creates an `EnvoyProxy` resource and references it from the Gateway, so the proxy deploys in the same namespace.
+
+**Remaining:**
+1. Verify canary HTTPRoute is actually applied during e2e test (currently warns "no envoy proxy service found")
+2. Production Helm chart should also configure `EnvoyProxy` parametersRef for the platform Gateway
+
+### 10. Nextest test-groups for Valkey isolation (Plan 30)
 
 **Status:** TODO (low priority)
 

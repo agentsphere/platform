@@ -1,4 +1,4 @@
-ARG PLATFORM_RUNNER_IMAGE=platform-runner:latest
+ARG PLATFORM_RUNNER_IMAGE=platform-runner:v1
 FROM ${PLATFORM_RUNNER_IMAGE}
 
 # Install project-specific tools and dependencies here.

@@ -172,6 +172,29 @@ kubectl create clusterrolebinding "${NS_PREFIX}-runner" \
 
 # Create shared platform Gateway for test (if Envoy Gateway is installed)
 if kubectl get gatewayclass eg &>/dev/null; then
+  # EnvoyProxy tells Envoy Gateway to provision the proxy pod/service
+  # in the Gateway's namespace (not envoy-gateway-system).
+  cat <<EPEOF | kubectl apply -f -
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: platform-proxy-config
+  namespace: ${NS_PREFIX}-services
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 1
+        container:
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+EPEOF
+
   cat <<GWEOF | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -182,6 +205,11 @@ metadata:
     platform.io/managed-by: platform
 spec:
   gatewayClassName: eg
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: platform-proxy-config
   listeners:
     - name: http
       protocol: HTTP

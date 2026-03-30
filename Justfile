@@ -47,10 +47,27 @@ dev-down:
     set -euo pipefail
     export KUBECONFIG="${HOME}/.kube/platform"
     WORKTREE="$(bash hack/detect-worktree.sh)"
-    NS="platform-dev-${WORKTREE}"
-    echo "Deleting namespace: ${NS}"
-    kubectl delete namespace "${NS}" --wait=false 2>/dev/null || true
+    NS_PREFIX="platform-dev-${WORKTREE}"
+
+    echo "Looking for namespaces starting with: ${NS_PREFIX}..."
+
+    # Grab all namespaces, format as 'namespace/name', and filter by prefix
+    # '|| true' prevents grep from failing the script if no matches are found
+    MATCHING_NS=$(kubectl get namespaces -o name | grep "^namespace/${NS_PREFIX}" || true)
+
+    if [[ -z "$MATCHING_NS" ]]; then
+        echo "No matching namespaces found."
+    else
+        for ns in $MATCHING_NS; do
+            echo "Deleting ${ns}..."
+            kubectl delete "$ns" --wait=false 2>/dev/null || true
+        done
+    fi
     rm -f .env.dev
+    # Clean up seed cache (MinIO is ephemeral — stale cache causes blob NotFound)
+    rm -f /tmp/platform-e2e/"${WORKTREE}"/seed-images/.*.seed-cache.json
+    rm -rf /tmp/platform-e2e/"${WORKTREE}"/repos
+    rm -rf /tmp/platform-e2e/"${WORKTREE}"/ops-repos
     # Clean up legacy PID files from old port-forward approach
     if [ -f /tmp/platform-dev-pf.pids ]; then
       while read -r pid; do kill "$pid" 2>/dev/null || true; done < /tmp/platform-dev-pf.pids

@@ -1,17 +1,10 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api, type ListResponse } from '../lib/api';
-import type { Project } from '../lib/types';
+import type { Project, DashboardStats } from '../lib/types';
 import { useAuth } from '../lib/auth';
 import { ProjectCard } from '../components/ProjectCard';
-
-interface DashboardStats {
-  projects: number;
-  active_sessions: number;
-  running_builds: number;
-  failed_builds: number;
-  healthy_deployments: number;
-  degraded_deployments: number;
-}
+import { SystemHealthPanel } from '../components/SystemHealthPanel';
+import { ActivityFeed } from '../components/ActivityFeed';
 
 export function Dashboard() {
   const { user } = useAuth();
@@ -28,33 +21,71 @@ export function Dashboard() {
       .catch(e => console.warn(e));
   }, []);
 
-  // Still loading
   if (total === null) {
     return <div class="empty-state">Loading...</div>;
   }
 
   const displayName = user?.display_name || user?.name || 'there';
 
-  // Mode A: No projects — hero screen
   if (total === 0) {
     return <HeroDashboard displayName={displayName} />;
   }
 
-  // Mode B: Has projects — card grid
   return (
-    <div>
-      <div class="dashboard-grid">
-        {/* Subtle stats badge */}
-        {stats && stats.active_sessions > 0 && (
-          <div style="text-align:right">
-            <span class="badge badge-running">{stats.active_sessions} active session{stats.active_sessions !== 1 ? 's' : ''}</span>
+    <div class="dashboard-2col">
+      {/* Left sidebar */}
+      <div class="dashboard-sidebar">
+        <SystemHealthPanel />
+
+        <div class="panel">
+          <div class="panel-header">Quick Actions</div>
+          <div class="panel-body">
+            <a href="/create-app" class="quick-action">
+              <span>+</span> New Project
+            </a>
+            <a href="/observe/logs" class="quick-action">
+              <span>&#128203;</span> View Logs
+            </a>
+            <a href="/observe" class="quick-action">
+              <span>&#128202;</span> Observability
+            </a>
+          </div>
+        </div>
+
+        {stats && (
+          <div class="panel">
+            <div class="panel-header">Platform</div>
+            <div class="panel-body stats-grid">
+              <div class="stat-item">
+                <span class="stat-value">{stats.active_sessions}</span>
+                <span class="stat-label">Sessions</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value">{stats.running_builds}</span>
+                <span class="stat-label">Builds</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value">{stats.healthy_deployments}</span>
+                <span class="stat-label">Healthy</span>
+              </div>
+              {stats.failed_builds > 0 && (
+                <div class="stat-item stat-danger">
+                  <span class="stat-value">{stats.failed_builds}</span>
+                  <span class="stat-label">Failed</span>
+                </div>
+              )}
+            </div>
           </div>
         )}
+
+        <ActivityFeed />
+      </div>
+
+      {/* Center: project cards (vertically centered) */}
+      <div class="dashboard-center">
         {projects.map(p => (
           <ProjectCard key={p.id} project={p} />
         ))}
-
-        {/* New project card */}
         <a href="/create-app" class="project-card-new">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 4v16m8-8H4" />

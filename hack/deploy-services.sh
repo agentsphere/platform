@@ -34,11 +34,18 @@ kubectl wait -n "${NS}" --for=condition=Ready pod/preview-proxy --timeout=30s
 echo "  All services ready"
 
 # Grant CREATEDB (required by sqlx::test macro)
+# Postgres does a shutdown/restart cycle after init — wait for it to stabilize.
 echo "==> Post-deploy setup"
-kubectl exec -n "${NS}" postgres -- \
-  psql -U platform -d platform_dev -c "SELECT 1;" -q
+for i in $(seq 1 15); do
+  if kubectl exec -n "${NS}" postgres -- \
+    psql -U platform -d platform_dev -c "SELECT 1;" -q 2>/dev/null; then
+    break
+  fi
+  echo "  Waiting for Postgres to stabilize ($i/15)..."
+  sleep 1
+done
 kubectl exec -n "${NS}" postgres -c postgres -- \
-  psql -U postgres -c "ALTER USER platform CREATEDB;" -q 2>/dev/null || true
+  psql -U platform -d platform_dev -c "ALTER USER platform CREATEDB;" -q 2>/dev/null || true
 
 # Create MinIO buckets (S55: MinIO serves HTTPS with self-signed cert)
 kubectl exec -n "${NS}" minio -- sh -c '
