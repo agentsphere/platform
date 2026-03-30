@@ -55,6 +55,16 @@ pub fn router() -> Router<AppState> {
             HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("SAMEORIGIN"),
         ))
+        // Override the platform's restrictive CSP for preview iframes.
+        // Project apps may load external scripts/styles (CDN, HTMX, Tailwind, etc.)
+        // so the preview needs a permissive policy.
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; \
+                 frame-ancestors 'self'",
+            ),
+        ))
 }
 
 /// Validate that a namespace string is safe for URL construction.
@@ -243,9 +253,8 @@ async fn preview_proxy(
         }));
     }
 
-    // HTTP proxy path — inject <base> so absolute paths resolve through the proxy
-    let base = format!("/preview/{session_id}/");
-    proxy_http_with_base(req, &target_url, Some(&base)).await
+    // HTTP proxy path
+    proxy_http_with_base(req, &target_url, None).await
 }
 
 /// Forward an HTTP request to the backend preview service.
@@ -301,30 +310,32 @@ async fn proxy_http_with_base(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/html"));
 
-    if let (true, Some(href)) = (is_html, base_href) {
+    if let (true, Some(prefix)) = (is_html, base_href) {
         let bytes = backend_resp
             .bytes()
             .await
             .map_err(|e| ApiError::BadGateway(format!("failed to read response: {e}")))?;
         let html = String::from_utf8_lossy(&bytes);
-        let base_tag = format!("<base href=\"{href}\">");
-        // Inject after <head> or <head ...> tag
-        let modified = if let Some(pos) = html.find("<head>") {
-            format!("{}{base_tag}{}", &html[..pos + 6], &html[pos + 6..])
-        } else if let Some(pos) = html.find("<head ") {
-            // Find the closing > of the <head ...> tag
-            if let Some(end) = html[pos..].find('>') {
-                let insert = pos + end + 1;
-                format!("{}{base_tag}{}", &html[..insert], &html[insert..])
-            } else {
-                html.into_owned()
-            }
-        } else {
-            html.into_owned()
-        };
+
+        // Rewrite absolute paths in HTML so they route through the proxy.
+        // /static/style.css → /deploy-preview/{id}/{svc}/static/style.css
+        // /cart              → /deploy-preview/{id}/{svc}/cart
+        // But DON'T rewrite external URLs (https://...) or the proxy prefix itself.
+        let modified = html
+            .replace("href=\"/", &format!("href=\"{prefix}"))
+            .replace("src=\"/", &format!("src=\"{prefix}"))
+            .replace("action=\"/", &format!("action=\"{prefix}"))
+            .replace("hx-get=\"/", &format!("hx-get=\"{prefix}"))
+            .replace("hx-post=\"/", &format!("hx-post=\"{prefix}"))
+            .replace("hx-delete=\"/", &format!("hx-delete=\"{prefix}"))
+            .replace("hx-patch=\"/", &format!("hx-patch=\"{prefix}"))
+            .replace("hx-put=\"/", &format!("hx-put=\"{prefix}"));
+
+        let mut modified_headers = resp_headers.clone();
+        modified_headers.remove("content-length");
         let mut response = Response::new(Body::from(modified));
         *response.status_mut() = status;
-        *response.headers_mut() = resp_headers;
+        *response.headers_mut() = modified_headers;
         return Ok(response);
     }
 

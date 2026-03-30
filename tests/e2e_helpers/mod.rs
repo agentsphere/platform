@@ -106,14 +106,10 @@ pub async fn e2e_state_with_api_url(
     // Ensure a rustls CryptoProvider is installed (needed by reqwest/fred)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Bootstrap seed data (retry once on transient DB pool errors)
-    if let Err(e) = platform::store::bootstrap::run(&pool, Some("testpassword"), true).await {
-        tracing::warn!(error = %e, "bootstrap failed on first attempt, retrying");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        platform::store::bootstrap::run(&pool, Some("testpassword"), true)
-            .await
-            .expect("bootstrap failed on retry");
-    }
+    // Bootstrap seed data
+    platform::store::bootstrap::run(&pool, Some("testpassword"), true)
+        .await
+        .expect("bootstrap failed");
 
     // Connect to real Valkey — no FLUSHDB needed (see tests/helpers/mod.rs).
     // Pool size 1 (not 4) to reduce connection count under parallel tests.
@@ -271,6 +267,7 @@ pub async fn e2e_state_with_api_url(
         registry_proxy_blobs: std::env::var("REGISTRY_PROXY_BLOBS")
             .ok()
             .is_some_and(|v| v == "true"),
+        mcp_servers_path: "mcp/servers".into(),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)

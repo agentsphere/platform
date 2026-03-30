@@ -20,6 +20,9 @@ pub enum AgentError {
     #[error("pod attach failed: {0}")]
     AttachFailed(String),
 
+    #[error("too many concurrent manager sessions")]
+    TooManySessions,
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 
@@ -37,6 +40,9 @@ impl From<AgentError> for ApiError {
             AgentError::SessionNotRunning => Self::BadRequest("session not running".into()),
             AgentError::InvalidProvider(msg) | AgentError::ConfigurationRequired(msg) => {
                 Self::BadRequest(msg)
+            }
+            AgentError::TooManySessions => {
+                Self::BadRequest("too many concurrent manager sessions (max 5)".into())
             }
             AgentError::PodCreationFailed(_)
             | AgentError::AttachFailed(_)
@@ -76,6 +82,12 @@ mod tests {
     }
 
     #[test]
+    fn too_many_sessions_maps_to_bad_request() {
+        let api: ApiError = AgentError::TooManySessions.into();
+        assert!(matches!(api, ApiError::BadRequest(msg) if msg.contains("too many")));
+    }
+
+    #[test]
     fn pod_creation_failed_maps_to_internal() {
         let api: ApiError = AgentError::PodCreationFailed("timeout".into()).into();
         assert!(matches!(api, ApiError::Internal(_)));
@@ -107,6 +119,10 @@ mod tests {
         assert_eq!(
             AgentError::ConfigurationRequired("set your key".into()).to_string(),
             "set your key"
+        );
+        assert_eq!(
+            AgentError::TooManySessions.to_string(),
+            "too many concurrent manager sessions"
         );
         assert_eq!(
             AgentError::PodCreationFailed("timeout".into()).to_string(),

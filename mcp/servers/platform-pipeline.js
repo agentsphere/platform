@@ -9,6 +9,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { apiGet, apiPost, PROJECT_ID } from "../lib/client.js";
+import { gateCheck } from '../lib/gate.js';
 
 const server = new Server(
   { name: "platform-pipeline", version: "0.1.0" },
@@ -117,6 +118,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const p = args.project_id || pid();
+
+  // Manager gate — checks permission mode, waits for user approval if needed
+  const gateResult = await gateCheck(process.env.SESSION_ID || '', name, args);
+  if (gateResult) return gateResult;
 
   try {
   switch (name) {

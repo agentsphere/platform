@@ -13,9 +13,10 @@ mod helpers;
 use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
+use tower::ServiceExt;
 use uuid::Uuid;
 
-use helpers::{create_project, create_user, set_user_api_key, test_router, test_state};
+use helpers::{create_project, create_user, test_router, test_state};
 
 // =========================================================================
 // Helpers — reusable shape assertions
@@ -614,37 +615,6 @@ async fn contract_secrets_list(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     let items = assert_list_response(&list_body, "secrets");
     assert!(!items.is_empty());
-}
-
-// =========================================================================
-// P0: Sessions (Create-App)
-// =========================================================================
-
-#[sqlx::test(migrations = "./migrations")]
-async fn contract_create_app_session(pool: PgPool) {
-    let (state, admin_token) = test_state(pool.clone()).await;
-    let app = test_router(state);
-
-    // Admin needs an API key to create app sessions
-    let admin_id: (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    set_user_api_key(&pool, admin_id.0).await;
-
-    let (status, body) = helpers::post_json(
-        &app,
-        &admin_token,
-        "/api/create-app",
-        serde_json::json!({"description": "Build a todo app"}),
-    )
-    .await;
-
-    // create-app returns the session
-    assert_eq!(status, StatusCode::CREATED, "create-app failed: {body}");
-    assert_uuid(&body["id"], "session.id");
-    assert!(body["status"].is_string(), "missing session status");
-    assert_timestamp(&body["created_at"], "session.created_at");
 }
 
 // =========================================================================
@@ -1561,4 +1531,429 @@ async fn contract_mcp_session_detail(pool: PgPool) {
     assert_timestamp(&body["created_at"], "session.created_at");
     // messages should be an array (from SessionDetailResponse flatten)
     assert!(body["messages"].is_array(), "missing messages array");
+}
+
+// =========================================================================
+// MCP Contract Tests — additional coverage for endpoints called by
+// MCP servers that weren't covered by the tests above.
+// =========================================================================
+
+// -- platform-core MCP: list_projects shape (MCP calls GET /api/projects) --
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_core_list_projects(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    // Create a project so we have data
+    create_project(&app, &admin_token, "mcp-list-proj", "private").await;
+
+    // MCP server: apiGet("/api/projects", { query: { limit, offset, search } })
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/projects?limit=50&offset=0").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = assert_list_response(&body, "mcp_core_list_projects");
+    assert!(!items.is_empty(), "expected at least one project");
+
+    // MCP accesses: data.items[].id, data.items[].name, data.total
+    let proj = &items[0];
+    assert_uuid(&proj["id"], "project.id");
+    assert!(proj["name"].is_string(), "missing project name");
+    assert!(proj["visibility"].is_string(), "missing visibility");
+    assert!(proj["default_branch"].is_string(), "missing default_branch");
+    assert_uuid(&proj["owner_id"], "project.owner_id");
+    assert_timestamp(&proj["created_at"], "project.created_at");
+}
+
+// -- platform-core MCP: create_project shape (MCP calls POST /api/projects) --
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_core_create_project(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    // MCP server: apiPost("/api/projects", { body: { name, display_name, description, visibility } })
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({
+            "name": "mcp-created-proj",
+            "description": "Created via MCP",
+            "visibility": "private"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_uuid(&body["id"], "project.id");
+    assert_eq!(body["name"], "mcp-created-proj");
+    assert!(body["visibility"].is_string(), "missing visibility");
+    assert!(body["default_branch"].is_string(), "missing default_branch");
+    assert_uuid(&body["owner_id"], "project.owner_id");
+    assert_timestamp(&body["created_at"], "project.created_at");
+    assert_timestamp(&body["updated_at"], "project.updated_at");
+}
+
+// -- platform-pipeline MCP: list_pipelines shape --
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_pipeline_list(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-pipe-list", "private").await;
+
+    // Insert a pipeline directly to verify shape when data exists
+    let pipeline_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pipelines (id, project_id, trigger, git_ref, status)
+         VALUES ($1, $2, 'api', 'main', 'pending')",
+    )
+    .bind(pipeline_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // MCP server: apiGet(`/api/projects/${p}/pipelines`, { query: { status, trigger, git_ref, limit, offset } })
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/pipelines?limit=50"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = assert_list_response(&body, "mcp_pipeline_list");
+    assert!(!items.is_empty(), "expected at least one pipeline");
+
+    let pipe = &items[0];
+    assert_uuid(&pipe["id"], "pipeline.id");
+    assert_uuid(&pipe["project_id"], "pipeline.project_id");
+    assert!(pipe["trigger"].is_string(), "missing trigger");
+    assert!(pipe["git_ref"].is_string(), "missing git_ref");
+    assert!(pipe["status"].is_string(), "missing status");
+    assert_timestamp(&pipe["created_at"], "pipeline.created_at");
+    // Nullable fields
+    assert!(
+        pipe["commit_sha"].is_string() || pipe["commit_sha"].is_null(),
+        "commit_sha should be string or null"
+    );
+    assert!(
+        pipe["triggered_by"].is_string() || pipe["triggered_by"].is_null(),
+        "triggered_by should be string or null"
+    );
+    assert!(
+        pipe["started_at"].is_string() || pipe["started_at"].is_null(),
+        "started_at should be string or null"
+    );
+    assert!(
+        pipe["finished_at"].is_string() || pipe["finished_at"].is_null(),
+        "finished_at should be string or null"
+    );
+}
+
+// -- platform-pipeline MCP: trigger_pipeline shape --
+// The MCP calls POST /api/projects/{id}/pipelines { git_ref }.
+// Triggering requires a valid repo with .platform.yaml — we insert a pipeline
+// directly to test the GET detail shape instead (the POST would fail without
+// a valid repo). The response shape is PipelineDetailResponse for GET.
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_pipeline_trigger(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-pipe-trig", "private").await;
+
+    // Insert a pipeline + step directly to test GET detail (same shape as trigger response)
+    let pipeline_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pipelines (id, project_id, trigger, git_ref, commit_sha, status)
+         VALUES ($1, $2, 'api', 'main', 'abc123def456', 'pending')",
+    )
+    .bind(pipeline_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let step_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pipeline_steps (id, pipeline_id, project_id, step_order, name, image, status, gate)
+         VALUES ($1, $2, $3, 0, 'build', 'alpine:latest', 'pending', false)",
+    )
+    .bind(step_id)
+    .bind(pipeline_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // GET pipeline detail — same shape MCP receives after trigger
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/pipelines/{pipeline_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    // PipelineDetailResponse = PipelineResponse (flattened) + steps
+    assert_uuid(&body["id"], "pipeline.id");
+    assert_uuid(&body["project_id"], "pipeline.project_id");
+    assert!(body["trigger"].is_string(), "missing trigger");
+    assert!(body["git_ref"].is_string(), "missing git_ref");
+    assert!(body["status"].is_string(), "missing status");
+    assert_timestamp(&body["created_at"], "pipeline.created_at");
+    // steps array
+    assert!(body["steps"].is_array(), "missing steps array");
+    let steps = body["steps"].as_array().unwrap();
+    assert!(!steps.is_empty(), "expected at least one step");
+
+    let step = &steps[0];
+    assert_uuid(&step["id"], "step.id");
+    assert_number(&step["step_order"], "step.step_order");
+    assert!(step["name"].is_string(), "missing step name");
+    assert!(step["image"].is_string(), "missing step image");
+    assert!(step["status"].is_string(), "missing step status");
+    assert!(step["gate"].is_boolean(), "missing step gate");
+    assert!(step["depends_on"].is_array(), "missing step depends_on");
+    assert_timestamp(&step["created_at"], "step.created_at");
+}
+
+// -- platform-pipeline MCP: get_step_logs shape --
+// MCP calls GET /api/projects/{id}/pipelines/{pid}/steps/{sid}/logs.
+// Returns text/plain. We test a completed step with no log_ref (returns "No logs available").
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_pipeline_get_logs(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-pipe-logs", "private").await;
+
+    let pipeline_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pipelines (id, project_id, trigger, git_ref, status)
+         VALUES ($1, $2, 'api', 'main', 'success')",
+    )
+    .bind(pipeline_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let step_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pipeline_steps (id, pipeline_id, project_id, step_order, name, image, status, gate)
+         VALUES ($1, $2, $3, 0, 'build', 'alpine:latest', 'success', false)",
+    )
+    .bind(step_id)
+    .bind(pipeline_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // GET step logs — returns text/plain
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/projects/{proj_id}/pipelines/{pipeline_id}/steps/{step_id}/logs"
+        ))
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/plain"),
+        "step logs should return text/plain, got: {content_type}"
+    );
+}
+
+// -- platform-deploy MCP: list_targets shape --
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_deploy_list_targets(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-tgt-list", "private").await;
+
+    // Insert a deploy target
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deploy_targets (id, project_id, name, environment, default_strategy, is_active)
+         VALUES ($1, $2, 'staging', 'staging', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(proj_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // MCP server: apiGet(`/api/projects/${p}/targets`, { query: { limit, offset } })
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/targets?limit=50"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = assert_list_response(&body, "mcp_deploy_list_targets");
+    assert!(!items.is_empty(), "expected at least one target");
+
+    let target = &items[0];
+    assert_uuid(&target["id"], "target.id");
+    assert_uuid(&target["project_id"], "target.project_id");
+    assert!(target["name"].is_string(), "missing target name");
+    assert!(target["environment"].is_string(), "missing environment");
+    assert!(
+        target["default_strategy"].is_string(),
+        "missing default_strategy"
+    );
+    assert!(target["is_active"].is_boolean(), "missing is_active");
+    assert_timestamp(&target["created_at"], "target.created_at");
+}
+
+// -- platform-deploy MCP: staging_status shape --
+// staging_status requires an ops repo with real git branches. Without an ops repo
+// the endpoint returns 404 (ApiError::NotFound). We verify this 404 contract.
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_deploy_staging_status(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-staging", "private").await;
+
+    // Without an ops repo, staging-status returns 404
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/staging-status"),
+    )
+    .await;
+
+    // MCP deploy server calls: apiGet(`/api/projects/${p}/staging-status`)
+    // Expected shape when ops repo exists: { diverged: bool, staging_image, prod_image, staging_sha, prod_sha }
+    // Without ops repo: 404 — verify the endpoint is wired and returns proper error
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "staging-status without ops repo should be 404: {body}"
+    );
+}
+
+// -- platform-core MCP: spawn_agent shape --
+// MCP calls POST /api/projects/{id}/sessions/{sid}/spawn { prompt }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_core_spawn_agent(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-spawn-proj", "private").await;
+
+    // Get admin user ID
+    let admin_id: (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Insert a parent session
+    let parent_session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, project_id, user_id, prompt, status, provider, spawn_depth)
+         VALUES ($1, $2, $3, 'parent task', 'running', 'anthropic', 0)",
+    )
+    .bind(parent_session_id)
+    .bind(proj_id)
+    .bind(admin_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // MCP server: apiPost(`/api/projects/${PROJECT_ID}/sessions/${SESSION_ID}/spawn`, { body: { prompt } })
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/sessions/{parent_session_id}/spawn"),
+        serde_json::json!({"prompt": "Fix the failing tests"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "spawn failed: {body}");
+    // SessionResponse shape
+    assert_uuid(&body["id"], "session.id");
+    assert!(body["status"].is_string(), "missing status");
+    assert!(body["prompt"].is_string(), "missing prompt");
+    assert_eq!(body["prompt"], "Fix the failing tests");
+    assert!(body["provider"].is_string(), "missing provider");
+    assert_uuid(&body["user_id"], "session.user_id");
+    assert_timestamp(&body["created_at"], "session.created_at");
+    // project_id should match
+    assert_uuid(&body["project_id"], "session.project_id");
+}
+
+// -- MCP flags: list flags shape --
+// No dedicated MCP flags server yet, but gate.js lists toggle_flag as UPDATE.
+// The platform has /api/projects/{id}/flags endpoint. Verify the contract.
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_mcp_flags_list(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+    let proj_id = create_project(&app, &admin_token, "mcp-flags-proj", "private").await;
+
+    // Create a flag directly
+    let admin_id: (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE name = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO feature_flags (project_id, key, flag_type, default_value, enabled, created_by)
+         VALUES ($1, 'dark-mode', 'boolean', 'true', true, $2)",
+    )
+    .bind(proj_id)
+    .bind(admin_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // GET /api/projects/{id}/flags
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/flags?limit=50"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = assert_list_response(&body, "mcp_flags_list");
+    assert!(!items.is_empty(), "expected at least one flag");
+
+    let flag = &items[0];
+    assert_uuid(&flag["id"], "flag.id");
+    assert!(flag["key"].is_string(), "missing flag key");
+    assert!(flag["flag_type"].is_string(), "missing flag_type");
+    assert!(flag["enabled"].is_boolean(), "missing enabled");
+    assert_timestamp(&flag["created_at"], "flag.created_at");
+    assert_timestamp(&flag["updated_at"], "flag.updated_at");
+    // Nullable fields
+    assert!(
+        flag["environment"].is_string() || flag["environment"].is_null(),
+        "environment should be string or null"
+    );
+    assert!(
+        flag["description"].is_string() || flag["description"].is_null(),
+        "description should be string or null"
+    );
 }

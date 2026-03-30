@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo } from 'preact/hooks';
 import { api, type ListResponse } from '../lib/api';
 import type { Project, DashboardStats } from '../lib/types';
 import { useAuth } from '../lib/auth';
-import { ProjectCard } from '../components/ProjectCard';
+import { ProjectCard, type CardTab } from '../components/ProjectCard';
 import { SystemHealthPanel } from '../components/SystemHealthPanel';
 import { ActivityFeed } from '../components/ActivityFeed';
 
@@ -19,6 +19,17 @@ export function Dashboard() {
     api.get<DashboardStats>('/api/dashboard/stats')
       .then(setStats)
       .catch(e => console.warn(e));
+  }, []);
+
+  // Parse URL params for initial expand state
+  const urlParams = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    const validTabs = ['files', 'issues', 'mrs', 'builds', 'deploys', 'sessions'];
+    const tab = params.get('tab');
+    return {
+      projectId: params.get('p'),
+      tab: (tab && validTabs.includes(tab) ? tab : null) as CardTab,
+    };
   }, []);
 
   if (total === null) {
@@ -84,7 +95,9 @@ export function Dashboard() {
       {/* Center: project cards (vertically centered) */}
       <div class="dashboard-center">
         {projects.map(p => (
-          <ProjectCard key={p.id} project={p} />
+          <ProjectCard key={p.id} project={p}
+            initialExpanded={urlParams.projectId === p.id}
+            initialTab={urlParams.projectId === p.id ? urlParams.tab : null} />
         ))}
         <a href="/create-app" class="project-card-new">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

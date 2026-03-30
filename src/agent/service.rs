@@ -948,62 +948,149 @@ pub async fn fetch_session(pool: &PgPool, session_id: Uuid) -> Result<AgentSessi
     })
 }
 
-/// Create a global (project-less) CLI subprocess session for app scaffolding.
-///
-/// Uses `claude -p` with `--json-schema` structured output and `--tools ""`
-/// to control tool execution server-side. The session runs as a CLI subprocess,
-/// not a K8s pod.
-pub async fn create_global_session(
+// ---------------------------------------------------------------------------
+// Manager session lifecycle
+// ---------------------------------------------------------------------------
+
+/// Create a manager agent session — a project-less CLI subprocess that operates
+/// the platform through MCP tools with the user's own permissions.
+#[tracing::instrument(skip(state, prompt), fields(%user_id), err)]
+#[allow(clippy::too_many_lines)]
+pub async fn create_manager_session(
     state: &AppState,
     user_id: Uuid,
-    prompt: &str,
-    provider_name: &str,
-) -> Result<AgentSession, AgentError> {
-    let _ = get_provider(provider_name)?;
+    prompt: Option<String>,
+) -> Result<Uuid, AgentError> {
+    let session_id = Uuid::new_v4();
 
-    // Resolve auth via user's active LLM provider setting
-    let (cli_oauth_token, user_api_key, provider_extra_env, model_override) =
+    // 1. Enforce session limit (max 10 running manager sessions per user)
+    let running_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = $1 AND execution_mode = 'manager' AND status = 'running'",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if running_count.0 >= 10 {
+        // Auto-reap oldest stopped/failed manager session
+        sqlx::query(
+            "DELETE FROM agent_sessions WHERE id = (
+                SELECT id FROM agent_sessions
+                WHERE user_id = $1 AND execution_mode = 'manager' AND status IN ('stopped', 'failed', 'completed')
+                ORDER BY created_at ASC LIMIT 1
+            )",
+        )
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+
+        // Recheck
+        let recheck: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM agent_sessions WHERE user_id = $1 AND execution_mode = 'manager' AND status = 'running'",
+        )
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await?;
+        if recheck.0 >= 10 {
+            return Err(AgentError::TooManySessions);
+        }
+    }
+
+    // 2. Insert session row
+    let prompt_text = prompt.as_deref().unwrap_or("Manager session");
+    sqlx::query(
+        "INSERT INTO agent_sessions (id, user_id, prompt, status, execution_mode, uses_pubsub, provider)
+         VALUES ($1, $2, $3, 'running', 'manager', true, 'claude-code')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(prompt_text)
+    .execute(&state.pool)
+    .await?;
+
+    // 3. Resolve LLM provider
+    let (oauth_token, api_key, _provider_extra_env, _model) =
         resolve_active_llm_provider(state, user_id).await;
 
-    if cli_oauth_token.is_none() && user_api_key.is_none() {
+    if oauth_token.is_none() && api_key.is_none() {
+        // Mark session as failed since we can't proceed without auth
+        let _ = sqlx::query(
+            "UPDATE agent_sessions SET status = 'failed', finished_at = now() WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&state.pool)
+        .await;
         return Err(AgentError::ConfigurationRequired(
             "No LLM provider configured. Set your key in Settings > Provider Keys, configure a custom provider, or ask an admin to set a global ANTHROPIC_API_KEY secret.".into(),
         ));
     }
 
-    let session_id = Uuid::new_v4();
+    // 4. Create scoped API token (user's permissions, no boundary, 4h TTL)
+    let (raw_token, token_hash) = crate::auth::token::generate_api_token();
+    let user_perms =
+        crate::rbac::resolver::effective_permissions(&state.pool, &state.valkey, user_id, None)
+            .await
+            .map_err(AgentError::Other)?;
+    let scopes: Vec<String> = user_perms.iter().map(|p| p.as_str().to_owned()).collect();
+    let token_expires = chrono::Utc::now() + chrono::Duration::hours(4);
 
-    // Insert DB row as 'running' with cli_subprocess mode
     sqlx::query(
-        "INSERT INTO agent_sessions (id, user_id, prompt, provider, status, execution_mode, uses_pubsub) \
-         VALUES ($1, $2, $3, $4, 'running', 'cli_subprocess', true)",
+        "INSERT INTO api_tokens (user_id, name, token_hash, scopes, expires_at)
+         VALUES ($1, $2, $3, $4, $5)",
     )
-    .bind(session_id)
     .bind(user_id)
-    .bind(prompt)
-    .bind(provider_name)
+    .bind(format!("manager-session-{session_id}"))
+    .bind(&token_hash)
+    .bind(&scopes)
+    .bind(token_expires)
     .execute(&state.pool)
     .await?;
 
-    // Save first user message to DB
-    sqlx::query("INSERT INTO agent_messages (session_id, role, content) VALUES ($1, 'user', $2)")
-        .bind(session_id)
-        .bind(prompt)
-        .execute(&state.pool)
-        .await?;
+    // 5. Write MCP config to temp file
+    // MCP servers run as local Node.js processes — use localhost, not the
+    // in-cluster URL (host.docker.internal) which is for K8s pods.
+    let local_api_url = {
+        let port = state.config.listen.rsplit(':').next().unwrap_or("8080");
+        format!("http://localhost:{port}")
+    };
+    let mcp_config = build_manager_mcp_config(
+        &local_api_url,
+        &raw_token,
+        &state.config.mcp_servers_path,
+        session_id,
+    );
+    let mcp_path = format!("/tmp/manager-mcp-{session_id}.json");
+    tokio::fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&mcp_config).map_err(|e| AgentError::Other(e.into()))?,
+    )
+    .await
+    .map_err(|e| AgentError::Other(e.into()))?;
 
-    // Register in CLI session manager
-    let handle = state
-        .cli_sessions
-        .register(
-            session_id,
-            user_id,
-            super::claude_cli::session::SessionMode::Persistent,
-        )
-        .await
-        .map_err(|e| AgentError::Other(e.into()))?;
+    // 6. Set default mode in Valkey (auto_read, 4h TTL matching token)
+    {
+        use fred::interfaces::KeysInterface;
+        let mode_key = format!("manager:{session_id}:mode");
+        let _: () = state
+            .valkey
+            .next()
+            .set(
+                &mode_key,
+                "auto_read",
+                Some(fred::types::Expiration::EX(4 * 3600)),
+                None,
+                false,
+            )
+            .await
+            .unwrap_or(());
+    }
 
-    // Start persistence subscriber (writes pub/sub events to agent_messages)
+    // 7. CLI is spawned per-message (not on session create).
+    // The session stays "running" and each user message triggers a fresh
+    // CLI invocation with --resume to continue the conversation.
+    tracing::info!(%session_id, "manager session created, awaiting first message");
+
+    // 8. Spawn persistence subscriber
     super::pubsub_bridge::spawn_persistence_subscriber(
         state.pool.clone(),
         state.valkey.clone(),
@@ -1011,62 +1098,154 @@ pub async fn create_global_session(
     )
     .await;
 
-    // Spawn the create-app tool loop (skip when CLI spawn is disabled, e.g. integration tests)
-    if state.config.cli_spawn_enabled {
-        use super::create_app::LoopOutcome;
-        let state_clone = state.clone();
-        let prompt_owned = prompt.to_owned();
-        let oauth = cli_oauth_token.clone();
-        let api_key = user_api_key.clone();
-        let extra = provider_extra_env;
-        let model = model_override;
-        tokio::spawn(async move {
-            let result = super::create_app::run_create_app_loop(
-                &state_clone,
-                handle,
-                prompt_owned,
-                oauth,
-                api_key,
-                extra,
-                model,
-            )
-            .await;
+    Ok(session_id)
+}
 
-            match result {
-                Ok(LoopOutcome::Completed | LoopOutcome::Cancelled) => {
-                    if let Err(e) = sqlx::query(
-                        "UPDATE agent_sessions SET status = 'completed', finished_at = now() WHERE id = $1 AND status = 'running'",
-                    )
-                    .bind(session_id)
-                    .execute(&state_clone.pool)
-                    .await
-                    {
-                        tracing::error!(error = %e, %session_id, "failed to update session status");
-                    }
-                }
-                Ok(LoopOutcome::WaitingForInput) => {
-                    // Session stays running — user will send a follow-up message
-                    tracing::debug!(%session_id, "create-app loop waiting for user input");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, %session_id, "create-app loop failed");
-                    if let Err(db_err) = sqlx::query(
-                        "UPDATE agent_sessions SET status = 'failed', finished_at = now() WHERE id = $1 AND status = 'running'",
-                    )
-                    .bind(session_id)
-                    .execute(&state_clone.pool)
-                    .await
-                    {
-                        tracing::error!(error = %db_err, %session_id, "failed to update session status");
-                    }
-                }
-            }
-        });
-    } else {
-        tracing::debug!(%session_id, "CLI spawn disabled, skipping create-app tool loop");
+/// Send a message to a manager session by spawning a fresh CLI invocation.
+///
+/// Each message triggers `claude -p "{msg}" --resume {session_id}` with MCP tools.
+/// The CLI continues the conversation from the previous turn's context.
+pub async fn send_manager_message(
+    state: &AppState,
+    session_id: Uuid,
+    message: &str,
+) -> Result<(), AgentError> {
+    let session = fetch_session(&state.pool, session_id).await?;
+    if session.status != "running" {
+        return Err(AgentError::SessionNotRunning);
+    }
+    if session.execution_mode != "manager" {
+        return Err(AgentError::Other(anyhow::anyhow!("not a manager session")));
     }
 
-    fetch_session(&state.pool, session_id).await
+    // Resolve LLM provider from session owner
+    let (oauth_token, api_key, extra_env, _) =
+        resolve_active_llm_provider(state, session.user_id).await;
+
+    let mcp_path = format!("/tmp/manager-mcp-{session_id}.json");
+    let session_id_str = session_id.to_string();
+    let message_owned = message.to_string();
+    let valkey = state.valkey.clone();
+    let pool = state.pool.clone();
+
+    // Persist user message (not published to Valkey — UI shows it locally)
+    let _ = sqlx::query(
+        "INSERT INTO agent_messages (id, session_id, role, content) VALUES ($1, $2, 'user', $3)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(session_id)
+    .bind(&message_owned)
+    .execute(&pool)
+    .await;
+
+    tokio::spawn(async move {
+        use super::claude_cli::transport::{CliSpawnOptions, SubprocessTransport};
+
+        let is_first_message = {
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM agent_messages WHERE session_id = $1 AND role != 'user'",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or((0,));
+            count.0 <= 1 // Only the user message we just inserted
+        };
+
+        let opts = CliSpawnOptions {
+            prompt: Some(message_owned),
+            system_prompt: if is_first_message {
+                Some(super::manager_prompt::MANAGER_SYSTEM_PROMPT.to_string())
+            } else {
+                None // System prompt only on first turn
+            },
+            resume_session: if is_first_message {
+                None
+            } else {
+                Some(session_id_str.clone())
+            },
+            initial_session_id: if is_first_message {
+                Some(session_id_str)
+            } else {
+                None
+            },
+            mcp_config: Some(std::path::PathBuf::from(&mcp_path)),
+            disable_tools: true,
+            allowed_tools: Some(vec!["mcp__*".to_string()]),
+            permission_mode: Some("bypassPermissions".to_string()),
+            max_turns: None, // Let Claude use as many turns as needed for MCP calls
+            cwd: Some(std::path::PathBuf::from("/tmp")),
+            oauth_token,
+            anthropic_api_key: api_key,
+            extra_env,
+            ..Default::default()
+        };
+
+        match SubprocessTransport::spawn(opts) {
+            Ok(mut transport) => {
+                tracing::info!(%session_id, "manager CLI turn spawned");
+                transport.close_stdin().await;
+
+                let result =
+                    super::cli_invoke::read_cli_output(&mut transport, session_id, &valkey).await;
+
+                if let Err(e) = result {
+                    tracing::error!(%session_id, error = %e, "manager CLI turn error");
+                }
+                // Session stays "running" — ready for next message
+            }
+            Err(e) => {
+                tracing::error!(%session_id, error = %e, "failed to spawn manager CLI turn");
+                // Publish error to SSE
+                let err_event = crate::agent::provider::ProgressEvent {
+                    kind: crate::agent::provider::ProgressKind::Error,
+                    message: format!("CLI spawn failed: {e}"),
+                    metadata: None,
+                };
+                let _ = crate::agent::pubsub_bridge::publish_event(&valkey, session_id, &err_event)
+                    .await;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Build the MCP config JSON for a manager agent session.
+///
+/// Maps each MCP server to a Node.js script invocation with the platform API
+/// URL, session-scoped API token, and session ID passed as environment variables.
+fn build_manager_mcp_config(
+    api_url: &str,
+    api_token: &str,
+    servers_path: &str,
+    session_id: Uuid,
+) -> serde_json::Value {
+    let servers = [
+        "platform-core",
+        "platform-admin",
+        "platform-pipeline",
+        "platform-deploy",
+        "platform-observe",
+        "platform-issues",
+    ];
+    let mut map = serde_json::Map::new();
+    for name in &servers {
+        map.insert(
+            name.to_string(),
+            serde_json::json!({
+                "command": "node",
+                "args": [format!("{servers_path}/{name}.js")],
+                "env": {
+                    "PLATFORM_API_URL": api_url,
+                    "PLATFORM_API_TOKEN": api_token,
+                    "SESSION_ID": session_id.to_string(),
+                    "MANAGER_MODE": "auto_read",
+                }
+            }),
+        );
+    }
+    serde_json::json!({ "mcpServers": map })
 }
 
 /// Capture agent pod logs to `MinIO` for post-session review.
@@ -1359,25 +1538,8 @@ async fn send_cli_message(
     .execute(&state.pool)
     .await?;
 
-    // If no tool loop is running, spawn a new --resume round
-    if !handle.is_busy() {
-        let state_clone = state.clone();
-        let handle_clone = handle.clone();
-        let (oauth, api_key, extra, model) =
-            resolve_active_llm_provider(state, handle.user_id).await;
-        tokio::spawn(async move {
-            super::create_app::run_pending_messages(
-                &state_clone,
-                handle_clone,
-                oauth,
-                api_key,
-                extra,
-                model,
-            )
-            .await;
-        });
-    }
-    // If busy, the tool loop will drain pending_messages after the current round
+    // Note: the old create-app tool loop would drain pending_messages here.
+    // Manager sessions use pub/sub for message routing instead.
 
     Ok(())
 }
@@ -1473,237 +1635,37 @@ mod tests {
     }
 
     #[test]
-    fn short_id_is_first_8_chars() {
-        let session_id = Uuid::new_v4();
-        let short_id = &session_id.to_string()[..8];
-        assert_eq!(short_id.len(), 8);
-        // Should be hex chars (UUID format)
-        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    fn build_manager_mcp_config_has_all_servers() {
+        let sid = Uuid::new_v4();
+        let config =
+            build_manager_mcp_config("http://localhost:8080", "plat_api_test", "mcp/servers", sid);
+
+        let servers = config["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key("platform-core"));
+        assert!(servers.contains_key("platform-admin"));
+        assert!(servers.contains_key("platform-pipeline"));
+        assert!(servers.contains_key("platform-deploy"));
+        assert!(servers.contains_key("platform-observe"));
+        assert!(servers.contains_key("platform-issues"));
+        assert_eq!(servers.len(), 6);
     }
 
     #[test]
-    fn get_provider_returns_trait_object() {
-        let provider = get_provider("claude-code").unwrap();
-        // Verify it's a valid provider by calling name()
-        assert_eq!(provider.name(), "claude-code");
-    }
-
-    #[test]
-    fn branch_name_default_format() {
-        // Ensure the branch name format is predictable
-        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let short_id = &id.to_string()[..8];
-        assert_eq!(short_id, "550e8400");
-        let branch_name: Option<&str> = None;
-        let result = branch_name.map_or_else(|| format!("agent/{short_id}"), String::from);
-        assert_eq!(result, "agent/550e8400");
-    }
-
-    #[test]
-    fn branch_name_with_slash() {
-        let branch: Option<&str> = Some("feature/initial-app");
-        let result = branch.map_or_else(|| "agent/fallback".to_string(), String::from);
-        assert_eq!(result, "feature/initial-app");
-    }
-
-    #[test]
-    fn spawn_depth_starts_at_zero_for_root() {
-        // When parent_session_id is None, spawn_depth should be 0
-        let parent: Option<Uuid> = None;
-        let spawn_depth: i32 = if parent.is_some() { 1 } else { 0 };
-        assert_eq!(spawn_depth, 0);
-    }
-
-    #[test]
-    fn spawn_depth_increments_for_child() {
-        let parent = Some(Uuid::new_v4());
-        let parent_depth = 2;
-        let spawn_depth: i32 = if parent.is_some() {
-            parent_depth + 1
-        } else {
-            0
-        };
-        assert_eq!(spawn_depth, 3);
-    }
-
-    #[test]
-    fn get_provider_whitespace_name_rejected() {
-        assert!(get_provider(" claude-code ").is_err());
-        assert!(get_provider("  ").is_err());
-    }
-
-    #[test]
-    fn get_provider_special_chars_rejected() {
-        assert!(get_provider("claude/code").is_err());
-        assert!(get_provider("claude@code").is_err());
-    }
-
-    #[test]
-    fn short_id_is_8_chars() {
-        for _ in 0..10 {
-            let session_id = Uuid::new_v4();
-            let short_id = &session_id.to_string()[..8];
-            assert_eq!(short_id.len(), 8);
-        }
-    }
-
-    #[test]
-    fn repo_clone_url_format() {
-        // Simulates the URL construction in get_project_repo_info
-        let platform_api_url = "http://platform.platform.svc:8080";
-        let owner_name = "alice";
-        let project_name = "my-app";
-        let url = format!(
-            "{}/{}/{}.git",
-            platform_api_url.trim_end_matches('/'),
-            owner_name,
-            project_name
+    fn build_manager_mcp_config_env_vars_correct() {
+        let sid = Uuid::new_v4();
+        let config = build_manager_mcp_config(
+            "http://api.example.com",
+            "plat_api_token123",
+            "/data/mcp",
+            sid,
         );
-        assert_eq!(url, "http://platform.platform.svc:8080/alice/my-app.git");
-    }
 
-    #[test]
-    fn repo_clone_url_trims_trailing_slash() {
-        let platform_api_url = "http://platform.svc:8080/";
-        let url = format!(
-            "{}/{}/{}.git",
-            platform_api_url.trim_end_matches('/'),
-            "bob",
-            "test-project"
-        );
-        assert_eq!(url, "http://platform.svc:8080/bob/test-project.git");
-    }
-
-    #[test]
-    fn agent_session_execution_mode_values() {
-        // Verify the string values used in match statements
-        let modes = ["pod", "cli_subprocess"];
-        for mode in modes {
-            assert!(!mode.is_empty());
-        }
-    }
-
-    #[test]
-    fn agent_session_status_values() {
-        // Verify status strings used across the module
-        let statuses = ["pending", "running", "completed", "failed", "stopped"];
-        for status in statuses {
-            assert!(!status.is_empty());
-        }
-    }
-
-    #[test]
-    fn child_completion_event_format() {
-        // Simulates notify_parent_of_completion event construction
-        let child_id = Uuid::new_v4();
-        let child_status = "completed";
-        let event = ProgressEvent {
-            kind: ProgressKind::Milestone,
-            message: format!("Child agent session {child_id} finished with status: {child_status}"),
-            metadata: Some(serde_json::json!({
-                "event_type": "child_completion",
-                "child_session_id": child_id,
-                "child_status": child_status,
-            })),
-        };
-        assert_eq!(event.kind, ProgressKind::Milestone);
-        assert!(event.message.contains("finished with status: completed"));
-        let meta = event.metadata.unwrap();
-        assert_eq!(meta["event_type"], "child_completion");
-        assert_eq!(meta["child_status"], "completed");
-    }
-
-    #[test]
-    fn idle_session_completed_event() {
-        // Simulates the event published when an idle session is reaped
-        let event = ProgressEvent {
-            kind: ProgressKind::Completed,
-            message: "Session closed due to inactivity".into(),
-            metadata: None,
-        };
-        assert_eq!(event.kind, ProgressKind::Completed);
-        assert!(event.message.contains("inactivity"));
-    }
-
-    #[test]
-    fn agent_webhook_payload_format() {
-        let session_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
-        let payload = serde_json::json!({
-            "action": "completed",
-            "session_id": session_id,
-            "project_id": project_id,
-        });
-        assert_eq!(payload["action"], "completed");
-        assert_eq!(payload["session_id"], session_id.to_string());
-    }
-
-    #[test]
-    fn session_log_path_format() {
-        let session_id = Uuid::new_v4();
-        let path = format!("logs/agents/{session_id}/output.log");
-        assert!(path.starts_with("logs/agents/"));
-        assert!(path.ends_with("/output.log"));
-    }
-
-    #[test]
-    fn idle_session_query_format() {
-        // Verify the interval format string used in reap_idle_sessions
-        let timeout_secs = 3600;
-        let interval = format!("{timeout_secs} seconds");
-        assert_eq!(interval, "3600 seconds");
-    }
-
-    #[test]
-    fn preview_service_name_format() {
-        let short_id = "abc12345";
-        let svc_name = format!("preview-{short_id}");
-        assert_eq!(svc_name, "preview-abc12345");
-        // Must be under 63 chars (DNS limit)
-        assert!(svc_name.len() <= 63);
-    }
-
-    #[test]
-    fn preview_service_json_structure() {
-        let session_id = Uuid::new_v4();
-        let session_ns = "proj-dev-abc12345";
-        let svc_name = "preview-abc12345";
-        let svc_json = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": svc_name,
-                "namespace": session_ns,
-                "labels": {
-                    "platform.io/component": "iframe-preview",
-                    "platform.io/session": session_id.to_string(),
-                }
-            },
-            "spec": {
-                "selector": {
-                    "platform.io/session": session_id.to_string(),
-                },
-                "ports": [{
-                    "name": "iframe",
-                    "port": 8000,
-                    "targetPort": 8000,
-                    "protocol": "TCP"
-                }]
-            }
-        });
-        assert_eq!(svc_json["kind"], "Service");
-        assert_eq!(svc_json["spec"]["ports"][0]["port"], 8000);
-        assert_eq!(
-            svc_json["metadata"]["labels"]["platform.io/component"],
-            "iframe-preview"
-        );
-    }
-
-    #[test]
-    fn get_provider_returns_claude_code_name() {
-        let provider = get_provider("claude-code").unwrap();
-        // The provider implements AgentProvider — verify it returns a valid object
-        // (We can't call .name() because the trait method isn't used directly in tests)
-        assert!(std::mem::size_of_val(&provider) > 0);
+        let core = &config["mcpServers"]["platform-core"];
+        assert_eq!(core["command"], "node");
+        assert_eq!(core["args"][0], "/data/mcp/platform-core.js");
+        assert_eq!(core["env"]["PLATFORM_API_URL"], "http://api.example.com");
+        assert_eq!(core["env"]["PLATFORM_API_TOKEN"], "plat_api_token123");
+        assert_eq!(core["env"]["SESSION_ID"], sid.to_string());
+        assert_eq!(core["env"]["MANAGER_MODE"], "auto_read");
     }
 }

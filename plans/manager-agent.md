@@ -261,7 +261,13 @@ const MODE_MATRIX = {
 };
 
 export function gate(toolName, mode) {
-  const actionType = ACTION_TYPES[toolName] || 'UPDATE'; // unknown tools default to UPDATE
+  // Fail closed: unknown tools require confirmation in ALL modes (except full_auto).
+  // This prevents a new destructive tool from auto-executing if someone forgets
+  // to add it to ACTION_TYPES.
+  const actionType = ACTION_TYPES[toolName] || 'UNKNOWN';
+  if (actionType === 'UNKNOWN') {
+    return mode === 'full_auto' ? 'auto' : 'ask';
+  }
   const decision = MODE_MATRIX[mode]?.[actionType] || 'ask';
   return decision; // 'auto' | 'ask' | 'deny'
 }
@@ -270,22 +276,24 @@ export function gate(toolName, mode) {
 **Each MCP server wraps its tool handler:**
 
 ```javascript
-import { gate } from '../lib/gate.js';
+import { gate, computeActionHash, checkApproval, setPending } from '../lib/gate.js';
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
-  const mode = readCurrentMode(); // from env, file, or Valkey
+  const mode = await readCurrentMode(); // from Valkey
 
   const decision = gate(name, mode);
 
   if (decision === 'deny') {
+    // Plan mode: tell Claude to describe the action as a plan step
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           status: 'denied',
           reason: `Action "${name}" is not available in ${mode} mode. ` +
-                  `Describe what you would do instead as a plan step.`,
+                  `Do NOT attempt alternative write operations. ` +
+                  `Describe this as a numbered plan step instead.`,
           action_type: ACTION_TYPES[name],
         })
       }]
@@ -293,23 +301,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (decision === 'ask') {
-    // Check if this tool was already approved for this session
-    if (!isApproved(name, args)) {
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'confirmation_required',
-            tool: name,
-            action_type: ACTION_TYPES[name],
-            summary: buildSummary(name, args), // human-readable description
-            params: args,
-            message: 'Please ask the user to confirm this action. ' +
-                     'When they approve, call this tool again with ' +
-                     '{ "confirmed": true } added to the parameters.',
-          })
-        }]
-      };
+    const actionHash = computeActionHash(SESSION_ID, name, args);
+
+    // Check if this specific action was approved via Valkey
+    const approved = await checkApproval(SESSION_ID, actionHash);
+    if (!approved) {
+      // Check if this tool name is session-approved (CREATE/UPDATE only)
+      const sessionApproved = await isToolSessionApproved(SESSION_ID, name);
+      if (!sessionApproved) {
+        // Write pending action to Valkey (expires in 5 min)
+        const summary = buildSummary(name, args);
+        await setPending(SESSION_ID, actionHash, summary);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: 'confirmation_required',
+              action_hash: actionHash,
+              tool: name,
+              action_type: ACTION_TYPES[name],
+              summary,
+              message: 'Ask the user to confirm this action before proceeding.',
+            })
+          }]
+        };
+      }
     }
   }
 
@@ -318,18 +335,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 ```
 
-**Confirmation round-trip:**
+**Confirmation round-trip (LLM-free authorization chain):**
+
+Critical: the LLM must NEVER be in the authorization chain. Claude could hallucinate `confirmed: true` on its first tool call attempt, bypassing the gate entirely. Instead, approvals flow through Valkey with a unique action hash:
 
 ```
 1. Claude calls: mcp__platform-deploy__promote_staging({ project_id: "..." })
-2. MCP gate returns: { status: "confirmation_required", summary: "Promote staging → prod" }
+
+2. MCP gate:
+   - Generates action_hash = sha256(session_id + tool_name + JSON(params))
+   - Writes to Valkey: SET manager:{session_id}:pending:{action_hash} "{summary}" EX 300
+   - Returns: { status: "confirmation_required", action_hash: "abc123",
+                summary: "Promote staging → prod" }
+
 3. Claude sees the result and writes to the user:
    "I'd like to promote staging to production. Shall I proceed?"
-4. User types: "yes" (or clicks an [Approve] button that sends "yes")
-5. Claude calls again: mcp__platform-deploy__promote_staging({ project_id: "...", confirmed: true })
-6. MCP gate sees confirmed=true → executes
-7. Result returns: { status: "success", ... }
+
+4. UI renders [Approve] [Approve for session] [Deny] buttons
+
+5. User clicks [Approve]:
+   - UI calls POST /api/manager/sessions/{id}/approve_action { action_hash: "abc123" }
+   - Backend writes: SET manager:{session_id}:approved:{action_hash} "1" EX 60
+   - UI sends "Approved, please proceed." as user message
+
+6. Claude calls the tool again (same params)
+
+7. MCP gate:
+   - Computes same action_hash
+   - Checks: EXISTS manager:{session_id}:approved:{action_hash} → found
+   - Deletes the approved key (single-use)
+   - Executes the actual tool
+   - Returns: { status: "success", ... }
 ```
+
+The LLM cannot forge an approval — it flows through the UI → backend → Valkey → MCP server chain. Even if Claude appends `confirmed: true`, the MCP server ignores that parameter and checks Valkey instead.
 
 **Advantages of MCP-level gate:**
 - Works correctly with `--output-format stream-json` (no race condition)
@@ -338,6 +377,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 - The confirmation becomes part of the conversation (auditable in message history)
 - Mode changes take effect on next tool call (read from shared state)
 - No UI-level tool interception needed (simpler frontend)
+- **LLM cannot bypass authorization** — approval state is in Valkey, not in tool params
 
 **How mode changes propagate to running MCP servers:**
 
@@ -490,6 +530,15 @@ observability, issues, and platform administration. Use them to help the user.
 - After completing a task, suggest logical next steps.
 - If a request is ambiguous, ask for clarification.
 - Summarize status checks concisely — users want quick answers.
+
+## Important: handling denied or confirmation-required tool results
+
+- If a tool returns `status: "confirmation_required"`, ask the user to confirm.
+  Do NOT call the tool again until the user explicitly approves.
+- If a tool returns `status: "denied"`, the current permission mode does not
+  allow this action. Do NOT attempt alternative write operations or retry.
+  Instead, immediately describe what you would do as a numbered plan.
+  The user can switch to a different mode to execute the plan.
 
 ## Available Tool Categories
 
@@ -759,7 +808,45 @@ Simple query across all `agent_sessions` with optional status filter.
 | `admin_list_all_sessions` | `tests/admin_integration.rs` | Cross-project session listing |
 | `admin_list_sessions_non_admin_403` | `tests/admin_integration.rs` | Permission check |
 
-### 4.3 Existing tests to update
+### 4.3 Delete old create-app flow
+
+The manager agent fully replaces the custom create-app tool loop. Delete, don't deprecate.
+
+**Files to delete:**
+
+| File | Lines | What it was |
+|------|-------|-------------|
+| `src/agent/create_app.rs` | 1260 | Custom tool loop, 4 hardcoded tools, structured output parsing |
+| `src/agent/create_app_prompt.rs` | 156 | System prompt with inline tool schemas |
+| `tests/create_app_integration.rs` | ~550 | Integration tests for custom tool dispatch |
+| `tests/cli_create_app_integration.rs` | ~200 | CLI subprocess create-app tests |
+
+**Files to modify (remove create-app references):**
+
+| File | Change |
+|------|--------|
+| `src/agent/mod.rs` | Remove `pub mod create_app; pub mod create_app_prompt;` |
+| `src/api/sessions.rs` | Remove `POST /api/create-app` route + `create_app()` handler (~80 lines) |
+| `src/agent/service.rs` | Remove `create_global_session()` (replaced by `create_manager_session()`) |
+| `tests/session_integration.rs` | Remove tests that reference create_app flow |
+| `tests/contract_integration.rs` | Remove create_app contract tests |
+| `tests/session_coverage_integration.rs` | Remove create_app coverage tests |
+| `ui/src/pages/Dashboard.tsx` | Change hero "Create" button from `/create-app` to manager chat |
+| `CLAUDE.md` | Update agent module description |
+
+**The `/api/create-app` endpoint is replaced by:**
+- `POST /api/manager/sessions` — creates a manager session
+- Manager agent can create projects via `mcp__platform-core__create_project`
+- Manager agent can spawn dev agents via `mcp__platform-core__spawn_agent`
+
+**LLM test files (keep, separate concern):**
+
+| File | Keep? | Reason |
+|------|-------|--------|
+| `tests/llm_create_app.rs` | Rename to `tests/llm_manager.rs` | Test real CLI + MCP flow |
+| `tests/llm_create_app_e2e.rs` | Rename to `tests/llm_manager_e2e.rs` | E2E with real Anthropic API |
+
+### 4.4 Existing tests to update
 
 | File | Change | Reason |
 |------|--------|--------|
@@ -787,36 +874,73 @@ fi
 
 ```
 === Backend ===
-Step 1:  Migration + config (mcp_servers_path)            (30 min)
-Step 2:  CliSpawnOptions (mcp_config_path, disable_tools)  (30 min)
-Step 3:  build_manager_mcp_config()                        (30 min)
-Step 4:  create_manager_session() + cleanup                (2 hours)
-Step 5:  manager_prompt.rs                                 (30 min)
-Step 6:  API endpoints (/api/manager/*)                    (1.5 hours)
-Step 7:  Mock CLI update (MCP mode)                        (30 min)
-Step 8:  Unit + integration tests                          (2 hours)
+Step 1:  Delete old create-app flow                         (1 hour)
+         - Delete src/agent/create_app.rs, create_app_prompt.rs
+         - Delete tests/create_app_integration.rs, cli_create_app_integration.rs
+         - Remove POST /api/create-app route + handler
+         - Remove create_global_session() from service.rs
+         - Clean up mod.rs, session tests, contract tests
+         - Rename LLM test files
+         - Update CLAUDE.md
+Step 2:  Migration + config (mcp_servers_path)              (30 min)
+Step 3:  CliSpawnOptions (mcp_config_path, disable_tools)   (30 min)
+Step 4:  build_manager_mcp_config()                         (30 min)
+Step 5:  create_manager_session() + cleanup                 (2 hours)
+Step 6:  manager_prompt.rs                                  (30 min)
+Step 7:  API endpoints (/api/manager/*)                     (2 hours)
+         - POST sessions (create, enforce limit, auto-reap)
+         - GET sessions (list user's manager sessions)
+         - POST sessions/{id}/message (send to CLI stdin)
+         - GET sessions/{id}/events (SSE from Valkey pub/sub)
+         - DELETE sessions/{id} (stop session + cleanup)
+         - POST sessions/{id}/mode { mode } (SET in Valkey)
+         - POST sessions/{id}/approve_action { action_hash }
+           (SET approved:{hash} in Valkey, single-use, 60s TTL)
+         - POST sessions/{id}/approve_tool { tool_name }
+           (SADD session-approved set, CREATE/UPDATE only)
+Step 8:  Mock CLI update (MCP mode)                          (30 min)
+Step 9:  Unit + integration tests                            (2 hours)
 --- backend done, test with curl ---
 
+=== MCP Gate ===
+Step 10: mcp/lib/gate.js — action classifier + mode matrix   (1 hour)
+         - Valkey-based approval checks (action hash)
+         - computeActionHash, checkApproval, setPending
+         - Unknown tools fail closed (always ask)
+Step 11: Wrap all 6 MCP servers with gate() checks            (2 hours)
+         - confirmation_required with action_hash for 'ask'
+         - denied with plan-mode instructions for 'deny'
+         - Valkey approval check (not LLM confirmed param)
+Step 12: Mode read from Valkey (via platform API)             (1 hour)
+Step 13: Session-approved tool set (Valkey SISMEMBER)         (30 min)
+--- MCP gate done ---
+
 === Frontend ===
-Step 9:  ManagerChat.tsx (single session, basic messages)  (2 hours)
-Step 10: SSE integration + NDJSON parsing                  (1.5 hours)
-Step 11: Multi-session tab bar + localStorage persist      (1.5 hours)
-Step 12: Mode selector dropdown (5 modes)                  (1 hour)
-Step 13: Action classifier (tool → READ/CREATE/UPDATE/     (1 hour)
-         DELETE/DEPLOY) + mode matrix
-Step 14: Confirmation dialog (approve/approve-session/deny)(1.5 hours)
-Step 15: Plan mode (deny mutations, show planned steps)    (1 hour)
-Step 16: Full Auto warning banner                          (15 min)
-Step 17: Suggestions panel (context-aware)                 (1 hour)
-Step 18: CSS + responsive + minimize/expand                (1.5 hours)
-Step 19: App root integration (persist across pages)       (30 min)
+Step 14: ManagerChat.tsx (single session, basic messages)     (2 hours)
+Step 15: SSE integration + NDJSON parsing                     (1.5 hours)
+Step 16: Multi-session tab bar + localStorage persist         (1.5 hours)
+Step 17: Mode selector dropdown (5 modes)                     (1 hour)
+         - calls POST /api/manager/sessions/{id}/mode
+Step 18: Confirmation rendering (Claude asks, user responds)  (1 hour)
+         - detect "confirmation_required" in assistant text
+         - render [Approve] [Approve for session] [Deny] buttons
+         - Approve calls POST .../approve_action { action_hash }
+           then sends "Approved, proceed." as user message
+         - Approve for session also calls POST .../approve_tool
+           (CREATE/UPDATE only)
+         - Deny sends "Denied, do not proceed." as user message
+Step 19: Plan mode UI (show plan steps, "switch mode" hint)   (30 min)
+Step 20: Full Auto warning banner                             (15 min)
+Step 21: Suggestions panel (context-aware)                    (1 hour)
+Step 22: CSS + responsive + minimize/expand                   (1.5 hours)
+Step 23: App root integration (persist across pages)          (30 min)
 --- frontend done ---
 
-=== MCP + Polish ===
-Step 20: MCP server enhancements (list_all_sessions etc.)  (2 hours)
-Step 21: Admin sessions endpoint                           (1 hour)
-Step 22: E2E test with real CLI                            (2 hours)
-Step 23: Polish: error handling, reconnection, loading     (2 hours)
+=== Polish ===
+Step 24: MCP server enhancements (list_all_sessions etc.)    (2 hours)
+Step 25: Admin sessions endpoint                              (1 hour)
+Step 26: E2E test with real CLI                               (2 hours)
+Step 27: Polish: error handling, reconnection, loading        (2 hours)
 ```
 
 ## Security Checklist
@@ -826,10 +950,16 @@ Step 23: Polish: error handling, reconnection, loading     (2 hours)
 - [ ] CLI: `--permission-mode dontAsk` (auto-deny non-MCP)
 - [ ] CLI: `env_clear()` (no secret leakage)
 - [ ] CLI: only `CLAUDE_CODE_OAUTH_TOKEN` for auth
-- [ ] Token: scoped to user's permissions (not elevated)
-- [ ] Token: workspace boundary (no cross-workspace)
+- [ ] Token: scoped to user's own permissions (not elevated)
+- [ ] Token: no boundary (global) — RBAC is the only constraint
 - [ ] Token: 4h TTL (auto-expires)
 - [ ] MCP config: temp file deleted on cleanup
-- [ ] UI: Tier 2 tools always require confirmation
-- [ ] UI: Tier 1 tools require first-time confirmation
+- [ ] MCP gate: DELETE/DEPLOY tools always require confirmation (except Full Auto)
+- [ ] MCP gate: Plan mode returns "denied" for all mutations
+- [ ] MCP gate: confirmed=true parameter required to bypass gate
+- [ ] MCP gate: session-approved set only for CREATE/UPDATE (never DELETE/DEPLOY)
+- [ ] Mode stored in Valkey with session TTL (auto-cleanup)
 - [ ] Rate limit: max 5 concurrent manager sessions per user
+- [ ] Session limit enforced BEFORE token creation (avoid resource waste)
+- [ ] On limit hit: auto-reap oldest stopped/failed session to make room
+- [ ] Unknown/unmapped tools default to 'ask' (fail closed), not 'auto'

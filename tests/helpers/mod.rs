@@ -53,7 +53,7 @@ pub fn init_test_tracing() {
 ///
 /// Wrapper around `test_state()` that optionally enables CLI subprocess spawning.
 /// `CLAUDE_CLI_PATH` must be set externally (by `hack/test-in-cluster.sh`) to point
-/// to `cli/claude-mock/claude` (unified mock covering --print and setup-token modes).
+/// to `tests/fixtures/mock-claude-cli.sh`.
 ///
 /// - `cli_spawn_enabled = false` — tests that don't exercise CLI subprocess flow
 /// - `cli_spawn_enabled = true` — tests that trigger the mock CLI subprocess
@@ -84,14 +84,10 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
     // Ensure a rustls CryptoProvider is installed (needed by reqwest/fred)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Bootstrap seed data (retry once on transient DB pool errors)
-    if let Err(e) = platform::store::bootstrap::run(&pool, Some("testpassword"), true).await {
-        tracing::warn!(error = %e, "bootstrap failed on first attempt, retrying");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        platform::store::bootstrap::run(&pool, Some("testpassword"), true)
-            .await
-            .expect("bootstrap failed on retry");
-    }
+    // Bootstrap seed data
+    platform::store::bootstrap::run(&pool, Some("testpassword"), true)
+        .await
+        .expect("bootstrap failed");
 
     // Connect to real Valkey — no FLUSHDB needed. All Valkey keys are UUID-scoped
     // (permission cache, upload sessions, WebAuthn challenges) and never collide
@@ -225,6 +221,7 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         git_clone_image: "alpine/git:2.47.2".into(),
         kaniko_image: "gcr.io/kaniko-project/executor:v1.23.2-debug".into(),
         registry_proxy_blobs: false,
+        mcp_servers_path: "mcp/servers".into(),
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)

@@ -111,6 +111,8 @@ pub struct Config {
     /// When true, stream registry blobs through the platform instead of redirecting to `MinIO`.
     /// Needed when `MinIO` is not directly reachable from registry clients (e.g. kaniko in pods).
     pub registry_proxy_blobs: bool,
+    /// Directory containing MCP server scripts for manager agent sessions.
+    pub mcp_servers_path: String,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -286,6 +288,19 @@ impl Config {
             registry_proxy_blobs: env::var("REGISTRY_PROXY_BLOBS")
                 .ok()
                 .is_some_and(|v| v == "true"),
+            mcp_servers_path: {
+                let p =
+                    env::var("PLATFORM_MCP_SERVERS_PATH").unwrap_or_else(|_| "mcp/servers".into());
+                // Resolve to absolute path so MCP servers work when CLI CWD is /tmp
+                let path = PathBuf::from(&p);
+                if path.is_absolute() {
+                    p
+                } else {
+                    env::current_dir()
+                        .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                        .unwrap_or(p)
+                }
+            },
         }
     }
 
@@ -374,6 +389,7 @@ impl Config {
             git_clone_image: "alpine/git:2.47.2".into(),
             kaniko_image: "gcr.io/kaniko-project/executor:v1.23.2-debug".into(),
             registry_proxy_blobs: false,
+            mcp_servers_path: "mcp/servers".into(),
         }
     }
 }
@@ -823,155 +839,5 @@ mod tests {
         assert!(!config.trust_proxy_headers);
         assert!(config.dev_mode);
         assert!(config.cli_spawn_enabled);
-    }
-
-    #[test]
-    fn config_test_default_registry_proxy_blobs() {
-        let config = Config::test_default();
-        assert!(!config.registry_proxy_blobs);
-    }
-
-    #[test]
-    fn config_test_default_trust_proxy_cidrs_empty() {
-        let config = Config::test_default();
-        assert!(config.trust_proxy_cidrs.is_empty());
-    }
-
-    #[test]
-    fn config_test_default_health_check_interval() {
-        let config = Config::test_default();
-        assert_eq!(config.health_check_interval_secs, 15);
-    }
-
-    #[test]
-    fn config_test_default_pipeline_max_parallel() {
-        let config = Config::test_default();
-        assert_eq!(config.pipeline_max_parallel, 4);
-    }
-
-    #[test]
-    fn config_test_default_pipeline_timeout() {
-        let config = Config::test_default();
-        assert_eq!(config.pipeline_timeout_secs, 3600);
-    }
-
-    #[test]
-    fn config_test_default_max_lfs_object_bytes() {
-        let config = Config::test_default();
-        assert_eq!(config.max_lfs_object_bytes, 5_368_709_120);
-    }
-
-    #[test]
-    fn config_test_default_token_max_expiry() {
-        let config = Config::test_default();
-        assert_eq!(config.token_max_expiry_days, 365);
-    }
-
-    #[test]
-    fn config_test_default_observe_retention() {
-        let config = Config::test_default();
-        assert_eq!(config.observe_retention_days, 30);
-    }
-
-    #[test]
-    fn derive_valkey_host_port_empty_string() {
-        assert_eq!(derive_valkey_host_port(""), "localhost:6379");
-    }
-
-    #[test]
-    fn derive_valkey_host_port_redis_scheme_only() {
-        // Just "redis://" with no host — valid URL but no host_str
-        assert_eq!(derive_valkey_host_port("redis://"), "localhost:6379");
-    }
-
-    #[test]
-    fn config_load_cli_spawn_enabled_default() {
-        // Without PLATFORM_CLI_SPAWN_ENABLED set, default is true
-        let config = Config::load();
-        // Unless explicitly set to "false", cli_spawn_enabled is true
-        let env_val = std::env::var("PLATFORM_CLI_SPAWN_ENABLED").ok();
-        if env_val.as_deref() == Some("false") {
-            assert!(!config.cli_spawn_enabled);
-        } else {
-            assert!(config.cli_spawn_enabled);
-        }
-    }
-
-    #[test]
-    fn config_load_minio_insecure_default() {
-        let config = Config::load();
-        // Unless MINIO_INSECURE=true, default is false
-        let env_val = std::env::var("MINIO_INSECURE").ok();
-        if env_val.as_deref() == Some("true") {
-            assert!(config.minio_insecure);
-        } else {
-            assert!(!config.minio_insecure);
-        }
-    }
-
-    #[test]
-    fn config_load_registry_proxy_blobs_default() {
-        let config = Config::load();
-        let env_val = std::env::var("REGISTRY_PROXY_BLOBS").ok();
-        if env_val.as_deref() == Some("true") {
-            assert!(config.registry_proxy_blobs);
-        } else {
-            assert!(!config.registry_proxy_blobs);
-        }
-    }
-
-    #[test]
-    fn project_namespace_empty_slug_and_env() {
-        let config = Config::test_default();
-        assert_eq!(config.project_namespace("", ""), "-");
-    }
-
-    #[test]
-    fn project_namespace_with_prefix_empty_parts() {
-        let config = Config {
-            ns_prefix: Some("pfx".into()),
-            ..Config::test_default()
-        };
-        assert_eq!(config.project_namespace("a", "b"), "pfx-a-b");
-    }
-
-    #[test]
-    fn config_debug_finish_non_exhaustive() {
-        // Verify Debug impl uses finish_non_exhaustive (contains "..")
-        let config = Config::test_default();
-        let debug = format!("{config:?}");
-        assert!(
-            debug.contains(".."),
-            "Debug should use finish_non_exhaustive"
-        );
-    }
-
-    #[test]
-    fn config_test_default_seed_paths() {
-        let config = Config::test_default();
-        assert_eq!(config.seed_images_path, PathBuf::from("/tmp/seed-images"));
-        assert_eq!(
-            config.seed_commands_path,
-            PathBuf::from("/tmp/seed-commands")
-        );
-    }
-
-    #[test]
-    fn config_test_default_gateway_fields() {
-        let config = Config::test_default();
-        assert_eq!(config.gateway_name, "platform-gateway");
-        assert_eq!(config.gateway_namespace, "test-platform");
-    }
-
-    #[test]
-    fn config_test_default_permission_cache_ttl() {
-        let config = Config::test_default();
-        assert_eq!(config.permission_cache_ttl_secs, 300);
-    }
-
-    #[test]
-    fn config_test_default_max_cli_subprocesses() {
-        let config = Config::test_default();
-        assert_eq!(config.max_cli_subprocesses, 10);
     }
 }

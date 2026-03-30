@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -134,7 +135,7 @@ pub async fn invoke_cli(
 ///
 /// Uses a two-phase timeout: 30s for the first message (startup hang detection),
 /// then 300s for subsequent messages (normal operation).
-async fn read_cli_output(
+pub(crate) async fn read_cli_output(
     transport: &mut SubprocessTransport,
     session_id: Uuid,
     valkey: &fred::clients::Pool,

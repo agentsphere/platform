@@ -5,6 +5,7 @@ import { AuthProvider, useAuth } from './lib/auth';
 import { Layout } from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
+import { ManagerChat } from './components/ManagerChat';
 import { Login } from './pages/Login';
 import { Setup } from './pages/Setup';
 import { Dashboard } from './pages/Dashboard';
@@ -108,6 +109,7 @@ function App() {
       <AuthProvider>
         <ToastProvider>
           <AppRouter />
+          <ManagerChat />
         </ToastProvider>
       </AuthProvider>
     </ErrorBoundary>

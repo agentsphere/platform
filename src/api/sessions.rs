@@ -57,14 +57,27 @@ pub struct SpawnChildRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateAppRequest {
-    pub description: String,
-    pub provider: Option<String>,
+pub struct UpdateSessionRequest {
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UpdateSessionRequest {
-    pub project_id: Option<Uuid>,
+pub struct CreateManagerSessionRequest {
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetManagerModeRequest {
+    pub mode: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagerSessionResponse {
+    pub id: Uuid,
+    pub status: String,
+    pub prompt: String,
+    pub mode: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -147,7 +160,6 @@ pub fn router() -> Router<AppState> {
             get(sse_session_events),
         )
         // Global (project-less) endpoints
-        .route("/api/create-app", axum::routing::post(create_app))
         .route(
             "/api/sessions/{session_id}",
             axum::routing::patch(update_session),
@@ -159,6 +171,55 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/events",
             get(sse_session_events_global),
+        )
+        // Manager agent endpoints
+        .route(
+            "/api/manager/sessions",
+            get(list_manager_sessions).post(create_manager_session_handler),
+        )
+        .route(
+            "/api/manager/sessions/{id}/message",
+            axum::routing::post(send_manager_message),
+        )
+        .route(
+            "/api/manager/sessions/{id}/events",
+            get(manager_session_events),
+        )
+        .route(
+            "/api/manager/sessions/{id}",
+            axum::routing::delete(stop_manager_session),
+        )
+        .route(
+            "/api/manager/sessions/{id}/mode",
+            axum::routing::post(set_manager_mode),
+        )
+        .route(
+            "/api/manager/sessions/{id}/approve_action",
+            axum::routing::post(approve_manager_action),
+        )
+        .route(
+            "/api/manager/sessions/{id}/approve_tool",
+            axum::routing::post(approve_manager_tool),
+        )
+        .route(
+            "/api/manager/sessions/{id}/pending_action",
+            axum::routing::post(register_pending_action),
+        )
+        .route(
+            "/api/manager/sessions/{id}/approval/{hash}",
+            axum::routing::get(check_action_approval),
+        )
+        .route(
+            "/api/manager/sessions/{id}/reject_action",
+            axum::routing::post(reject_manager_action),
+        )
+        .route(
+            "/api/manager/sessions/{id}/rejection/{hash}",
+            axum::routing::get(check_action_rejection),
+        )
+        .route(
+            "/api/manager/sessions/{id}/approved_tools",
+            axum::routing::get(list_approved_tools),
         )
 }
 
@@ -549,86 +610,6 @@ async fn stop_session(
     .await;
 
     Ok(Json(serde_json::json!({"ok": true})))
-}
-
-// ---------------------------------------------------------------------------
-// Create App (project-less session)
-// ---------------------------------------------------------------------------
-
-/// Create a project-less agent session for the "Create App" flow.
-#[tracing::instrument(skip(state, body), err)]
-async fn create_app(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Json(body): Json<CreateAppRequest>,
-) -> Result<(StatusCode, Json<SessionResponse>), ApiError> {
-    // Project-scoped tokens cannot create project-less sessions
-    if auth.boundary_project_id.is_some() {
-        return Err(ApiError::Forbidden);
-    }
-
-    // Rate limit: 5 create-app sessions per 10 minutes per user
-    crate::auth::rate_limit::check_rate(
-        &state.valkey,
-        "create_app",
-        &auth.user_id.to_string(),
-        5,
-        600,
-    )
-    .await?;
-
-    validation::check_length("description", &body.description, 1, 100_000)?;
-    let provider = body.provider.as_deref().unwrap_or("claude-code");
-    validation::check_length("provider", provider, 1, 50)?;
-
-    // Check that the user has project:write and agent:run (global scope)
-    let has_write = resolver::has_permission_scoped(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        None,
-        Permission::ProjectWrite,
-        auth.token_scopes.as_deref(),
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-    let has_run = resolver::has_permission_scoped(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        None,
-        Permission::AgentRun,
-        auth.token_scopes.as_deref(),
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-    if !has_write || !has_run {
-        return Err(ApiError::Forbidden);
-    }
-
-    // Create project-less session via service
-    let session = service::create_global_session(&state, auth.user_id, &body.description, provider)
-        .await
-        .map_err(ApiError::from)?;
-
-    send_audit(
-        &state.audit_tx,
-        AuditEntry {
-            actor_id: auth.user_id,
-            actor_name: auth.user_name.clone(),
-            action: "agent_session.create_app".into(),
-            resource: "agent_session".into(),
-            resource_id: Some(session.id),
-            project_id: None,
-            detail: Some(serde_json::json!({"provider": provider})),
-            ip_addr: auth.ip_addr.clone(),
-        },
-    );
-
-    Ok((
-        StatusCode::CREATED,
-        Json(session_to_response(&session, false)),
-    ))
 }
 
 /// Link a project-less session to a newly created project.
@@ -1165,6 +1146,510 @@ async fn sse_session_events_global(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+// ---------------------------------------------------------------------------
+// Manager Agent endpoints
+// ---------------------------------------------------------------------------
+
+/// Valid permission modes for manager sessions.
+const VALID_MANAGER_MODES: &[&str] = &["plan", "guided", "auto_read", "auto_write", "full_auto"];
+
+/// Create a new manager session.
+#[tracing::instrument(skip(state, body), err)]
+async fn create_manager_session_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<CreateManagerSessionRequest>,
+) -> Result<(StatusCode, Json<ManagerSessionResponse>), ApiError> {
+    // Project-scoped tokens cannot create manager sessions
+    if auth.boundary_project_id.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+
+    // Rate limit: 30 manager session creations per 5 minutes per user
+    crate::auth::rate_limit::check_rate(
+        &state.valkey,
+        "manager_session",
+        &auth.user_id.to_string(),
+        30,
+        300,
+    )
+    .await?;
+
+    if let Some(ref prompt) = body.prompt {
+        validation::check_length("prompt", prompt, 1, 100_000)?;
+    }
+
+    let session_id = service::create_manager_session(&state, auth.user_id, body.prompt)
+        .await
+        .map_err(ApiError::from)?;
+
+    send_audit(
+        &state.audit_tx,
+        AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: auth.user_name.clone(),
+            action: "manager_session.create".into(),
+            resource: "manager_session".into(),
+            resource_id: Some(session_id),
+            project_id: None,
+            detail: None,
+            ip_addr: auth.ip_addr.clone(),
+        },
+    );
+
+    // Read back session for response
+    let session = service::fetch_session(&state.pool, session_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagerSessionResponse {
+            id: session.id,
+            status: session.status,
+            prompt: session.prompt,
+            mode: "auto_read".into(),
+            created_at: session.created_at,
+        }),
+    ))
+}
+
+/// List current user's manager sessions.
+async fn list_manager_sessions(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<ListSessionsParams>,
+) -> Result<Json<ListResponse<ManagerSessionResponse>>, ApiError> {
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = $1 AND execution_mode = 'manager'",
+    )
+    .bind(auth.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let rows: Vec<(Uuid, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, status, prompt, created_at FROM agent_sessions
+         WHERE user_id = $1 AND execution_mode = 'manager'
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(auth.user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    // Read modes from Valkey (best-effort, default to auto_read)
+    let mut items = Vec::with_capacity(rows.len());
+    for (id, status, prompt, created_at) in rows {
+        let mode = read_manager_mode(&state.valkey, id).await;
+        items.push(ManagerSessionResponse {
+            id,
+            status,
+            prompt: truncate_prompt(&prompt, 200),
+            mode,
+            created_at,
+        });
+    }
+
+    Ok(Json(ListResponse {
+        items,
+        total: total.0,
+    }))
+}
+
+/// Send a message to a running manager session.
+#[tracing::instrument(skip(state, body), fields(%id), err)]
+async fn send_manager_message(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SendMessageRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validation::check_length("content", &body.content, 1, 100_000)?;
+
+    let session = service::fetch_session(&state.pool, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    if session.user_id != auth.user_id {
+        return Err(ApiError::NotFound("session".into()));
+    }
+    if session.execution_mode != "manager" {
+        return Err(ApiError::NotFound("session".into()));
+    }
+
+    service::send_manager_message(&state, id, &body.content)
+        .await
+        .map_err(ApiError::from)?;
+
+    send_audit(
+        &state.audit_tx,
+        AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: auth.user_name.clone(),
+            action: "manager_session.message".into(),
+            resource: "manager_session".into(),
+            resource_id: Some(id),
+            project_id: None,
+            detail: None, // Never log message content
+            ip_addr: auth.ip_addr.clone(),
+        },
+    );
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// SSE events for a manager session.
+async fn manager_session_events(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let session = service::fetch_session(&state.pool, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    if session.user_id != auth.user_id {
+        return Err(ApiError::NotFound("session".into()));
+    }
+    if session.execution_mode != "manager" {
+        return Err(ApiError::NotFound("session".into()));
+    }
+
+    // Replay stored events from DB
+    let stored = replay_stored_events(&state.pool, id).await;
+
+    // Subscribe to live events
+    let rx = crate::agent::pubsub_bridge::subscribe_session_events(&state.valkey, id)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let replay_stream =
+        tokio_stream::iter(stored.into_iter().map(Ok::<_, std::convert::Infallible>));
+    let live_stream = ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
+    let stream = replay_stream.chain(live_stream).map(|event| {
+        let json =
+            serde_json::to_string(&event.expect("Infallible error type")).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().event("progress").data(json))
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Stop a manager session.
+#[tracing::instrument(skip(state), fields(%id), err)]
+async fn stop_manager_session(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = service::fetch_session(&state.pool, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    if session.user_id != auth.user_id {
+        return Err(ApiError::NotFound("session".into()));
+    }
+    if session.execution_mode != "manager" {
+        return Err(ApiError::NotFound("session".into()));
+    }
+
+    service::stop_session(&state, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Clean up MCP config temp file
+    let mcp_path = format!("/tmp/manager-mcp-{id}.json");
+    let _ = tokio::fs::remove_file(&mcp_path).await;
+
+    send_audit(
+        &state.audit_tx,
+        AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: auth.user_name.clone(),
+            action: "manager_session.stop".into(),
+            resource: "manager_session".into(),
+            resource_id: Some(id),
+            project_id: None,
+            detail: None,
+            ip_addr: auth.ip_addr.clone(),
+        },
+    );
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Set the permission mode for a manager session.
+#[tracing::instrument(skip(state, body), fields(%id), err)]
+async fn set_manager_mode(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetManagerModeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !VALID_MANAGER_MODES.contains(&body.mode.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid mode: '{}'. Valid modes: {}",
+            body.mode,
+            VALID_MANAGER_MODES.join(", ")
+        )));
+    }
+
+    let session = service::fetch_session(&state.pool, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    if session.user_id != auth.user_id {
+        return Err(ApiError::NotFound("session".into()));
+    }
+    if session.execution_mode != "manager" {
+        return Err(ApiError::NotFound("session".into()));
+    }
+
+    // Store mode in Valkey (4h TTL matching session token)
+    {
+        let mode_key = format!("manager:{id}:mode");
+        state
+            .valkey
+            .next()
+            .set::<(), _, _>(
+                &mode_key,
+                body.mode.as_str(),
+                Some(fred::types::Expiration::EX(4 * 3600)),
+                None,
+                false,
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    }
+
+    send_audit(
+        &state.audit_tx,
+        AuditEntry {
+            actor_id: auth.user_id,
+            actor_name: auth.user_name.clone(),
+            action: "manager_session.set_mode".into(),
+            resource: "manager_session".into(),
+            resource_id: Some(id),
+            project_id: None,
+            detail: Some(serde_json::json!({"mode": body.mode})),
+            ip_addr: auth.ip_addr.clone(),
+        },
+    );
+
+    Ok(Json(serde_json::json!({"ok": true, "mode": body.mode})))
+}
+
+// ---------------------------------------------------------------------------
+// Manager session: MCP gate approval endpoints
+// ---------------------------------------------------------------------------
+
+use fred::interfaces::{KeysInterface, SetsInterface};
+
+/// Approve a specific pending action (by hash). Single-use, 60s TTL.
+async fn approve_manager_action(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = body["action_hash"]
+        .as_str()
+        .ok_or_else(|| ApiError::BadRequest("action_hash required".into()))?;
+
+    let key = format!("manager:{id}:approved:{hash}");
+    state
+        .valkey
+        .next()
+        .set::<(), _, _>(
+            &key,
+            "1",
+            Some(fred::types::Expiration::EX(60)),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    tracing::info!(%id, %hash, user_id = %auth.user_id, "manager action approved");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Session-approve a tool name (CREATE/UPDATE only). Lasts for session lifetime.
+async fn approve_manager_tool(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tool = body["tool_name"]
+        .as_str()
+        .ok_or_else(|| ApiError::BadRequest("tool_name required".into()))?;
+
+    let key = format!("manager:{id}:approved_tools");
+    state
+        .valkey
+        .next()
+        .sadd::<(), _, _>(&key, tool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    // Set TTL on the set (4h)
+    state
+        .valkey
+        .next()
+        .expire::<(), _>(&key, 4 * 3600, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    tracing::info!(%id, %tool, user_id = %auth.user_id, "manager tool session-approved");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Register a pending action (called by MCP gate).
+/// Publishes a `confirmation_needed` event to SSE so the UI shows approve/reject buttons.
+async fn register_pending_action(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = body["action_hash"]
+        .as_str()
+        .ok_or_else(|| ApiError::BadRequest("action_hash required".into()))?;
+    let summary = body["summary"].as_str().unwrap_or("action pending");
+    let tool = body["tool"].as_str().unwrap_or("");
+
+    let key = format!("manager:{id}:pending:{hash}");
+    state
+        .valkey
+        .next()
+        .set::<(), _, _>(
+            &key,
+            summary,
+            Some(fred::types::Expiration::EX(300)),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    // Publish confirmation_needed event to SSE
+    let event = crate::agent::provider::ProgressEvent {
+        kind: crate::agent::provider::ProgressKind::SecretRequest, // Reuse SecretRequest kind for confirmation UI
+        message: summary.to_string(),
+        metadata: Some(serde_json::json!({
+            "type": "confirmation_needed",
+            "action_hash": hash,
+            "tool": tool,
+            "summary": summary,
+        })),
+    };
+    let _ = crate::agent::pubsub_bridge::publish_event(&state.valkey, id, &event).await;
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Reject a pending action.
+async fn reject_manager_action(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = body["action_hash"]
+        .as_str()
+        .ok_or_else(|| ApiError::BadRequest("action_hash required".into()))?;
+
+    let key = format!("manager:{id}:rejected:{hash}");
+    state
+        .valkey
+        .next()
+        .set::<(), _, _>(
+            &key,
+            "1",
+            Some(fred::types::Expiration::EX(60)),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Check if an action hash has been rejected.
+async fn check_action_rejection(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path((id, hash)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = format!("manager:{id}:rejected:{hash}");
+    let exists: bool = state
+        .valkey
+        .next()
+        .exists::<i64, _>(&key)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if exists {
+        let _: () = state.valkey.next().del(&key).await.unwrap_or(());
+    }
+    Ok(Json(serde_json::json!({"rejected": exists})))
+}
+
+/// Check if an action hash has been approved.
+async fn check_action_approval(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path((id, hash)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = format!("manager:{id}:approved:{hash}");
+    let exists: bool = state
+        .valkey
+        .next()
+        .exists::<i64, _>(&key)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
+
+    // If approved, consume it (single-use)
+    if exists {
+        let _: () = state.valkey.next().del(&key).await.unwrap_or(());
+    }
+
+    Ok(Json(serde_json::json!({"approved": exists})))
+}
+
+/// List session-approved tool names.
+async fn list_approved_tools(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = format!("manager:{id}:approved_tools");
+    let tools: Vec<String> = state.valkey.next().smembers(&key).await.unwrap_or_default();
+
+    Ok(Json(serde_json::json!({"tools": tools})))
+}
+
+/// Read the current permission mode for a manager session from Valkey.
+async fn read_manager_mode(valkey: &fred::clients::Pool, session_id: Uuid) -> String {
+    let mode_key = format!("manager:{session_id}:mode");
+    valkey
+        .next()
+        .get::<Option<String>, _>(&mode_key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "auto_read".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1403,35 +1888,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_prompt_unicode_boundary() {
-        // Unicode chars: each emoji is >1 byte but 1 char
-        let emoji_str = "🎉🎊🎈🎁🎀";
-        // 5 chars, truncate to 3
-        let result = truncate_prompt(emoji_str, 3);
-        assert_eq!(result, "🎉🎊🎈...");
-    }
-
-    #[test]
-    fn truncate_prompt_single_char_max() {
-        assert_eq!(truncate_prompt("abcdef", 1), "a...");
-    }
-
-    #[test]
-    fn validate_provider_config_valid_admin_role() {
-        let config = serde_json::json!({ "role": "admin" });
-        assert!(validate_provider_config(&config).is_ok());
-    }
-
-    #[test]
-    fn validate_provider_config_browser_with_review_role_rejected() {
-        let config = serde_json::json!({
-            "browser": { "allowed_origins": ["http://localhost:3000"] },
-            "role": "review"
-        });
-        assert!(validate_provider_config(&config).is_err());
-    }
-
-    #[test]
     fn session_to_response_browser_disabled_without_config() {
         let session = crate::agent::provider::AgentSession {
             id: uuid::Uuid::new_v4(),
@@ -1457,5 +1913,20 @@ mod tests {
 
         let response = session_to_response(&session, false);
         assert!(!response.browser_enabled);
+    }
+
+    #[test]
+    fn valid_manager_modes_contains_expected() {
+        assert!(VALID_MANAGER_MODES.contains(&"plan"));
+        assert!(VALID_MANAGER_MODES.contains(&"guided"));
+        assert!(VALID_MANAGER_MODES.contains(&"auto_read"));
+        assert!(VALID_MANAGER_MODES.contains(&"auto_write"));
+        assert!(VALID_MANAGER_MODES.contains(&"full_auto"));
+    }
+
+    #[test]
+    fn invalid_mode_not_in_valid_list() {
+        assert!(!VALID_MANAGER_MODES.contains(&"invalid"));
+        assert!(!VALID_MANAGER_MODES.contains(&""));
     }
 }
