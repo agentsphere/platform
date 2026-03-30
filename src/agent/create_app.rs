@@ -1080,4 +1080,134 @@ mod tests {
         let result = parse_create_project_input(&input);
         assert!(result.is_ok(), "empty description should be ok (min=0)");
     }
+
+    #[test]
+    fn parse_create_project_input_name_with_dots_and_dashes() {
+        // Names with dots and dashes are valid
+        let input = serde_json::json!({"name": "my-app.v2"});
+        let (name, _, _) = parse_create_project_input(&input).unwrap();
+        assert_eq!(name, "my-app.v2");
+    }
+
+    #[test]
+    fn parse_create_project_input_name_with_underscores() {
+        let input = serde_json::json!({"name": "my_app_v2"});
+        let (name, _, _) = parse_create_project_input(&input).unwrap();
+        assert_eq!(name, "my_app_v2");
+    }
+
+    #[test]
+    fn parse_create_project_input_description_non_string_ignored() {
+        // description as a number is silently ignored (returns None)
+        let input = serde_json::json!({
+            "name": "my-app",
+            "description": 12345,
+        });
+        let (_, _, desc) = parse_create_project_input(&input).unwrap();
+        assert!(desc.is_none(), "non-string description should be None");
+    }
+
+    #[test]
+    fn parse_create_project_input_display_name_non_string_ignored() {
+        let input = serde_json::json!({
+            "name": "my-app",
+            "display_name": true,
+        });
+        let (_, dn, _) = parse_create_project_input(&input).unwrap();
+        assert!(dn.is_none(), "non-string display_name should be None");
+    }
+
+    #[test]
+    fn parse_uuid_field_whitespace_uuid_invalid() {
+        let input = serde_json::json!({"project_id": " "});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "whitespace-only should fail UUID parse");
+    }
+
+    #[test]
+    fn parse_uuid_field_partial_uuid_invalid() {
+        // Truncated UUID
+        let input = serde_json::json!({"project_id": "550e8400-e29b-41d4-a716"});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "partial UUID should fail");
+    }
+
+    #[test]
+    fn parse_uuid_field_array_value() {
+        let input = serde_json::json!({"project_id": [1, 2, 3]});
+        let result = parse_uuid_field(&input, "project_id");
+        assert!(result.is_err(), "array value should fail as_str()");
+    }
+
+    #[test]
+    fn parse_create_project_input_long_name() {
+        // Names up to 255 chars are valid
+        let name = "a".repeat(255);
+        let input = serde_json::json!({"name": name});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_ok(), "255-char name should be ok");
+    }
+
+    #[test]
+    fn parse_create_project_input_name_over_max_rejected() {
+        let name = "a".repeat(256);
+        let input = serde_json::json!({"name": name});
+        let result = parse_create_project_input(&input);
+        assert!(result.is_err(), "256-char name should be rejected");
+    }
+
+    #[test]
+    fn check_progress_limit_exactly_50() {
+        let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": 50});
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(20)
+            .min(50);
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn check_progress_float_limit_ignored() {
+        // JSON float should not parse as i64
+        let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": 10.5});
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(20)
+            .min(50);
+        assert_eq!(limit, 20, "float should fall back to default");
+    }
+
+    #[test]
+    fn check_progress_string_limit_ignored() {
+        let input = serde_json::json!({"session_id": Uuid::new_v4().to_string(), "limit": "ten"});
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(20)
+            .min(50);
+        assert_eq!(limit, 20, "string should fall back to default");
+    }
+
+    #[test]
+    fn prompt_format_includes_rules_and_user_request() {
+        // Test the prompt wrapping logic from run_create_app_loop
+        let user_prompt = "Build me a REST API";
+        let formatted = format!(
+            "RULES (you MUST follow these):\n\
+             - You are the Manager Agent. You orchestrate, you do NOT write code.\n\
+             - Use the tools: create_project, then spawn_coding_agent. That is ALL you do.\n\
+             - Your spawn_coding_agent prompt MUST be SHORT — only describe WHAT to build.\n\
+             - Do NOT include file paths, code, Dockerfiles, docker-compose, k8s manifests, or project structure.\n\
+             - Do NOT mention /tmp, /private, or any absolute paths. The worker knows its workspace.\n\
+             - This is a Kubernetes-native platform. There is NO docker-compose, NO SQLite — use PostgreSQL.\n\
+             - The worker has CLAUDE.md with the full development workflow. Do NOT repeat it.\n\n\
+             USER REQUEST:\n{user_prompt}"
+        );
+        assert!(formatted.contains("RULES (you MUST follow these):"));
+        assert!(formatted.contains("USER REQUEST:"));
+        assert!(formatted.contains("Build me a REST API"));
+        assert!(formatted.contains("Manager Agent"));
+    }
 }

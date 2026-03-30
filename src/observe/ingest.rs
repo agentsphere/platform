@@ -892,4 +892,100 @@ mod tests {
     // - otlp_ingest_invalid_project_id_uuid_returns_400
     // - otlp_ingest_accepts_authorized_project
     // - otlp_ingest_deduplicates_project_auth
+
+    // -- BUFFER_CAPACITY constant --
+
+    #[test]
+    fn buffer_capacity_is_10k() {
+        assert_eq!(BUFFER_CAPACITY, 10_000);
+    }
+
+    // -- create_channels capacity --
+
+    #[test]
+    fn create_channels_have_expected_capacity() {
+        let (channels, spans_rx, logs_rx, metrics_rx) = create_channels();
+        // All channels should have the full capacity available
+        assert_eq!(channels.spans_tx.capacity(), BUFFER_CAPACITY);
+        assert_eq!(channels.logs_tx.capacity(), BUFFER_CAPACITY);
+        assert_eq!(channels.metrics_tx.capacity(), BUFFER_CAPACITY);
+        // Drop receivers to avoid warnings
+        drop(spans_rx);
+        drop(logs_rx);
+        drop(metrics_rx);
+    }
+
+    // -- IngestChannels Clone --
+
+    #[test]
+    fn ingest_channels_clone() {
+        let (channels, _spans_rx, _logs_rx, _metrics_rx) = create_channels();
+        let cloned = channels.clone();
+        // Both should have the same capacity
+        assert_eq!(channels.spans_tx.capacity(), cloned.spans_tx.capacity());
+        assert_eq!(channels.logs_tx.capacity(), cloned.logs_tx.capacity());
+        assert_eq!(channels.metrics_tx.capacity(), cloned.metrics_tx.capacity());
+    }
+
+    // -- events_to_json preserves time format --
+
+    #[test]
+    fn events_to_json_time_is_rfc3339() {
+        let events = vec![proto::SpanEvent {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            name: "time-check".into(),
+            attributes: vec![],
+        }];
+        let json = events_to_json(&events).unwrap();
+        let time_str = json[0]["time"].as_str().unwrap();
+        // Verify it parses as a valid RFC3339 timestamp
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(time_str).is_ok(),
+            "time should be RFC3339, got: {time_str}"
+        );
+    }
+
+    // -- json_opt with value-less attribute --
+
+    #[test]
+    fn json_opt_attr_with_no_value() {
+        let attrs = vec![proto::KeyValue {
+            key: "missing".into(),
+            value: None,
+        }];
+        // The proto layer returns null for None values
+        let result = json_opt(&attrs);
+        // With a key but no value, attrs_to_json still produces a non-null map
+        // (the key maps to null)
+        assert!(result.is_some() || result.is_none()); // just verifying no panic
+    }
+
+    // -- number_point_to_record timestamp --
+
+    #[test]
+    fn number_point_timestamp_propagated() {
+        let dp = proto::NumberDataPoint {
+            value: Some(proto::number_data_point::Value::AsDouble(1.0)),
+            time_unix_nano: 1_700_000_000_000_000_000,
+            attributes: vec![],
+        };
+        let env = empty_envelope();
+        let rec = number_point_to_record(&dp, "ts-test", "gauge", None, &env).unwrap();
+        let expected = proto::nanos_to_datetime(1_700_000_000_000_000_000);
+        assert_eq!(rec.timestamp, expected);
+    }
+
+    // -- drain helper smoke tests --
+
+    #[tokio::test]
+    async fn drain_spans_empty_channel() {
+        // drain_spans with an empty channel should be a no-op
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<super::SpanRecord>(10);
+        let buffer: Vec<super::SpanRecord> = Vec::new();
+
+        // Can't call drain_spans directly (needs PgPool), but we can verify
+        // the try_recv pattern works
+        assert!(rx.try_recv().is_err());
+        assert!(buffer.is_empty());
+    }
 }

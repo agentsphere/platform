@@ -372,3 +372,160 @@ async fn deploy_preview_service_not_found_in_k8s(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].as_str().unwrap().contains("service"));
 }
+
+// ---------------------------------------------------------------------------
+// Deploy preview with environment query param
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_with_env_query_param(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-env-param", "public").await;
+
+    // Request with ?env=staging — service won't exist but validates the env param is accepted
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/my-svc?env=staging"),
+    )
+    .await;
+    // K8s namespace doesn't exist, so service lookup fails with 404
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}
+
+// ---------------------------------------------------------------------------
+// Preview proxy: owner can access null-project session
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_owner_can_access_null_project_session(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    // Session with no project — only owner can access
+    let session_id = insert_session_opt(&pool, None, admin_id, "running", Some("test-ns")).await;
+
+    // Owner can access — gets 502 because no real backend is running
+    let status = helpers::get_status(&app, &admin_token, &format!("/preview/{session_id}")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+// ---------------------------------------------------------------------------
+// Preview proxy: path with trailing slash
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_path_with_trailing_slash(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let project_id = create_project(&app, &admin_token, "preview-trail", "private").await;
+    let session_id = insert_session(&pool, project_id, admin_id, "running", Some("test-ns")).await;
+
+    // Request with trailing slash
+    let status = helpers::get_status(&app, &admin_token, &format!("/preview/{session_id}/")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview: trailing slash on URL
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_trailing_slash(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-trail", "public").await;
+
+    // Request with trailing slash — should still work (validates routing)
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/my-svc/"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview: empty service name in URL segment
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_with_path(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-path", "public").await;
+
+    // Request with deep path — validates the {*path} wildcard segment
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/my-svc/assets/app.js"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview: viewer on public project can access
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_viewer_public_project(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "dp-viewer-pub", "public").await;
+
+    // Create a viewer user
+    let (user_id, user_token) =
+        create_user(&app, &admin_token, "dp-viewer", "dpviewer@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
+
+    // Viewer can access public project deploy preview (gets 404 because K8s service doesn't exist)
+    let (status, body) = helpers::get_json(
+        &app,
+        &user_token,
+        &format!("/deploy-preview/{project_id}/my-svc"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}
+
+// ---------------------------------------------------------------------------
+// Deploy preview: query string preserved
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deploy_preview_preserves_query_string(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let project_id = create_project(&app, &admin_token, "dp-query", "public").await;
+
+    // Request with query parameters
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/deploy-preview/{project_id}/my-svc/api/data?page=1&limit=10"),
+    )
+    .await;
+    // Service doesn't exist, but query is accepted without errors
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("service"));
+}

@@ -3378,3 +3378,412 @@ async fn create_issue_too_many_labels_rejected(pool: PgPool) {
         "51 labels on create should be rejected, got {status}"
     );
 }
+
+// ===========================================================================
+// Auto-merge enable/disable endpoints
+// ===========================================================================
+
+/// PUT auto-merge on an open MR returns 200.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_enable_auto_merge(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-enable", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify auto_merge is true in DB
+    let am: (bool,) = sqlx::query_as(
+        "SELECT auto_merge FROM merge_requests WHERE project_id = $1 AND number = 1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(am.0, "auto_merge should be true");
+}
+
+/// PUT auto-merge with explicit merge_method stores it.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_enable_auto_merge_with_method(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-method", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+        json!({ "merge_method": "squash" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let method: (Option<String>,) = sqlx::query_as(
+        "SELECT auto_merge_method FROM merge_requests WHERE project_id = $1 AND number = 1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(method.0.as_deref(), Some("squash"));
+}
+
+/// DELETE auto-merge disables it.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_disable_auto_merge(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-disable", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Enable first
+    helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+        json!({}),
+    )
+    .await;
+
+    // Disable
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify auto_merge is false
+    let am: (bool,) = sqlx::query_as(
+        "SELECT auto_merge FROM merge_requests WHERE project_id = $1 AND number = 1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!am.0, "auto_merge should be false");
+}
+
+/// Enable auto-merge on nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_enable_auto_merge_nonexistent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-404", "public").await;
+
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999/auto-merge"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Disable auto-merge on nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_disable_auto_merge_nonexistent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-dis404", "public").await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999/auto-merge"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Enable auto-merge on closed MR returns 404 (WHERE status='open' doesn't match).
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_enable_auto_merge_closed_mr(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-closed", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Close the MR
+    helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+        json!({ "status": "closed" }),
+    )
+    .await;
+
+    // Try to enable auto-merge on closed MR
+    let (status, _) = helpers::put_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Viewer cannot enable auto-merge (requires project:write).
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_enable_auto_merge_forbidden_viewer(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-am-viewer", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let (user_id, user_token) =
+        helpers::create_user(&app, &admin_token, "am-viewer", "amviewer@test.com").await;
+    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
+
+    let (status, _) = helpers::put_json(
+        &app,
+        &user_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/auto-merge"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ===========================================================================
+// Get review by ID
+// ===========================================================================
+
+/// GET individual review returns correct fields.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_review_by_id(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "rev-get-id", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Create a review
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews"),
+        json!({ "verdict": "approve", "body": "Ship it" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let review_id = body["id"].as_str().unwrap();
+
+    // GET it
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews/{review_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], review_id);
+    assert_eq!(body["verdict"], "approve");
+    assert_eq!(body["body"], "Ship it");
+    assert_eq!(body["mr_id"], mr_id.to_string());
+}
+
+/// GET nonexistent review returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_review_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "rev-get-404", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/reviews/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET review on nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_review_nonexistent_mr(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "rev-get-nomr", "public").await;
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999/reviews/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// MR delete comment by author succeeds
+// ===========================================================================
+
+/// Author can delete their own MR comment.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_comment_by_author(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmtdel-ok", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Admin creates a comment
+    let comment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO comments (id, project_id, mr_id, author_id, body) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(comment_id)
+    .bind(project_id)
+    .bind(mr_id)
+    .bind(admin_id)
+    .bind("to be deleted")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Author (admin) deletes their own comment
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify it's gone
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1/comments/{comment_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Delete MR comment on nonexistent MR returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_mr_comment_nonexistent_mr(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-cmtdel-nomr", "public").await;
+    let fake_id = Uuid::new_v4();
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/999/comments/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// MR update body > 100000 chars via PATCH
+// ===========================================================================
+// MR create with empty title
+// ===========================================================================
+
+/// MR create with empty title is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn mr_create_empty_title_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-empty-title", "public").await;
+
+    let row: (Option<String>,) = sqlx::query_as("SELECT repo_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_path = row.0.unwrap();
+    seed_bare_repo(&repo_path);
+
+    tokio::process::Command::new("git")
+        .args(["branch", "empty-title", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests"),
+        json!({
+            "source_branch": "empty-title",
+            "target_branch": "main",
+            "title": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
+// Delete an already-closed MR is idempotent
+// ===========================================================================
+
+/// Delete an already-closed MR succeeds (idempotent close).
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_already_closed_mr(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let project_id = helpers::create_project(&app, &admin_token, "mr-del-closed", "public").await;
+    let admin_id = helpers::admin_user_id(&pool).await;
+    let _mr_id = helpers::insert_mr(&pool, project_id, admin_id, "feat", "main", 1).await;
+
+    // Close first
+    helpers::patch_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+        json!({ "status": "closed" }),
+    )
+    .await;
+
+    // Delete already-closed MR should still succeed
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{project_id}/merge-requests/1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

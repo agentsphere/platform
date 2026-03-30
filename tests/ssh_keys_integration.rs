@@ -516,3 +516,175 @@ async fn test_admin_list_ssh_keys_unauthenticated(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/users/me/ssh-keys/{id} — individual key retrieval
+// ---------------------------------------------------------------------------
+
+/// Successfully retrieve a single SSH key by ID.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_get_ssh_key_success(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Add key first
+    let (status, created) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/users/me/ssh-keys",
+        serde_json::json!({
+            "name": "get-test-key",
+            "public_key": TEST_ED25519_KEY,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let key_id = created["id"].as_str().unwrap();
+
+    // Retrieve it
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/users/me/ssh-keys/{key_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"].as_str().unwrap(), key_id);
+    assert_eq!(body["name"].as_str().unwrap(), "get-test-key");
+    assert_eq!(body["algorithm"].as_str().unwrap(), "ssh-ed25519");
+    assert!(body["fingerprint"].is_string());
+    assert!(body["created_at"].is_string());
+    assert!(body["last_used_at"].is_null());
+}
+
+/// GET for a nonexistent SSH key returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_get_ssh_key_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/users/me/ssh-keys/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET another user's SSH key returns 404 (user_id filter).
+#[sqlx::test(migrations = "./migrations")]
+async fn test_get_ssh_key_other_user_returns_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Admin adds a key
+    let (status, created) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/users/me/ssh-keys",
+        serde_json::json!({
+            "name": "admin-key",
+            "public_key": TEST_ED25519_KEY,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let key_id = created["id"].as_str().unwrap();
+
+    // Create a different user
+    let (_other_id, other_token) =
+        helpers::create_user(&app, &admin_token, "ssh-other-get", "sshother-get@test.com").await;
+
+    // Other user cannot retrieve admin's key
+    let (status, _) = helpers::get_json(
+        &app,
+        &other_token,
+        &format!("/api/users/me/ssh-keys/{key_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET SSH key unauthenticated returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_get_ssh_key_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        "bad-token",
+        &format!("/api/users/me/ssh-keys/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Admin list SSH keys for nonexistent user
+// ---------------------------------------------------------------------------
+
+/// Admin listing SSH keys for a nonexistent user returns empty list (not 404).
+#[sqlx::test(migrations = "./migrations")]
+async fn test_admin_list_ssh_keys_nonexistent_user(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_user_id = Uuid::new_v4();
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{fake_user_id}/ssh-keys"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 0);
+    assert!(body["items"].as_array().unwrap().is_empty());
+}
+
+/// Deleting a key that doesn't belong to the user returns 404 and key still exists.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_delete_ssh_key_wrong_user_key_persists(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Admin adds a key
+    let (status, created) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/users/me/ssh-keys",
+        serde_json::json!({
+            "name": "persist-key",
+            "public_key": TEST_ED25519_KEY,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let key_id = created["id"].as_str().unwrap();
+
+    // Create another user
+    let (_other_id, other_token) =
+        helpers::create_user(&app, &admin_token, "ssh-delwrong", "ssh-delwrong@test.com").await;
+
+    // Other user tries to delete admin's key - should get 404
+    let (status, _) = helpers::delete_json(
+        &app,
+        &other_token,
+        &format!("/api/users/me/ssh-keys/{key_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Key should still be visible to admin
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/users/me/ssh-keys/{key_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"].as_str().unwrap(), "persist-key");
+}

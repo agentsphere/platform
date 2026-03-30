@@ -1955,6 +1955,74 @@ async fn ops_repo_updated_creates_new_target(pool: PgPool) {
 // AlertFired — value: null variant
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// AlertFired — per-project concurrent limit
+// ---------------------------------------------------------------------------
+
+/// `AlertFired` with 3+ active ops sessions → skipped (concurrent limit).
+#[sqlx::test(migrations = "./migrations")]
+async fn alert_fired_concurrent_limit_skipped(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state.clone());
+    let project_id =
+        helpers::create_project(&app, &admin_token, "eb-alert-conclimit", "public").await;
+
+    // Get admin user id
+    let admin_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM users WHERE name = 'admin' AND is_active = true")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // Create 3 fake "pending" agent sessions to hit the concurrent limit
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO agent_sessions (project_id, status, prompt, user_id, provider) \
+             VALUES ($1, 'pending', $2, $3, 'claude-code')",
+        )
+        .bind(project_id)
+        .bind(format!("fake session {i}"))
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let rule_id = Uuid::new_v4();
+    let event = serde_json::json!({
+        "type": "AlertFired",
+        "rule_id": rule_id,
+        "project_id": project_id,
+        "severity": "critical",
+        "value": 99.0,
+        "message": "Should be skipped due to concurrent limit",
+        "alert_name": "conc-limit-test",
+    });
+
+    let result = platform::store::eventbus::handle_event(&state, &event.to_string()).await;
+    assert!(
+        result.is_ok(),
+        "concurrent limit should not fail: {result:?}"
+    );
+
+    // Cooldown should NOT be set (skipped before spawn)
+    let cooldown_key = format!("alert-agent:{project_id}:{rule_id}");
+    let exists: bool = state
+        .valkey
+        .next()
+        .exists::<bool, _>(&cooldown_key)
+        .await
+        .unwrap();
+    assert!(
+        !exists,
+        "cooldown should not be set when concurrent limit reached"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AlertFired — value: null variant
+// ---------------------------------------------------------------------------
+
 /// `AlertFired` with value: null (absent metric) → still processes correctly.
 #[sqlx::test(migrations = "./migrations")]
 async fn alert_fired_with_null_value(pool: PgPool) {

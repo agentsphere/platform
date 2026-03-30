@@ -1998,7 +1998,7 @@ async fn copy_tag_creates_alias(pool: PgPool) {
     let layer_digest = registry_upload_blob(&app, &api_token, "copy-proj", b"copy-lyr").await;
 
     // Push manifest tagged as "source-tag"
-    let manifest_digest = registry_push_manifest(
+    let _manifest_digest = registry_push_manifest(
         &app,
         &api_token,
         "copy-proj",
@@ -2323,4 +2323,377 @@ async fn delete_nonexistent_manifest(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked upload: wrong user cannot PATCH another user's upload
+// ---------------------------------------------------------------------------
+
+/// PATCH from a different user returns BlobUploadUnknown (404).
+#[sqlx::test(migrations = "./migrations")]
+async fn chunked_upload_wrong_user_rejected(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "chunk-wrong-u", "private").await;
+    let (_, admin_api) =
+        create_user_with_api_token(&app, &admin_token, "chunk-a", "chunk-a@test.com", &pool).await;
+    let (_, other_api) =
+        create_user_with_api_token(&app, &admin_token, "chunk-b", "chunk-b@test.com", &pool).await;
+
+    // User A starts upload
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/chunk-wrong-u/blobs/uploads/")
+        .header("Authorization", format!("Bearer {admin_api}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // User B tries to PATCH user A's upload
+    let chunk = b"stolen-data";
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&location)
+        .header("Authorization", format!("Bearer {other_api}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(chunk.to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "wrong user should not be able to patch upload"
+    );
+}
+
+/// PUT complete from a different user returns BlobUploadUnknown (404).
+#[sqlx::test(migrations = "./migrations")]
+async fn chunked_complete_wrong_user_rejected(pool: PgPool) {
+    use sha2::Digest as _;
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "comp-wrong-u", "private").await;
+    let (_, admin_api) =
+        create_user_with_api_token(&app, &admin_token, "comp-a", "comp-a@test.com", &pool).await;
+    let (_, other_api) =
+        create_user_with_api_token(&app, &admin_token, "comp-b", "comp-b@test.com", &pool).await;
+
+    // User A starts upload
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/comp-wrong-u/blobs/uploads/")
+        .header("Authorization", format!("Bearer {admin_api}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let hash = sha2::Sha256::digest(b"");
+    let digest = format!("sha256:{}", hex::encode(hash));
+
+    // User B tries to PUT complete user A's upload
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("{location}?digest={digest}"))
+        .header("Authorization", format!("Bearer {other_api}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "wrong user should not be able to complete upload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Chunked upload: digest mismatch on complete
+// ---------------------------------------------------------------------------
+
+/// PUT complete with wrong digest returns error.
+#[sqlx::test(migrations = "./migrations")]
+async fn chunked_complete_digest_mismatch(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "dg-mm-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "dg-mm-u", "dg-mm@test.com", &pool).await;
+
+    // Start upload
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/dg-mm-proj/blobs/uploads/")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // PATCH a chunk
+    let chunk = b"real-data-here";
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&location)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(chunk.to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // PUT complete with a WRONG digest (sha256 of "other-data")
+    use sha2::Digest as _;
+    let wrong_hash = sha2::Sha256::digest(b"other-data");
+    let wrong_digest = format!("sha256:{}", hex::encode(wrong_hash));
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("{location}?digest={wrong_digest}"))
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "digest mismatch should return 400"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-chunk upload then complete
+// ---------------------------------------------------------------------------
+
+/// Upload with multiple PATCH chunks, then PUT complete.
+#[sqlx::test(migrations = "./migrations")]
+async fn multi_chunk_upload_then_complete(pool: PgPool) {
+    use sha2::Digest as _;
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "multi-chunk", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "multi-u", "multi@test.com", &pool).await;
+
+    // Step 1: Start upload
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v2/multi-chunk/blobs/uploads/")
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _upload_uuid = resp
+        .headers()
+        .get("docker-upload-uuid")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // Step 2: PATCH first chunk
+    let chunk1 = b"hello-";
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&location)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(chunk1.to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let range_hdr = resp.headers().get("range").unwrap().to_str().unwrap();
+    // After first chunk (6 bytes), range should be "0-5"
+    assert_eq!(range_hdr, "0-5");
+
+    // Step 3: PATCH second chunk
+    let chunk2 = b"world";
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&location)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(axum::body::Body::from(chunk2.to_vec()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let range_hdr = resp.headers().get("range").unwrap().to_str().unwrap();
+    // After second chunk (6+5=11 bytes), range should be "0-10"
+    assert_eq!(range_hdr, "0-10");
+
+    // Step 4: PUT complete
+    let full_data = b"hello-world";
+    let hash = sha2::Sha256::digest(full_data);
+    let digest = format!("sha256:{}", hex::encode(hash));
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("{location}?digest={digest}"))
+        .header("Authorization", format!("Bearer {api_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Verify blob is accessible
+    let (status, headers, _) = registry_request(
+        &app,
+        &api_token,
+        "HEAD",
+        &format!("/v2/multi-chunk/blobs/{digest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        digest
+    );
+    assert_eq!(
+        headers.get("content-length").unwrap().to_str().unwrap(),
+        "11"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blob proxy mode: GET returns data directly when registry_proxy_blobs=true
+// ---------------------------------------------------------------------------
+
+/// When `registry_proxy_blobs` is true, GET blob returns data (200) instead of redirect (307).
+#[sqlx::test(migrations = "./migrations")]
+async fn blob_get_proxy_mode_returns_data(pool: PgPool) {
+    let (mut state, admin_token) = test_state(pool.clone()).await;
+    // Enable proxy mode
+    let mut config = (*state.config).clone();
+    config.registry_proxy_blobs = true;
+    state.config = std::sync::Arc::new(config);
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "proxy-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "proxy-u", "proxy@test.com", &pool).await;
+
+    let data = b"proxy-blob-data";
+    let digest = registry_upload_blob(&app, &api_token, "proxy-proj", data).await;
+
+    // GET blob in proxy mode should return 200 with the data
+    let (status, _headers, body) = registry_request(
+        &app,
+        &api_token,
+        "GET",
+        &format!("/v2/proxy-proj/blobs/{digest}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "proxy mode should return 200, not redirect"
+    );
+    assert_eq!(body, data, "proxy mode should return raw blob data");
+}
+
+// ---------------------------------------------------------------------------
+// GC: collect_garbage runs cleanly on empty DB
+// ---------------------------------------------------------------------------
+
+/// GC on an empty registry does not error.
+#[sqlx::test(migrations = "./migrations")]
+async fn gc_empty_registry_ok(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    // Run GC — should complete without error
+    platform::registry::gc::collect_garbage(&state)
+        .await
+        .expect("GC on empty registry should not fail");
+}
+
+// ---------------------------------------------------------------------------
+// Monolithic upload with data in the body (tests complete_monolithic path)
+// ---------------------------------------------------------------------------
+
+/// HEAD blob returns correct content-length and digest headers.
+#[sqlx::test(migrations = "./migrations")]
+async fn head_blob_returns_correct_headers(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    create_project(&app, &admin_token, "head-proj", "private").await;
+    let (_, api_token) =
+        create_user_with_api_token(&app, &admin_token, "head-u", "head@test.com", &pool).await;
+
+    let data = b"head-blob-test-data";
+    let digest = registry_upload_blob(&app, &api_token, "head-proj", data).await;
+
+    let (status, headers, body) = registry_request(
+        &app,
+        &api_token,
+        "HEAD",
+        &format!("/v2/head-proj/blobs/{digest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "HEAD should return no body");
+    assert_eq!(
+        headers
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        digest
+    );
+    assert_eq!(
+        headers.get("content-length").unwrap().to_str().unwrap(),
+        data.len().to_string()
+    );
+    assert_eq!(
+        headers.get("content-type").unwrap().to_str().unwrap(),
+        "application/octet-stream"
+    );
 }

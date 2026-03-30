@@ -1244,3 +1244,548 @@ async fn read_project_secret_requires_permission(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "should return 404 not 403");
 }
+
+// ---------------------------------------------------------------------------
+// Secret name/value validation
+// ---------------------------------------------------------------------------
+
+/// Secret with empty name is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_secret_empty_name(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "sec-empty-name", "private").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "", "value": "some-val", "scope": "all" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Secret with empty value is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_secret_empty_value(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "sec-empty-val", "private").await;
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "GOOD_NAME", "value": "", "scope": "all" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Delete nonexistent project secret returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_nonexistent_project_secret(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "sec-del-404", "private").await;
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets/nonexistent"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Delete nonexistent global secret returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn delete_nonexistent_global_secret(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) =
+        helpers::delete_json(&app, &admin_token, "/api/admin/secrets/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Global secret with invalid scope is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_global_secret_invalid_scope(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/secrets",
+        serde_json::json!({ "name": "BAD_SCOPE", "value": "val", "scope": "invalid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Global secret with empty value is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_global_secret_empty_value(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/secrets",
+        serde_json::json!({ "name": "EMPTY_VAL", "value": "", "scope": "all" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Global secret with empty name is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_global_secret_empty_name(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/admin/secrets",
+        serde_json::json!({ "name": "", "value": "val", "scope": "all" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Secret request list with filters
+// ---------------------------------------------------------------------------
+
+/// List secret requests with session_id filter.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_secret_requests_filter_session(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-filt-sess", "private").await;
+    let session_a = uuid::Uuid::new_v4();
+    let session_b = uuid::Uuid::new_v4();
+
+    // Create requests for two different sessions
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "KEY_A",
+            "environments": [],
+            "session_id": session_a,
+        }),
+    )
+    .await;
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "KEY_B",
+            "environments": [],
+            "session_id": session_b,
+        }),
+    )
+    .await;
+
+    // Filter by session_a
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests?session_id={session_a}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "KEY_A");
+}
+
+/// List secret requests with status filter.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_secret_requests_filter_status(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-filt-st", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create two requests
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "COMPLETED_KEY",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap().to_string();
+
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "PENDING_KEY",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+
+    // Complete the first request
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "secret-val" }),
+    )
+    .await;
+
+    // Filter by status=pending
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests?status=pending"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "PENDING_KEY");
+
+    // Filter by status=completed
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests?status=completed"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "COMPLETED_KEY");
+}
+
+/// List secret requests with pagination.
+#[sqlx::test(migrations = "./migrations")]
+async fn list_secret_requests_pagination(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-page", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create 3 requests
+    for i in 0..3 {
+        helpers::post_json(
+            &app,
+            &admin_token,
+            &format!("/api/projects/{proj_id}/secret-requests"),
+            serde_json::json!({
+                "name": format!("PAGE_KEY_{i}"),
+                "environments": [],
+                "session_id": session_id,
+            }),
+        )
+        .await;
+    }
+
+    // Page 1: limit=2, offset=0
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests?limit=2&offset=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    // Page 2: limit=2, offset=2
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests?limit=2&offset=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+/// Create secret on inactive (soft-deleted) project returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_secret_inactive_project(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "sec-inactive", "public").await;
+
+    // Soft-delete the project
+    sqlx::query("UPDATE projects SET is_active = false WHERE id = $1")
+        .bind(proj_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+        serde_json::json!({ "name": "NEW_SECRET", "value": "val", "scope": "all" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Complete secret request with no environments stores secret with NULL env.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_secret_request_no_environments(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-noenv", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // Create request with empty environments
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "NO_ENV_SECRET",
+            "environments": [],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap();
+
+    // Complete it
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "the-value" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "complete failed: {body}");
+    assert_eq!(body["status"], "completed");
+
+    // Verify the secret was stored (list should show it)
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secrets = body["items"].as_array().expect("items should be array");
+    assert!(
+        secrets.iter().any(|s| s["name"] == "NO_ENV_SECRET"),
+        "secret should be stored even with empty environments"
+    );
+}
+
+/// Complete secret request with multiple environments stores one secret per env.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_secret_request_multiple_environments(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-multi-env", "private").await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let (_, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "MULTI_ENV_SECRET",
+            "environments": ["staging", "production"],
+            "session_id": session_id,
+        }),
+    )
+    .await;
+    let request_id = body["id"].as_str().unwrap();
+
+    // Complete
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests/{request_id}"),
+        serde_json::json!({ "value": "multi-env-value" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // List staging secrets
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets?environment=staging"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secrets = body["items"].as_array().expect("items should be array");
+    assert!(
+        secrets.iter().any(|s| s["name"] == "MULTI_ENV_SECRET"),
+        "should have secret in staging"
+    );
+
+    // List production secrets
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secrets?environment=production"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secrets = body["items"].as_array().expect("items should be array");
+    assert!(
+        secrets.iter().any(|s| s["name"] == "MULTI_ENV_SECRET"),
+        "should have secret in production"
+    );
+}
+
+/// Workspace secret delete by non-admin member is forbidden.
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_secret_delete_non_admin_forbidden(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let ws = platform::workspace::service::create_workspace(
+        &pool,
+        admin_id,
+        &format!("ws-delperm-{}", uuid::Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Create a secret as admin
+    helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{}/secrets", ws.id),
+        serde_json::json!({ "name": "WS_DEL_SEC", "value": "val", "scope": "all" }),
+    )
+    .await;
+
+    // Create a regular member
+    let (member_id, member_token) =
+        create_user(&app, &admin_token, "wsdelmem", "wsdelmem@test.com").await;
+    platform::workspace::service::add_member(&pool, ws.id, member_id, "member")
+        .await
+        .unwrap();
+
+    // Member cannot delete secrets (requires admin/owner)
+    let (status, _) = helpers::delete_json(
+        &app,
+        &member_token,
+        &format!("/api/workspaces/{}/secrets/WS_DEL_SEC", ws.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Delete nonexistent workspace secret returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_secret_delete_nonexistent(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let ws = platform::workspace::service::create_workspace(
+        &pool,
+        admin_id,
+        &format!("ws-del404-{}", uuid::Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = helpers::delete_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{}/secrets/nonexistent", ws.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Workspace secret with invalid scope is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_workspace_secret_invalid_scope(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = uuid::Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let ws = platform::workspace::service::create_workspace(
+        &pool,
+        admin_id,
+        &format!("ws-badscope-{}", uuid::Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/workspaces/{}/secrets", ws.id),
+        serde_json::json!({ "name": "BAD", "value": "val", "scope": "not_valid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Secret description > 500 chars is rejected.
+#[sqlx::test(migrations = "./migrations")]
+async fn secret_request_description_too_long(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let proj_id = create_project(&app, &admin_token, "secreq-desclong", "private").await;
+
+    let long_desc = "x".repeat(501);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/projects/{proj_id}/secret-requests"),
+        serde_json::json!({
+            "name": "LONG_DESC",
+            "description": long_desc,
+            "environments": [],
+            "session_id": uuid::Uuid::new_v4(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

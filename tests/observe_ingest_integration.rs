@@ -702,6 +702,528 @@ async fn ensure_scoped_tokens_rotates_existing(pool: PgPool) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Tests — Phase 5C: OTLP ingest edge cases (metric types, log body variants)
+// ---------------------------------------------------------------------------
+
+/// Ingest Sum (monotonic counter) metrics via OTLP protobuf.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_sum_monotonic_metric(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, _logs_rx, metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "sum-metric-proj", "private").await;
+
+    let metric_name = format!("sum_counter_{}", Uuid::new_v4().simple());
+    let request = platform::observe::proto::ExportMetricsServiceRequest {
+        resource_metrics: vec![platform::observe::proto::ResourceMetrics {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("sum-metric-svc", project_id),
+            }),
+            scope_metrics: vec![platform::observe::proto::ScopeMetrics {
+                metrics: vec![platform::observe::proto::Metric {
+                    name: metric_name.clone(),
+                    unit: "requests".into(),
+                    data: Some(platform::observe::proto::metric_data::Data::Sum(
+                        platform::observe::proto::Sum {
+                            data_points: vec![platform::observe::proto::NumberDataPoint {
+                                value: Some(
+                                    platform::observe::proto::number_data_point::Value::AsInt(150),
+                                ),
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                ..Default::default()
+                            }],
+                            is_monotonic: true,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/metrics", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_metrics(
+        pool.clone(),
+        metrics_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    // Query
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/metrics?name={metric_name}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "sum metric query failed: {body}");
+    let series: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert!(!series.is_empty(), "sum metric series should exist");
+}
+
+/// Ingest non-monotonic Sum (gauge-like) metrics via OTLP protobuf.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_sum_non_monotonic_metric(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, _logs_rx, metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "sum-nonmon-proj", "private").await;
+
+    let metric_name = format!("sum_gauge_{}", Uuid::new_v4().simple());
+    let request = platform::observe::proto::ExportMetricsServiceRequest {
+        resource_metrics: vec![platform::observe::proto::ResourceMetrics {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("sum-nonmon-svc", project_id),
+            }),
+            scope_metrics: vec![platform::observe::proto::ScopeMetrics {
+                metrics: vec![platform::observe::proto::Metric {
+                    name: metric_name.clone(),
+                    unit: "connections".into(),
+                    data: Some(platform::observe::proto::metric_data::Data::Sum(
+                        platform::observe::proto::Sum {
+                            data_points: vec![platform::observe::proto::NumberDataPoint {
+                                value: Some(
+                                    platform::observe::proto::number_data_point::Value::AsDouble(
+                                        75.5,
+                                    ),
+                                ),
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                ..Default::default()
+                            }],
+                            is_monotonic: false,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/metrics", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_metrics(
+        pool.clone(),
+        metrics_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/metrics?name={metric_name}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "non-monotonic sum query: {body}");
+    let series: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert!(!series.is_empty(), "non-monotonic sum metric should exist");
+}
+
+/// Ingest Histogram metrics via OTLP protobuf.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_histogram_metric(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, _logs_rx, metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "hist-metric-proj", "private").await;
+
+    let metric_name = format!("hist_{}", Uuid::new_v4().simple());
+    let request = platform::observe::proto::ExportMetricsServiceRequest {
+        resource_metrics: vec![platform::observe::proto::ResourceMetrics {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("hist-metric-svc", project_id),
+            }),
+            scope_metrics: vec![platform::observe::proto::ScopeMetrics {
+                metrics: vec![platform::observe::proto::Metric {
+                    name: metric_name.clone(),
+                    unit: "ms".into(),
+                    data: Some(platform::observe::proto::metric_data::Data::Histogram(
+                        platform::observe::proto::Histogram {
+                            data_points: vec![platform::observe::proto::HistogramDataPoint {
+                                count: 100,
+                                sum: Some(5000.0),
+                                bucket_counts: vec![10, 30, 40, 20],
+                                explicit_bounds: vec![10.0, 50.0, 100.0],
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/metrics", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_metrics(
+        pool.clone(),
+        metrics_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/metrics?name={metric_name}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "histogram query failed: {body}");
+    let series: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert!(!series.is_empty(), "histogram metric series should exist");
+}
+
+/// Ingest metric with no data (None) — should succeed without producing records.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_metric_with_no_data(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, _logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "nodata-metric-proj", "private").await;
+
+    let request = platform::observe::proto::ExportMetricsServiceRequest {
+        resource_metrics: vec![platform::observe::proto::ResourceMetrics {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("nodata-svc", project_id),
+            }),
+            scope_metrics: vec![platform::observe::proto::ScopeMetrics {
+                metrics: vec![platform::observe::proto::Metric {
+                    name: "empty_metric".into(),
+                    unit: String::new(),
+                    data: None, // No metric data
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/metrics", body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metric with no data should be accepted"
+    );
+}
+
+/// Ingest logs with non-string body (integer value) → should be JSON-stringified.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_logs_with_integer_body(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "int-body-log-proj", "private").await;
+
+    let request = platform::observe::proto::ExportLogsServiceRequest {
+        resource_logs: vec![platform::observe::proto::ResourceLogs {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("int-body-svc", project_id),
+            }),
+            scope_logs: vec![platform::observe::proto::ScopeLogs {
+                log_records: vec![platform::observe::proto::LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    severity_number: 9,
+                    severity_text: String::new(), // empty → use severity_number
+                    body: Some(platform::observe::proto::AnyValue {
+                        value: Some(platform::observe::proto::any_value::Value::IntValue(42)),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/logs", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_logs(
+        pool.clone(),
+        state.valkey.clone(),
+        logs_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/observe/logs?service=int-body-svc").await;
+    assert_eq!(status, StatusCode::OK, "logs query failed: {body}");
+    assert!(body["total"].as_i64().unwrap() >= 1);
+}
+
+/// Ingest logs with zero timestamp → should use current time.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_logs_with_zero_timestamp(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "zero-ts-log-proj", "private").await;
+
+    let request = platform::observe::proto::ExportLogsServiceRequest {
+        resource_logs: vec![platform::observe::proto::ResourceLogs {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("zero-ts-svc", project_id),
+            }),
+            scope_logs: vec![platform::observe::proto::ScopeLogs {
+                log_records: vec![platform::observe::proto::LogRecord {
+                    time_unix_nano: 0, // zero → should use Utc::now()
+                    severity_number: 13,
+                    severity_text: "WARN".into(),
+                    body: Some(platform::observe::proto::AnyValue {
+                        value: Some(platform::observe::proto::any_value::Value::StringValue(
+                            "zero timestamp log".into(),
+                        )),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/logs", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_logs(
+        pool.clone(),
+        state.valkey.clone(),
+        logs_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/observe/logs?service=zero-ts-svc").await;
+    assert_eq!(status, StatusCode::OK, "logs query failed: {body}");
+    assert!(
+        body["total"].as_i64().unwrap() >= 1,
+        "should find the zero-timestamp log"
+    );
+}
+
+/// Ingest logs with empty body (None) → should produce empty message.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_logs_with_no_body(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "nobody-log-proj", "private").await;
+
+    let request = platform::observe::proto::ExportLogsServiceRequest {
+        resource_logs: vec![platform::observe::proto::ResourceLogs {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("nobody-svc", project_id),
+            }),
+            scope_logs: vec![platform::observe::proto::ScopeLogs {
+                log_records: vec![platform::observe::proto::LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    body: None, // No body
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/logs", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_logs(
+        pool.clone(),
+        state.valkey.clone(),
+        logs_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/observe/logs?service=nobody-svc").await;
+    assert_eq!(status, StatusCode::OK, "logs query failed: {body}");
+    assert!(body["total"].as_i64().unwrap() >= 1);
+}
+
+/// Ingest span with parent span ID → parent_span_id populated.
+#[sqlx::test(migrations = "./migrations")]
+async fn ingest_trace_with_parent_span(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, spans_rx, _logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels);
+
+    let project_id =
+        helpers::create_project(&app, &admin_token, "parent-span-proj", "private").await;
+
+    let trace_id: [u8; 16] = [
+        11, 22, 33, 44, 55, 66, 77, 88, 99, 10, 11, 12, 13, 14, 15, 16,
+    ];
+    let parent_span_id: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let child_span_id: [u8; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
+
+    let request = platform::observe::proto::ExportTraceServiceRequest {
+        resource_spans: vec![platform::observe::proto::ResourceSpans {
+            resource: Some(platform::observe::proto::Resource {
+                attributes: project_resource_attrs("parent-span-svc", project_id),
+            }),
+            scope_spans: vec![platform::observe::proto::ScopeSpans {
+                spans: vec![
+                    platform::observe::proto::Span {
+                        trace_id: trace_id.to_vec(),
+                        span_id: parent_span_id.to_vec(),
+                        parent_span_id: vec![], // root span
+                        name: "parent-op".into(),
+                        kind: 2, // CLIENT
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_000_100_000_000,
+                        status: Some(platform::observe::proto::SpanStatus {
+                            code: 1,
+                            message: String::new(),
+                        }),
+                        events: vec![platform::observe::proto::SpanEvent {
+                            time_unix_nano: 1_700_000_000_050_000_000,
+                            name: "exception".into(),
+                            attributes: vec![],
+                        }],
+                        ..Default::default()
+                    },
+                    platform::observe::proto::Span {
+                        trace_id: trace_id.to_vec(),
+                        span_id: child_span_id.to_vec(),
+                        parent_span_id: parent_span_id.to_vec(), // child of parent
+                        name: "child-op".into(),
+                        kind: 1, // SERVER
+                        start_time_unix_nano: 1_700_000_000_010_000_000,
+                        end_time_unix_nano: 0, // zero end time
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        }],
+    };
+    let body = request.encode_to_vec();
+
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/traces", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_spans(
+        pool.clone(),
+        spans_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    // Verify spans were written
+    let expected_trace_id = "0b16212c37424d58630a0b0c0d0e0f10";
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        &format!("/api/observe/traces/{expected_trace_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "trace not found: {body}");
+}
+
+/// Flush logs publishes to Valkey for live tail.
+#[sqlx::test(migrations = "./migrations")]
+async fn flush_logs_publishes_to_valkey(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state.clone(), channels.clone());
+
+    let project_id = helpers::create_project(&app, &admin_token, "live-tail-proj", "private").await;
+
+    // Send a log with a valid project_id so it publishes to Valkey
+    let body = build_logs_request(project_id);
+    let (status, _) = post_protobuf(&app, &admin_token, "/v1/logs", body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Flush — this should publish to Valkey channel `logs:{project_id}`
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let handle = tokio::spawn(platform::observe::ingest::flush_logs(
+        pool.clone(),
+        state.valkey.clone(),
+        logs_rx,
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+
+    // Verify the log was written to DB at minimum
+    let (status, body) = helpers::get_json(
+        &app,
+        &admin_token,
+        "/api/observe/logs?service=ingest-log-svc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "logs query failed: {body}");
+    assert!(body["total"].as_i64().unwrap() >= 1);
+}
+
 /// `ensure_scoped_tokens` returns an error for a nonexistent project.
 #[sqlx::test(migrations = "./migrations")]
 async fn ensure_scoped_tokens_nonexistent_project_returns_error(pool: PgPool) {

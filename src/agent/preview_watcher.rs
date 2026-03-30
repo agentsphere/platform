@@ -316,4 +316,116 @@ mod tests {
         assert_eq!(event.kind, ProgressKind::IframeRemoved);
         assert!(event.message.contains("Preview removed"));
     }
+
+    #[test]
+    fn build_iframe_event_other_kind_produces_empty_message() {
+        let id = Uuid::new_v4();
+        let event = build_iframe_event(
+            ProgressKind::Completed,
+            "preview-abc12345",
+            8000,
+            "iframe",
+            id,
+        );
+        assert_eq!(event.kind, ProgressKind::Completed);
+        assert!(
+            event.message.is_empty(),
+            "non-iframe kind should produce empty message"
+        );
+        // Metadata should still be populated
+        let meta = event.metadata.unwrap();
+        assert_eq!(meta["service_name"], "preview-abc12345");
+        assert_eq!(meta["port"], 8000);
+    }
+
+    #[test]
+    fn build_iframe_event_removed_metadata_has_preview_url() {
+        let id = Uuid::new_v4();
+        let event = build_iframe_event(ProgressKind::IframeRemoved, "svc-name", 9000, "iframe", id);
+        let meta = event.metadata.unwrap();
+        assert_eq!(meta["preview_url"], format!("/preview/{id}/"));
+        assert_eq!(meta["port"], 9000);
+        assert_eq!(meta["port_name"], "iframe");
+    }
+
+    #[test]
+    fn extract_iframe_ports_no_ports_field() {
+        // ServiceSpec with ports = None (different from empty vec)
+        let svc = Service {
+            metadata: ObjectMeta::default(),
+            spec: Some(ServiceSpec {
+                ports: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(extract_iframe_ports(&svc).is_empty());
+    }
+
+    #[test]
+    fn extract_session_id_no_labels_map() {
+        // Service with labels = None entirely
+        let svc = Service {
+            metadata: ObjectMeta {
+                name: Some("test-svc".into()),
+                labels: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(extract_session_id(&svc), None);
+    }
+
+    #[test]
+    fn extract_session_id_labels_without_session_key() {
+        let mut labels = BTreeMap::new();
+        labels.insert("platform.io/component".into(), "iframe-preview".into());
+        let svc = make_service(labels, vec![iframe_port()]);
+        assert_eq!(extract_session_id(&svc), None);
+    }
+
+    #[test]
+    fn build_iframe_event_available_message_includes_service_name() {
+        let id = Uuid::new_v4();
+        let event = build_iframe_event(
+            ProgressKind::IframeAvailable,
+            "my-custom-service",
+            3000,
+            "iframe",
+            id,
+        );
+        assert!(event.message.contains("my-custom-service"));
+        assert!(event.message.contains("3000"));
+    }
+
+    #[test]
+    fn extract_iframe_ports_mixed_named_unnamed() {
+        let p1 = ServicePort {
+            name: Some("iframe".into()),
+            port: 8000,
+            ..Default::default()
+        };
+        let p2 = ServicePort {
+            name: None,
+            port: 9090,
+            ..Default::default()
+        };
+        let p3 = ServicePort {
+            name: Some("http".into()),
+            port: 80,
+            ..Default::default()
+        };
+        let svc = make_service(BTreeMap::new(), vec![p1, p2, p3]);
+        let ports = extract_iframe_ports(&svc);
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].0, 8000);
+    }
+
+    #[test]
+    fn build_iframe_event_with_error_kind() {
+        let id = Uuid::new_v4();
+        let event = build_iframe_event(ProgressKind::Error, "preview-svc", 8000, "iframe", id);
+        assert_eq!(event.kind, ProgressKind::Error);
+        assert!(event.message.is_empty());
+    }
 }

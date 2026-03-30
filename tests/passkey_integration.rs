@@ -1280,3 +1280,101 @@ async fn login_clone_detection_rejects(pool: PgPool) {
         "clone detection should reject login"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/auth/passkeys/{id} — individual passkey retrieval
+// ---------------------------------------------------------------------------
+
+/// Successfully retrieve a single passkey by ID.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_passkey_success(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let user_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    let cred_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO passkey_credentials (id, user_id, credential_id, public_key, name,
+         backup_eligible, backup_state, transports)
+         VALUES ($1, $2, $3, $4, 'My Yubikey', true, true, ARRAY['usb']::text[])",
+    )
+    .bind(cred_id)
+    .bind(user_id)
+    .bind(vec![1u8, 2, 3, 4])
+    .bind(serde_json::to_vec(&serde_json::json!({"type": "public-key"})).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, &format!("/api/auth/passkeys/{cred_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"].as_str().unwrap(), cred_id.to_string());
+    assert_eq!(body["name"].as_str().unwrap(), "My Yubikey");
+    assert_eq!(body["backup_eligible"], true);
+    assert_eq!(body["backup_state"], true);
+    assert!(body["created_at"].is_string());
+    assert!(body["last_used_at"].is_null());
+    let transports = body["transports"].as_array().unwrap();
+    assert_eq!(transports.len(), 1);
+    assert_eq!(transports[0], "usb");
+}
+
+/// GET for a nonexistent passkey ID returns 404.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_passkey_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) =
+        helpers::get_json(&app, &admin_token, &format!("/api/auth/passkeys/{fake_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET another user's passkey returns 404 (user_id filter).
+#[sqlx::test(migrations = "./migrations")]
+async fn get_passkey_other_user_returns_not_found(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state);
+
+    let (_, me) = helpers::get_json(&app, &admin_token, "/api/auth/me").await;
+    let admin_id = Uuid::parse_str(me["id"].as_str().unwrap()).unwrap();
+
+    // Insert passkey for admin
+    let cred_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO passkey_credentials (id, user_id, credential_id, public_key, name)
+         VALUES ($1, $2, $3, $4, 'Admin PK')",
+    )
+    .bind(cred_id)
+    .bind(admin_id)
+    .bind(vec![10u8, 11, 12])
+    .bind(serde_json::to_vec(&serde_json::json!({"type": "public-key"})).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create other user
+    let (_other_id, other_token) =
+        create_user(&app, &admin_token, "pk-get-other", "pk-get-other@test.com").await;
+
+    // Other user cannot retrieve admin's passkey
+    let (status, _) =
+        helpers::get_json(&app, &other_token, &format!("/api/auth/passkeys/{cred_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// GET passkey unauthenticated returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_passkey_unauthenticated(pool: PgPool) {
+    let (state, _) = test_state(pool).await;
+    let app = test_router(state);
+
+    let fake_id = Uuid::new_v4();
+    let (status, _) =
+        helpers::get_json(&app, "bad-token", &format!("/api/auth/passkeys/{fake_id}")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

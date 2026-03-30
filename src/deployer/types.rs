@@ -650,4 +650,319 @@ mod tests {
             Some(&"treatment".to_string())
         );
     }
+
+    // -- AnalysisVerdict --
+
+    #[test]
+    fn analysis_verdict_is_terminal() {
+        assert!(!AnalysisVerdict::Running.is_terminal());
+        assert!(AnalysisVerdict::Pass.is_terminal());
+        assert!(AnalysisVerdict::Fail.is_terminal());
+        assert!(!AnalysisVerdict::Inconclusive.is_terminal());
+        assert!(AnalysisVerdict::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn unknown_analysis_verdict_errors() {
+        assert!("bogus".parse::<AnalysisVerdict>().is_err());
+    }
+
+    #[test]
+    fn unknown_release_health_errors() {
+        assert!("bogus".parse::<ReleaseHealth>().is_err());
+    }
+
+    #[test]
+    fn analysis_verdict_display() {
+        assert_eq!(AnalysisVerdict::Running.to_string(), "running");
+        assert_eq!(AnalysisVerdict::Pass.to_string(), "pass");
+        assert_eq!(AnalysisVerdict::Fail.to_string(), "fail");
+        assert_eq!(AnalysisVerdict::Inconclusive.to_string(), "inconclusive");
+        assert_eq!(AnalysisVerdict::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn release_health_display() {
+        assert_eq!(ReleaseHealth::Unknown.to_string(), "unknown");
+        assert_eq!(ReleaseHealth::Healthy.to_string(), "healthy");
+        assert_eq!(ReleaseHealth::Degraded.to_string(), "degraded");
+        assert_eq!(ReleaseHealth::Unhealthy.to_string(), "unhealthy");
+    }
+
+    #[test]
+    fn deploy_strategy_display() {
+        assert_eq!(DeployStrategy::Rolling.to_string(), "rolling");
+        assert_eq!(DeployStrategy::Canary.to_string(), "canary");
+        assert_eq!(DeployStrategy::AbTest.to_string(), "ab_test");
+    }
+
+    #[test]
+    fn release_phase_display() {
+        assert_eq!(ReleasePhase::Pending.to_string(), "pending");
+        assert_eq!(ReleasePhase::RollingBack.to_string(), "rolling_back");
+    }
+
+    #[test]
+    fn analysis_verdict_serde_roundtrip() {
+        for v in [
+            AnalysisVerdict::Running,
+            AnalysisVerdict::Pass,
+            AnalysisVerdict::Fail,
+            AnalysisVerdict::Inconclusive,
+            AnalysisVerdict::Cancelled,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            let parsed: AnalysisVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, v);
+        }
+    }
+
+    #[test]
+    fn release_health_serde_roundtrip() {
+        for h in [
+            ReleaseHealth::Unknown,
+            ReleaseHealth::Healthy,
+            ReleaseHealth::Degraded,
+            ReleaseHealth::Unhealthy,
+        ] {
+            let json = serde_json::to_string(&h).unwrap();
+            let parsed: ReleaseHealth = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, h);
+        }
+    }
+
+    // -- ReleasePhase parse edge cases --
+
+    #[test]
+    fn release_phase_parse_returns_none_for_unknown() {
+        assert!(ReleasePhase::parse("nonexistent").is_none());
+        assert!(ReleasePhase::parse("").is_none());
+    }
+
+    #[test]
+    fn release_phase_parse_all_variants() {
+        let variants = [
+            ("pending", ReleasePhase::Pending),
+            ("progressing", ReleasePhase::Progressing),
+            ("holding", ReleasePhase::Holding),
+            ("paused", ReleasePhase::Paused),
+            ("promoting", ReleasePhase::Promoting),
+            ("completed", ReleasePhase::Completed),
+            ("rolling_back", ReleasePhase::RollingBack),
+            ("rolled_back", ReleasePhase::RolledBack),
+            ("cancelled", ReleasePhase::Cancelled),
+            ("failed", ReleasePhase::Failed),
+        ];
+        for (s, expected) in variants {
+            assert_eq!(ReleasePhase::parse(s), Some(expected), "parse({s})");
+        }
+    }
+
+    // -- Negative transition tests --
+
+    #[test]
+    fn pending_cannot_hold() {
+        assert!(!ReleasePhase::Pending.can_transition_to(ReleasePhase::Holding));
+    }
+
+    #[test]
+    fn pending_cannot_rollback() {
+        assert!(!ReleasePhase::Pending.can_transition_to(ReleasePhase::RollingBack));
+    }
+
+    #[test]
+    fn pending_cannot_pause() {
+        assert!(!ReleasePhase::Pending.can_transition_to(ReleasePhase::Paused));
+    }
+
+    #[test]
+    fn pending_cannot_rolled_back() {
+        assert!(!ReleasePhase::Pending.can_transition_to(ReleasePhase::RolledBack));
+    }
+
+    #[test]
+    fn progressing_cannot_complete() {
+        assert!(!ReleasePhase::Progressing.can_transition_to(ReleasePhase::Completed));
+    }
+
+    #[test]
+    fn progressing_cannot_cancel() {
+        assert!(!ReleasePhase::Progressing.can_transition_to(ReleasePhase::Cancelled));
+    }
+
+    #[test]
+    fn progressing_cannot_rolled_back() {
+        assert!(!ReleasePhase::Progressing.can_transition_to(ReleasePhase::RolledBack));
+    }
+
+    #[test]
+    fn holding_cannot_complete() {
+        assert!(!ReleasePhase::Holding.can_transition_to(ReleasePhase::Completed));
+    }
+
+    #[test]
+    fn holding_cannot_pause() {
+        assert!(!ReleasePhase::Holding.can_transition_to(ReleasePhase::Paused));
+    }
+
+    #[test]
+    fn holding_cannot_cancel() {
+        assert!(!ReleasePhase::Holding.can_transition_to(ReleasePhase::Cancelled));
+    }
+
+    #[test]
+    fn holding_cannot_promote() {
+        assert!(!ReleasePhase::Holding.can_transition_to(ReleasePhase::Promoting));
+    }
+
+    #[test]
+    fn paused_cannot_hold() {
+        assert!(!ReleasePhase::Paused.can_transition_to(ReleasePhase::Holding));
+    }
+
+    #[test]
+    fn paused_cannot_complete() {
+        assert!(!ReleasePhase::Paused.can_transition_to(ReleasePhase::Completed));
+    }
+
+    #[test]
+    fn paused_cannot_promote() {
+        assert!(!ReleasePhase::Paused.can_transition_to(ReleasePhase::Promoting));
+    }
+
+    #[test]
+    fn promoting_cannot_rollback() {
+        assert!(!ReleasePhase::Promoting.can_transition_to(ReleasePhase::RollingBack));
+    }
+
+    #[test]
+    fn promoting_cannot_progress() {
+        assert!(!ReleasePhase::Promoting.can_transition_to(ReleasePhase::Progressing));
+    }
+
+    #[test]
+    fn rolling_back_cannot_progress() {
+        assert!(!ReleasePhase::RollingBack.can_transition_to(ReleasePhase::Progressing));
+    }
+
+    #[test]
+    fn rolling_back_cannot_complete() {
+        assert!(!ReleasePhase::RollingBack.can_transition_to(ReleasePhase::Completed));
+    }
+
+    // -- MetricGate defaults --
+
+    #[test]
+    fn metric_gate_defaults() {
+        let json = serde_json::json!({
+            "metric": "error_rate",
+            "condition": "lt",
+            "threshold": 0.05,
+        });
+        let gate: MetricGate = serde_json::from_value(json).unwrap();
+        assert_eq!(gate.aggregation, "avg");
+        assert_eq!(gate.window, 120);
+        assert!(gate.name.is_none());
+    }
+
+    #[test]
+    fn metric_gate_with_custom_name() {
+        let json = serde_json::json!({
+            "metric": "custom",
+            "name": "my_metric",
+            "condition": "gt",
+            "threshold": 100.0,
+            "aggregation": "sum",
+            "window": 300,
+        });
+        let gate: MetricGate = serde_json::from_value(json).unwrap();
+        assert_eq!(gate.name.as_deref(), Some("my_metric"));
+        assert_eq!(gate.aggregation, "sum");
+        assert_eq!(gate.window, 300);
+    }
+
+    // -- AbTestRolloutConfig --
+
+    #[test]
+    fn ab_test_config_defaults() {
+        let json = serde_json::json!({
+            "control_service": "ctrl",
+            "treatment_service": "treat",
+            "match": {"headers": {}},
+            "success_metric": "cr",
+            "success_condition": "gt",
+        });
+        let config: AbTestRolloutConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.duration, 86400);
+        assert_eq!(config.min_samples, 1000);
+        assert!(config.match_rule.headers.is_empty());
+    }
+
+    #[test]
+    fn ab_test_config_custom_duration_and_samples() {
+        let json = serde_json::json!({
+            "control_service": "c",
+            "treatment_service": "t",
+            "match": {"headers": {}},
+            "success_metric": "m",
+            "success_condition": "gt",
+            "duration": 3600,
+            "min_samples": 500,
+        });
+        let config: AbTestRolloutConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.duration, 3600);
+        assert_eq!(config.min_samples, 500);
+    }
+
+    // -- CanaryRolloutConfig edge cases --
+
+    #[test]
+    fn canary_config_empty_steps() {
+        let json = serde_json::json!({
+            "stable_service": "s",
+            "canary_service": "c",
+            "steps": [],
+        });
+        let config: CanaryRolloutConfig = serde_json::from_value(json).unwrap();
+        assert!(config.steps.is_empty());
+    }
+
+    #[test]
+    fn canary_config_with_all_fields() {
+        let json = serde_json::json!({
+            "stable_service": "stable",
+            "canary_service": "canary",
+            "steps": [5, 10, 25, 50, 100],
+            "interval": 60,
+            "min_requests": 50,
+            "max_failures": 5,
+            "progress_gates": [{
+                "metric": "latency_p99",
+                "condition": "lt",
+                "threshold": 200.0,
+                "aggregation": "max",
+                "window": 60,
+            }],
+            "rollback_triggers": [{
+                "metric": "custom",
+                "name": "panic_count",
+                "condition": "gt",
+                "threshold": 0.0,
+                "aggregation": "count",
+                "window": 300,
+            }],
+        });
+        let config: CanaryRolloutConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.steps, vec![5, 10, 25, 50, 100]);
+        assert_eq!(config.interval, 60);
+        assert_eq!(config.min_requests, 50);
+        assert_eq!(config.max_failures, 5);
+        assert_eq!(config.progress_gates.len(), 1);
+        assert_eq!(config.progress_gates[0].aggregation, "max");
+        assert_eq!(config.rollback_triggers.len(), 1);
+        assert_eq!(
+            config.rollback_triggers[0].name.as_deref(),
+            Some("panic_count")
+        );
+    }
 }

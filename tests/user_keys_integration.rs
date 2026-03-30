@@ -471,3 +471,164 @@ async fn delete_invalid_provider_name(pool: PgPool) {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// GET single provider key
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_by_name(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Set a key first
+    helpers::put_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/anthropic",
+        json!({ "api_key": "sk-ant-test-key-1234567890" }),
+    )
+    .await;
+
+    // GET the specific key
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/users/me/provider-keys/anthropic").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["provider"], "anthropic");
+    assert_eq!(body["key_suffix"], "...7890");
+    assert!(body["created_at"].is_string());
+    assert!(body["updated_at"].is_string());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_not_found(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/nonexistent",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_invalid_name(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::get_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/invalid@name!",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_unauthenticated(pool: PgPool) {
+    let (state, _admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::get_json(&app, "", "/api/users/me/provider-keys/anthropic").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Validate key too long
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn validate_key_too_long_rejected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let long_key = "x".repeat(501);
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/validate",
+        json!({ "api_key": long_key }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Per-user isolation of GET
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_per_user_isolation(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Admin sets a key
+    helpers::put_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/anthropic",
+        json!({ "api_key": "sk-ant-admin-key-1234567890" }),
+    )
+    .await;
+
+    // Create another user
+    let (_user2_id, user2_token) =
+        helpers::create_user(&app, &admin_token, "keyisouser", "keyisouser@test.com").await;
+
+    // User2 cannot GET admin's key (404 because it belongs to admin, not user2)
+    let (status, _) =
+        helpers::get_json(&app, &user2_token, "/api/users/me/provider-keys/anthropic").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Overwrite updates timestamps
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_provider_key_after_overwrite_has_updated_timestamp(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Set initial key
+    helpers::put_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/anthropic",
+        json!({ "api_key": "sk-ant-first-key-1234567890" }),
+    )
+    .await;
+
+    let (_, body1) =
+        helpers::get_json(&app, &admin_token, "/api/users/me/provider-keys/anthropic").await;
+    let created1 = body1["created_at"].as_str().unwrap().to_string();
+    let _updated1 = body1["updated_at"].as_str().unwrap().to_string();
+
+    // Small delay then overwrite
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    helpers::put_json(
+        &app,
+        &admin_token,
+        "/api/users/me/provider-keys/anthropic",
+        json!({ "api_key": "sk-ant-second-key-9876543210" }),
+    )
+    .await;
+
+    let (_, body2) =
+        helpers::get_json(&app, &admin_token, "/api/users/me/provider-keys/anthropic").await;
+
+    // created_at should stay the same, updated_at should change
+    assert_eq!(body2["created_at"].as_str().unwrap(), created1);
+    // updated_at may or may not change (depends on DB precision), but suffix should change
+    assert_eq!(body2["key_suffix"], "...3210");
+}

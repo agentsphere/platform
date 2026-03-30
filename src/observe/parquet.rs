@@ -748,7 +748,7 @@ mod tests {
                 labels: serde_json::json!({"instance": format!("node{i}")}),
                 series_id: Uuid::new_v4(),
                 timestamp: Utc::now(),
-                value: i as f64 * 10.0,
+                value: f64::from(i) * 10.0,
             })
             .collect();
         let batch = build_metric_batch(&rows).unwrap();
@@ -901,5 +901,184 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(col.value(0), ts.timestamp_micros());
+    }
+
+    // ── write_parquet_buffer round-trip read ────────────────────────
+
+    #[test]
+    fn write_parquet_log_batch_readable() {
+        let batch = build_log_batch(&[sample_log_row()]).unwrap();
+        let bytes = write_parquet_buffer(&batch).unwrap();
+
+        // Verify we can read back the parquet file
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].num_columns(), 10);
+    }
+
+    #[test]
+    fn write_parquet_span_batch_readable() {
+        let batch = build_span_batch(&[sample_span_row()]).unwrap();
+        let bytes = write_parquet_buffer(&batch).unwrap();
+
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn write_parquet_metric_batch_readable() {
+        let batch = build_metric_batch(&[sample_metric_row()]).unwrap();
+        let bytes = write_parquet_buffer(&batch).unwrap();
+
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    // ── Schema nullable correctness ──────────────────────────────
+
+    #[test]
+    fn log_schema_nullable_fields() {
+        let schema = log_schema();
+        // Non-nullable: id, timestamp, service, level, message
+        assert!(!schema.field_with_name("id").unwrap().is_nullable());
+        assert!(!schema.field_with_name("timestamp").unwrap().is_nullable());
+        assert!(!schema.field_with_name("service").unwrap().is_nullable());
+        assert!(!schema.field_with_name("level").unwrap().is_nullable());
+        assert!(!schema.field_with_name("message").unwrap().is_nullable());
+        // Nullable: trace_id, span_id, project_id, session_id, attributes
+        assert!(schema.field_with_name("trace_id").unwrap().is_nullable());
+        assert!(schema.field_with_name("span_id").unwrap().is_nullable());
+        assert!(schema.field_with_name("project_id").unwrap().is_nullable());
+        assert!(schema.field_with_name("session_id").unwrap().is_nullable());
+        assert!(schema.field_with_name("attributes").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn span_schema_nullable_fields() {
+        let schema = span_schema();
+        // Non-nullable: trace_id, span_id, name, service, kind, status, started_at
+        assert!(!schema.field_with_name("trace_id").unwrap().is_nullable());
+        assert!(!schema.field_with_name("span_id").unwrap().is_nullable());
+        assert!(!schema.field_with_name("name").unwrap().is_nullable());
+        assert!(!schema.field_with_name("service").unwrap().is_nullable());
+        // Nullable: parent_span_id, duration_ms, attributes
+        assert!(
+            schema
+                .field_with_name("parent_span_id")
+                .unwrap()
+                .is_nullable()
+        );
+        assert!(schema.field_with_name("duration_ms").unwrap().is_nullable());
+        assert!(schema.field_with_name("attributes").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn metric_schema_all_non_nullable() {
+        let schema = metric_schema();
+        for field in schema.fields() {
+            assert!(
+                !field.is_nullable(),
+                "metric field {} should not be nullable",
+                field.name()
+            );
+        }
+    }
+
+    // ── Large batch write ──────────────────────────────────────────
+
+    #[test]
+    fn write_parquet_large_span_batch() {
+        let rows: Vec<SpanQueryRow> = (0..100)
+            .map(|i| SpanQueryRow {
+                trace_id: format!("trace-{i}"),
+                span_id: format!("span-{i}"),
+                parent_span_id: if i > 0 {
+                    Some(format!("span-{}", i - 1))
+                } else {
+                    None
+                },
+                name: format!("op-{i}"),
+                service: format!("svc-{}", i % 5),
+                kind: "server".into(),
+                status: if i % 3 == 0 { "error" } else { "ok" }.into(),
+                duration_ms: Some(i),
+                started_at: Utc::now(),
+                attributes: if i % 2 == 0 {
+                    Some(serde_json::json!({"index": i}))
+                } else {
+                    None
+                },
+            })
+            .collect();
+        let batch = build_span_batch(&rows).unwrap();
+        assert_eq!(batch.num_rows(), 100);
+
+        let bytes = write_parquet_buffer(&batch).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+        assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+    }
+
+    // ── build_metric_batch with zero and negative values ────────
+
+    #[test]
+    fn build_metric_batch_extreme_values() {
+        let rows = vec![
+            MetricSampleRow {
+                name: "extreme".into(),
+                labels: serde_json::json!({}),
+                series_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                value: f64::MAX,
+            },
+            MetricSampleRow {
+                name: "extreme".into(),
+                labels: serde_json::json!({}),
+                series_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                value: f64::MIN,
+            },
+            MetricSampleRow {
+                name: "extreme".into(),
+                labels: serde_json::json!({}),
+                series_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                value: 0.0,
+            },
+        ];
+        let batch = build_metric_batch(&rows).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((col.value(0) - f64::MAX).abs() < f64::EPSILON);
+        assert!((col.value(1) - f64::MIN).abs() < f64::EPSILON);
+        assert!((col.value(2) - 0.0).abs() < f64::EPSILON);
     }
 }

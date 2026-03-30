@@ -1099,7 +1099,9 @@ async fn verify_oauth_token_invalid_returns_false(pool: PgPool) {
     let (state, admin_token) = helpers::test_state(pool).await;
     let app = helpers::test_router(state);
 
-    // We send a token that's long enough to pass validation but won't work
+    // Token doesn't start with "sk-ant-oat" → mock CLI detects invalid token
+    // via CLAUDE_CODE_OAUTH_TOKEN env var (forwarded through env_clear by
+    // run_cli_validation) and returns authentication_failed error.
     let (status, body) = helpers::post_json(
         &app,
         &admin_token,
@@ -1108,17 +1110,11 @@ async fn verify_oauth_token_invalid_returns_false(pool: PgPool) {
     )
     .await;
 
-    // Without a real CLI binary, this will return 500 (spawn fails)
-    // or 200 with valid=false if mock CLI returns auth_failed
-    assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "unexpected status: {status}, body: {body}"
+    assert_eq!(status, StatusCode::OK, "verify-token failed: {body}");
+    assert_eq!(
+        body["valid"], false,
+        "invalid token should return valid=false, body: {body}"
     );
-
-    if status == StatusCode::OK {
-        assert_eq!(body["valid"], false);
-        assert!(body["error"].is_string());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,5 +1624,360 @@ async fn submit_auth_code_no_master_key(pool: PgPool) {
         status,
         StatusCode::BAD_REQUEST,
         "submit_auth_code without master key should return 400: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Wizard status: completed wizard shows false
+// ---------------------------------------------------------------------------
+
+/// After completing the wizard, wizard_status returns show_wizard=false.
+#[sqlx::test(migrations = "./migrations")]
+async fn wizard_status_after_completion_shows_false(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Complete the wizard first
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "solo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Now check status
+    let (status, body) =
+        helpers::get_json(&app, &admin_token, "/api/onboarding/wizard-status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["show_wizard"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Complete wizard: idempotent completion
+// ---------------------------------------------------------------------------
+
+/// Completing the wizard twice succeeds (idempotent).
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_idempotent(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // First completion
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "solo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Second completion — should still succeed (idempotent)
+    let (status, _body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "startup" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Complete wizard: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// Completing the wizard without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "bad-token",
+        "/api/onboarding/wizard",
+        serde_json::json!({ "org_type": "solo_dev" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Settings: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// GET settings without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn get_settings_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::get_json(&app, "bad-token", "/api/onboarding/settings").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// PATCH settings without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_settings_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::patch_json(
+        &app,
+        "bad-token",
+        "/api/onboarding/settings",
+        serde_json::json!({ "org_type": "solo_dev" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Demo project: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// POST create-demo-project without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn create_demo_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "bad-token",
+        "/api/onboarding/demo-project",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Wizard status: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// GET wizard-status without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn wizard_status_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::get_json(&app, "bad-token", "/api/onboarding/wizard-status").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Start claude auth: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// POST start-claude-auth without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn start_claude_auth_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "bad-token",
+        "/api/onboarding/claude-auth/start",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Claude auth status: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// GET claude-auth status without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn claude_auth_status_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::get_json(
+        &app,
+        "bad-token",
+        &format!("/api/onboarding/claude-auth/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Cancel claude auth: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// DELETE cancel-claude-auth without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn cancel_claude_auth_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::delete_json(
+        &app,
+        "bad-token",
+        &format!("/api/onboarding/claude-auth/{fake_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Submit auth code: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// POST submit-auth-code without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn submit_auth_code_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = helpers::post_json(
+        &app,
+        "bad-token",
+        &format!("/api/onboarding/claude-auth/{fake_id}/code"),
+        serde_json::json!({ "code": "test-code" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Verify OAuth token: unauthenticated returns 401
+// ---------------------------------------------------------------------------
+
+/// POST verify-token without authentication returns 401.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_oauth_token_unauthenticated(pool: PgPool) {
+    let (state, _) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, _) = helpers::post_json(
+        &app,
+        "bad-token",
+        "/api/onboarding/claude-auth/verify-token",
+        serde_json::json!({ "token": "sk-ant-oat01-fake-token-1234567890" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Complete wizard: with all options and provider key suffix
+// ---------------------------------------------------------------------------
+
+/// Wizard with short provider key uses full key as suffix.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_provider_key_very_short(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Provider key shorter than 4 chars
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({
+            "org_type": "solo",
+            "provider_key": "abc"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "wizard should succeed: {body}");
+
+    // Verify the suffix is the full key (< 4 chars)
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT key_suffix FROM user_provider_keys WHERE provider = 'anthropic'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(row.is_some());
+    assert_eq!(row.unwrap().0, "abc");
+}
+
+// ---------------------------------------------------------------------------
+// Settings: after update, reflect new settings
+// ---------------------------------------------------------------------------
+
+/// After updating org_type to tech_org, settings reflect the change.
+#[sqlx::test(migrations = "./migrations")]
+async fn update_settings_tech_org_reflected(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    let (status, body) = helpers::patch_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/settings",
+        serde_json::json!({ "org_type": "tech_org" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify response reflects the updated org_type
+    assert!(body["onboarding_completed"].is_boolean());
+    assert!(
+        body["org_type"].is_string() || body["org_type"].is_null() || body["org_type"].is_object()
+    );
+    assert!(body["preset_config"].is_object() || body["preset_config"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Custom provider: bedrock type
+// ---------------------------------------------------------------------------
+
+/// Complete wizard with bedrock custom provider.
+#[sqlx::test(migrations = "./migrations")]
+async fn complete_wizard_custom_provider_bedrock(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    let mut env_vars = std::collections::HashMap::new();
+    env_vars.insert("AWS_REGION".to_string(), "us-east-1".to_string());
+    env_vars.insert(
+        "AWS_ACCESS_KEY_ID".to_string(),
+        "AKIAIOSFODNN7EXAMPLE".to_string(),
+    );
+    env_vars.insert(
+        "AWS_SECRET_ACCESS_KEY".to_string(),
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+    );
+
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/onboarding/wizard",
+        serde_json::json!({
+            "org_type": "solo",
+            "custom_provider": {
+                "provider_type": "bedrock",
+                "env_vars": env_vars,
+                "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "label": "My Bedrock"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "wizard should succeed: {body}");
+
+    // Verify custom provider was saved
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT active_provider FROM user_llm_preferences LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(row.is_some());
+    let active = row.unwrap().0;
+    assert!(
+        active.starts_with("custom:"),
+        "active should be custom:UUID, got: {active}"
     );
 }

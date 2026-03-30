@@ -5799,4 +5799,641 @@ mod tests {
         };
         assert_eq!(node_registry_url(&config), Some("node-registry.com:5000"));
     }
+
+    // -- extract_branch: comprehensive coverage --
+
+    #[test]
+    fn extract_branch_prefers_refs_heads_over_refs_tags() {
+        // refs/heads/ is tried first
+        assert_eq!(extract_branch("refs/heads/refs/tags/v1"), "refs/tags/v1");
+    }
+
+    #[test]
+    fn extract_branch_exact_prefix_match() {
+        // Should not match partial prefix
+        assert_eq!(extract_branch("refs/headsbranch"), "refs/headsbranch");
+    }
+
+    // -- detect_unrecoverable_container: CreateContainerConfigError without message --
+
+    #[test]
+    fn check_container_statuses_create_config_error_no_message() {
+        let statuses = vec![make_waiting_status(
+            "app",
+            "CreateContainerConfigError",
+            None,
+        )];
+        let result = check_container_statuses(&statuses, "");
+        assert_eq!(
+            result,
+            Some("CreateContainerConfigError: container config error".into())
+        );
+    }
+
+    #[test]
+    fn check_container_statuses_err_image_pull_no_message() {
+        let statuses = vec![make_waiting_status("app", "ErrImagePull", None)];
+        let result = check_container_statuses(&statuses, "");
+        assert_eq!(result, Some("ErrImagePull: image pull failed".into()));
+    }
+
+    #[test]
+    fn check_container_statuses_image_pull_backoff_no_message() {
+        let statuses = vec![make_waiting_status("app", "ImagePullBackOff", None)];
+        let result = check_container_statuses(&statuses, "");
+        assert_eq!(result, Some("ImagePullBackOff: image pull failed".into()));
+    }
+
+    // -- check_container_statuses: CrashLoopBackOff edge cases --
+
+    #[test]
+    fn check_container_statuses_crash_loop_exactly_3_restarts() {
+        let statuses = vec![ContainerStatus {
+            name: "app".into(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("CrashLoopBackOff".into()),
+                    message: None,
+                }),
+                ..Default::default()
+            }),
+            restart_count: 3,
+            ..Default::default()
+        }];
+        let result = check_container_statuses(&statuses, "");
+        assert_eq!(result, Some("CrashLoopBackOff after 3 restarts".into()));
+    }
+
+    #[test]
+    fn check_container_statuses_crash_loop_with_prefix() {
+        let statuses = vec![ContainerStatus {
+            name: "init".into(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("CrashLoopBackOff".into()),
+                    message: None,
+                }),
+                ..Default::default()
+            }),
+            restart_count: 4,
+            ..Default::default()
+        }];
+        let result = check_container_statuses(&statuses, "init container ");
+        assert_eq!(
+            result,
+            Some("init container CrashLoopBackOff after 4 restarts".into())
+        );
+    }
+
+    // -- check_container_statuses: multiple containers, second has error --
+
+    #[test]
+    fn check_container_statuses_second_container_error() {
+        let statuses = vec![
+            ContainerStatus {
+                name: "healthy".into(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning { started_at: None }),
+                    ..Default::default()
+                }),
+                restart_count: 0,
+                ..Default::default()
+            },
+            make_waiting_status("broken", "ImagePullBackOff", Some("bad image")),
+        ];
+        let result = check_container_statuses(&statuses, "");
+        assert_eq!(result, Some("ImagePullBackOff: bad image".into()));
+    }
+
+    // -- check_container_statuses: waiting with no reason --
+
+    #[test]
+    fn check_container_statuses_waiting_no_reason() {
+        let statuses = vec![ContainerStatus {
+            name: "app".into(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: None,
+                    message: None,
+                }),
+                ..Default::default()
+            }),
+            restart_count: 0,
+            ..Default::default()
+        }];
+        // No reason means the match falls through to the default arm
+        assert!(check_container_statuses(&statuses, "").is_none());
+    }
+
+    // -- detect_unrecoverable_container: empty container + init statuses --
+
+    #[test]
+    fn detect_unrecoverable_empty_containers_empty_init() {
+        let status = PodStatus {
+            container_statuses: Some(vec![]),
+            init_container_statuses: Some(vec![]),
+            ..Default::default()
+        };
+        // Empty containers → check_container_statuses returns None
+        // Empty init containers → check_container_statuses returns None
+        assert!(detect_unrecoverable_container(&status).is_none());
+    }
+
+    #[test]
+    fn detect_unrecoverable_containers_ok_no_init_statuses() {
+        let status = PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "app".into(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning { started_at: None }),
+                    ..Default::default()
+                }),
+                restart_count: 0,
+                ..Default::default()
+            }]),
+            init_container_statuses: None,
+            ..Default::default()
+        };
+        // Regular containers OK, init_container_statuses is None → returns None via ?
+        assert!(detect_unrecoverable_container(&status).is_none());
+    }
+
+    // -- build_env_vars_core: trigger types --
+
+    #[test]
+    fn env_vars_core_trigger_tag() {
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "refs/tags/v1.0",
+            None,
+            "test",
+            None,
+            None,
+            "tag",
+        );
+        assert_eq!(find_env(&vars, "PIPELINE_TRIGGER"), Some("tag".into()));
+    }
+
+    #[test]
+    fn env_vars_core_trigger_schedule() {
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+            "schedule",
+        );
+        assert_eq!(find_env(&vars, "PIPELINE_TRIGGER"), Some("schedule".into()));
+    }
+
+    #[test]
+    fn env_vars_core_trigger_api() {
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+            "api",
+        );
+        assert_eq!(find_env(&vars, "PIPELINE_TRIGGER"), Some("api".into()));
+    }
+
+    // -- build_env_vars_core: version + registry + commit_sha combination --
+
+    #[test]
+    fn env_vars_core_all_optional_fields_present() {
+        let pid = Uuid::new_v4();
+        let proj = Uuid::new_v4();
+        let vars = build_env_vars_core(
+            pid,
+            proj,
+            "my-app",
+            "refs/heads/main",
+            Some("abcdef1234567890"),
+            "deploy",
+            Some("registry.io:5000"),
+            Some("2.0.0"),
+            "push",
+        );
+        assert_eq!(
+            find_env(&vars, "PLATFORM_PROJECT_ID"),
+            Some(proj.to_string())
+        );
+        assert_eq!(
+            find_env(&vars, "PLATFORM_PROJECT_NAME"),
+            Some("my-app".into())
+        );
+        assert_eq!(find_env(&vars, "PIPELINE_ID"), Some(pid.to_string()));
+        assert_eq!(find_env(&vars, "STEP_NAME"), Some("deploy".into()));
+        assert_eq!(
+            find_env(&vars, "COMMIT_REF"),
+            Some("refs/heads/main".into())
+        );
+        assert_eq!(find_env(&vars, "COMMIT_BRANCH"), Some("main".into()));
+        assert_eq!(
+            find_env(&vars, "COMMIT_SHA"),
+            Some("abcdef1234567890".into())
+        );
+        assert_eq!(find_env(&vars, "SHORT_SHA"), Some("abcdef1".into()));
+        assert_eq!(find_env(&vars, "IMAGE_TAG"), Some("sha-abcdef1".into()));
+        assert_eq!(find_env(&vars, "VERSION"), Some("2.0.0".into()));
+        assert_eq!(find_env(&vars, "REGISTRY"), Some("registry.io:5000".into()));
+        assert_eq!(
+            find_env(&vars, "DOCKER_CONFIG"),
+            Some("/kaniko/.docker".into())
+        );
+        assert_eq!(find_env(&vars, "PROJECT"), Some("my-app".into()));
+        assert_eq!(find_env(&vars, "PIPELINE_TRIGGER"), Some("push".into()));
+    }
+
+    // -- step_condition_from_row: with depends_on (should not affect condition) --
+
+    #[test]
+    fn step_condition_from_row_ignores_depends_on() {
+        let row = StepRow {
+            id: Uuid::nil(),
+            step_order: 0,
+            name: "test".into(),
+            image: "alpine".into(),
+            commands: vec![],
+            condition_events: vec!["push".into()],
+            condition_branches: vec![],
+            deploy_test: None,
+            depends_on: vec!["build".into()],
+            environment: None,
+            gate: false,
+            step_type: "command".into(),
+            step_config: None,
+        };
+        let cond = step_condition_from_row(&row).unwrap();
+        assert_eq!(cond.events, vec!["push"]);
+        // depends_on should not affect the condition
+    }
+
+    // -- mark_transitive_dependents_skipped: cycle between two nodes --
+
+    #[test]
+    fn mark_transitive_dependents_two_node_cycle() {
+        // 0 → 1, 1 → 0 (mutual dependency — malformed DAG)
+        let dependents = vec![vec![1], vec![0]];
+        let mut skipped = std::collections::HashSet::new();
+        let completed = std::collections::HashSet::new();
+        mark_transitive_dependents_skipped(0, &dependents, &mut skipped, &completed);
+        // Both should end up skipped without infinite loop
+        assert!(skipped.contains(&0));
+        assert!(skipped.contains(&1));
+    }
+
+    // -- build_pod_spec: imagebuild step type special behavior --
+
+    #[test]
+    fn build_pod_spec_gitops_sync_step_type_has_security_context() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "sync",
+            image: "alpine:3.19",
+            commands: &["echo sync".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "gitops_sync",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert!(
+            container.security_context.is_some(),
+            "gitops_sync step type should have hardened security context"
+        );
+    }
+
+    #[test]
+    fn build_pod_spec_deploy_watch_step_type_has_security_context() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "watch",
+            image: "alpine:3.19",
+            commands: &["echo watch".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "deploy_watch",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert!(
+            container.security_context.is_some(),
+            "deploy_watch step type should have hardened security context"
+        );
+    }
+
+    // -- build_pod_spec: init container image from config --
+
+    #[test]
+    fn build_pod_spec_custom_git_clone_image() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "custom-registry/git-clone:v3.0",
+        });
+
+        let spec = pod.spec.unwrap();
+        let init = &spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(
+            init.image.as_deref(),
+            Some("custom-registry/git-clone:v3.0"),
+            "init container should use the git_clone_image from config"
+        );
+    }
+
+    // -- is_reserved_pipeline_env_var: exhaustive coverage of all reserved vars --
+
+    #[test]
+    fn all_reserved_pipeline_env_vars_are_blocked() {
+        for var in RESERVED_PIPELINE_ENV_VARS {
+            assert!(
+                is_reserved_pipeline_env_var(var),
+                "{var} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_pipeline_env_var_count() {
+        // Ensure we have the expected number of reserved vars (catches accidental removal)
+        assert!(
+            RESERVED_PIPELINE_ENV_VARS.len() >= 15,
+            "should have at least 15 reserved pipeline env vars, got {}",
+            RESERVED_PIPELINE_ENV_VARS.len()
+        );
+    }
+
+    // -- build_env_vars_core: special characters in project name --
+
+    #[test]
+    fn env_vars_core_project_name_with_special_chars() {
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "my-app_v2.0",
+            "main",
+            None,
+            "test",
+            None,
+            None,
+            "push",
+        );
+        assert_eq!(
+            find_env(&vars, "PLATFORM_PROJECT_NAME"),
+            Some("my-app_v2.0".into())
+        );
+        assert_eq!(find_env(&vars, "PROJECT"), Some("my-app_v2.0".into()));
+    }
+
+    // -- build_pod_spec: pod name from pipeline ID and step name --
+
+    #[test]
+    fn pod_name_slug_applied_correctly() {
+        let pipeline_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let pod_name = format!(
+            "pl-{}-{}",
+            &pipeline_id.to_string()[..8],
+            slug("Build Image")
+        );
+        assert_eq!(pod_name, "pl-12345678-build-image");
+    }
+
+    // -- build_pod_spec: fs_group in pod security context --
+
+    #[test]
+    fn build_pod_spec_fs_group_is_1000() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let psc = spec.security_context.as_ref().unwrap();
+        assert_eq!(psc.fs_group, Some(1000));
+    }
+
+    // -- build_pod_spec: restart policy is Never --
+
+    #[test]
+    fn build_pod_spec_restart_policy_never() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+    }
+
+    // -- build_pod_spec: init container uses sh -c --
+
+    #[test]
+    fn build_pod_spec_init_container_uses_sh_c() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let init = &spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(
+            init.command.as_deref(),
+            Some(&["sh".into(), "-c".into()][..])
+        );
+    }
+
+    // -- build_pod_spec: step container uses sh -c --
+
+    #[test]
+    fn build_pod_spec_step_container_uses_sh_c() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["echo hello".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(
+            container.command.as_deref(),
+            Some(&["sh".into(), "-c".into()][..])
+        );
+    }
+
+    // -- build_pod_spec: init container clone command uses GIT_ASKPASS with secret --
+
+    #[test]
+    fn build_pod_spec_clone_uses_git_askpass_with_secret_file() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test",
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            step_name: "test",
+            image: "alpine:3.19",
+            commands: &["true".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/test.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: Some("pl-git-abc123"),
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+        });
+
+        let spec = pod.spec.unwrap();
+        let init = &spec.init_containers.as_ref().unwrap()[0];
+        let clone_cmd = &init.args.as_ref().unwrap()[0];
+
+        // Verify the clone command reads from /git-auth/token
+        assert!(
+            clone_cmd.contains("/git-auth/token"),
+            "clone command should read from /git-auth/token, got: {clone_cmd}"
+        );
+        // Verify it uses GIT_ASKPASS
+        assert!(
+            clone_cmd.contains("GIT_ASKPASS"),
+            "clone command should use GIT_ASKPASS"
+        );
+        // Verify it uses --depth 1
+        assert!(
+            clone_cmd.contains("--depth 1"),
+            "clone command should use --depth 1 for shallow clone"
+        );
+    }
+
+    // -- step_condition_from_row: both events and branches simultaneously --
+
+    #[test]
+    fn step_condition_from_row_events_only() {
+        let row = StepRow {
+            id: Uuid::nil(),
+            step_order: 0,
+            name: "test".into(),
+            image: "alpine".into(),
+            commands: vec![],
+            condition_events: vec!["push".into(), "tag".into()],
+            condition_branches: vec![],
+            deploy_test: None,
+            depends_on: vec![],
+            environment: None,
+            gate: false,
+            step_type: "command".into(),
+            step_config: None,
+        };
+        let cond = step_condition_from_row(&row).unwrap();
+        assert_eq!(cond.events, vec!["push", "tag"]);
+        assert!(cond.branches.is_empty());
+    }
+
+    // -- mark_transitive_dependents_skipped: large fan-in --
+
+    #[test]
+    fn mark_transitive_dependents_fan_in() {
+        // Steps 0,1,2 all depend on step 3
+        // 0 → 3, 1 → 3, 2 → 3
+        let dependents = vec![vec![3], vec![3], vec![3], vec![]];
+        let mut skipped = std::collections::HashSet::new();
+        let completed = std::collections::HashSet::new();
+        mark_transitive_dependents_skipped(0, &dependents, &mut skipped, &completed);
+        // Only 3 should be skipped (not 1 or 2, they are not dependents of 0)
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped.contains(&3));
+    }
+
+    // -- build_env_vars_core: empty step name --
+
+    #[test]
+    fn env_vars_core_empty_step_name() {
+        let vars = build_env_vars_core(
+            Uuid::nil(),
+            Uuid::nil(),
+            "proj",
+            "main",
+            None,
+            "",
+            None,
+            None,
+            "push",
+        );
+        assert_eq!(find_env(&vars, "STEP_NAME"), Some(String::new()));
+    }
 }

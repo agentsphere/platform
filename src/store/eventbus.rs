@@ -1788,4 +1788,170 @@ mod tests {
             _ => panic!("wrong variants"),
         }
     }
+
+    // -- PlatformEvent deserialization error cases --
+
+    #[test]
+    fn event_missing_required_field_fails() {
+        // ImageBuilt missing image_ref
+        let json = r#"{
+            "type": "ImageBuilt",
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "environment": "staging",
+            "pipeline_id": "00000000-0000-0000-0000-000000000002"
+        }"#;
+        let result: Result<PlatformEvent, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing image_ref should fail");
+    }
+
+    #[test]
+    fn event_invalid_uuid_field_fails() {
+        let json = r#"{
+            "type": "ImageBuilt",
+            "project_id": "not-a-uuid",
+            "environment": "staging",
+            "image_ref": "img:v1",
+            "pipeline_id": "00000000-0000-0000-0000-000000000002",
+            "triggered_by": null
+        }"#;
+        let result: Result<PlatformEvent, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "invalid UUID should fail");
+    }
+
+    #[test]
+    fn event_empty_string_type_fails() {
+        let json = r#"{"type": "", "project_id": "00000000-0000-0000-0000-000000000001"}"#;
+        let result: Result<PlatformEvent, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "empty type should fail");
+    }
+
+    // -- resolve_deploy_config edge cases --
+
+    #[test]
+    fn resolve_deploy_unknown_environment_falls_back_to_rolling() {
+        let mut pf = minimal_platform_file();
+        pf.deploy = Some(
+            serde_json::from_value(serde_json::json!({
+                "specs": [{
+                    "name": "web",
+                    "type": "canary",
+                    "canary": {
+                        "stable_service": "web-stable",
+                        "canary_service": "web-canary",
+                        "steps": [10, 50, 100]
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        // "preview" environment is not in any default stages
+        let (config, strategy) = resolve_deploy_config_from_specs(&pf, "preview");
+        assert_eq!(strategy, Some("rolling".into()));
+        assert_eq!(config, serde_json::json!({}));
+    }
+
+    // -- PlatformEvent with special characters --
+
+    #[test]
+    fn event_with_special_chars_in_strings() {
+        let event = PlatformEvent::AlertFired {
+            rule_id: Uuid::nil(),
+            project_id: Some(Uuid::nil()),
+            severity: "critical".into(),
+            value: Some(99.9),
+            message: "Alert: \"high\" CPU usage (>95%) on node-1".into(),
+            alert_name: "CPU > 95%".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::AlertFired {
+                message,
+                alert_name,
+                ..
+            } => {
+                assert!(message.contains("\"high\""));
+                assert!(message.contains(">95%"));
+                assert_eq!(alert_name, "CPU > 95%");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // -- CHANNEL constant --
+
+    #[test]
+    fn channel_name_is_platform_events() {
+        assert_eq!(CHANNEL, "platform:events");
+    }
+
+    // -- PlatformEvent Debug impl --
+
+    #[test]
+    fn platform_event_debug() {
+        let event = PlatformEvent::ImageBuilt {
+            project_id: Uuid::nil(),
+            environment: "prod".into(),
+            image_ref: "img:v1".into(),
+            pipeline_id: Uuid::nil(),
+            triggered_by: None,
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("ImageBuilt"));
+        assert!(debug.contains("prod"));
+    }
+
+    // -- PlatformEvent Clone --
+
+    #[test]
+    fn platform_event_clone() {
+        let event = PlatformEvent::ImageBuilt {
+            project_id: Uuid::new_v4(),
+            environment: "staging".into(),
+            image_ref: "img:v1".into(),
+            pipeline_id: Uuid::new_v4(),
+            triggered_by: Some(Uuid::new_v4()),
+        };
+        let cloned = event.clone();
+        let json1 = serde_json::to_string(&event).unwrap();
+        let json2 = serde_json::to_string(&cloned).unwrap();
+        assert_eq!(json1, json2);
+    }
+
+    // -- TrafficShifted with empty weights --
+
+    #[test]
+    fn traffic_shifted_empty_weights() {
+        let event = PlatformEvent::TrafficShifted {
+            release_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            weights: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::TrafficShifted { weights, .. } => {
+                assert!(weights.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // -- FlagsRegistered with empty flags --
+
+    #[test]
+    fn flags_registered_empty_flags() {
+        let event = PlatformEvent::FlagsRegistered {
+            project_id: Uuid::nil(),
+            flags: vec![],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::FlagsRegistered { flags, .. } => {
+                assert!(flags.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }

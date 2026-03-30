@@ -957,4 +957,136 @@ mod tests {
             assert_eq!(r.name, name);
         }
     }
+
+    // -- build_provider_extra_env: vertex with all auto-inject vars already set --
+
+    #[test]
+    fn build_provider_extra_env_vertex_all_preset() {
+        let vars = HashMap::from([
+            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj".into()),
+            ("CLAUDE_CODE_USE_VERTEX".into(), "0".into()),
+            ("CLOUD_ML_REGION".into(), "europe-west1".into()),
+        ]);
+        let (_, extra) = build_provider_extra_env("vertex", &vars);
+        // User values should be preserved
+        let vertex_entries: Vec<_> = extra
+            .iter()
+            .filter(|(k, _)| k == "CLAUDE_CODE_USE_VERTEX")
+            .collect();
+        assert_eq!(vertex_entries.len(), 1);
+        assert_eq!(vertex_entries[0].1, "0");
+        let region_entries: Vec<_> = extra
+            .iter()
+            .filter(|(k, _)| k == "CLOUD_ML_REGION")
+            .collect();
+        assert_eq!(region_entries.len(), 1);
+        assert_eq!(region_entries[0].1, "europe-west1");
+    }
+
+    // -- build_provider_extra_env: API key alone (no extra vars) --
+
+    #[test]
+    fn build_provider_extra_env_api_key_only() {
+        let vars = HashMap::from([("ANTHROPIC_API_KEY".into(), "sk-only-key".into())]);
+        let (api_key, extra) = build_provider_extra_env("custom_endpoint", &vars);
+        assert_eq!(api_key.as_deref(), Some("sk-only-key"));
+        assert!(extra.is_empty(), "no extra vars when only API key provided");
+    }
+
+    // -- Validation event type field in JSON --
+
+    #[test]
+    fn validation_event_test_type_field() {
+        let event = ValidationEvent::Test(TestResult {
+            test: 1,
+            name: "connection",
+            status: TestStatus::Running,
+            detail: String::new(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "test");
+    }
+
+    #[test]
+    fn validation_event_done_type_field() {
+        let event = ValidationEvent::Done { all_passed: true };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "done");
+    }
+
+    // -- TestResult Debug formatting --
+
+    #[test]
+    fn test_result_debug_format() {
+        let r = TestResult {
+            test: 2,
+            name: "output_format",
+            status: TestStatus::Failed,
+            detail: "tools array empty".into(),
+        };
+        let debug = format!("{r:?}");
+        assert!(debug.contains("output_format"));
+        assert!(debug.contains("Failed"));
+    }
+
+    // -- build_provider_extra_env with only ANTHROPIC_API_KEY --
+
+    #[test]
+    fn build_provider_extra_env_bedrock_with_api_key_extracts_it() {
+        // Even for bedrock, ANTHROPIC_API_KEY should be extracted
+        let vars = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-bedrock-key".into()),
+            ("AWS_ACCESS_KEY_ID".into(), "AKIA".into()),
+        ]);
+        let (api_key, extra) = build_provider_extra_env("bedrock", &vars);
+        assert_eq!(api_key.as_deref(), Some("sk-bedrock-key"));
+        assert!(!extra.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        // Auto-inject should still happen
+        assert!(
+            extra
+                .iter()
+                .any(|(k, v)| k == "DISABLE_PROMPT_CACHING" && v == "1")
+        );
+    }
+
+    // -- ValidationEvent with empty detail --
+
+    #[test]
+    fn validation_event_test_empty_detail() {
+        let event = ValidationEvent::Test(TestResult {
+            test: 1,
+            name: "connection",
+            status: TestStatus::Running,
+            detail: String::new(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"detail\":\"\""));
+    }
+
+    // -- push_if_missing with empty env --
+
+    #[test]
+    fn push_if_missing_empty_env() {
+        let mut env: Vec<(String, String)> = vec![];
+        push_if_missing(&mut env, "NEW_KEY", "new_value");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0], ("NEW_KEY".to_owned(), "new_value".to_owned()));
+    }
+
+    // -- build_provider_extra_env: large env_vars map --
+
+    #[test]
+    fn build_provider_extra_env_many_vars() {
+        let mut vars = HashMap::new();
+        for i in 0..20 {
+            vars.insert(format!("VAR_{i}"), format!("val_{i}"));
+        }
+        vars.insert("ANTHROPIC_API_KEY".into(), "sk-test".into());
+        let (api_key, extra) = build_provider_extra_env("custom_endpoint", &vars);
+        assert_eq!(api_key.as_deref(), Some("sk-test"));
+        assert_eq!(extra.len(), 20); // 20 custom vars, API key extracted
+        assert!(!extra.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+    }
 }

@@ -455,14 +455,23 @@ fn parse_validation_ndjson(stdout: &str) -> bool {
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let msg_subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-        let msg_error = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        // error field may be a string ("authentication_failed") or an object
+        // ({"type": "authentication_failed", "message": "..."})
+        let msg_error = v
+            .get("error")
+            .and_then(|e| {
+                e.as_str()
+                    .map(String::from)
+                    .or_else(|| e.get("type").and_then(|t| t.as_str()).map(String::from))
+            })
+            .unwrap_or_default();
 
         tracing::debug!(
             line_count,
             json_count,
             msg_type,
             msg_subtype,
-            msg_error,
+            %msg_error,
             "validation: parsed NDJSON line"
         );
 
@@ -1095,5 +1104,237 @@ echo "Store this token securely."
 
         // Clean up
         manager.cancel(session_id).await;
+    }
+
+    // =====================================================================
+    // Additional parse_validation_ndjson coverage
+    // =====================================================================
+
+    #[test]
+    fn parse_validation_ndjson_init_only_no_result() {
+        // init line seen but no result line → saw_init is true → returns true
+        let output = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
+        assert!(parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_result_error_after_init() {
+        // init + result with is_error=true → saw_init is true from init line,
+        // result checks if is_error == Some(false) || saw_init → true
+        let output = r#"{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"result","is_error":true,"result":"some error"}"#;
+        assert!(parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_result_without_is_error_and_no_init() {
+        // result line without is_error field (and no init) → is_error == None
+        // Neither is_error == Some(false) nor saw_init → false
+        let output = r#"{"type":"result","result":"something"}"#;
+        assert!(!parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_mixed_json_and_non_json() {
+        // Lines with non-JSON interspersed — should skip non-JSON
+        let output = "not json at all\n{\"type\":\"system\",\"subtype\":\"init\"}\nmore text\n{\"type\":\"result\",\"is_error\":false}";
+        assert!(parse_validation_ndjson(output));
+    }
+
+    #[test]
+    fn parse_validation_ndjson_auth_failed_before_init() {
+        // auth_failed appears before any init → false (early return)
+        let output = r#"{"error":"authentication_failed","message":"bad token"}
+{"type":"system","subtype":"init"}"#;
+        assert!(!parse_validation_ndjson(output));
+    }
+
+    // =====================================================================
+    // Additional strip_ansi_escapes coverage
+    // =====================================================================
+
+    #[test]
+    fn strip_ansi_handles_osc_sequences() {
+        // OSC sequence: ESC ] ... BEL
+        let input = "\x1b]0;window title\x07Hello";
+        let result = strip_ansi_escapes(input);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn strip_ansi_handles_esc_with_unknown_next_char() {
+        // ESC followed by a non-[ non-] char → skip ESC + that char
+        let input = "\x1bMHello";
+        let result = strip_ansi_escapes(input);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn strip_ansi_handles_esc_at_end() {
+        // ESC at end of string with no following char → skipped
+        let input = "Hello\x1b";
+        let result = strip_ansi_escapes(input);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn strip_ansi_handles_multiple_csi() {
+        let input = "\x1b[1m\x1b[31mRed Bold\x1b[0m Normal";
+        let result = strip_ansi_escapes(input);
+        assert_eq!(result, "Red Bold Normal");
+    }
+
+    // =====================================================================
+    // Additional find_oauth_url coverage
+    // =====================================================================
+
+    #[test]
+    fn find_oauth_url_too_short_returns_none() {
+        // URL exactly equal to the marker (no query params) → length <= marker_len → None
+        let text = "https://claude.ai/oauth/authorize?";
+        assert!(find_oauth_url(text).is_none());
+    }
+
+    #[test]
+    fn find_oauth_url_handles_cr_in_url() {
+        // \r chars within URL should be skipped
+        let text = "https://claude.ai/oauth/authorize?code=true\r&state=abc";
+        let url = find_oauth_url(text).unwrap();
+        assert_eq!(url, "https://claude.ai/oauth/authorize?code=true&state=abc");
+    }
+
+    #[test]
+    fn find_oauth_url_stops_at_non_url_char() {
+        // Space terminates URL
+        let text = "https://claude.ai/oauth/authorize?code=true next text";
+        let url = find_oauth_url(text).unwrap();
+        assert_eq!(url, "https://claude.ai/oauth/authorize?code=true");
+    }
+
+    // =====================================================================
+    // Additional find_oauth_token coverage
+    // =====================================================================
+
+    #[test]
+    fn find_oauth_token_stops_at_space() {
+        let text = "sk-ant-oat01-FAKE_LONG_TOKEN_abcdef1234567890 next";
+        let token = find_oauth_token(text).unwrap();
+        assert_eq!(token, "sk-ant-oat01-FAKE_LONG_TOKEN_abcdef1234567890");
+    }
+
+    #[test]
+    fn find_oauth_token_stops_at_newline() {
+        let text = "sk-ant-oat01-FAKE_LONG_TOKEN_abcdef1234567890\nnext line";
+        let token = find_oauth_token(text).unwrap();
+        assert_eq!(token, "sk-ant-oat01-FAKE_LONG_TOKEN_abcdef1234567890");
+    }
+
+    #[test]
+    fn find_oauth_token_exactly_21_chars() {
+        // Just above the 20 char threshold (token.len() > 20)
+        let text = "sk-ant-oat01-ABCDEFGH";
+        // "sk-ant-oat01-ABCDEFGH" is 21 chars
+        let token = find_oauth_token(text).unwrap();
+        assert_eq!(token, "sk-ant-oat01-ABCDEFGH");
+    }
+
+    #[test]
+    fn find_oauth_token_exactly_20_chars() {
+        // At the threshold (token.len() > 20 required, so 20 is too short)
+        let text = "sk-ant-oat01-ABCDEFG";
+        // "sk-ant-oat01-ABCDEFG" is 20 chars
+        assert!(find_oauth_token(text).is_none());
+    }
+
+    // =====================================================================
+    // is_url_char coverage
+    // =====================================================================
+
+    #[test]
+    fn is_url_char_basic() {
+        assert!(is_url_char('a'));
+        assert!(is_url_char('Z'));
+        assert!(is_url_char('0'));
+        assert!(is_url_char('-'));
+        assert!(is_url_char('_'));
+        assert!(is_url_char('.'));
+        assert!(is_url_char('~'));
+        assert!(is_url_char(':'));
+        assert!(is_url_char('/'));
+        assert!(is_url_char('?'));
+        assert!(is_url_char('#'));
+        assert!(is_url_char('&'));
+        assert!(is_url_char('='));
+        assert!(is_url_char('%'));
+        assert!(!is_url_char(' '));
+        assert!(!is_url_char('\n'));
+        assert!(!is_url_char('\x00'));
+        assert!(!is_url_char('<'));
+        assert!(!is_url_char('>'));
+    }
+
+    // =====================================================================
+    // CliAuthManager: concurrent session replacement
+    // =====================================================================
+
+    #[tokio::test]
+    async fn cli_auth_manager_replaces_existing_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock_cli = create_mock_cli(tmp.path());
+
+        let manager = CliAuthManager::new();
+        let user_id = Uuid::new_v4();
+
+        // Start first session
+        let (session_id_1, url_1) = manager
+            .start_auth(user_id, mock_cli.to_str().unwrap())
+            .await
+            .expect("first start_auth failed");
+        assert!(url_1.contains("claude.ai/oauth/authorize"));
+
+        // Start second session for same user — should kill the first
+        let (session_id_2, url_2) = manager
+            .start_auth(user_id, mock_cli.to_str().unwrap())
+            .await
+            .expect("second start_auth failed");
+        assert!(url_2.contains("claude.ai/oauth/authorize"));
+        assert_ne!(session_id_1, session_id_2);
+
+        // First session should be gone
+        assert!(manager.get_state(session_id_1).await.is_none());
+        // Second session should exist
+        assert!(manager.get_state(session_id_2).await.is_some());
+
+        // Clean up
+        manager.cancel(session_id_2).await;
+    }
+
+    #[tokio::test]
+    async fn cli_auth_manager_get_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock_cli = create_mock_cli(tmp.path());
+
+        let manager = CliAuthManager::new();
+        let user_id = Uuid::new_v4();
+
+        let (session_id, _) = manager
+            .start_auth(user_id, mock_cli.to_str().unwrap())
+            .await
+            .expect("start_auth failed");
+
+        let owner = manager.get_owner(session_id).await;
+        assert_eq!(owner, Some(user_id));
+
+        // Unknown session returns None
+        assert!(manager.get_owner(Uuid::new_v4()).await.is_none());
+
+        manager.cancel(session_id).await;
+    }
+
+    #[tokio::test]
+    async fn cli_auth_manager_cancel_nonexistent_is_noop() {
+        let manager = CliAuthManager::new();
+        // Should not panic
+        manager.cancel(Uuid::new_v4()).await;
     }
 }

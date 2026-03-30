@@ -151,4 +151,69 @@ mod tests {
         // verifies the router construction is sound.
         let _ = router;
     }
+
+    #[test]
+    fn create_channels_senders_are_functional() {
+        let (channels, mut spans_rx, mut logs_rx, mut metrics_rx) = ingest::create_channels();
+
+        // Verify we can send to each channel
+        let span = super::store::SpanRecord {
+            trace_id: "test".into(),
+            span_id: "test".into(),
+            parent_span_id: None,
+            name: "test".into(),
+            service: "test".into(),
+            kind: "server".into(),
+            status: "ok".into(),
+            attributes: None,
+            events: None,
+            duration_ms: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            project_id: None,
+            session_id: None,
+            user_id: None,
+        };
+        channels.spans_tx.try_send(span).unwrap();
+
+        let log = super::store::LogEntryRecord {
+            timestamp: chrono::Utc::now(),
+            trace_id: None,
+            span_id: None,
+            project_id: None,
+            session_id: None,
+            user_id: None,
+            service: "test".into(),
+            level: "info".into(),
+            source: "external".into(),
+            message: "test".into(),
+            attributes: None,
+        };
+        channels.logs_tx.try_send(log).unwrap();
+
+        let metric = super::store::MetricRecord {
+            name: "test".into(),
+            labels: serde_json::json!({}),
+            metric_type: "gauge".into(),
+            unit: None,
+            project_id: None,
+            timestamp: chrono::Utc::now(),
+            value: 1.0,
+        };
+        channels.metrics_tx.try_send(metric).unwrap();
+
+        // Verify we can receive from each channel
+        assert!(spans_rx.try_recv().is_ok());
+        assert!(logs_rx.try_recv().is_ok());
+        assert!(metrics_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn router_builds_multiple_times() {
+        // Verify router can be built multiple times without issues
+        for _ in 0..3 {
+            let (channels, _spans_rx, _logs_rx, _metrics_rx) = ingest::create_channels();
+            let _router: Router<AppState> = router(channels);
+        }
+    }
 }

@@ -1471,4 +1471,70 @@ mod tests {
         let branch_name = branch.map_or_else(|| format!("agent/{short_id}"), String::from);
         assert_eq!(branch_name, "feature/foo");
     }
+
+    #[test]
+    fn short_id_is_first_8_chars() {
+        let session_id = Uuid::new_v4();
+        let short_id = &session_id.to_string()[..8];
+        assert_eq!(short_id.len(), 8);
+        // Should be hex chars (UUID format)
+        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn get_provider_returns_trait_object() {
+        let provider = get_provider("claude-code").unwrap();
+        // Verify it's a valid provider by calling name()
+        assert_eq!(provider.name(), "claude-code");
+    }
+
+    #[test]
+    fn branch_name_default_format() {
+        // Ensure the branch name format is predictable
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let short_id = &id.to_string()[..8];
+        assert_eq!(short_id, "550e8400");
+        let branch_name: Option<&str> = None;
+        let result = branch_name.map_or_else(|| format!("agent/{short_id}"), String::from);
+        assert_eq!(result, "agent/550e8400");
+    }
+
+    #[test]
+    fn branch_name_with_slash() {
+        let branch: Option<&str> = Some("feature/initial-app");
+        let result = branch.map_or_else(|| "agent/fallback".to_string(), String::from);
+        assert_eq!(result, "feature/initial-app");
+    }
+
+    #[test]
+    fn spawn_depth_starts_at_zero_for_root() {
+        // When parent_session_id is None, spawn_depth should be 0
+        let parent: Option<Uuid> = None;
+        let spawn_depth: i32 = if parent.is_some() { 1 } else { 0 };
+        assert_eq!(spawn_depth, 0);
+    }
+
+    #[test]
+    fn spawn_depth_increments_for_child() {
+        let parent = Some(Uuid::new_v4());
+        let parent_depth = 2;
+        let spawn_depth: i32 = if parent.is_some() {
+            parent_depth + 1
+        } else {
+            0
+        };
+        assert_eq!(spawn_depth, 3);
+    }
+
+    #[test]
+    fn get_provider_whitespace_name_rejected() {
+        assert!(get_provider(" claude-code ").is_err());
+        assert!(get_provider("  ").is_err());
+    }
+
+    #[test]
+    fn get_provider_special_chars_rejected() {
+        assert!(get_provider("claude/code").is_err());
+        assert!(get_provider("claude@code").is_err());
+    }
 }

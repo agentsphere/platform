@@ -693,4 +693,203 @@ mod tests {
     fn first_message_timeout_is_30s() {
         assert_eq!(CLI_FIRST_MESSAGE_TIMEOUT.as_secs(), 30);
     }
+
+    #[test]
+    fn cli_invoke_timeout_is_300s() {
+        assert_eq!(CLI_INVOKE_TIMEOUT.as_secs(), 300);
+    }
+
+    #[test]
+    fn format_tool_results_non_object_value() {
+        // When tool result is a plain string/number (not an object), should use "result: " format
+        let results = vec![(
+            "create_project".to_owned(),
+            Ok(serde_json::json!("simple string result")),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[create_project] OK"));
+        assert!(formatted.contains("result: \"simple string result\""));
+    }
+
+    #[test]
+    fn format_tool_results_array_value() {
+        let results = vec![("list_items".to_owned(), Ok(serde_json::json!([1, 2, 3])))];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[list_items] OK"));
+        assert!(formatted.contains("result: [1,2,3]"));
+    }
+
+    #[test]
+    fn format_tool_results_boolean_value() {
+        let results = vec![("check".to_owned(), Ok(serde_json::json!(true)))];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[check] OK"));
+        assert!(formatted.contains("result: true"));
+    }
+
+    #[test]
+    fn format_tool_results_null_value() {
+        let results = vec![("noop".to_owned(), Ok(serde_json::json!(null)))];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[noop] OK"));
+        assert!(formatted.contains("result: null"));
+    }
+
+    #[test]
+    fn format_tool_results_with_underscore_prefix_key_skipped() {
+        // Keys starting with _ (other than _next) should be skipped in the data section
+        let results = vec![(
+            "create_project".to_owned(),
+            Ok(
+                serde_json::json!({"project_id": "abc", "_internal": "skip this", "_next": "Do next thing"}),
+            ),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("project_id: abc"));
+        assert!(!formatted.contains("_internal"));
+        assert!(formatted.contains("→ Do next thing"));
+    }
+
+    #[test]
+    fn format_tool_results_hint_non_string() {
+        // _next that is not a string should produce empty hint
+        let results = vec![(
+            "tool1".to_owned(),
+            Ok(serde_json::json!({"id": "123", "_next": 42})),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("id: 123"));
+        assert!(formatted.contains("→ "));
+    }
+
+    #[test]
+    fn format_tool_results_multiple_success_entries() {
+        let results = vec![
+            ("tool_a".to_owned(), Ok(serde_json::json!({"a": 1}))),
+            ("tool_b".to_owned(), Ok(serde_json::json!({"b": 2}))),
+            ("tool_c".to_owned(), Ok(serde_json::json!({"c": 3}))),
+        ];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[tool_a] OK"));
+        assert!(formatted.contains("[tool_b] OK"));
+        assert!(formatted.contains("[tool_c] OK"));
+        assert!(formatted.contains("a: 1"));
+        assert!(formatted.contains("b: 2"));
+        assert!(formatted.contains("c: 3"));
+    }
+
+    #[test]
+    fn format_tool_results_object_with_nested_json() {
+        let results = vec![(
+            "complex".to_owned(),
+            Ok(serde_json::json!({"nested": {"key": "value"}})),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[complex] OK"));
+        assert!(formatted.contains("nested: {\"key\":\"value\"}"));
+    }
+
+    #[test]
+    fn parse_structured_output_no_result_text() {
+        // Neither result text nor structured_output — should use default message
+        let result = ResultMessage {
+            subtype: "error_max_turns".into(),
+            session_id: "s1".into(),
+            is_error: true,
+            result: None,
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            usage: None,
+            structured_output: None,
+        };
+        let resp = parse_structured_output(&result, None);
+        assert_eq!(resp.text, "No response from agent");
+        assert!(resp.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_structured_output_malformed_structured_with_valid_fallback() {
+        // structured_output is malformed but assistant fallback is valid
+        let result = ResultMessage {
+            subtype: "success".into(),
+            session_id: "s1".into(),
+            is_error: false,
+            result: Some("Text fallback".into()),
+            total_cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            usage: None,
+            structured_output: Some(serde_json::json!("not an object")),
+        };
+        let fallback = serde_json::json!({
+            "text": "From fallback",
+            "tools": [{"name": "spawn_coding_agent", "parameters": {"prompt": "do it"}}]
+        });
+        let resp = parse_structured_output(&result, Some(&fallback));
+        assert_eq!(resp.text, "From fallback");
+        assert_eq!(resp.tools.len(), 1);
+        assert_eq!(resp.tools[0].name, "spawn_coding_agent");
+    }
+
+    #[test]
+    fn structured_response_serialize_roundtrip() {
+        let resp = StructuredResponse {
+            text: "Hello world".into(),
+            tools: vec![
+                ToolRequest {
+                    name: "create_project".into(),
+                    parameters: serde_json::json!({"name": "test"}),
+                },
+                ToolRequest {
+                    name: "spawn_coding_agent".into(),
+                    parameters: serde_json::json!({"prompt": "build it"}),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: StructuredResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.text, "Hello world");
+        assert_eq!(back.tools.len(), 2);
+    }
+
+    #[test]
+    fn create_app_schema_has_tool_descriptions() {
+        let schema = create_app_schema();
+        let tools_desc = schema["properties"]["tools"]["description"].as_str();
+        assert!(tools_desc.is_some(), "tools should have a description");
+        let text_desc = schema["properties"]["text"]["description"].as_str();
+        assert!(text_desc.is_some(), "text should have a description");
+    }
+
+    #[test]
+    fn format_tool_results_error_preserves_message() {
+        let results = vec![(
+            "spawn_coding_agent".to_owned(),
+            Err("pod creation timed out after 60s".into()),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("[spawn_coding_agent] ERROR: pod creation timed out after 60s"));
+    }
+
+    #[test]
+    fn format_tool_results_header_always_present() {
+        let results: Vec<(String, Result<serde_json::Value, String>)> = Vec::new();
+        let formatted = format_tool_results(&results);
+        assert!(formatted.starts_with("TOOL RESULTS:\n"));
+    }
+
+    #[test]
+    fn format_tool_results_string_field_in_object() {
+        // String values in objects should not have extra quotes
+        let results = vec![(
+            "tool1".to_owned(),
+            Ok(serde_json::json!({"name": "my-project", "id": "uuid-here"})),
+        )];
+        let formatted = format_tool_results(&results);
+        assert!(formatted.contains("name: my-project"));
+        assert!(formatted.contains("id: uuid-here"));
+        // Should NOT contain extra quotes around string values
+        assert!(!formatted.contains("name: \"my-project\""));
+    }
 }

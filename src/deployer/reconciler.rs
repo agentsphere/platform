@@ -1767,4 +1767,138 @@ mod tests {
             "platform-test-very-long-prefix-svc-staging"
         );
     }
+
+    // -- sample_release construction variants --
+
+    #[test]
+    fn sample_release_default_fields() {
+        let r = sample_release();
+        assert_eq!(r.strategy, "rolling");
+        assert_eq!(r.phase, "pending");
+        assert_eq!(r.traffic_weight, 0);
+        assert_eq!(r.current_step, 0);
+        assert!(r.tracked_resources.is_empty());
+        assert!(!r.skip_prune);
+        assert!(r.pipeline_id.is_none());
+        assert!(r.ops_repo_id.is_none());
+        assert!(r.manifest_path.is_none());
+        assert!(r.branch_slug.is_none());
+        assert!(r.commit_sha.is_none());
+    }
+
+    #[test]
+    fn sample_release_deployed_by_is_set() {
+        let r = sample_release();
+        assert!(r.deployed_by.is_some());
+    }
+
+    // -- generate_basic_manifest with special characters in project name --
+
+    #[test]
+    fn basic_manifest_with_hyphenated_project() {
+        let mut r = sample_release();
+        r.project_name = "my-cool-service".into();
+        r.environment = "staging".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains("name: my-cool-service-staging"));
+    }
+
+    #[test]
+    fn basic_manifest_with_underscored_project() {
+        let mut r = sample_release();
+        r.project_name = "my_app".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains("name: my_app-production"));
+    }
+
+    // -- build_deploy_docker_config with empty credentials --
+
+    #[test]
+    fn build_docker_config_empty_username() {
+        let config = build_deploy_docker_config("reg:5000", None, "", "tok");
+        let auth_str = config["auths"]["reg:5000"]["auth"].as_str().unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, auth_str).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), ":tok");
+    }
+
+    #[test]
+    fn build_docker_config_empty_token() {
+        let config = build_deploy_docker_config("reg:5000", None, "admin", "");
+        let auth_str = config["auths"]["reg:5000"]["auth"].as_str().unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, auth_str).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "admin:");
+    }
+
+    // -- env_suffix with unusual inputs --
+
+    #[test]
+    fn env_suffix_case_sensitive() {
+        assert_eq!(env_suffix("Production"), "Production");
+        assert_eq!(env_suffix("PRODUCTION"), "PRODUCTION");
+    }
+
+    // -- target_namespace with empty slug --
+
+    #[test]
+    fn target_namespace_empty_slug() {
+        let config = crate::config::Config::test_default();
+        let ns = target_namespace(&config, "", "production");
+        assert_eq!(ns, "-prod");
+    }
+
+    // -- REGISTRY_PULL_SECRET_NAME constant --
+
+    #[test]
+    fn registry_pull_secret_name_is_expected() {
+        assert_eq!(REGISTRY_PULL_SECRET_NAME, "platform-registry-pull");
+    }
+
+    // -- generate_basic_manifest: image with SHA256 digest --
+
+    #[test]
+    fn basic_manifest_with_sha_digest() {
+        let mut r = sample_release();
+        r.image_ref = "registry.io/app@sha256:abc123def456".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains("image: registry.io/app@sha256:abc123def456"));
+    }
+
+    // -- generate_basic_manifest: multipart registry paths --
+
+    #[test]
+    fn basic_manifest_with_nested_registry_path() {
+        let mut r = sample_release();
+        r.image_ref = "ghcr.io/org/team/project:v1.0.0".into();
+        let manifest = generate_basic_manifest(&r).unwrap();
+        assert!(manifest.contains("image: ghcr.io/org/team/project:v1.0.0"));
+    }
+
+    // -- build_deploy_docker_config: long registry URLs --
+
+    #[test]
+    fn build_docker_config_long_registry_url() {
+        let long_url = format!("registry.{}.example.com:5000", "a".repeat(100));
+        let config = build_deploy_docker_config(&long_url, None, "user", "pass");
+        let auths = config["auths"].as_object().unwrap();
+        assert!(auths.contains_key(&long_url));
+    }
+
+    // -- target_namespace: production env maps to prod suffix --
+
+    #[test]
+    fn target_namespace_uses_env_suffix() {
+        let config = crate::config::Config::test_default();
+        // Verify "production" is mapped to "prod" via env_suffix
+        let ns = target_namespace(&config, "svc", "production");
+        assert!(
+            ns.ends_with("-prod"),
+            "production should map to -prod suffix"
+        );
+        assert!(
+            !ns.contains("production"),
+            "should not contain full 'production' word"
+        );
+    }
 }

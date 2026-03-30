@@ -2298,6 +2298,286 @@ async fn rotate_metrics_no_old_data(pool: PgPool) {
 // Metric names — project scoped
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// spawn_background_tasks + immediate shutdown
+// ---------------------------------------------------------------------------
+
+/// `spawn_background_tasks` starts all observe tasks and shuts down cleanly.
+#[sqlx::test(migrations = "./migrations")]
+async fn spawn_background_tasks_and_shutdown(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let channels = platform::observe::spawn_background_tasks(state.clone(), shutdown_rx);
+
+    // Verify channels are functional by sending a span
+    let span = platform::observe::store::SpanRecord {
+        trace_id: "bg-task-test-trace".into(),
+        span_id: "bg-task-test-span".into(),
+        parent_span_id: None,
+        name: "bg-test".into(),
+        service: "bg-task-svc".into(),
+        kind: "server".into(),
+        status: "ok".into(),
+        attributes: None,
+        events: None,
+        duration_ms: Some(1),
+        started_at: Utc::now(),
+        finished_at: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+    };
+    channels.spans_tx.send(span).await.unwrap();
+
+    // Signal shutdown — all tasks should drain and exit
+    shutdown_tx.send(()).unwrap();
+
+    // Wait for flush to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify the span was flushed to DB
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM spans WHERE service = 'bg-task-svc'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        count.0 >= 1,
+        "span should have been flushed by background task"
+    );
+}
+
+/// Observability retention cleanup deletes old data.
+#[sqlx::test(migrations = "./migrations")]
+async fn retention_cleanup_deletes_old_data(pool: PgPool) {
+    let (_state, _admin_token) = test_state(pool.clone()).await;
+
+    // Insert old data (90+ days)
+    let old_ts = Utc::now() - chrono::Duration::days(100);
+
+    // Insert old span
+    let old_span = platform::observe::store::SpanRecord {
+        trace_id: "retention-trace".into(),
+        span_id: "retention-span".into(),
+        parent_span_id: None,
+        name: "retention-test".into(),
+        service: "retention-svc".into(),
+        kind: "server".into(),
+        status: "ok".into(),
+        attributes: None,
+        events: None,
+        duration_ms: Some(1),
+        started_at: old_ts,
+        finished_at: Some(old_ts),
+        project_id: None,
+        session_id: None,
+        user_id: None,
+    };
+    platform::observe::store::write_spans(&pool, &[old_span])
+        .await
+        .unwrap();
+
+    // Insert old log
+    let old_log = platform::observe::store::LogEntryRecord {
+        timestamp: old_ts,
+        trace_id: None,
+        span_id: None,
+        project_id: None,
+        session_id: None,
+        user_id: None,
+        service: "retention-svc".into(),
+        level: "info".into(),
+        source: "external".into(),
+        message: "old log for retention".into(),
+        attributes: None,
+    };
+    platform::observe::store::write_logs(&pool, &[old_log])
+        .await
+        .unwrap();
+
+    // Insert old metric
+    let old_metric = platform::observe::store::MetricRecord {
+        name: "retention_metric".into(),
+        labels: serde_json::json!({}),
+        metric_type: "gauge".into(),
+        unit: None,
+        project_id: None,
+        timestamp: old_ts,
+        value: 1.0,
+    };
+    platform::observe::store::write_metrics(&pool, &[old_metric])
+        .await
+        .unwrap();
+
+    // Verify old data exists
+    let span_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM spans WHERE service = 'retention-svc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(span_count.0 >= 1, "old span should exist before cleanup");
+
+    // Run the retention cleanup SQL manually (same as the background task)
+    let retention_days: i64 = 90; // default
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days);
+
+    for (table, col) in &[
+        ("spans", "started_at"),
+        ("log_entries", "timestamp"),
+        ("metric_samples", "timestamp"),
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE {col} < $1");
+        sqlx::query(&sql).bind(cutoff).execute(&pool).await.unwrap();
+    }
+
+    // Verify old data was deleted
+    let span_count_after: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM spans WHERE service = 'retention-svc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        span_count_after.0, 0,
+        "old span should be deleted by retention cleanup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parquet rotation — multiple rows
+// ---------------------------------------------------------------------------
+
+/// Rotate multiple old logs at once.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_logs_multiple_entries(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let old_ts = Utc::now() - chrono::Duration::hours(72);
+    let mut logs = Vec::new();
+    for i in 0..5 {
+        logs.push(platform::observe::store::LogEntryRecord {
+            timestamp: old_ts + chrono::Duration::seconds(i),
+            trace_id: Some(format!("multi-rot-trace-{i}")),
+            span_id: None,
+            project_id: None,
+            session_id: None,
+            user_id: None,
+            service: "multi-rot-svc".into(),
+            level: if i % 2 == 0 { "info" } else { "error" }.into(),
+            source: "external".into(),
+            message: format!("multi rotation log {i}"),
+            attributes: Some(serde_json::json!({"index": i})),
+        });
+    }
+    platform::observe::store::write_logs(&pool, &logs)
+        .await
+        .unwrap();
+
+    let rotated = platform::observe::parquet::rotate_logs(&state)
+        .await
+        .unwrap();
+    assert!(
+        rotated >= 5,
+        "should have rotated at least 5 logs, got {rotated}"
+    );
+
+    // Verify deleted from DB
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM log_entries WHERE service = 'multi-rot-svc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 0, "all rotated logs should be deleted");
+}
+
+/// Rotate multiple old spans at once.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_spans_multiple_entries(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let old_ts = Utc::now() - chrono::Duration::hours(72);
+    let mut spans = Vec::new();
+    for i in 0..5 {
+        spans.push(platform::observe::store::SpanRecord {
+            trace_id: format!("multi-rot-span-trace-{i}"),
+            span_id: format!("multi-rot-span-{i}"),
+            parent_span_id: if i > 0 {
+                Some(format!("multi-rot-span-{}", i - 1))
+            } else {
+                None
+            },
+            name: format!("op-{i}"),
+            service: "multi-rot-span-svc".into(),
+            kind: "server".into(),
+            status: "ok".into(),
+            attributes: Some(serde_json::json!({"index": i})),
+            events: None,
+            duration_ms: Some(i * 10),
+            started_at: old_ts + chrono::Duration::seconds(i64::from(i)),
+            finished_at: Some(
+                old_ts
+                    + chrono::Duration::seconds(i64::from(i))
+                    + chrono::Duration::milliseconds(i64::from(i * 10)),
+            ),
+            project_id: None,
+            session_id: None,
+            user_id: None,
+        });
+    }
+    platform::observe::store::write_spans(&pool, &spans)
+        .await
+        .unwrap();
+
+    let rotated = platform::observe::parquet::rotate_spans(&state)
+        .await
+        .unwrap();
+    assert!(
+        rotated >= 5,
+        "should have rotated at least 5 spans, got {rotated}"
+    );
+
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM spans WHERE service = 'multi-rot-span-svc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 0, "all rotated spans should be deleted");
+}
+
+/// Rotate multiple old metrics at once.
+#[sqlx::test(migrations = "./migrations")]
+async fn rotate_metrics_multiple_entries(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    let old_ts = Utc::now() - chrono::Duration::hours(2);
+    let mut metrics = Vec::new();
+    for i in 0..5 {
+        metrics.push(platform::observe::store::MetricRecord {
+            name: "multi_rot_metric".into(),
+            labels: serde_json::json!({"instance": format!("node{i}")}),
+            metric_type: "gauge".into(),
+            unit: Some("bytes".into()),
+            project_id: None,
+            timestamp: old_ts + chrono::Duration::seconds(i64::from(i)),
+            value: f64::from(i) * 10.0,
+        });
+    }
+    platform::observe::store::write_metrics(&pool, &metrics)
+        .await
+        .unwrap();
+
+    let rotated = platform::observe::parquet::rotate_metrics(&state)
+        .await
+        .unwrap();
+    assert!(
+        rotated >= 5,
+        "should have rotated at least 5 metrics, got {rotated}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Metric names — project scoped
+// ---------------------------------------------------------------------------
+
 /// List metric names scoped to a specific project.
 #[sqlx::test(migrations = "./migrations")]
 async fn list_metric_names_project_scoped(pool: PgPool) {

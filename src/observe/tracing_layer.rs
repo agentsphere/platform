@@ -307,36 +307,6 @@ pub fn parse_level(s: &str) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing::field::Field;
-
-    // Helper to create a tracing Field for testing.
-    // We use tracing::Span with known field names.
-    fn with_field<F: Fn(&Field)>(name: &'static str, f: F) {
-        use tracing::subscriber::with_default;
-        use tracing_subscriber::registry;
-
-        let subscriber = registry();
-        with_default(subscriber, || {
-            // Create a span with the field name we need
-            match name {
-                "project_id" => {
-                    let span = tracing::trace_span!("test", project_id = tracing::field::Empty);
-                    span.record("project_id", "placeholder");
-                    if let Some(id) = span.id() {
-                        let _ = id;
-                    }
-                    // Use field from the span's metadata
-                    let meta = span.metadata().unwrap();
-                    if let Some(field) = meta.fields().field(name) {
-                        f(&field);
-                    }
-                }
-                _ => {
-                    // For other fields we test via the visitor directly using parse_level etc.
-                }
-            }
-        });
-    }
 
     // -- SpanFields::merge --
 

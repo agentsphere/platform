@@ -3544,7 +3544,7 @@ async fn canary_pass_advances_step(pool: PgPool) {
         "max_failures": 3
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -3680,7 +3680,7 @@ async fn canary_max_failures_triggers_rollback(pool: PgPool) {
         "max_failures": 2
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -3750,7 +3750,7 @@ async fn canary_single_fail_holds(pool: PgPool) {
         "max_failures": 3
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -3815,7 +3815,7 @@ async fn canary_inconclusive_waits(pool: PgPool) {
         "max_failures": 3
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -3975,15 +3975,25 @@ async fn promoting_transitions_to_completed(pool: PgPool) {
         .unwrap();
     assert_eq!(health, "healthy");
 
-    // Verify history
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'promoted'",
-    )
-    .bind(release_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(count >= 1, "promoted history should exist");
+    // Verify history (poll — reconciler inserts history after phase transition)
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'promoted'",
+        )
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "promoted history should exist within 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     drop(tx);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -4325,7 +4335,7 @@ async fn holding_phase_handled_by_canary(pool: PgPool) {
         "max_failures": 3
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -4605,7 +4615,7 @@ async fn canary_holding_with_max_failures_rolls_back(pool: PgPool) {
         "max_failures": 2
     });
 
-    let (target_id, release_id) = setup_deployment_with_strategy(
+    let (_target_id, release_id) = setup_deployment_with_strategy(
         &pool,
         project_id,
         "staging",
@@ -8726,4 +8736,1319 @@ async fn get_target_wrong_project_returns_404(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Additional reconciler coverage tests
+// ---------------------------------------------------------------------------
+
+/// Canary release in holding phase with fail verdict: if fail_count < max_failures
+/// the release should stay in holding (not re-transition from holding to holding).
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_holding_fail_stays_holding(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-hold-stay", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 5
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-hold-stay",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Release is already in holding phase (was moved here by a previous fail)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'holding', current_step = 0, traffic_weight = 10, started_at = now(), health = 'degraded' WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a single fail verdict (below max_failures=5)
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}', 'fail', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be holding (not re-transitioned)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "holding",
+        "holding phase should remain when fail count < max_failures and already holding"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release in holding phase with pass verdict: should advance to next step.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_holding_pass_advances_step(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-hold-pass", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-hold-pass",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to holding at step 0
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'holding', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a "pass" verdict for step 0
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}', 'pass', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Verify step advanced: current_step should be 1, weight should be 50
+    let (step, weight): (i32, i32) =
+        sqlx::query_as("SELECT current_step, traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(step, 1, "current_step should advance from holding");
+    assert_eq!(
+        weight, 50,
+        "traffic_weight should be 50 after step advance from holding"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary release in holding phase with max_failures exceeded: triggers rollback.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_holding_max_failures_rolls_back(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-hold-rb2", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 2
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-hold-rb2",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to holding at step 0
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'holding', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 2 fail verdicts (meets max_failures=2)
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+             VALUES ($1, 0, '{}', 'fail', now())",
+        )
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolling_back", 5000).await;
+    assert_eq!(
+        phase, "rolling_back",
+        "holding with max failures should transition to rolling_back"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Promoting phase for canary strategy transitions to completed.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_promoting_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-promo-c", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "stable_service": "stable-svc",
+        "canary_service": "canary-svc",
+        "steps": [50, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-promo-c",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to promoting
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "completed", 10000).await;
+    assert_eq!(phase, "completed", "canary promoting should complete");
+
+    // Verify health
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "healthy");
+
+    // Verify history
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM release_history WHERE release_id = $1 AND action = 'promoted'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(count >= 1, "promoted history entry should exist");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Rolling back canary strategy transitions to rolled_back.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_rolling_back_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-rb-c", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "stable_service": "stable-svc",
+        "canary_service": "canary-svc",
+        "steps": [50, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-rb-c",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to rolling_back
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'rolling_back', traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolled_back", 10000).await;
+    assert_eq!(phase, "rolled_back", "canary rolling_back should complete");
+
+    // Verify health is unhealthy
+    let health: String = sqlx::query_scalar("SELECT health FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health, "unhealthy");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// AB test: promoting completes the release.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_promoting_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-promo", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": {"headers": {"x-experiment": "treatment"}},
+        "success_metric": "conversion_rate",
+        "success_condition": "gt",
+        "duration": 3600,
+        "min_samples": 100,
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:ab-promo",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Move to promoting
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'promoting', traffic_weight = 100, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "completed", 10000).await;
+    assert_eq!(phase, "completed", "AB test promoting should complete");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// AB test: rolling_back transitions to rolled_back.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_rolling_back_completes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-rb", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": {"headers": {"x-experiment": "treatment"}},
+        "success_metric": "conversion_rate",
+        "success_condition": "gt",
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:ab-rb",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Move to rolling_back
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'rolling_back', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolled_back", 10000).await;
+    assert_eq!(phase, "rolled_back", "AB test rolling_back should complete");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// AB test: duration not elapsed, release stays in progressing (with started_at set recently).
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_recent_start_waits(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-recent", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": {"headers": {}},
+        "success_metric": "cr",
+        "success_condition": "gt",
+        "duration": 86400,
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:ab-recent",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing, started just now
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be progressing (86400s duration not elapsed)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "AB test with 86400s duration should still be progressing"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// ensure_scoped_tokens creates tokens with correct scopes for staging.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_staging_scope(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "scoped-stg", "private").await;
+
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging").await;
+    assert!(
+        result.is_ok(),
+        "ensure_scoped_tokens should succeed for staging"
+    );
+
+    let (otel_token, api_token) = result.unwrap();
+    assert!(!otel_token.is_empty(), "OTEL token should not be empty");
+    assert!(!api_token.is_empty(), "API token should not be empty");
+
+    // Verify tokens were created with correct names
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-staging-{proj8}");
+    let api_name = format!("api-staging-{proj8}");
+
+    let otel_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_tokens WHERE name = $1)")
+            .bind(&otel_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(otel_exists, "OTEL token should exist in DB");
+
+    let api_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_tokens WHERE name = $1)")
+            .bind(&api_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(api_exists, "API token should exist in DB");
+}
+
+/// ensure_scoped_tokens creates tokens with correct scopes for prod.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_prod_scope(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "scoped-prod", "private").await;
+
+    let result =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "prod").await;
+    assert!(
+        result.is_ok(),
+        "ensure_scoped_tokens should succeed for prod"
+    );
+
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-prod-{proj8}");
+    let api_name = format!("api-prod-{proj8}");
+
+    let otel_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_tokens WHERE name = $1)")
+            .bind(&otel_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(otel_exists);
+
+    let api_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_tokens WHERE name = $1)")
+            .bind(&api_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(api_exists);
+}
+
+/// ensure_scoped_tokens rotates existing tokens without gap.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_scoped_tokens_rotation_no_gap(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "scoped-rotate", "private").await;
+
+    // First call creates tokens
+    let (otel1, api1) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging")
+            .await
+            .unwrap();
+
+    // Second call rotates them
+    let (otel2, api2) =
+        platform::deployer::reconciler::ensure_scoped_tokens(&state, project_id, "staging")
+            .await
+            .unwrap();
+
+    // Tokens should be different (new ones created)
+    assert_ne!(otel1, otel2, "rotated OTEL token should differ");
+    assert_ne!(api1, api2, "rotated API token should differ");
+
+    // Verify only 1 token per name remains (old deleted within transaction)
+    let proj8 = &project_id.to_string()[..8];
+    let otel_name = format!("otlp-staging-{proj8}");
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_tokens WHERE name = $1")
+        .bind(&otel_name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should have exactly 1 token after rotation");
+}
+
+/// Reconciler with canary strategy ignores unknown verdicts (not pass/fail/inconclusive).
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_unknown_verdict_ignored(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-unk", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-unk",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a "running" verdict (not a terminal verdict)
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict)
+         VALUES ($1, 0, '{}', 'running')",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be progressing (running verdict is ignored)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "running verdict should not change phase"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary rollout_config with no steps defaults to empty, pass still promotes.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_empty_steps_pass_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-empty", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-empty",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing at step 0 (no steps defined)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 0, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert pass verdict
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 0, '{}', 'pass', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "promoting", 5000).await;
+    assert_eq!(phase, "promoting", "empty steps with pass should promote");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Canary fail with default max_failures (no max_failures key in config).
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_default_max_failures(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-defmax", "private").await;
+
+    // No max_failures key — defaults to 3
+    let rollout_config = serde_json::json!({
+        "steps": [10, 50, 100]
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-defmax",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 0, traffic_weight = 10, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert 3 fail verdicts (default max_failures=3)
+    for _ in 0..3 {
+        sqlx::query(
+            "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+             VALUES ($1, 0, '{}', 'fail', now())",
+        )
+        .bind(release_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "rolling_back", 5000).await;
+    assert_eq!(
+        phase, "rolling_back",
+        "default max_failures=3 should trigger rollback"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Multiple expired previews are all cleaned up in one reconcile pass.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_cleanup_multiple_expired_previews(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "multi-exp", "private").await;
+
+    let mut target_ids = Vec::new();
+    let mut release_ids = Vec::new();
+
+    // Create 3 expired preview targets
+    for i in 0..3 {
+        let target_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO deploy_targets
+               (id, project_id, name, environment, branch, branch_slug, ttl_hours,
+                expires_at, default_strategy, is_active)
+               VALUES ($1, $2, $3, 'preview', $4, $5, 24,
+                       now() - interval '1 hour', 'rolling', true)",
+        )
+        .bind(target_id)
+        .bind(project_id)
+        .bind(format!("exp-{i}"))
+        .bind(format!("feature/exp-{i}"))
+        .bind(format!("exp-{i}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let release_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO deploy_releases
+               (id, target_id, project_id, image_ref, strategy, phase, health)
+               VALUES ($1, $2, $3, $4, 'rolling', 'progressing', 'unknown')",
+        )
+        .bind(release_id)
+        .bind(target_id)
+        .bind(project_id)
+        .bind(format!("app:exp-{i}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        target_ids.push(target_id);
+        release_ids.push(release_id);
+    }
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+    // Verify all targets are deactivated
+    for tid in &target_ids {
+        let is_active: bool =
+            sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+                .bind(tid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !is_active,
+            "expired preview target {tid} should be deactivated"
+        );
+    }
+
+    // Verify all releases are cancelled
+    for rid in &release_ids {
+        let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+            .bind(rid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(phase, "cancelled", "release {rid} should be cancelled");
+    }
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Non-expired preview is not cleaned up.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_non_expired_preview_preserved(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "no-exp", "private").await;
+
+    // Create a preview target that expires in the future
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, branch, branch_slug, ttl_hours,
+            expires_at, default_strategy, is_active)
+           VALUES ($1, $2, 'future', 'preview', 'feature/future', 'future', 24,
+                   now() + interval '24 hours', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Target should still be active
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(is_active, "non-expired preview target should remain active");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// ensure_registry_pull_secret_for without registry_url is a no-op.
+#[sqlx::test(migrations = "./migrations")]
+async fn ensure_registry_pull_secret_no_url_is_noop(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "reg-pull-no", "private").await;
+    let release_id = Uuid::new_v4();
+
+    // Override config to ensure registry_url is None (may be set in cluster env)
+    let mut config = (*state.config).clone();
+    config.registry_url = None;
+    let state_no_reg = platform::store::AppState {
+        config: std::sync::Arc::new(config),
+        pool: state.pool.clone(),
+        valkey: state.valkey.clone(),
+        minio: state.minio.clone(),
+        kube: state.kube.clone(),
+        webauthn: state.webauthn.clone(),
+        pipeline_notify: state.pipeline_notify.clone(),
+        deploy_notify: state.deploy_notify.clone(),
+        secret_requests: state.secret_requests.clone(),
+        cli_sessions: state.cli_sessions.clone(),
+        health: state.health.clone(),
+        task_registry: state.task_registry.clone(),
+        cli_auth_manager: state.cli_auth_manager.clone(),
+        audit_tx: state.audit_tx.clone(),
+        webhook_semaphore: state.webhook_semaphore.clone(),
+    };
+
+    platform::deployer::reconciler::ensure_registry_pull_secret_for(
+        &state_no_reg,
+        project_id,
+        release_id,
+        "test-ns-noop",
+    )
+    .await;
+
+    // No token should be created (registry_url is None)
+    let proj8 = &release_id.to_string()[..8];
+    let token_name = format!("deploy-pull-{proj8}");
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_tokens WHERE name = $1)")
+            .bind(&token_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !exists,
+        "no token should be created when registry_url is None"
+    );
+}
+
+/// Canary pass at step N with weight from config steps array.
+#[sqlx::test(migrations = "./migrations")]
+async fn canary_pass_uses_config_weight(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "canary-wt", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "steps": [5, 25, 75, 100],
+        "max_failures": 3
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:canary-wt",
+        "canary",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing at step 1 (weight=25)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', current_step = 1, traffic_weight = 25, started_at = now() WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert pass verdict for step 1
+    sqlx::query(
+        "INSERT INTO rollout_analyses (release_id, step_index, config, verdict, completed_at)
+         VALUES ($1, 1, '{}', 'pass', now())",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Verify step advanced to 2, weight should be 75 (steps[2])
+    let (step, weight): (i32, i32) =
+        sqlx::query_as("SELECT current_step, traffic_weight FROM deploy_releases WHERE id = $1")
+            .bind(release_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(step, 2, "current_step should advance to 2");
+    assert_eq!(weight, 75, "traffic_weight should be 75 from steps[2]");
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Preview target with no expires_at is not cleaned up.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_preview_without_expires_not_cleaned(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "no-expiry", "private").await;
+
+    // Create a preview target WITHOUT expires_at
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, branch, branch_slug,
+            default_strategy, is_active)
+           VALUES ($1, $2, 'no-exp', 'preview', 'feature/no-exp', 'no-exp', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Target should still be active
+    let is_active: bool = sqlx::query_scalar("SELECT is_active FROM deploy_targets WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        is_active,
+        "preview without expires_at should not be cleaned up"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// mark_failed with long error message still succeeds.
+#[sqlx::test(migrations = "./migrations")]
+async fn mark_failed_long_error_message(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "mark-fail-long", "private").await;
+    let (target_id, release_id) =
+        setup_deployment(&pool, project_id, "production", "app:broken-long").await;
+
+    let release = platform::deployer::reconciler::PendingRelease {
+        id: release_id,
+        target_id,
+        project_id,
+        image_ref: "app:broken-long".into(),
+        commit_sha: None,
+        strategy: "rolling".into(),
+        phase: "pending".into(),
+        traffic_weight: 0,
+        current_step: 0,
+        rollout_config: serde_json::json!({}),
+        values_override: None,
+        deployed_by: None,
+        pipeline_id: None,
+        environment: "production".into(),
+        ops_repo_id: None,
+        manifest_path: None,
+        branch_slug: None,
+        project_name: "mark-fail-long".into(),
+        namespace_slug: "mark-fail-long".into(),
+        tracked_resources: Vec::new(),
+        skip_prune: false,
+    };
+
+    let long_msg = "x".repeat(10_000);
+    platform::deployer::reconciler::mark_failed(&state, &release, &long_msg).await;
+
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "failed");
+
+    // Verify the error detail is stored in history
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM release_history WHERE release_id = $1 AND action = 'failed'",
+    )
+    .bind(release_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let error_text = detail["error"].as_str().unwrap();
+    assert_eq!(error_text.len(), 10_000);
+}
+
+/// Reconciler handles release with unknown strategy by skipping it.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_unknown_strategy_progressing_skipped(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "unk-strat-prog", "private").await;
+
+    // Create deployment target with valid strategy, then release with unknown strategy
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_targets
+           (id, project_id, name, environment, default_strategy, is_active)
+           VALUES ($1, $2, 'staging', 'staging', 'rolling', true)",
+    )
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let release_id = Uuid::new_v4();
+    sqlx::query(
+        r"INSERT INTO deploy_releases
+           (id, target_id, project_id, image_ref, strategy, phase, health, started_at)
+           VALUES ($1, $2, $3, 'app:v1', 'blue_green', 'progressing', 'unknown', now())",
+    )
+    .bind(release_id)
+    .bind(target_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Phase should still be progressing (unknown strategy is a no-op)
+    let phase: String = sqlx::query_scalar("SELECT phase FROM deploy_releases WHERE id = $1")
+        .bind(release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "progressing",
+        "unknown strategy should not change the phase"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// AB test elapsed (started_at far in the past) transitions to promoting.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_elapsed_custom_duration_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-elapsed2", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": {"headers": {}},
+        "success_metric": "cr",
+        "success_condition": "gt",
+        "duration": 1,
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:ab-elapsed2",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing with started_at in the past (duration=1 second)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() - interval '10 seconds' WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "promoting", 5000).await;
+    assert_eq!(
+        phase, "promoting",
+        "AB test with 1s duration elapsed should promote"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// AB test: holding phase also checks duration elapsed.
+#[sqlx::test(migrations = "./migrations")]
+async fn ab_test_holding_elapsed_promotes(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let project_id = create_project(&app, &admin_token, "ab-hold-el", "private").await;
+
+    let rollout_config = serde_json::json!({
+        "control_service": "control",
+        "treatment_service": "treatment",
+        "match": {"headers": {}},
+        "success_metric": "cr",
+        "success_condition": "gt",
+        "duration": 1,
+    });
+
+    let (_target_id, release_id) = setup_deployment_with_strategy(
+        &pool,
+        project_id,
+        "staging",
+        "staging",
+        "app:ab-hold-el",
+        "ab_test",
+        rollout_config,
+    )
+    .await;
+
+    // Move to progressing with started_at in the past (duration elapsed)
+    sqlx::query(
+        "UPDATE deploy_releases SET phase = 'progressing', started_at = now() - interval '10 seconds' WHERE id = $1",
+    )
+    .bind(release_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Start reconciler
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+    state.deploy_notify.notify_one();
+
+    let phase = poll_release_phase(&pool, release_id, "promoting", 5000).await;
+    assert_eq!(
+        phase, "promoting",
+        "AB test in progressing with elapsed duration should promote"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+}
+
+/// Reconciler error handling: heartbeats on success, reports error on failure.
+#[sqlx::test(migrations = "./migrations")]
+async fn reconciler_heartbeats_on_empty_run(pool: PgPool) {
+    let (state, _admin_token) = test_state(pool.clone()).await;
+
+    // Start reconciler with no pending releases
+    let (tx, rx) = tokio::sync::watch::channel(());
+    let s = state.clone();
+    let handle = tokio::spawn(platform::deployer::reconciler::run(s, rx));
+
+    // Let it tick
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check task registry has the heartbeat
+    let snapshot = state.task_registry.snapshot();
+    let deployer = snapshot.iter().find(|t| t.name == "deployer_reconciler");
+    assert!(
+        deployer.is_some(),
+        "deployer_reconciler should be registered"
+    );
+    let deployer = deployer.unwrap();
+    assert!(
+        deployer.last_heartbeat.is_some(),
+        "should have heartbeat after tick"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
 }
