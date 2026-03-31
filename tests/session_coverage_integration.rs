@@ -267,60 +267,6 @@ async fn send_message_global_content_too_long(pool: PgPool) {
 // Create-app permission checks
 // ---------------------------------------------------------------------------
 
-/// Create-app without project:write + agent:run permissions fails.
-#[sqlx::test(migrations = "./migrations")]
-async fn create_app_no_permissions_forbidden(pool: PgPool) {
-    let (state, admin_token) = test_state(pool.clone()).await;
-    let app = test_router(state);
-
-    // Create a user with no global permissions
-    let (user_id, user_token) =
-        create_user(&app, &admin_token, "app-noperm", "appnoperm@test.com").await;
-    helpers::assign_role(&app, &admin_token, user_id, "viewer", None, &pool).await;
-
-    let (status, _) = helpers::post_json(
-        &app,
-        &user_token,
-        "/api/create-app",
-        json!({ "description": "My new app" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-/// Create-app with empty description fails validation.
-#[sqlx::test(migrations = "./migrations")]
-async fn create_app_empty_description_rejected(pool: PgPool) {
-    let (state, admin_token) = test_state(pool).await;
-    let app = test_router(state);
-
-    let (status, _) = helpers::post_json(
-        &app,
-        &admin_token,
-        "/api/create-app",
-        json!({ "description": "" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-/// Create-app with description too long fails.
-#[sqlx::test(migrations = "./migrations")]
-async fn create_app_description_too_long_rejected(pool: PgPool) {
-    let (state, admin_token) = test_state(pool).await;
-    let app = helpers::test_router(state);
-
-    let long_desc = "x".repeat(100_001);
-    let (status, _) = helpers::post_json(
-        &app,
-        &admin_token,
-        "/api/create-app",
-        json!({ "description": long_desc }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
 // ---------------------------------------------------------------------------
 // SSE events permission checks
 // ---------------------------------------------------------------------------

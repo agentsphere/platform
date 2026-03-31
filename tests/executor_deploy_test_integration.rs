@@ -532,7 +532,6 @@ async fn executor_deploy_test_via_step_type(pool: PgPool) {
         setup_pipeline_project(&state, &app, &admin_token, "dt-direct").await;
 
     commit_deploy_manifests(&work_path, DEPLOY_MANIFEST);
-    update_pipeline_yaml(&work_path, DEFAULT_PIPELINE_YAML);
 
     let deploy_test_config = serde_json::json!({
         "test_image": "busybox:1.36",

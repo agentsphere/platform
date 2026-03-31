@@ -1453,10 +1453,16 @@ async fn download_agent_runner_invalid_arch(pool: PgPool) {
 /// Download agent-runner with no binary returns 500 (binary not found).
 #[sqlx::test(migrations = "./migrations")]
 async fn download_agent_runner_binary_not_found(pool: PgPool) {
-    let (state, admin_token) = helpers::test_state(pool).await;
+    let (mut state, admin_token) = helpers::test_state(pool).await;
+    // Override agent_runner_dir to an empty temp dir so no binaries exist,
+    // even when PLATFORM_AGENT_RUNNER_DIR points to pre-built binaries.
+    let empty_dir =
+        std::env::temp_dir().join(format!("agent-runner-empty-{}", uuid::Uuid::new_v4()));
+    let mut config = (*state.config).clone();
+    config.agent_runner_dir = empty_dir;
+    state.config = std::sync::Arc::new(config);
     let app = helpers::test_router(state);
 
-    // Config points to a temp dir that doesn't contain the binary
     let status =
         helpers::get_status(&app, &admin_token, "/api/downloads/agent-runner?arch=amd64").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1465,7 +1471,12 @@ async fn download_agent_runner_binary_not_found(pool: PgPool) {
 /// Download MCP servers tarball not found returns 500.
 #[sqlx::test(migrations = "./migrations")]
 async fn download_mcp_servers_not_found(pool: PgPool) {
-    let (state, admin_token) = helpers::test_state(pool).await;
+    let (mut state, admin_token) = helpers::test_state(pool).await;
+    // Override mcp_servers_tarball to a non-existent path.
+    let mut config = (*state.config).clone();
+    config.mcp_servers_tarball =
+        std::env::temp_dir().join(format!("mcp-nonexist-{}.tar.gz", uuid::Uuid::new_v4()));
+    state.config = std::sync::Arc::new(config);
     let app = helpers::test_router(state);
 
     let status = helpers::get_status(&app, &admin_token, "/api/downloads/mcp-servers").await;

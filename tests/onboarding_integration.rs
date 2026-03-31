@@ -1970,7 +1970,7 @@ async fn complete_wizard_custom_provider_bedrock(pool: PgPool) {
 
     // Verify custom provider was saved (active_llm_provider on users table)
     let row: Option<(String,)> =
-        sqlx::query_as("SELECT active_llm_provider FROM users WHERE username = 'admin'")
+        sqlx::query_as("SELECT active_llm_provider FROM users WHERE name = 'admin'")
             .fetch_optional(&pool)
             .await
             .unwrap();

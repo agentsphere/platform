@@ -47,17 +47,19 @@ async fn insert_pipeline(
 async fn insert_step(
     pool: &PgPool,
     pipeline_id: Uuid,
+    project_id: Uuid,
     step_order: i32,
     name: &str,
     status: &str,
 ) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO pipeline_steps (id, pipeline_id, step_order, name, image, status, gate, depends_on)
-         VALUES ($1, $2, $3, $4, 'alpine:latest', $5, false, '{}')",
+        "INSERT INTO pipeline_steps (id, pipeline_id, project_id, step_order, name, image, status, gate, depends_on)
+         VALUES ($1, $2, $3, $4, $5, 'alpine:latest', $6, false, '{}')",
     )
     .bind(id)
     .bind(pipeline_id)
+    .bind(project_id)
     .bind(step_order)
     .bind(name)
     .bind(status)
@@ -212,8 +214,8 @@ async fn get_pipeline_with_steps(pool: PgPool) {
         "push",
     )
     .await;
-    insert_step(&pool, pipeline_id, 1, "build", "success").await;
-    insert_step(&pool, pipeline_id, 2, "test", "success").await;
+    insert_step(&pool, pipeline_id, project_id, 1, "build", "success").await;
+    insert_step(&pool, pipeline_id, project_id, 2, "test", "success").await;
 
     let (status, body) = helpers::get_json(
         &app,
@@ -379,7 +381,7 @@ async fn step_logs_wrong_project_returns_404(pool: PgPool) {
         "push",
     )
     .await;
-    let step_id = insert_step(&pool, pipeline_id, 1, "build", "success").await;
+    let step_id = insert_step(&pool, pipeline_id, project_a, 1, "build", "success").await;
 
     let (status, _) = helpers::get_json(
         &app,
@@ -408,7 +410,7 @@ async fn step_logs_no_log_ref_returns_no_logs(pool: PgPool) {
         "push",
     )
     .await;
-    let step_id = insert_step(&pool, pipeline_id, 1, "build", "success").await;
+    let step_id = insert_step(&pool, pipeline_id, project_id, 1, "build", "success").await;
 
     // Use a raw request to check body text (not JSON)
     use axum::body::Body;

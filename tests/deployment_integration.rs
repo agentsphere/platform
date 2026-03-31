@@ -9918,8 +9918,8 @@ async fn reconciler_completed_rolling_release_is_noop(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        phase, "progressing",
-        "unknown strategy should not change the phase"
+        phase, "completed",
+        "already-completed releases should remain completed (no-op)"
     );
 
     drop(tx);

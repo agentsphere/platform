@@ -1975,22 +1975,31 @@ async fn execute_deploy_test_step(
 
     // If path ends with `/`, read all YAML files from the directory;
     // otherwise read a single file (backward compat).
-    let manifest_content = if manifests_path.ends_with('/') {
+    let manifest_content_opt = if manifests_path.ends_with('/') {
         super::trigger::read_dir_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
             .await
-            .ok_or_else(|| {
-                PipelineError::InvalidDefinition(format!(
-                    "deploy manifests directory '{manifests_path}' not found or empty at ref '{branch}'"
-                ))
-            })?
     } else {
         super::trigger::read_file_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
             .await
-            .ok_or_else(|| {
-                PipelineError::InvalidDefinition(format!(
-                    "deploy manifest '{manifests_path}' not found at ref '{branch}'"
-                ))
-            })?
+    };
+    let Some(manifest_content) = manifest_content_opt else {
+        let msg = if manifests_path.ends_with('/') {
+            format!(
+                "deploy manifests directory '{manifests_path}' not found or empty at ref '{branch}'"
+            )
+        } else {
+            format!("deploy manifest '{manifests_path}' not found at ref '{branch}'")
+        };
+        tracing::error!(%msg, "deploy_test manifest read failed");
+        let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
+        sqlx::query!(
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            step.id,
+            duration_ms,
+        )
+        .execute(&state.pool)
+        .await?;
+        return Ok(false);
     };
 
     // Determine app image ref (use node registry URL for containerd pulls)
