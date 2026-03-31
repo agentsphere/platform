@@ -99,6 +99,7 @@ function AppRouter() {
           <ProviderKeys path="/settings/provider-keys" />
         </Router>
       </Layout>
+      <ManagerChat />
     </OnboardingProvider>
   );
 }
@@ -109,7 +110,6 @@ function App() {
       <AuthProvider>
         <ToastProvider>
           <AppRouter />
-          <ManagerChat />
         </ToastProvider>
       </AuthProvider>
     </ErrorBoundary>

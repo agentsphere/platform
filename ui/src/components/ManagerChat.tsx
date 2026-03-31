@@ -70,14 +70,52 @@ export function ManagerChat() {
 
   const active = sessions[activeIdx] || null;
 
-  // Load sessions from localStorage on mount
+  const [providerMissing, setProviderMissing] = useState(false);
+  const autoCreated = useRef(false);
+
+  const createSession = async (prompt?: string) => {
+    try {
+      const resp = await api.post<{ id: string; status: string }>('/api/manager/sessions', {
+        prompt: prompt || undefined,
+      });
+      setProviderMissing(false);
+      const newSession: ManagerSession = {
+        id: resp.id,
+        title: prompt?.slice(0, 25) || 'New session',
+        status: resp.status || 'running',
+        mode: 'auto_read',
+        messages: [],
+      };
+      setSessions(prev => {
+        const next = [...prev, newSession];
+        setActiveIdx(next.length - 1);
+        return next;
+      });
+    } catch (e: any) {
+      const msg = e?.message || e?.error || '';
+      if (msg.toLowerCase().includes('provider') || msg.toLowerCase().includes('llm') || msg.toLowerCase().includes('api_key')) {
+        setProviderMissing(true);
+      }
+      console.warn('create manager session:', e);
+    }
+  };
+
+  // Load sessions from localStorage on mount, auto-create first session if none
   useEffect(() => {
     const stored = localStorage.getItem('manager_sessions');
     if (stored) {
       try {
         const parsed = JSON.parse(stored);
-        setSessions(parsed.map((s: any) => ({ ...s, messages: s.messages || [] })));
+        if (parsed.length > 0) {
+          setSessions(parsed.map((s: any) => ({ ...s, messages: s.messages || [] })));
+          return;
+        }
       } catch {}
+    }
+    // No stored sessions — auto-create one
+    if (!autoCreated.current) {
+      autoCreated.current = true;
+      createSession();
     }
   }, []);
 
@@ -175,32 +213,6 @@ export function ManagerChat() {
     ));
   };
 
-  const [providerMissing, setProviderMissing] = useState(false);
-
-  const createSession = async (prompt?: string) => {
-    try {
-      const resp = await api.post<{ id: string; status: string }>('/api/manager/sessions', {
-        prompt: prompt || undefined,
-      });
-      setProviderMissing(false);
-      const newSession: ManagerSession = {
-        id: resp.id,
-        title: prompt?.slice(0, 25) || 'New session',
-        status: resp.status || 'running',
-        mode: 'auto_read',
-        messages: [],
-      };
-      setSessions(prev => [...prev, newSession]);
-      setActiveIdx(sessions.length);
-    } catch (e: any) {
-      const msg = e?.message || e?.error || '';
-      if (msg.toLowerCase().includes('provider') || msg.toLowerCase().includes('llm') || msg.toLowerCase().includes('api_key')) {
-        setProviderMissing(true);
-      }
-      console.warn('create manager session:', e);
-    }
-  };
-
   const sendMessage = async () => {
     if (!input.trim() || !active || sending) return;
     const text = input.trim();
@@ -275,7 +287,7 @@ export function ManagerChat() {
   }
 
   return (
-    <div ref={chatRef} class="manager-chat"
+    <div ref={chatRef} class={`manager-chat${providerMissing ? ' manager-chat-compact' : ''}`}
       style={pos ? `left:${pos.x}px;top:${pos.y}px;width:${pos.w}px;height:${pos.h}px;transform:none;bottom:auto;` : undefined}>
       {/* Header */}
       <div class="manager-chat-header" onMouseDown={onDragStart} style="cursor:grab">
@@ -399,9 +411,9 @@ export function ManagerChat() {
           value={input}
           onInput={(e) => setInput((e.target as HTMLInputElement).value)}
           onKeyDown={handleKeyDown}
-          disabled={!active || active.status !== 'running'}
+          disabled={providerMissing || !active || active.status !== 'running'}
         />
-        <button type="submit" class="manager-send-btn" disabled={!input.trim() || sending || !active}>
+        <button type="submit" class="manager-send-btn" disabled={providerMissing || !input.trim() || sending || !active}>
           ↑
         </button>
       </form>
