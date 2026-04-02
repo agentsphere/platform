@@ -1,0 +1,157 @@
+{{- if .Values.gateway.enabled }}
+{{- if eq (default "daemonset" .Values.gateway.mode) "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Values.gateway.name | default "platform-gateway" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: platform-gateway
+    platform.io/component: gateway
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selector:
+    matchLabels:
+      app: platform-gateway
+  template:
+    metadata:
+      labels:
+        app: platform-gateway
+        platform.io/component: gateway
+    spec:
+      hostNetwork: {{ .Values.gateway.hostNetwork | default true }}
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "platform.fullname" . }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.platform.image.repository }}:{{ .Values.platform.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.platform.image.pullPolicy }}
+          command: ["/usr/local/bin/platform-proxy"]
+          args: ["--gateway"]
+          env:
+            - name: PLATFORM_API_URL
+              value: "http://{{ include "platform.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:8080"
+            - name: PLATFORM_SERVICE_NAME
+              value: "platform-gateway"
+            - name: PROXY_GATEWAY_HTTP_PORT
+              value: "{{ .Values.gateway.httpPort | default 80 }}"
+            - name: PROXY_GATEWAY_TLS_PORT
+              value: "{{ .Values.gateway.tlsPort | default 443 }}"
+            - name: PROXY_GATEWAY_NAME
+              value: "{{ .Values.gateway.name | default "platform-gateway" }}"
+            - name: PROXY_GATEWAY_NAMESPACE
+              value: "{{ .Release.Namespace }}"
+          ports:
+            - containerPort: {{ .Values.gateway.httpPort | default 80 }}
+              name: http
+              hostPort: 80
+            - containerPort: {{ .Values.gateway.tlsPort | default 443 }}
+              name: https
+              hostPort: 443
+            - containerPort: 15020
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 15020
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 15020
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.gateway.name | default "platform-gateway" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: platform-gateway
+    platform.io/component: gateway
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.gateway.replicas | default 2 }}
+  selector:
+    matchLabels:
+      app: platform-gateway
+  template:
+    metadata:
+      labels:
+        app: platform-gateway
+        platform.io/component: gateway
+    spec:
+      serviceAccountName: {{ include "platform.fullname" . }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.platform.image.repository }}:{{ .Values.platform.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.platform.image.pullPolicy }}
+          command: ["/usr/local/bin/platform-proxy"]
+          args: ["--gateway"]
+          env:
+            - name: PLATFORM_API_URL
+              value: "http://{{ include "platform.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:8080"
+            - name: PLATFORM_SERVICE_NAME
+              value: "platform-gateway"
+            - name: PROXY_GATEWAY_HTTP_PORT
+              value: "{{ .Values.gateway.httpPort | default 80 }}"
+            - name: PROXY_GATEWAY_TLS_PORT
+              value: "{{ .Values.gateway.tlsPort | default 443 }}"
+            - name: PROXY_GATEWAY_NAME
+              value: "{{ .Values.gateway.name | default "platform-gateway" }}"
+            - name: PROXY_GATEWAY_NAMESPACE
+              value: "{{ .Release.Namespace }}"
+          ports:
+            - containerPort: {{ .Values.gateway.httpPort | default 80 }}
+              name: http
+            - containerPort: {{ .Values.gateway.tlsPort | default 443 }}
+              name: https
+            - containerPort: 15020
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 15020
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 15020
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.gateway.name | default "platform-gateway" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    platform.io/component: gateway
+spec:
+  type: {{ .Values.gateway.serviceType | default "LoadBalancer" }}
+  selector:
+    app: platform-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: {{ .Values.gateway.tlsPort | default 443 }}
+    - name: http
+      port: 80
+      targetPort: {{ .Values.gateway.httpPort | default 80 }}
+{{- end }}
+{{- end }}

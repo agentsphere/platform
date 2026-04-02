@@ -40,6 +40,7 @@ pub struct TargetResponse {
     pub default_strategy: String,
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
+    pub hostname: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -91,6 +92,7 @@ pub struct CreateTargetRequest {
     pub default_strategy: Option<String>,
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +301,7 @@ async fn list_targets(
 
     let rows = sqlx::query(
         "SELECT id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
-                default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at
+                default_strategy, ops_repo_id, manifest_path, hostname, is_active, created_at, updated_at
          FROM deploy_targets WHERE project_id = $1 AND is_active = true
          ORDER BY environment, name LIMIT $2 OFFSET $3",
     )
@@ -322,7 +324,7 @@ async fn get_target(
 
     let row = sqlx::query(
         "SELECT id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
-                default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at
+                default_strategy, ops_repo_id, manifest_path, hostname, is_active, created_at, updated_at
          FROM deploy_targets WHERE id = $1 AND project_id = $2 AND is_active = true",
     )
     .bind(target_id)
@@ -356,12 +358,15 @@ async fn create_target(
             "strategy must be rolling, canary, or ab_test".into(),
         ));
     }
+    if let Some(ref h) = body.hostname {
+        validation::check_length("hostname", h, 1, 255)?;
+    }
 
     let row = sqlx::query(
-        "INSERT INTO deploy_targets (project_id, name, environment, default_strategy, ops_repo_id, manifest_path, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "INSERT INTO deploy_targets (project_id, name, environment, default_strategy, ops_repo_id, manifest_path, hostname, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING id, project_id, name, environment, branch, branch_slug, ttl_hours, expires_at,
-                   default_strategy, ops_repo_id, manifest_path, is_active, created_at, updated_at",
+                   default_strategy, ops_repo_id, manifest_path, hostname, is_active, created_at, updated_at",
     )
     .bind(id)
     .bind(&body.name)
@@ -369,6 +374,7 @@ async fn create_target(
     .bind(strategy)
     .bind(body.ops_repo_id)
     .bind(&body.manifest_path)
+    .bind(&body.hostname)
     .bind(auth.user_id)
     .fetch_one(&state.pool)
     .await
@@ -1362,6 +1368,7 @@ fn row_to_target(row: &sqlx::postgres::PgRow) -> TargetResponse {
         default_strategy: row.get("default_strategy"),
         ops_repo_id: row.get("ops_repo_id"),
         manifest_path: row.get("manifest_path"),
+        hostname: row.get("hostname"),
         is_active: row.get("is_active"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),

@@ -80,7 +80,7 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
                 r.strategy, r.phase, r.traffic_weight, r.current_step,
                 r.rollout_config, r.values_override, r.deployed_by,
                 r.tracked_resources, r.pipeline_id,
-                dt.environment, dt.ops_repo_id, dt.manifest_path, dt.branch_slug,
+                dt.environment, dt.ops_repo_id, dt.manifest_path, dt.branch_slug, dt.hostname as target_hostname,
                 p.name as project_name, p.namespace_slug
          FROM deploy_releases r
          JOIN deploy_targets dt ON dt.id = r.target_id
@@ -122,6 +122,7 @@ async fn reconcile(state: &AppState) -> Result<(), DeployerError> {
             ops_repo_id: row.get("ops_repo_id"),
             manifest_path: row.get("manifest_path"),
             branch_slug: row.get("branch_slug"),
+            target_hostname: row.get("target_hostname"),
             project_name: row.get("project_name"),
             namespace_slug: row.get("namespace_slug"),
             tracked_resources: tracked,
@@ -164,6 +165,7 @@ pub struct PendingRelease {
     pub ops_repo_id: Option<Uuid>,
     pub manifest_path: Option<String>,
     pub branch_slug: Option<String>,
+    pub target_hostname: Option<String>,
     // From projects
     pub project_name: String,
     pub namespace_slug: String,
@@ -580,6 +582,7 @@ async fn apply_gateway_resources(
     let hostname = config
         .get("hostname")
         .and_then(|v| v.as_str())
+        .or(release.target_hostname.as_deref())
         .unwrap_or("*");
     let route_name = format!("{}-traffic", release.project_name);
     let gw = super::gateway::GatewayRef {
@@ -673,7 +676,7 @@ async fn resolve_gateway_url(state: &AppState) -> Option<String> {
     let svc_api: kube::Api<k8s_openapi::api::core::v1::Service> =
         kube::Api::namespaced(state.kube.clone(), gw_ns);
 
-    let label = format!("gateway.envoyproxy.io/owning-gateway-name={gw_name}");
+    let label = "platform.io/component=gateway".to_string();
     let lp = ListParams::default().labels(&label);
 
     match svc_api.list(&lp).await {

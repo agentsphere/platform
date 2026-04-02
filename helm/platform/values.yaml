@@ -75,6 +75,24 @@ platform:
     name: ""       # defaults to "platform-gateway" in config.rs
     namespace: ""  # defaults to PLATFORM_NAMESPACE in config.rs
 
+# -- Platform-native ingress gateway (replaces Envoy Gateway)
+gateway:
+  enabled: false
+  name: "platform-gateway"
+  # "daemonset" (self-hosted, hostNetwork) or "deployment" (cloud, LoadBalancer)
+  mode: daemonset
+  replicas: 2            # only used in deployment mode
+  hostNetwork: true      # only used in daemonset mode
+  httpPort: 80
+  tlsPort: 443
+  serviceType: ClusterIP # daemonset: ClusterIP, deployment: LoadBalancer
+  acme:
+    enabled: false
+    email: ""
+    directoryUrl: "https://acme-v2.api.letsencrypt.org/directory"
+  tls:
+    selfSigned: true     # dev default, disabled when acme.enabled=true
+
   # -- Valkey host for agent pods (auto-derived from subchart if empty)
   valkeyAgentHost: ""
 
