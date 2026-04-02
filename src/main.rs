@@ -56,6 +56,12 @@ mod workspace;
 // Onboarding
 mod onboarding;
 
+// Service Mesh CA
+mod mesh;
+
+// Process-wrapper proxy
+mod proxy;
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -161,6 +167,22 @@ async fn main() -> anyhow::Result<()> {
     let webauthn = auth::passkey::build_webauthn(&cfg)?;
     tracing::info!(rp_id = %cfg.webauthn_rp_id, "webauthn initialized");
 
+    // Initialize mesh CA if enabled
+    let mesh_ca = if cfg.mesh_enabled {
+        match mesh::MeshCa::init(&pool, &cfg).await {
+            Ok(ca) => {
+                tracing::info!("mesh CA initialized");
+                Some(Arc::new(ca))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "mesh CA initialization failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build AppState
     let state = store::AppState {
         pool: pool.clone(),
@@ -178,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         cli_auth_manager: Arc::new(onboarding::claude_auth::CliAuthManager::new()),
         audit_tx: audit::AuditLog::new(pool.clone()),
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
+        mesh_ca,
     };
 
     // Set configurable permission cache TTL
@@ -380,6 +403,10 @@ fn spawn_background_tasks(
         shutdown_tx.subscribe(),
     ));
     tokio::spawn(health::checks::run(state.clone(), shutdown_tx.subscribe()));
+    tokio::spawn(mesh::sync_trust_bundles(
+        state.clone(),
+        shutdown_tx.subscribe(),
+    ));
     (shutdown_tx, observe_channels)
 }
 

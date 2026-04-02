@@ -45,4 +45,6 @@ pub struct AppState {
     pub audit_tx: crate::audit::AuditLog,
     /// Concurrency limiter for webhook dispatch (max 50 concurrent deliveries).
     pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Mesh certificate authority (None if mesh is disabled).
+    pub mesh_ca: Option<Arc<crate::mesh::MeshCa>>,
 }

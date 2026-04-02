@@ -1,39 +1,5 @@
 # Lightweight Valkey (Redis-compatible) for per-run test namespaces.
-# Includes OTEL collector sidecar for Redis metrics.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: valkey-otel-config
-data:
-  config.yaml: |
-    receivers:
-      redis:
-        endpoint: localhost:6379
-        password: dev
-        collection_interval: 15s
-    processors:
-      resource:
-        attributes:
-          - key: service.name
-            value: platform-valkey
-            action: upsert
-          - key: deployment.environment
-            value: dev
-            action: upsert
-    exporters:
-      otlphttp:
-        endpoint: "${env:OTEL_EXPORTER_OTLP_ENDPOINT}"
-        tls:
-          insecure: true
-        headers:
-          authorization: "Bearer ${env:OTEL_API_TOKEN}"
-    service:
-      pipelines:
-        metrics:
-          receivers: [redis]
-          processors: [resource]
-          exporters: [otlphttp]
----
+# Process-wrapper proxy provides metrics scraping + log capture.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -44,42 +10,54 @@ spec:
   containers:
     - name: valkey
       image: valkey/valkey:8-alpine
-      args: ["--save", "", "--appendonly", "no", "--requirepass", "dev"]
+      command: ["/proxy/platform-proxy"]
+      args:
+        - "--wrap"
+        - "--tcp-ports=6379"
+        - "--scrape-type=redis"
+        - "--"
+        - "valkey-server"
+        - "--save"
+        - ""
+        - "--appendonly"
+        - "no"
+        - "--requirepass"
+        - "dev"
+      env:
+        - name: PLATFORM_API_URL
+          value: "__PLATFORM_API_URL__"
+        - name: PLATFORM_API_TOKEN
+          value: "plat_api_otel_system_dev_000000000000000000000000000000"
+        - name: PLATFORM_SERVICE_NAME
+          value: platform-valkey
+        - name: PROXY_SCRAPE_REDIS_URL
+          value: "redis://:dev@localhost:6379"
+        - name: PROXY_HEALTH_PORT
+          value: "15020"
       ports:
         - containerPort: 6379
+        - containerPort: 15020
       readinessProbe:
-        tcpSocket:
-          port: 6379
+        httpGet:
+          path: /readyz
+          port: 15020
         initialDelaySeconds: 1
         periodSeconds: 1
+      volumeMounts:
+        - name: proxy
+          mountPath: /proxy
+          readOnly: true
       resources:
         requests:
           cpu: 50m
-          memory: 64Mi
+          memory: 96Mi
         limits:
-          memory: 512Mi
-    - name: otel-collector
-      image: otel/opentelemetry-collector-contrib:0.121.0
-      args: ["--config=/etc/otel/config.yaml"]
-      env:
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "__OTEL_ENDPOINT__"
-        - name: OTEL_API_TOKEN
-          value: "plat_api_otel_system_dev_000000000000000000000000000000"
-      volumeMounts:
-        - name: otel-config
-          mountPath: /etc/otel
-      resources:
-        requests:
-          cpu: 25m
-          memory: 48Mi
-        limits:
-          cpu: 100m
-          memory: 128Mi
+          memory: 544Mi
   volumes:
-    - name: otel-config
-      configMap:
-        name: valkey-otel-config
+    - name: proxy
+      hostPath:
+        path: __PROXY_PATH__
+        type: Directory
 ---
 apiVersion: v1
 kind: Service

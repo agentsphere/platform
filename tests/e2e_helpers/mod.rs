@@ -273,6 +273,10 @@ pub async fn e2e_state_with_api_url(
         mcp_servers_path: "mcp/servers".into(),
         max_artifact_file_bytes: 50 * 1024 * 1024,
         max_artifact_total_bytes: 500 * 1024 * 1024,
+        mesh_enabled: false,
+        mesh_ca_cert_ttl_secs: 3600,
+        mesh_ca_root_ttl_days: 365,
+        proxy_binary_path: None,
     };
 
     // Seed registry images from OCI tarballs (idempotent, uses file-based cache)
@@ -306,6 +310,7 @@ pub async fn e2e_state_with_api_url(
         cli_auth_manager: Arc::new(platform::onboarding::claude_auth::CliAuthManager::new()),
         audit_tx,
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
+        mesh_ca: None,
     };
 
     // Match production behavior: initialize permission cache TTL

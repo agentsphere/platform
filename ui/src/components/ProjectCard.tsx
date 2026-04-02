@@ -66,6 +66,7 @@ export function ProjectCard({ project, initialExpanded, initialTab }: Props) {
   const [mrs, setMrs] = useState<MergeRequest[] | null>(null);
   const [recentPipelines, setRecentPipelines] = useState<Pipeline[] | null>(null);
   const [projectState, setProjectState] = useState<Project>(project);
+  const [showSticky, setShowSticky] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
 
   // URL navigation — use pushState with /projects/:id/:tab paths
@@ -92,6 +93,19 @@ export function ProjectCard({ project, initialExpanded, initialTab }: Props) {
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  // Show sticky compact header when card top scrolls above viewport
+  useEffect(() => {
+    if (!expanded || !activeTab) { setShowSticky(false); return; }
+    const handleScroll = () => {
+      const card = cardRef.current;
+      if (!card) return;
+      const rect = card.getBoundingClientRect();
+      setShowSticky(rect.top < -80);
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, [expanded, activeTab]);
 
   useEffect(() => {
     if (!visible) return;
@@ -203,7 +217,7 @@ export function ProjectCard({ project, initialExpanded, initialTab }: Props) {
       case 'mrs': return <MRsTab projectId={project.id} />;
       case 'builds': return <BuildsTab projectId={project.id} />;
       case 'ui': return <UiPreviewsTab projectId={project.id} defaultBranch={projectState.default_branch} />;
-      case 'docs': return <DocsTab projectId={project.id} />;
+      case 'docs': return <DocsTab projectId={project.id} defaultBranch={projectState.default_branch} />;
       case 'deploys': return <DeploymentsTab projectId={project.id} />;
       case 'observe': return <ObserveTab projectId={project.id} />;
       case 'sessions': return <SessionsTab projectId={project.id} />;
@@ -217,6 +231,24 @@ export function ProjectCard({ project, initialExpanded, initialTab }: Props) {
 
   return (
     <div ref={cardRef} class={`project-card-wrapper${expanded ? ' expanded' : ''}${activeTab ? ' has-tab' : ''}`}>
+      {/* Sticky compact header — shown when scrolled past card top */}
+      {showSticky && (
+        <div class="project-card-sticky"
+          onClick={() => { window.scrollTo({ top: (cardRef.current?.offsetTop || 0) - 20, behavior: 'smooth' }); }}>
+          <span class="project-card-sticky-name">{displayName}</span>
+          <span class="project-card-sticky-session">
+            {session ? (progressText || 'Agent running...') : 'No active session'}
+          </span>
+          <div class="project-card-sticky-tabs">
+            {ALL_TABS.map(t => (
+              <button key={t} class={`project-card-tab-btn${activeTab === t ? ' active' : ''}`}
+                onClick={(e: Event) => { e.stopPropagation(); selectTab(t); }}>
+                {TAB_LABELS[t]}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       <div class="project-card" onClick={toggleExpand}>
         {/* Left: preview */}
         <div class="project-card-preview">

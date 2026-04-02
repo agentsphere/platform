@@ -133,6 +133,10 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         mcp_servers_path: "mcp/servers".into(),
         max_artifact_file_bytes: 50 * 1024 * 1024,
         max_artifact_total_bytes: 500 * 1024 * 1024,
+        mesh_enabled: false,
+        mesh_ca_cert_ttl_secs: 3600,
+        mesh_ca_root_ttl_days: 365,
+        proxy_binary_path: None,
     };
 
     let webauthn = platform::auth::passkey::build_webauthn(&config).expect("webauthn build failed");
@@ -161,6 +165,7 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         ),
         audit_tx,
         webhook_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(50)),
+        mesh_ca: None,
     };
 
     (state, setup_token)

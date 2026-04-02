@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mesh_ca (id, root_cert_pem, secret_name, serial_counter, not_after)\n               VALUES ($1, $2, $3, 1, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d5586b6c8571420922849cb79a4f9271aeed640183ffccd2cf920111772d5989"
+}

@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS mesh_certs;
+DROP TABLE IF EXISTS mesh_ca;

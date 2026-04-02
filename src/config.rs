@@ -124,6 +124,14 @@ pub struct Config {
     pub registry_http_body_limit_bytes: usize,
     /// Maximum individual registry blob size in bytes (default 5 GB).
     pub registry_max_blob_size_bytes: u64,
+    /// Enable the mesh CA module (default: false).
+    pub mesh_enabled: bool,
+    /// Leaf certificate TTL in seconds (default: 3600 = 1 hour).
+    pub mesh_ca_cert_ttl_secs: u64,
+    /// Root CA certificate validity in days (default: 365).
+    pub mesh_ca_root_ttl_days: u32,
+    /// Path to prebuilt platform-proxy binary directory (dev/test only).
+    pub proxy_binary_path: Option<String>,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -328,6 +336,18 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5_368_709_120), // 5 GB
+            mesh_enabled: env::var("PLATFORM_MESH_ENABLED")
+                .ok()
+                .is_some_and(|v| v == "true"),
+            mesh_ca_cert_ttl_secs: env::var("PLATFORM_MESH_CERT_TTL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
+            mesh_ca_root_ttl_days: env::var("PLATFORM_MESH_CA_ROOT_TTL_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(365),
+            proxy_binary_path: env::var("PLATFORM_PROXY_PATH").ok(),
         }
     }
 
@@ -421,6 +441,10 @@ impl Config {
             max_artifact_total_bytes: 500 * 1024 * 1024,
             registry_http_body_limit_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
             registry_max_blob_size_bytes: 5_368_709_120,            // 5 GB
+            mesh_enabled: false,
+            mesh_ca_cert_ttl_secs: 3600,
+            mesh_ca_root_ttl_days: 365,
+            proxy_binary_path: None,
         }
     }
 }

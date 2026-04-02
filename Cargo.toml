@@ -10,6 +10,10 @@ repository = "https://github.com/agentsphere/platform"
 name = "platform"
 path = "src/main.rs"
 
+[[bin]]
+name = "platform-proxy"
+path = "src/proxy/main.rs"
+
 [dependencies]
 # HTTP + SSE
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
@@ -134,12 +138,38 @@ rust-embed = { version = "8", features = ["compression"] }
 # TLS crypto provider (needed by kube-client, reqwest, lettre)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+# X.509 certificate generation (mesh CA)
+rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.16"
+time = "0.3"
+
+# Async TLS (proxy mTLS)
+tokio-rustls = "0.26"
+
+# Lock-free atomic swap (cert rotation in proxy)
+arc-swap = "1"
+
+# Signal handling (proxy binary)
+nix = { version = "0.29", features = ["signal", "process"] }
+
+# PEM certificate parsing
+rustls-pemfile = "2"
+
 # TypeScript type generation
 ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-compat", "serde-json-impl"] }
 
+# HTTP client (gateway proxy)
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-legacy"] }
+
+# Regex (gateway HTTPRoute matching)
+regex = "1"
+
+# Concurrent hash map (gateway connection pool)
+dashmap = "6"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-hyper = { version = "1", features = ["full"] }
 proptest = "1"
 rstest = "0.25"
 wiremock = "0.6"

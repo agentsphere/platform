@@ -1,49 +1,7 @@
 # Lightweight MinIO for per-run test namespaces.
 # Bucket creation handled by deploy-services.sh (mc mb).
 # S55: TLS enabled via self-signed certs (same pattern as postgres.yaml).
-# Includes OTEL collector sidecar for S3 metrics.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: minio-otel-config
-data:
-  config.yaml: |
-    receivers:
-      # Scrape MinIO's built-in Prometheus metrics endpoint
-      prometheus:
-        config:
-          scrape_configs:
-            - job_name: minio
-              scheme: https
-              tls_config:
-                insecure_skip_verify: true
-              metrics_path: /minio/v2/metrics/cluster
-              static_configs:
-                - targets: ["localhost:9000"]
-              scrape_interval: 15s
-    processors:
-      resource:
-        attributes:
-          - key: service.name
-            value: platform-minio
-            action: upsert
-          - key: deployment.environment
-            value: dev
-            action: upsert
-    exporters:
-      otlphttp:
-        endpoint: "${env:OTEL_EXPORTER_OTLP_ENDPOINT}"
-        tls:
-          insecure: true
-        headers:
-          authorization: "Bearer ${env:OTEL_API_TOKEN}"
-    service:
-      pipelines:
-        metrics:
-          receivers: [prometheus]
-          processors: [resource]
-          exporters: [otlphttp]
----
+# Process-wrapper proxy provides metrics scraping + log capture.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -60,9 +18,7 @@ spec:
       args:
         - |
           set -e
-          echo "[gen-certs] installing openssl..."
           apk add --no-cache openssl
-          echo "[gen-certs] generating self-signed cert..."
           mkdir -p /certs/CAs
           openssl req -new -x509 -days 3650 -nodes \
             -subj "/CN=minio" \
@@ -70,64 +26,65 @@ spec:
           cp /certs/public.crt /certs/CAs/public.crt
           chmod 644 /certs/public.crt /certs/CAs/public.crt
           chmod 600 /certs/private.key
-          echo "[gen-certs] done — cert ready"
       volumeMounts:
         - name: certs
           mountPath: /certs
   containers:
     - name: minio
       image: quay.io/minio/minio:RELEASE.2025-02-28T09-55-16Z
-      args: ["server", "/data", "--certs-dir", "/certs"]
+      command: ["/proxy/platform-proxy"]
+      args:
+        - "--wrap"
+        - "--scrape-url=https://localhost:9000/minio/v2/metrics/cluster"
+        - "--scrape-tls-insecure"
+        - "--"
+        - "minio"
+        - "server"
+        - "/data"
+        - "--certs-dir"
+        - "/certs"
       env:
         - name: MINIO_ROOT_USER
           value: platform
         - name: MINIO_ROOT_PASSWORD
           value: devdevdev
-        - name: MINIO_PROMETHEUS_AUTH_TYPE
-          value: public
+        - name: PLATFORM_API_URL
+          value: "__PLATFORM_API_URL__"
+        - name: PLATFORM_API_TOKEN
+          value: "plat_api_otel_system_dev_000000000000000000000000000000"
+        - name: PLATFORM_SERVICE_NAME
+          value: platform-minio
+        - name: PROXY_HEALTH_PORT
+          value: "15020"
       ports:
         - containerPort: 9000
+        - containerPort: 15020
       readinessProbe:
         httpGet:
-          path: /minio/health/live
-          port: 9000
-          scheme: HTTPS
+          path: /readyz
+          port: 15020
         initialDelaySeconds: 2
         periodSeconds: 1
       volumeMounts:
         - name: certs
           mountPath: /certs
           readOnly: true
+        - name: proxy
+          mountPath: /proxy
+          readOnly: true
       resources:
         requests:
           cpu: 50m
-          memory: 128Mi
+          memory: 160Mi
         limits:
-          memory: 512Mi
-    - name: otel-collector
-      image: otel/opentelemetry-collector-contrib:0.121.0
-      args: ["--config=/etc/otel/config.yaml"]
-      env:
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "__OTEL_ENDPOINT__"
-        - name: OTEL_API_TOKEN
-          value: "plat_api_otel_system_dev_000000000000000000000000000000"
-      volumeMounts:
-        - name: otel-config
-          mountPath: /etc/otel
-      resources:
-        requests:
-          cpu: 25m
-          memory: 48Mi
-        limits:
-          cpu: 100m
-          memory: 128Mi
+          memory: 544Mi
   volumes:
     - name: certs
       emptyDir: {}
-    - name: otel-config
-      configMap:
-        name: minio-otel-config
+    - name: proxy
+      hostPath:
+        path: __PROXY_PATH__
+        type: Directory
 ---
 apiVersion: v1
 kind: Service

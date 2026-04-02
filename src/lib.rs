@@ -43,3 +43,10 @@ pub mod workspace;
 
 // Onboarding
 pub mod onboarding;
+
+// Service Mesh CA
+pub mod mesh;
+
+// Process-wrapper proxy (used by the `platform-proxy` binary, not the main binary)
+#[allow(dead_code)]
+pub mod proxy;

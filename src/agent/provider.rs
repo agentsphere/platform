@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Steven Hooker. Exclusively licensed to and distributed by AgentSphere GmbH.
-// SPDX-License-Identifier: BUSL-1.1
-
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Pod;
 use serde::{Deserialize, Serialize};
@@ -192,6 +189,9 @@ pub struct BuildPodParams<'a> {
     pub default_runner_image: &'a str,
     /// Git clone init container image from config (A4: pinned, no `:latest`).
     pub git_clone_image: &'a str,
+    /// Host path to the platform-proxy binary directory (mesh wrapping).
+    /// Only used when dev mode is enabled (hostPath volumes restricted to dev).
+    pub proxy_binary_path: Option<&'a str>,
 }
 
 /// Trait for agent provider implementations.

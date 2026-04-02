@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Steven Hooker. Exclusively licensed to and distributed by AgentSphere GmbH.
-// SPDX-License-Identifier: BUSL-1.1
-
 use serde_json::json;
 
 use crate::config::Config;
@@ -13,28 +10,6 @@ pub fn session_namespace_name(config: &Config, slug: &str, short_id: &str) -> St
     match config.ns_prefix.as_deref() {
         Some(prefix) => format!("{prefix}-{slug}-s-{short_id}"),
         None => format!("{slug}-s-{short_id}"),
-    }
-}
-
-/// Compute the pipeline namespace name for a pipeline run.
-///
-/// Format: `{slug}-p-{short_id}` (or `{prefix}-{slug}-p-{short_id}` with `ns_prefix`).
-/// Each pipeline run gets its own isolated namespace, cleaned up on completion.
-pub fn pipeline_namespace_name(config: &Config, slug: &str, short_id: &str) -> String {
-    match config.ns_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}-{slug}-p-{short_id}"),
-        None => format!("{slug}-p-{short_id}"),
-    }
-}
-
-/// Compute the deploy-test namespace name for a pipeline's test step.
-///
-/// Format: `{slug}-t-{short_id}` (or `{prefix}-{slug}-t-{short_id}` with `ns_prefix`).
-/// Cleaned up automatically when the test step completes.
-pub fn test_namespace_name(config: &Config, slug: &str, short_id: &str) -> String {
-    match config.ns_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}-{slug}-t-{short_id}"),
-        None => format!("{slug}-t-{short_id}"),
     }
 }
 
@@ -294,6 +269,44 @@ async fn apply_namespaced_object(
     Ok(())
 }
 
+/// Create or update the mesh CA trust bundle `ConfigMap` in the given namespace.
+///
+/// The `ConfigMap` contains the CA certificate PEM for mTLS verification.
+/// Uses server-side apply (idempotent).
+#[tracing::instrument(skip(kube_client, ca_pem), fields(%namespace), err)]
+pub async fn ensure_mesh_ca_bundle(
+    kube_client: &kube::Client,
+    namespace: &str,
+    ca_pem: &str,
+) -> Result<(), super::error::DeployerError> {
+    let cm_json = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "mesh-ca-bundle",
+            "namespace": namespace,
+            "labels": {
+                "platform.io/managed-by": "platform"
+            }
+        },
+        "data": {
+            "ca.pem": ca_pem
+        }
+    });
+
+    apply_namespaced_object(
+        kube_client,
+        namespace,
+        "",
+        "v1",
+        "ConfigMap",
+        "configmaps",
+        "mesh-ca-bundle",
+        cm_json,
+    )
+    .await
+}
+
 /// Delete a K8s namespace. Ignores 404 (already deleted).
 ///
 /// S30: Refuses to delete namespaces not labelled `platform.io/managed-by: platform`.
@@ -433,7 +446,9 @@ pub fn build_namespace_object(
 /// Build a `NetworkPolicy` for a session namespace.
 ///
 /// Build a namespace-level `NetworkPolicy` allowing egress to platform API (8080),
-/// DNS, same-namespace, and public internet (blocking private ranges).
+/// DNS, same-namespace, mTLS (8443) to platform-managed namespaces, and public
+/// internet (blocking private ranges). Also allows ingress on 8443 from
+/// platform-managed namespaces for mTLS.
 fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
     json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -444,7 +459,19 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
         },
         "spec": {
             "podSelector": {},
-            "policyTypes": ["Egress"],
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                {
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                }
+            ],
             "egress": [
                 {
                     "to": [{
@@ -485,6 +512,16 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
                 },
                 {
                     "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                },
+                {
+                    "to": [{
                         "ipBlock": {
                             "cidr": "0.0.0.0/0",
                             "except": [
@@ -502,6 +539,7 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_session_network_policy(
     ns_name: &str,
     platform_namespace: &str,
@@ -538,16 +576,28 @@ pub fn build_session_network_policy(
                 }
             },
             "policyTypes": ["Ingress", "Egress"],
-            "ingress": [{
-                "from": [{
-                    "namespaceSelector": {
-                        "matchLabels": {
-                            "kubernetes.io/metadata.name": platform_namespace
+            "ingress": [
+                {
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": platform_namespace
+                            }
                         }
-                    }
-                }],
-                "ports": [{"port": 8000, "protocol": "TCP"}]
-            }],
+                    }],
+                    "ports": [{"port": 8000, "protocol": "TCP"}]
+                },
+                {
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                }
+            ],
             "egress": [
                 {
                     "to": egress_ns_selectors,
@@ -576,6 +626,16 @@ pub fn build_session_network_policy(
                 },
                 {
                     "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                },
+                {
+                    "to": [{
                         "ipBlock": {
                             "cidr": "0.0.0.0/0",
                             "except": [
@@ -598,8 +658,9 @@ pub fn build_session_network_policy(
 /// Allows:
 /// - Egress to the platform API namespace (port 8080)
 /// - Egress to kube-system DNS (port 53 UDP+TCP)
+/// - Egress to platform-managed namespaces on port 8443 (mTLS)
 /// - Egress to internet (blocking cluster-internal CIDRs)
-/// - Ingress: deny all (no ingress rules)
+/// - Ingress from platform-managed namespaces on port 8443 (mTLS)
 ///
 /// `ns_name` is the full namespace name (e.g. `my-app-dev` or `prefix-my-app-dev`).
 pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
@@ -617,6 +678,18 @@ pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_js
                 }
             },
             "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                {
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                }
+            ],
             "egress": [
                 {
                     "to": [{
@@ -645,6 +718,16 @@ pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_js
                         {"port": 53, "protocol": "UDP"},
                         {"port": 53, "protocol": "TCP"}
                     ]
+                },
+                {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "platform.io/managed-by": "platform"
+                            }
+                        }
+                    }],
+                    "ports": [{"port": 8443, "protocol": "TCP"}]
                 },
                 {
                     "to": [{
@@ -983,8 +1066,8 @@ mod tests {
     fn network_policy_egress_internet_except_cluster() {
         let np = build_network_policy("my-app", "platform");
         let egress = np["spec"]["egress"].as_array().unwrap();
-        // Third rule: internet
-        let internet_rule = &egress[2];
+        // Fourth rule: internet (after platform API, DNS, mTLS)
+        let internet_rule = &egress[3];
         let ip_block = &internet_rule["to"][0]["ipBlock"];
         assert_eq!(ip_block["cidr"], "0.0.0.0/0");
         let except = ip_block["except"].as_array().unwrap();
@@ -997,14 +1080,34 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_ingress_deny_all() {
+    fn network_policy_ingress_allows_mtls() {
         let np = build_network_policy("my-app", "platform");
         let policy_types = np["spec"]["policyTypes"].as_array().unwrap();
         let types: Vec<&str> = policy_types.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(types.contains(&"Ingress"));
         assert!(types.contains(&"Egress"));
-        // No ingress rules = deny all ingress
-        assert!(np["spec"]["ingress"].is_null());
+        // Ingress allows mTLS on 8443 from platform-managed namespaces
+        let ingress = np["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 1);
+        let mtls_rule = &ingress[0];
+        let from_selector =
+            &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(from_selector, "platform");
+        let ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["port"], 8443);
+    }
+
+    #[test]
+    fn network_policy_egress_mtls() {
+        let np = build_network_policy("my-app", "platform");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        // Third rule: mTLS egress to platform-managed namespaces
+        let mtls_rule = &egress[2];
+        let to_selector =
+            &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(to_selector, "platform");
+        let ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["port"], 8443);
     }
 
     #[test]
@@ -1058,17 +1161,27 @@ mod tests {
     // -- build_session_network_policy --
 
     #[test]
-    fn session_network_policy_ingress_allows_platform() {
+    fn session_network_policy_ingress_allows_platform_and_mtls() {
         let np = build_session_network_policy("my-app", "platform", "platform");
         let ingress = np["spec"]["ingress"].as_array().unwrap();
-        assert_eq!(ingress.len(), 1);
-        let rule = &ingress[0];
-        let ns_selector = &rule["from"][0]["namespaceSelector"]["matchLabels"];
+        assert_eq!(
+            ingress.len(),
+            2,
+            "should have preview (8000) + mTLS (8443) ingress"
+        );
+        // First rule: preview proxy from platform namespace
+        let preview_rule = &ingress[0];
+        let ns_selector = &preview_rule["from"][0]["namespaceSelector"]["matchLabels"];
         assert_eq!(ns_selector["kubernetes.io/metadata.name"], "platform");
-        let ports = rule["ports"].as_array().unwrap();
-        assert_eq!(ports.len(), 1);
+        let ports = preview_rule["ports"].as_array().unwrap();
         assert_eq!(ports[0]["port"], 8000);
-        assert_eq!(ports[0]["protocol"], "TCP");
+        // Second rule: mTLS from platform-managed namespaces
+        let mtls_rule = &ingress[1];
+        let mtls_selector =
+            &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(mtls_selector, "platform");
+        let mtls_ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(mtls_ports[0]["port"], 8443);
     }
 
     #[test]
@@ -1084,10 +1197,25 @@ mod tests {
     }
 
     #[test]
-    fn project_network_policy_still_denies_ingress() {
-        // Verify build_network_policy hasn't been accidentally modified
+    fn session_network_policy_egress_includes_mtls() {
+        let session_np = build_session_network_policy("my-app", "platform", "platform");
+        let egress = session_np["spec"]["egress"].as_array().unwrap();
+        // Third rule (index 2): mTLS to platform-managed namespaces
+        let mtls_rule = &egress[2];
+        let to_selector =
+            &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(to_selector, "platform");
+        let ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["port"], 8443);
+    }
+
+    #[test]
+    fn project_network_policy_allows_mtls_ingress_only() {
+        // Verify build_network_policy allows mTLS ingress on 8443
         let np = build_network_policy("my-app", "platform");
-        assert!(np["spec"]["ingress"].is_null());
+        let ingress = np["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 1, "only mTLS ingress should be allowed");
+        assert_eq!(ingress[0]["ports"][0]["port"], 8443);
     }
 
     // -- build_session_rbac --
@@ -1303,16 +1431,42 @@ mod tests {
     // -- build_namespace_network_policy --
 
     #[test]
-    fn namespace_network_policy_has_four_egress_rules() {
+    fn namespace_network_policy_has_five_egress_rules() {
         let np = build_namespace_network_policy("my-app", "platform");
         let egress = np["spec"]["egress"].as_array().unwrap();
-        // 4 rules: same-namespace + platform API + DNS + public internet
+        // 5 rules: same-namespace + platform API + DNS + mTLS + public internet
         assert_eq!(
             egress.len(),
-            4,
-            "same services_ns should not duplicate: got {}",
+            5,
+            "expected 5 egress rules (same-ns, platform, dns, mTLS, internet): got {}",
             egress.len()
         );
+    }
+
+    #[test]
+    fn namespace_network_policy_has_mtls_ingress() {
+        let np = build_namespace_network_policy("my-app", "platform");
+        let ingress = np["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 1);
+        let mtls_rule = &ingress[0];
+        let from_selector =
+            &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(from_selector, "platform");
+        let ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["port"], 8443);
+    }
+
+    #[test]
+    fn namespace_network_policy_has_mtls_egress() {
+        let np = build_namespace_network_policy("my-app", "platform");
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        // Fourth rule (index 3): mTLS egress
+        let mtls_rule = &egress[3];
+        let to_selector =
+            &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
+        assert_eq!(to_selector, "platform");
+        let ports = mtls_rule["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["port"], 8443);
     }
 
     // -- build_session_rbac: all 3 rules, no networking.k8s.io --

@@ -9680,6 +9680,7 @@ async fn ensure_registry_pull_secret_no_url_is_noop(pool: PgPool) {
         cli_auth_manager: state.cli_auth_manager.clone(),
         audit_tx: state.audit_tx.clone(),
         webhook_semaphore: state.webhook_semaphore.clone(),
+        mesh_ca: state.mesh_ca.clone(),
     };
 
     platform::deployer::reconciler::ensure_registry_pull_secret_for(

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO secrets (name, encrypted_value, scope, created_by)\n           VALUES ($1, $2, 'all', (SELECT id FROM users WHERE name = 'admin' LIMIT 1))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "694e0ea681824bd4d9524566f3c693e244a9fae5da50c9a19e1c0db5270c698a"
+}

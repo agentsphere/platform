@@ -15,6 +15,7 @@ import { Modal } from './Modal';
 import { Overlay } from './Overlay';
 import { FilterBar } from './FilterBar';
 import { Markdown } from './Markdown';
+import { MermaidBlock, ZoomableDiagram, renderMermaid } from './MermaidBlock';
 import { Sessions } from '../pages/Sessions';
 
 /* ---- Helpers ---- */
@@ -1679,31 +1680,220 @@ export function SecretsTab({ projectId }: { projectId: string }) {
   );
 }
 
-/* ---- Docs Tab (placeholder) ---- */
+/* ---- Docs Tab ---- */
 
-export function DocsTab({ projectId }: { projectId: string }) {
+// Hierarchical docs.json schema (up to 3 levels)
+// Leaf: { id, file, title } — file is .md or .mmd
+// Group: { title, children: [...] }
+interface DocLeaf { id: string; file: string; title: string; }
+interface DocGroup { title: string; children: DocNode[]; }
+type DocNode = DocLeaf | DocGroup;
+function isDocLeaf(n: DocNode): n is DocLeaf { return 'file' in n; }
+
+// Legacy flat schema
+interface LegacyDocEntry { id: string; file: string; title: string; section: number; }
+interface LegacyManifest { docs: LegacyDocEntry[]; }
+
+// Convert legacy flat → tree
+function legacyToTree(docs: LegacyDocEntry[]): DocNode[] {
+  return docs.sort((a, b) => a.section - b.section).map(d => ({ id: d.id, file: d.file, title: d.title }));
+}
+
+// Find the first leaf in a tree
+function firstLeaf(nodes: DocNode[]): DocLeaf | null {
+  for (const n of nodes) {
+    if (isDocLeaf(n)) return n;
+    const found = firstLeaf((n as DocGroup).children);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Sidebar tree renderer
+function DocsSidebarTree({ nodes, activeFile, depth, onSelect }: {
+  nodes: DocNode[]; activeFile: string | null; depth: number;
+  onSelect: (file: string) => void;
+}) {
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const toggle = (title: string) => {
+    setCollapsed(prev => { const n = new Set(prev); if (n.has(title)) n.delete(title); else n.add(title); return n; });
+  };
+
   return (
-    <div class="card">
-      <div class="empty-state">
-        <p>Documentation</p>
-        <p class="text-muted text-sm mt-sm">Project documentation will appear here once configured.</p>
+    <>
+      {nodes.map((node, i) => {
+        if (isDocLeaf(node)) {
+          const isDiagram = node.file.endsWith('.mmd');
+          return (
+            <button key={node.id}
+              class={`docs-sidebar-item${activeFile === node.file ? ' active' : ''}`}
+              style={`padding-left: ${0.5 + depth * 0.75}rem`}
+              onClick={() => onSelect(node.file)}>
+              {isDiagram && <span class="docs-icon-diagram" title="Diagram">&#9670; </span>}
+              {node.title}
+            </button>
+          );
+        }
+        const group = node as DocGroup;
+        const key = `${depth}-${i}-${group.title}`;
+        const isCollapsed = collapsed.has(key);
+        return (
+          <div key={key}>
+            <button class="docs-sidebar-group" style={`padding-left: ${0.5 + depth * 0.75}rem`}
+              onClick={() => toggle(key)}>
+              <span class="docs-sidebar-chevron">{isCollapsed ? '\u25B8' : '\u25BE'}</span>
+              {group.title}
+            </button>
+            {!isCollapsed && (
+              <DocsSidebarTree nodes={group.children} activeFile={activeFile}
+                depth={depth + 1} onSelect={onSelect} />
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+export function DocsTab({ projectId, defaultBranch }: { projectId: string; defaultBranch: string }) {
+  const [tree, setTree] = useState<DocNode[]>([]);
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [gitRef, setRef] = useState(defaultBranch);
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [docsPrefix, setDocsPrefix] = useState('docs/');
+  // Diagram zoom overlay
+  const [zoomSvg, setZoomSvg] = useState<string | null>(null);
+  const [zoomTitle, setZoomTitle] = useState('');
+
+  useEffect(() => {
+    api.get<BranchInfo[]>(`/api/projects/${projectId}/branches`).then(setBranches).catch(() => {});
+  }, [projectId]);
+
+  // Load manifest
+  useEffect(() => {
+    setLoading(true);
+    setTree([]);
+    setActiveFile(null);
+    setContent(null);
+
+    const tryManifest = (path: string, prefix: string): Promise<boolean> =>
+      api.get<{ content: string; encoding: string }>(
+        `/api/projects/${projectId}/blob${qs({ ref: gitRef, path })}`
+      ).then(blob => {
+        const text = blob.encoding === 'base64' ? atob(blob.content) : blob.content;
+        const parsed = JSON.parse(text);
+        setDocsPrefix(prefix);
+        let nodes: DocNode[];
+        if (parsed.tree) {
+          nodes = parsed.tree;
+        } else if (parsed.docs) {
+          nodes = legacyToTree(parsed.docs as LegacyDocEntry[]);
+        } else {
+          return false;
+        }
+        setTree(nodes);
+        const first = firstLeaf(nodes);
+        if (first) setActiveFile(first.file);
+        setLoading(false);
+        return true;
+      }).catch(() => false);
+
+    // Try docs/docs.json → docs/arc42/docs.json → fallback dir listing
+    tryManifest('docs/docs.json', 'docs/').then(ok => {
+      if (ok) return;
+      return tryManifest('docs/arc42/docs.json', 'docs/arc42/').then(ok2 => {
+        if (ok2) return;
+        // Fallback: list docs/ for .md files
+        api.get<TreeEntry[]>(`/api/projects/${projectId}/tree${qs({ ref: gitRef, path: 'docs' })}`)
+          .then(entries => {
+            const mds = entries
+              .filter(e => e.entry_type === 'blob' && (e.name.endsWith('.md') || e.name.endsWith('.mmd')))
+              .sort((a, b) => a.name.localeCompare(b.name));
+            const nodes: DocNode[] = mds.map(f => ({
+              id: f.name, file: f.name,
+              title: f.name.replace(/^\d+-/, '').replace(/\.(md|mmd)$/, '').replace(/-/g, ' '),
+            }));
+            setDocsPrefix('docs/');
+            setTree(nodes);
+            if (nodes.length > 0 && isDocLeaf(nodes[0])) setActiveFile((nodes[0] as DocLeaf).file);
+            setLoading(false);
+          })
+          .catch(() => setLoading(false));
+      });
+    });
+  }, [projectId, gitRef]);
+
+  // Load active file content
+  useEffect(() => {
+    if (!activeFile) { setContent(null); return; }
+    setContent(null);
+    const fullPath = `${docsPrefix}${activeFile}`;
+    api.get<{ content: string; encoding: string }>(
+      `/api/projects/${projectId}/blob${qs({ ref: gitRef, path: fullPath })}`
+    )
+      .then(blob => setContent(blob.encoding === 'base64' ? atob(blob.content) : blob.content))
+      .catch(() => setContent('*Failed to load document.*'));
+  }, [activeFile, projectId, gitRef, docsPrefix]);
+
+  const isDiagram = activeFile?.endsWith('.mmd');
+
+  const openDiagramZoom = (mermaidCode: string, title: string) => {
+    renderMermaid(mermaidCode)
+      .then(result => { setZoomSvg(result.svg); setZoomTitle(title); })
+      .catch(() => {});
+  };
+
+  if (loading) return <div class="empty-state">Loading documentation...</div>;
+
+  if (tree.length === 0) {
+    return (
+      <div class="card">
+        <div class="empty-state">
+          <p>No documentation found</p>
+          <p class="text-muted text-sm mt-sm">
+            Add a <code>docs/</code> directory with <code>.md</code> files to your repo.
+            Optionally include a <code>docs/docs.json</code> manifest for ordered navigation.
+          </p>
+        </div>
       </div>
+    );
+  }
+
+  return (
+    <div class="docs-viewer">
+      <div class="docs-sidebar">
+        <div class="mb-sm">
+          <select class="input" style="width:100%;font-size:0.75rem;padding:0.25rem 0.5rem" value={gitRef}
+            onChange={(e) => setRef((e.target as HTMLSelectElement).value)}>
+            {branches.map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
+          </select>
+        </div>
+        <DocsSidebarTree nodes={tree} activeFile={activeFile} depth={0} onSelect={setActiveFile} />
+      </div>
+      <div class="docs-content">
+        {content === null ? (
+          <div class="text-muted text-sm" style="padding:2rem;text-align:center">Loading...</div>
+        ) : isDiagram ? (
+          <div class="mermaid-block">
+            <MermaidBlock code={content}
+              onClick={() => openDiagramZoom(content, activeFile?.replace(/\.(mmd)$/, '') || 'Diagram')} />
+            <div class="text-xs text-muted mt-sm" style="text-align:center">Click diagram to zoom</div>
+          </div>
+        ) : (
+          <Markdown content={content} />
+        )}
+      </div>
+
+      {/* Zoomable diagram overlay */}
+      <Overlay open={!!zoomSvg} onClose={() => setZoomSvg(null)} title={zoomTitle}>
+        {zoomSvg && <ZoomableDiagram svg={zoomSvg} />}
+      </Overlay>
     </div>
   );
 }
 
-/* ---- Observe Tab (placeholder) ---- */
+/* ---- Observe Tab (re-exported from dedicated file) ---- */
 
-export function ObserveTab({ projectId }: { projectId: string }) {
-  return (
-    <div class="card">
-      <div class="empty-state">
-        <p>Observability</p>
-        <p class="text-muted text-sm mt-sm">
-          Combined traces, logs, and metrics view coming soon.
-          Traces are the primary unit — logs and metrics are aggregated per trace for efficient deduplication.
-        </p>
-      </div>
-    </div>
-  );
-}
+export { ObserveTab } from './ObserveTab';

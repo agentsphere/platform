@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useCallback } from 'preact/hooks';
 import { api, type ListResponse } from '../lib/api';
 import type { Project, DashboardStats } from '../lib/types';
 import { useAuth } from '../lib/auth';
@@ -16,10 +16,14 @@ export function Dashboard({ id: routeProjectId, tab: routeTab }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [total, setTotal] = useState<number | null>(null);
   const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [sidebarFocused, setSidebarFocused] = useState(false);
 
   // Parse initial expand state from route params
   const expandedProjectId = routeProjectId || null;
   const initialTab: CardTab = routeTab ? parseTabFromUrl(routeTab) : (routeProjectId ? null : null);
+
+  // Reset sidebar focus when project changes
+  useEffect(() => { setSidebarFocused(false); }, [expandedProjectId]);
 
   useEffect(() => {
     api.get<ListResponse<Project>>('/api/projects?limit=20')
@@ -42,8 +46,9 @@ export function Dashboard({ id: routeProjectId, tab: routeTab }: Props) {
 
   return (
     <div class="dashboard-2col">
-      {/* Left sidebar */}
-      <div class="dashboard-sidebar">
+      {/* Left sidebar — dims when a project is expanded, click to un-dim */}
+      <div class={`dashboard-sidebar${expandedProjectId && !sidebarFocused ? ' sidebar-dimmed' : ''}`}
+        onClick={expandedProjectId && !sidebarFocused ? (e: Event) => { e.preventDefault(); e.stopPropagation(); setSidebarFocused(true); } : undefined}>
         <SystemHealthPanel />
 
         <div class="panel">

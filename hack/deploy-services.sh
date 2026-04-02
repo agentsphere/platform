@@ -20,21 +20,30 @@ for _ in $(seq 1 30); do
   sleep 0.2
 done
 
-# Build OTEL endpoint from backend host/port (same vars the registry proxy uses)
-OTEL_ENDPOINT="http://${REGISTRY_BACKEND_HOST:-host.docker.internal}:${REGISTRY_BACKEND_PORT:-8080}"
+# ── Compute proxy path + platform API URL for sed replacement ────────────
+WORKTREE="${WORKTREE:-$(bash "${SCRIPT_DIR}/detect-worktree.sh")}"
+PLATFORM_URL="http://${REGISTRY_BACKEND_HOST:-host.docker.internal}:${REGISTRY_BACKEND_PORT:-8080}"
+PROXY_PATH="/tmp/platform-e2e/${WORKTREE}/proxy"
 
 echo "==> Deploying services into namespace: ${NS}"
-echo "  OTEL endpoint: ${OTEL_ENDPOINT}"
+echo "  Proxy path: ${PROXY_PATH}"
+echo "  Platform URL: ${PLATFORM_URL}"
+
+# Apply proxy-wrapped manifests (sed replaces __PLATFORM_API_URL__ and __PROXY_PATH__)
 for f in postgres.yaml valkey.yaml minio.yaml; do
-  sed "s|__OTEL_ENDPOINT__|${OTEL_ENDPOINT}|g" "${SCRIPT_DIR}/test-manifests/${f}" \
+  sed -e "s|__PLATFORM_API_URL__|${PLATFORM_URL}|g" \
+      -e "s|__PROXY_PATH__|${PROXY_PATH}|g" \
+    "${SCRIPT_DIR}/test-manifests/${f}" \
     | kubectl apply -n "${NS}" -f -
 done
+
+# preview-proxy has no placeholders — apply directly
 kubectl apply -n "${NS}" -f "${SCRIPT_DIR}/test-manifests/preview-proxy.yaml"
 
 echo "==> Waiting for services to be ready"
-kubectl wait -n "${NS}" --for=condition=Ready pod/postgres --timeout=90s
-kubectl wait -n "${NS}" --for=condition=Ready pod/valkey --timeout=60s
-kubectl wait -n "${NS}" --for=condition=Ready pod/minio --timeout=60s
+kubectl wait -n "${NS}" --for=condition=Ready pod/postgres --timeout=60s
+kubectl wait -n "${NS}" --for=condition=Ready pod/valkey --timeout=30s
+kubectl wait -n "${NS}" --for=condition=Ready pod/minio --timeout=30s
 kubectl wait -n "${NS}" --for=condition=Ready pod/preview-proxy --timeout=30s
 echo "  All services ready"
 

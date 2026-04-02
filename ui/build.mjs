@@ -9,6 +9,8 @@ await esbuild.build({
   entryPoints: ['src/index.tsx'],
   bundle: true,
   outdir: 'dist',
+  format: 'esm',
+  splitting: true,
   minify: !isDev,
   sourcemap: isDev,
   loader: { '.tsx': 'tsx', '.ts': 'ts', '.css': 'css' },

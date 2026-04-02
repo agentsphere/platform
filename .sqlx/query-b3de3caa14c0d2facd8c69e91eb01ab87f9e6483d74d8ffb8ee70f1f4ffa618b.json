@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, root_cert_pem, secret_name, serial_counter FROM mesh_ca ORDER BY created_at DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "root_cert_pem",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "secret_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "serial_counter",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b3de3caa14c0d2facd8c69e91eb01ab87f9e6483d74d8ffb8ee70f1f4ffa618b"
+}

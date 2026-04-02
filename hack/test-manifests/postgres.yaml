@@ -1,45 +1,7 @@
 # Lightweight Postgres for per-run test namespaces.
 # Boots in ~3-5s (vs 30-60s for CNPG operator).
 # The platform user gets CREATEDB via post-deploy script.
-# Includes OTEL collector sidecar for Postgres metrics.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: postgres-otel-config
-data:
-  config.yaml: |
-    receivers:
-      postgresql:
-        endpoint: localhost:5432
-        username: platform
-        password: dev
-        databases: [platform_dev]
-        collection_interval: 15s
-        tls:
-          insecure_skip_verify: true
-    processors:
-      resource:
-        attributes:
-          - key: service.name
-            value: platform-postgres
-            action: upsert
-          - key: deployment.environment
-            value: dev
-            action: upsert
-    exporters:
-      otlphttp:
-        endpoint: "${env:OTEL_EXPORTER_OTLP_ENDPOINT}"
-        tls:
-          insecure: true
-        headers:
-          authorization: "Bearer ${env:OTEL_API_TOKEN}"
-    service:
-      pipelines:
-        metrics:
-          receivers: [postgresql]
-          processors: [resource]
-          exporters: [otlphttp]
----
+# Process-wrapper proxy provides metrics scraping + log capture.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -56,22 +18,33 @@ spec:
       args:
         - |
           set -e
-          echo "[gen-certs] installing openssl..."
           apk add --no-cache openssl
-          echo "[gen-certs] generating self-signed cert..."
           openssl req -new -x509 -days 365 -nodes \
             -out /certs/server.crt -keyout /certs/server.key \
             -subj "/CN=postgres"
           chown 70:70 /certs/server.crt /certs/server.key
           chmod 600 /certs/server.key
-          echo "[gen-certs] done — cert ready"
       volumeMounts:
         - name: certs
           mountPath: /certs
   containers:
     - name: postgres
       image: postgres:16-alpine
-      args: ["-c", "max_connections=300", "-c", "ssl=on", "-c", "ssl_cert_file=/certs/server.crt", "-c", "ssl_key_file=/certs/server.key"]
+      command: ["/proxy/platform-proxy"]
+      args:
+        - "--wrap"
+        - "--tcp-ports=5432"
+        - "--scrape-type=postgres"
+        - "--"
+        - "postgres"
+        - "-c"
+        - "max_connections=300"
+        - "-c"
+        - "ssl=on"
+        - "-c"
+        - "ssl_cert_file=/certs/server.crt"
+        - "-c"
+        - "ssl_key_file=/certs/server.key"
       env:
         - name: POSTGRES_USER
           value: platform
@@ -79,47 +52,45 @@ spec:
           value: dev
         - name: POSTGRES_DB
           value: platform_dev
+        - name: PLATFORM_API_URL
+          value: "__PLATFORM_API_URL__"
+        - name: PLATFORM_API_TOKEN
+          value: "plat_api_otel_system_dev_000000000000000000000000000000"
+        - name: PLATFORM_SERVICE_NAME
+          value: platform-postgres
+        - name: PROXY_SCRAPE_POSTGRES_URL
+          value: "postgres://platform:dev@localhost:5432/platform_dev"
+        - name: PROXY_HEALTH_PORT
+          value: "15020"
       ports:
         - containerPort: 5432
+        - containerPort: 15020
       readinessProbe:
-        exec:
-          command: ["pg_isready", "-U", "platform", "-d", "platform_dev"]
+        httpGet:
+          path: /readyz
+          port: 15020
         initialDelaySeconds: 10
         periodSeconds: 2
       volumeMounts:
         - name: certs
           mountPath: /certs
           readOnly: true
+        - name: proxy
+          mountPath: /proxy
+          readOnly: true
       resources:
         requests:
           cpu: 100m
-          memory: 128Mi
+          memory: 160Mi
         limits:
-          memory: 512Mi
-    - name: otel-collector
-      image: otel/opentelemetry-collector-contrib:0.121.0
-      args: ["--config=/etc/otel/config.yaml"]
-      env:
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "__OTEL_ENDPOINT__"
-        - name: OTEL_API_TOKEN
-          value: "plat_api_otel_system_dev_000000000000000000000000000000"
-      volumeMounts:
-        - name: otel-config
-          mountPath: /etc/otel
-      resources:
-        requests:
-          cpu: 25m
-          memory: 48Mi
-        limits:
-          cpu: 100m
-          memory: 128Mi
+          memory: 544Mi
   volumes:
     - name: certs
       emptyDir: {}
-    - name: otel-config
-      configMap:
-        name: postgres-otel-config
+    - name: proxy
+      hostPath:
+        path: __PROXY_PATH__
+        type: Directory
 ---
 apiVersion: v1
 kind: Service

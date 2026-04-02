@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Steven Hooker. Exclusively licensed to and distributed by AgentSphere GmbH.
-// SPDX-License-Identifier: BUSL-1.1
-
 use k8s_openapi::api::core::v1::Pod;
 
 use crate::agent::error::AgentError;
@@ -38,6 +35,7 @@ impl AgentProvider for ClaudeCodeProvider {
             session_short_id: params.session_short_id,
             default_runner_image: params.default_runner_image,
             git_clone_image: params.git_clone_image,
+            proxy_binary_path: params.proxy_binary_path,
         }))
     }
 

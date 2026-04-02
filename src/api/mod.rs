@@ -17,6 +17,7 @@ pub mod helpers;
 pub mod issues;
 pub mod llm_providers;
 pub mod merge_requests;
+pub mod mesh;
 pub mod notifications;
 pub mod onboarding;
 pub mod passkeys;
@@ -66,5 +67,6 @@ pub fn router() -> Router<AppState> {
         .merge(downloads::router())
         .merge(health::router())
         .merge(llm_providers::router())
+        .merge(mesh::router())
         .merge(crate::git::browser_router())
 }

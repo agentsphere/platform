@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Steven Hooker. Exclusively licensed to and distributed by AgentSphere GmbH.
-// SPDX-License-Identifier: BUSL-1.1
-
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -176,13 +173,10 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     // Create a short-lived OTLP token for pipeline pods to emit telemetry
     let otlp_token = create_pipeline_otlp_token(state, project_id, pipeline_id).await;
 
-    let short_id = &pipeline_id.to_string()[..8];
-    let pipeline_namespace = crate::deployer::namespace::pipeline_namespace_name(
-        &state.config,
-        &pipeline.namespace_slug,
-        short_id,
-    );
-    let git_secret_name = format!("pl-git-{short_id}");
+    let pipeline_namespace = state
+        .config
+        .project_namespace(&pipeline.namespace_slug, "dev");
+    let git_secret_name = format!("pl-git-{}", &pipeline_id.to_string()[..8]);
 
     let meta = PipelineMeta {
         git_ref: pipeline.git_ref,
@@ -198,8 +192,8 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
         git_secret_name,
     };
 
-    // Ensure pipeline namespace exists (unique per pipeline run)
-    ensure_pipeline_namespace(state, &meta.namespace, project_id).await?;
+    // Ensure project namespace exists (lazy creation for DB-only projects)
+    ensure_project_namespace(state, &meta.namespace, project_id).await?;
 
     // S31: Create git auth Secret for init container (avoids exposing token as env var)
     {
@@ -303,9 +297,6 @@ async fn execute_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), Pip
     // Clean up git auth token
     cleanup_git_auth_token(state, &git_token.1).await;
 
-    // Clean up the pipeline namespace (unique per run)
-    cleanup_pipeline_namespace(&state.kube, &meta.namespace).await;
-
     finalize_pipeline(state, pipeline_id, project_id, all_succeeded, &pipeline_svc).await
 }
 
@@ -402,7 +393,7 @@ struct PipelineMeta {
     repo_clone_url: String,
     /// Short-lived API token for authenticating git clone via `GIT_ASKPASS`.
     git_auth_token: String,
-    /// K8s namespace for this pipeline's pods (e.g. `{slug}-p-{short_id}`).
+    /// K8s namespace for this pipeline's pods (e.g. `{slug}-dev`).
     namespace: String,
     /// How the pipeline was triggered: push, mr, tag, api.
     trigger_type: String,
@@ -433,9 +424,9 @@ struct StepRow {
     step_config: Option<serde_json::Value>,
 }
 
-/// Ensure the pipeline namespace (and network policy) exist before running pods.
-/// Each pipeline run gets its own namespace (`{slug}-p-{short_id}`).
-async fn ensure_pipeline_namespace(
+/// Ensure the project's dev namespace (and network policy) exist before running pods.
+/// Idempotent — no-op if the namespace was already created by `setup_project_infrastructure`.
+async fn ensure_project_namespace(
     state: &AppState,
     namespace: &str,
     project_id: Uuid,
@@ -443,7 +434,7 @@ async fn ensure_pipeline_namespace(
     crate::deployer::namespace::ensure_namespace(
         &state.kube,
         namespace,
-        "pipeline",
+        "dev",
         &project_id.to_string(),
         &state.config.platform_namespace,
         false,
@@ -918,27 +909,13 @@ async fn execute_single_step(
         step.environment.as_ref(),
     );
 
-    // Expand $REGISTRY, $PROJECT, $COMMIT_SHA etc. in the step image reference.
-    // Override REGISTRY with the node-visible URL so containerd can pull the image.
-    let mut env_pairs: Vec<(String, String)> = env_vars
-        .iter()
-        .filter_map(|ev| Some((ev.name.clone(), ev.value.as_ref()?.clone())))
-        .collect();
-    if let Some(node_reg) = node_registry_url(&state.config)
-        && let Some(pair) = env_pairs.iter_mut().find(|(k, _)| k == "REGISTRY")
-    {
-        pair.1 = node_reg.to_string();
-    }
-    let resolved_image = super::definition::expand_step_env(&step.image, &env_pairs);
-
     let pod_name = format!("pl-{}-{}", &pipeline_id.to_string()[..8], slug(&step.name));
-    let step_artifacts = extract_artifact_defs(step.step_config.as_ref());
     let pod_spec = build_pod_spec(&PodSpecParams {
         pod_name: &pod_name,
         pipeline_id,
         project_id,
         step_name: &step.name,
-        image: &resolved_image,
+        image: &step.image,
         commands: &step.commands,
         env_vars: &env_vars,
         repo_clone_url: &pipeline.repo_clone_url,
@@ -947,7 +924,12 @@ async fn execute_single_step(
         git_secret_name: Some(&pipeline.git_secret_name),
         step_type: &step.step_type,
         git_clone_image: &state.config.git_clone_image,
-        has_artifacts: !step_artifacts.is_empty(),
+        proxy_binary_path: if state.config.dev_mode {
+            state.config.proxy_binary_path.as_deref()
+        } else {
+            None
+        },
+        project_name: &pipeline.project_name,
     });
 
     let step_svc = format!("pipeline/{}/{}", pipeline.project_name, step.name);
@@ -964,23 +946,13 @@ async fn execute_single_step(
         project_id,
         &step_svc,
         "info",
-        &format!("Step '{}' started (image: {})", step.name, resolved_image),
+        &format!("Step '{}' started (image: {})", step.name, step.image),
         Some(serde_json::json!({"pipeline_id": pipeline_id.to_string(), "step": step.name})),
     )
     .await;
 
     let start = Instant::now();
-    let result = run_step(
-        pods,
-        &pod_name,
-        &pod_spec,
-        state,
-        pipeline_id,
-        step.id,
-        &step.name,
-        &step_artifacts,
-    )
-    .await;
+    let result = run_step(pods, &pod_name, &pod_spec, state, pipeline_id, &step.name).await;
     let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
 
     match result {
@@ -1046,616 +1018,27 @@ async fn execute_single_step(
 // ---------------------------------------------------------------------------
 
 /// Create a K8s pod, wait for completion, capture logs, clean up. Returns exit code.
-#[allow(clippy::too_many_arguments)]
 async fn run_step(
     pods: &Api<Pod>,
     pod_name: &str,
     pod_spec: &Pod,
     state: &AppState,
     pipeline_id: Uuid,
-    step_id: Uuid,
     step_name: &str,
-    artifact_defs: &[super::definition::ArtifactDef],
 ) -> Result<i32, PipelineError> {
     // Create the pod
     pods.create(&PostParams::default(), pod_spec).await?;
 
-    if artifact_defs.is_empty() {
-        // No artifacts: original flow
-        let exit_code = wait_for_pod(pods, pod_name).await?;
-        capture_logs(pods, pod_name, state, pipeline_id, step_name, exit_code).await;
-        let _ = pods.delete(pod_name, &DeleteParams::default()).await;
-        Ok(exit_code)
-    } else {
-        // Artifacts: wait for exit-code marker, then collect before signaling done
-        let exit_code = wait_for_step_completion(pods, pod_name).await?;
-        capture_logs(pods, pod_name, state, pipeline_id, step_name, exit_code).await;
+    // Wait for pod to finish
+    let exit_code = wait_for_pod(pods, pod_name).await?;
 
-        if exit_code == 0
-            && let Err(e) =
-                collect_step_artifacts(pods, pod_name, state, pipeline_id, step_id, artifact_defs)
-                    .await
-        {
-            tracing::error!(error = %e, step = step_name, "artifact collection failed");
-            // Signal done so container can exit, then clean up
-            signal_pod_done(pods, pod_name).await;
-            let _ = wait_for_pod(pods, pod_name).await;
-            let _ = pods.delete(pod_name, &DeleteParams::default()).await;
-            return Err(e);
-        }
+    // Capture logs to MinIO + emit to platform logs on failure
+    capture_logs(pods, pod_name, state, pipeline_id, step_name, exit_code).await;
 
-        signal_pod_done(pods, pod_name).await;
-        let _ = wait_for_pod(pods, pod_name).await;
-        let _ = pods.delete(pod_name, &DeleteParams::default()).await;
-        Ok(exit_code)
-    }
-}
+    // Clean up pod
+    let _ = pods.delete(pod_name, &DeleteParams::default()).await;
 
-// ---------------------------------------------------------------------------
-// Artifact collection
-// ---------------------------------------------------------------------------
-
-/// Extract artifact definitions from a step's `step_config` JSON.
-fn extract_artifact_defs(
-    step_config: Option<&serde_json::Value>,
-) -> Vec<super::definition::ArtifactDef> {
-    step_config
-        .and_then(|c| c.get("artifacts"))
-        .and_then(|v| serde_json::from_value::<Vec<super::definition::ArtifactDef>>(v.clone()).ok())
-        .unwrap_or_default()
-}
-
-/// Wait for the step's user commands to finish by polling `/tmp/.exit-code`.
-/// The container stays alive (marker file pattern) until we signal `/tmp/.done`.
-async fn wait_for_step_completion(pods: &Api<Pod>, pod_name: &str) -> Result<i32, PipelineError> {
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(DEFAULT_STEP_TIMEOUT_SECS);
-
-    // Wait for pod to be running first
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "pod {pod_name} timed out waiting for running state"
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match pods.get(pod_name).await {
-            Ok(pod) => {
-                let phase = pod
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.phase.as_deref())
-                    .unwrap_or("Unknown");
-                match phase {
-                    "Running" => break,
-                    "Failed" => {
-                        let code = pod.status.as_ref().and_then(extract_exit_code).unwrap_or(1);
-                        return Ok(code);
-                    }
-                    "Succeeded" => return Ok(0),
-                    _ => {
-                        if let Some(ref status) = pod.status
-                            && let Some(reason) = detect_unrecoverable_container(status)
-                        {
-                            return Err(PipelineError::Other(anyhow::anyhow!(
-                                "pod {pod_name} failed: {reason}"
-                            )));
-                        }
-                    }
-                }
-            }
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                return Err(PipelineError::Other(anyhow::anyhow!(
-                    "pod {pod_name} disappeared"
-                )));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    // Poll for /tmp/.exit-code marker file
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "pod {pod_name} timed out waiting for exit-code marker"
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        // Check if pod is still running
-        match pods.get(pod_name).await {
-            Ok(pod) => {
-                let phase = pod
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.phase.as_deref())
-                    .unwrap_or("Unknown");
-                if phase == "Succeeded" {
-                    // Container completed — exit code is 0 by definition
-                    return Ok(0);
-                }
-                if phase == "Failed" {
-                    let code = pod.status.as_ref().and_then(extract_exit_code).unwrap_or(1);
-                    return Ok(code);
-                }
-            }
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                return Err(PipelineError::Other(anyhow::anyhow!(
-                    "pod {pod_name} disappeared"
-                )));
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        // Try to read the exit-code marker (written atomically via mv)
-        if let Ok(output) = exec_in_pod(pods, pod_name, "step", &["cat", "/tmp/.exit-code"]).await {
-            let raw = output.trim();
-            if raw.is_empty() {
-                // File exists but empty — race with write; retry next poll
-                continue;
-            }
-            let code = raw.parse::<i32>().unwrap_or(1);
-            return Ok(code);
-        }
-        // File doesn't exist yet — keep polling
-    }
-}
-
-/// Collect artifacts from a running pod container.
-#[tracing::instrument(skip(pods, state, artifact_defs), fields(%pipeline_id, %step_id), err)]
-async fn collect_step_artifacts(
-    pods: &Api<Pod>,
-    pod_name: &str,
-    state: &AppState,
-    pipeline_id: Uuid,
-    step_id: Uuid,
-    artifact_defs: &[super::definition::ArtifactDef],
-) -> Result<(), PipelineError> {
-    for artifact_def in artifact_defs {
-        // Read and validate config if specified
-        let config_json = if let Some(ref config_path) = artifact_def.config {
-            let config_bytes = exec_in_pod(
-                pods,
-                pod_name,
-                "step",
-                &["cat", &format!("/workspace/{config_path}")],
-            )
-            .await
-            .map_err(|_| {
-                PipelineError::Other(anyhow::anyhow!(
-                    "artifact config file not found: {config_path}"
-                ))
-            })?;
-            let validated = validate_artifact_config(config_bytes.as_bytes(), &artifact_def.name)?;
-            Some(validated)
-        } else {
-            None
-        };
-
-        // Create parent artifact row (is_directory = true)
-        let parent_id = Uuid::new_v4();
-        let parent_minio_path = format!("artifacts/{pipeline_id}/{step_id}/{}", artifact_def.name);
-        // Dynamic query: references new columns from artifact_collection migration.
-        // Will be converted to sqlx::query!() after `just db-prepare`.
-        sqlx::query(
-            "INSERT INTO artifacts (id, pipeline_id, step_id, name, minio_path, content_type,
-                                    size_bytes, artifact_type, config, is_directory)
-             VALUES ($1, $2, $3, $4, $5, NULL, 0, $6, $7, true)",
-        )
-        .bind(parent_id)
-        .bind(pipeline_id)
-        .bind(step_id)
-        .bind(&artifact_def.name)
-        .bind(&parent_minio_path)
-        .bind(&artifact_def.artifact_type)
-        .bind(&config_json)
-        .execute(&state.pool)
-        .await?;
-
-        // Exec tar to stream the artifact path.
-        // Strip leading '/' so the path is relative to -C /workspace
-        // (absolute paths cause tar to ignore -C and archive from root).
-        let rel_path = artifact_def.path.trim_start_matches('/');
-        let tar_result = exec_bytes(
-            pods,
-            pod_name,
-            "step",
-            &["tar", "czf", "-", "-C", "/workspace", rel_path],
-        )
-        .await;
-
-        match tar_result {
-            Ok(tar_bytes) => {
-                if let Err(e) = unpack_and_store(
-                    &tar_bytes,
-                    state,
-                    pipeline_id,
-                    step_id,
-                    &artifact_def.name,
-                    parent_id,
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %e,
-                        artifact = %artifact_def.name,
-                        "failed to unpack and store artifact"
-                    );
-                    return Err(e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    artifact = %artifact_def.name,
-                    "failed to tar artifact path"
-                );
-                // Non-fatal: artifact path may not exist
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A single file extracted from a tar archive, ready for upload.
-#[cfg_attr(test, derive(Debug))]
-struct ExtractedFile {
-    sanitized_path: String,
-    contents: Vec<u8>,
-    content_type: String,
-    size: u64,
-}
-
-/// Decompress a tar.gz byte stream, upload each file to `MinIO`, insert child artifact rows.
-#[tracing::instrument(skip(tar_bytes, state), fields(%pipeline_id, %step_id, %artifact_name), err)]
-async fn unpack_and_store(
-    tar_bytes: &[u8],
-    state: &AppState,
-    pipeline_id: Uuid,
-    step_id: Uuid,
-    artifact_name: &str,
-    parent_id: Uuid,
-) -> Result<(), PipelineError> {
-    // Extract all files synchronously (tar::Entries is not Send)
-    let files = extract_tar_files(
-        tar_bytes,
-        state.config.max_artifact_file_bytes,
-        state.config.max_artifact_total_bytes,
-    )?;
-
-    let file_count = files.len();
-    let total_size: u64 = files.iter().map(|f| f.size).sum();
-
-    // Upload files and insert DB rows asynchronously
-    for file in &files {
-        let minio_path = format!(
-            "artifacts/{pipeline_id}/{step_id}/{artifact_name}/{}",
-            file.sanitized_path
-        );
-
-        // Upload to MinIO
-        state
-            .minio
-            .write(&minio_path, file.contents.clone())
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow::anyhow!("failed to upload artifact to MinIO: {e}"))
-            })?;
-
-        // Insert child artifact row
-        // Dynamic query: references new columns from artifact_collection migration.
-        // Will be converted to sqlx::query!() after `just db-prepare`.
-        sqlx::query(
-            "INSERT INTO artifacts (pipeline_id, step_id, name, minio_path, content_type,
-                                    size_bytes, artifact_type, is_directory, parent_id, relative_path)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, $9)",
-        )
-        .bind(pipeline_id)
-        .bind(step_id)
-        .bind(&file.sanitized_path)
-        .bind(&minio_path)
-        .bind(&file.content_type)
-        .bind(i64::try_from(file.size).unwrap_or(i64::MAX))
-        .bind("file")
-        .bind(parent_id)
-        .bind(&file.sanitized_path)
-        .execute(&state.pool)
-        .await?;
-    }
-
-    tracing::info!(
-        artifact = artifact_name,
-        files = file_count,
-        total_bytes = total_size,
-        "artifact collection complete"
-    );
-    Ok(())
-}
-
-/// Extract files from a tar.gz byte stream synchronously.
-/// Validates path traversal, file/total size limits, and file count.
-fn extract_tar_files(
-    tar_bytes: &[u8],
-    max_file_bytes: u64,
-    max_total_bytes: u64,
-) -> Result<Vec<ExtractedFile>, PipelineError> {
-    let decoder = flate2::read::GzDecoder::new(tar_bytes);
-    let mut archive = tar::Archive::new(decoder);
-
-    let max_file_count: usize = 1000;
-    let mut total_size: u64 = 0;
-    let mut files = Vec::new();
-
-    let entries = archive
-        .entries()
-        .map_err(|e| PipelineError::Other(anyhow::anyhow!("failed to read tar entries: {e}")))?;
-
-    for entry_result in entries {
-        let mut entry = entry_result
-            .map_err(|e| PipelineError::Other(anyhow::anyhow!("failed to read tar entry: {e}")))?;
-
-        // Skip directories and symlinks
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            continue;
-        }
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
-            tracing::warn!("skipping symlink/hard link in artifact tar");
-            continue;
-        }
-
-        let raw_path = entry
-            .path()
-            .map_err(|e| PipelineError::Other(anyhow::anyhow!("invalid tar entry path: {e}")))?
-            .to_string_lossy()
-            .to_string();
-
-        let sanitized_path = sanitize_relative_path(&raw_path)?;
-
-        let entry_size = entry.size();
-        if entry_size > max_file_bytes {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "artifact file '{sanitized_path}' exceeds size limit ({entry_size} > {max_file_bytes} bytes)",
-            )));
-        }
-
-        total_size += entry_size;
-        if total_size > max_total_bytes {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "artifact total size exceeds limit ({total_size} > {max_total_bytes} bytes)",
-            )));
-        }
-
-        if files.len() >= max_file_count {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "artifact file count exceeds limit (> {max_file_count})",
-            )));
-        }
-
-        // Read file contents
-        #[allow(clippy::cast_possible_truncation)]
-        let mut contents = Vec::with_capacity(entry_size as usize);
-        std::io::Read::read_to_end(&mut entry, &mut contents).map_err(|e| {
-            PipelineError::Other(anyhow::anyhow!("failed to read tar entry contents: {e}"))
-        })?;
-
-        let content_type = infer_content_type(&sanitized_path);
-
-        files.push(ExtractedFile {
-            sanitized_path,
-            contents,
-            content_type,
-            size: entry_size,
-        });
-    }
-
-    Ok(files)
-}
-
-/// Validate a config JSON file's structure against the expected schema.
-fn validate_artifact_config(
-    bytes: &[u8],
-    artifact_name: &str,
-) -> Result<serde_json::Value, PipelineError> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
-        PipelineError::Other(anyhow::anyhow!("artifact config is not valid JSON: {e}"))
-    })?;
-
-    let groups = value
-        .get("groups")
-        .and_then(|g| g.as_object())
-        .ok_or_else(|| {
-            PipelineError::Other(anyhow::anyhow!(
-                "artifact config missing root \"groups\" object"
-            ))
-        })?;
-
-    validate_groups(groups, "", 1)?;
-
-    let _ = artifact_name; // used for context in caller
-    Ok(value)
-}
-
-/// Regex pattern for valid group keys: `[a-z0-9_-]{1,64}`.
-fn is_valid_group_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 64
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
-/// Recursively validate groups/items structure. `depth` starts at 1.
-fn validate_groups(
-    groups: &serde_json::Map<String, serde_json::Value>,
-    path: &str,
-    depth: u32,
-) -> Result<(), PipelineError> {
-    if depth > 3 {
-        return Err(PipelineError::Other(anyhow::anyhow!(
-            "artifact config exceeds maximum group nesting depth (3)"
-        )));
-    }
-
-    for (key, group_value) in groups {
-        if !is_valid_group_key(key) {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "invalid group key \"{key}\""
-            )));
-        }
-
-        let group_obj = group_value.as_object().ok_or_else(|| {
-            PipelineError::Other(anyhow::anyhow!("group \"{key}\" must be an object"))
-        })?;
-
-        // label is required
-        if !group_obj.contains_key("label") || !group_obj["label"].is_string() {
-            return Err(PipelineError::Other(anyhow::anyhow!(
-                "group \"{key}\" missing required \"label\" field"
-            )));
-        }
-
-        let current_path = if path.is_empty() {
-            key.clone()
-        } else {
-            format!("{path}.{key}")
-        };
-
-        // Validate nested groups
-        if let Some(sub_groups) = group_obj.get("groups").and_then(|g| g.as_object()) {
-            validate_groups(sub_groups, &current_path, depth + 1)?;
-        }
-
-        // Validate items
-        if let Some(items) = group_obj.get("items").and_then(|i| i.as_object()) {
-            for (item_key, item_value) in items {
-                let item_obj = item_value.as_object().ok_or_else(|| {
-                    PipelineError::Other(anyhow::anyhow!(
-                        "item \"{item_key}\" in group \"{current_path}\" must be an object"
-                    ))
-                })?;
-
-                if !item_obj.contains_key("label") || !item_obj["label"].is_string() {
-                    return Err(PipelineError::Other(anyhow::anyhow!(
-                        "item \"{item_key}\" in group \"{current_path}\" missing required \"label\" field"
-                    )));
-                }
-
-                if let Some(meta) = item_obj.get("meta")
-                    && !meta.is_object()
-                {
-                    return Err(PipelineError::Other(anyhow::anyhow!(
-                        "item \"{item_key}\" meta must be an object"
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Sanitize a relative path from a tar entry, rejecting path traversal.
-fn sanitize_relative_path(raw: &str) -> Result<String, PipelineError> {
-    use std::path::{Component, Path, PathBuf};
-    let path = Path::new(raw);
-    let mut clean = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(c) => clean.push(c),
-            Component::ParentDir => {
-                return Err(PipelineError::Other(anyhow::anyhow!(
-                    "path traversal in artifact: {raw}"
-                )));
-            }
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        return Err(PipelineError::Other(anyhow::anyhow!("empty artifact path")));
-    }
-    Ok(clean.to_string_lossy().to_string())
-}
-
-/// Infer MIME content type from file extension.
-fn infer_content_type(path: &str) -> String {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "pdf" => "application/pdf",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" => "application/javascript",
-        "txt" | "log" => "text/plain",
-        "zip" => "application/zip",
-        "tar" => "application/x-tar",
-        "gz" => "application/gzip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-/// Signal the pod container to exit by creating the `/tmp/.done` marker file.
-async fn signal_pod_done(pods: &Api<Pod>, pod_name: &str) {
-    if let Err(e) = exec_in_pod(pods, pod_name, "step", &["touch", "/tmp/.done"]).await {
-        tracing::warn!(error = %e, pod = pod_name, "failed to signal pod done");
-    }
-}
-
-/// Execute a command in a pod container and return stdout as a String.
-async fn exec_in_pod(
-    pods: &Api<Pod>,
-    pod_name: &str,
-    container: &str,
-    cmd: &[&str],
-) -> Result<String, PipelineError> {
-    let bytes = exec_bytes(pods, pod_name, container, cmd).await?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
-}
-
-/// Execute a command in a pod container and return stdout as raw bytes.
-async fn exec_bytes(
-    pods: &Api<Pod>,
-    pod_name: &str,
-    container: &str,
-    cmd: &[&str],
-) -> Result<Vec<u8>, PipelineError> {
-    use tokio::io::AsyncReadExt;
-
-    let cmd_owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-    let mut ap = pods
-        .exec(
-            pod_name,
-            cmd_owned,
-            &kube::api::AttachParams {
-                container: Some(container.to_string()),
-                stdout: true,
-                stderr: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow::anyhow!("exec in pod failed: {e}")))?;
-
-    let mut stdout_buf = Vec::new();
-    if let Some(mut stdout) = ap.stdout() {
-        stdout
-            .read_to_end(&mut stdout_buf)
-            .await
-            .map_err(|e| PipelineError::Other(anyhow::anyhow!("exec read stdout failed: {e}")))?;
-    }
-
-    ap.join()
-        .await
-        .map_err(|e| PipelineError::Other(anyhow::anyhow!("exec join failed: {e}")))?;
-
-    Ok(stdout_buf)
+    Ok(exit_code)
 }
 
 /// Poll pod status until it reaches a terminal phase.
@@ -1971,11 +1354,11 @@ async fn create_registry_secret(
             )])),
             ..Default::default()
         },
-        string_data: Some(BTreeMap::from([
-            (".dockerconfigjson".into(), config_json.to_string()),
-            ("config.json".into(), config_json.to_string()),
-        ])),
-        type_: Some("kubernetes.io/dockerconfigjson".into()),
+        string_data: Some(BTreeMap::from([(
+            "config.json".into(),
+            config_json.to_string(),
+        )])),
+        type_: Some("Opaque".into()),
         ..Default::default()
     };
 
@@ -2016,17 +1399,6 @@ async fn cleanup_registry_secret(
     }
 }
 
-/// Delete the pipeline's unique namespace after the run finishes.
-/// Best-effort — failures are logged but don't block finalization.
-async fn cleanup_pipeline_namespace(kube: &kube::Client, namespace: &str) {
-    let namespaces: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(kube.clone());
-    if let Err(e) = namespaces.delete(namespace, &DeleteParams::default()).await {
-        tracing::warn!(error = %e, %namespace, "failed to delete pipeline namespace");
-    } else {
-        tracing::info!(%namespace, "pipeline namespace deleted");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Pod spec builder
 // ---------------------------------------------------------------------------
@@ -2050,14 +1422,17 @@ struct PodSpecParams<'a> {
     step_type: &'a str,
     /// Git clone init container image from config (A4: pinned, no `:latest`).
     git_clone_image: &'a str,
-    /// Whether this step has artifacts to collect (wraps script with marker file pattern).
-    has_artifacts: bool,
+    /// Host path to the platform-proxy binary (mesh wrapping). Only used in dev mode.
+    proxy_binary_path: Option<&'a str>,
+    /// Project name for `PLATFORM_SERVICE_NAME` env var (used with proxy).
+    project_name: &'a str,
 }
 
 /// Build the volumes and step container mounts for a pipeline pod.
 fn build_volumes_and_mounts(
     registry_secret: Option<&str>,
     git_secret_name: Option<&str>,
+    proxy_binary_path: Option<&str>,
 ) -> (Vec<Volume>, Vec<VolumeMount>) {
     let mut step_mounts = vec![VolumeMount {
         name: "workspace".into(),
@@ -2101,19 +1476,64 @@ fn build_volumes_and_mounts(
         });
     }
 
+    // Mesh proxy binary — mount from host (dev mode only)
+    if let Some(host_path) = proxy_binary_path {
+        volumes.push(Volume {
+            name: "proxy".into(),
+            host_path: Some(k8s_openapi::api::core::v1::HostPathVolumeSource {
+                path: host_path.into(),
+                type_: Some("Directory".into()),
+            }),
+            ..Default::default()
+        });
+        step_mounts.push(VolumeMount {
+            name: "proxy".into(),
+            mount_path: "/proxy".into(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
     (volumes, step_mounts)
 }
 
-fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
-    let script = if p.has_artifacts {
-        // Wrap user commands with marker file pattern to keep container alive for artifact collection
-        let user_cmds = p.commands.join(" && ");
-        format!(
-            "({user_cmds}); EC=$?; echo $EC > /tmp/.exit-code.tmp && mv /tmp/.exit-code.tmp /tmp/.exit-code; while [ ! -f /tmp/.done ]; do sleep 1; done; exit $EC"
+/// Build command/args and env vars for a step container, optionally wrapping with the mesh proxy.
+fn build_step_container_parts(
+    script: String,
+    env_vars: &[EnvVar],
+    proxy_binary_path: Option<&str>,
+    project_name: &str,
+    step_name: &str,
+) -> (Vec<String>, Vec<String>, Vec<EnvVar>) {
+    let (command, args) = if proxy_binary_path.is_some() {
+        (
+            vec!["/proxy/platform-proxy".to_owned()],
+            vec![
+                "--wrap".to_owned(),
+                "--".to_owned(),
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ],
         )
     } else {
-        p.commands.join(" && ")
+        (vec!["sh".to_owned(), "-c".to_owned()], vec![script])
     };
+
+    let mut env = env_vars.to_vec();
+    if proxy_binary_path.is_some() {
+        env.push(env_var(
+            "PLATFORM_SERVICE_NAME",
+            &format!("pipeline/{project_name}/{step_name}"),
+        ));
+        env.push(env_var("PROXY_HEALTH_PORT", "15020"));
+    }
+
+    (command, args, env)
+}
+
+fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
+    let script = p.commands.join(" && ");
 
     let labels = BTreeMap::from([
         ("platform.io/pipeline".into(), p.pipeline_id.to_string()),
@@ -2128,7 +1548,8 @@ fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
         .or_else(|| p.git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(p.git_ref);
 
-    let (volumes, step_mounts) = build_volumes_and_mounts(p.registry_secret, p.git_secret_name);
+    let (volumes, step_mounts) =
+        build_volumes_and_mounts(p.registry_secret, p.git_secret_name, p.proxy_binary_path);
 
     // S31: Init container volume mounts — workspace + git-auth secret (if present)
     let mut init_mounts = vec![VolumeMount {
@@ -2144,6 +1565,14 @@ fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
             ..Default::default()
         });
     }
+
+    let (step_command, step_args, step_env) = build_step_container_parts(
+        script,
+        p.env_vars,
+        p.proxy_binary_path,
+        p.project_name,
+        p.step_name,
+    );
 
     Pod {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
@@ -2188,10 +1617,10 @@ fn build_pod_spec(p: &PodSpecParams<'_>) -> Pod {
             containers: vec![Container {
                 name: "step".into(),
                 image: Some(p.image.into()),
-                command: Some(vec!["sh".into(), "-c".into()]),
-                args: Some(vec![script]),
+                command: Some(step_command),
+                args: Some(step_args),
                 working_dir: Some("/workspace".into()),
-                env: Some(p.env_vars.to_vec()),
+                env: Some(step_env),
                 volume_mounts: Some(step_mounts),
                 // Imagebuild (kaniko) needs root + capabilities to unpack base
                 // image layers. All other step types get hardened context.
@@ -2566,12 +1995,11 @@ async fn execute_deploy_test_step(
 
     let start = std::time::Instant::now();
 
-    // 1. Create temp test namespace
-    let short_id = &pipeline_id.to_string()[..8];
-    let ns_name = crate::deployer::namespace::test_namespace_name(
-        &state.config,
-        &pipeline.namespace_slug,
-        short_id,
+    // 1. Create temp namespace
+    let ns_name = format!(
+        "{}-test-{}",
+        pipeline.namespace_slug,
+        &pipeline_id.to_string()[..8]
     );
     crate::deployer::namespace::ensure_namespace(
         &state.kube,
@@ -2620,31 +2048,22 @@ async fn execute_deploy_test_step(
 
     // If path ends with `/`, read all YAML files from the directory;
     // otherwise read a single file (backward compat).
-    let manifest_content_opt = if manifests_path.ends_with('/') {
+    let manifest_content = if manifests_path.ends_with('/') {
         super::trigger::read_dir_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
             .await
+            .ok_or_else(|| {
+                PipelineError::InvalidDefinition(format!(
+                    "deploy manifests directory '{manifests_path}' not found or empty at ref '{branch}'"
+                ))
+            })?
     } else {
         super::trigger::read_file_at_ref(std::path::Path::new(&repo_path), branch, manifests_path)
             .await
-    };
-    let Some(manifest_content) = manifest_content_opt else {
-        let msg = if manifests_path.ends_with('/') {
-            format!(
-                "deploy manifests directory '{manifests_path}' not found or empty at ref '{branch}'"
-            )
-        } else {
-            format!("deploy manifest '{manifests_path}' not found at ref '{branch}'")
-        };
-        tracing::error!(%msg, "deploy_test manifest read failed");
-        let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
-        sqlx::query!(
-            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
-            step.id,
-            duration_ms,
-        )
-        .execute(&state.pool)
-        .await?;
-        return Ok(false);
+            .ok_or_else(|| {
+                PipelineError::InvalidDefinition(format!(
+                    "deploy manifest '{manifests_path}' not found at ref '{branch}'"
+                ))
+            })?
     };
 
     // Determine app image ref (use node registry URL for containerd pulls)
@@ -3700,8 +3119,7 @@ pub async fn cancel_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), 
 
     skip_remaining_steps(&state.pool, pipeline_id).await?;
 
-    // Look up project namespace slug and reconstruct pipeline namespace
-    let short_id = &pipeline_id.to_string()[..8];
+    // Look up project namespace for pod deletion
     let namespace = sqlx::query_scalar!(
         r#"
         SELECT p.namespace_slug as "namespace_slug!: String"
@@ -3714,7 +3132,7 @@ pub async fn cancel_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), 
     .await?
     .map_or_else(
         || state.config.pipeline_namespace.clone(),
-        |slug| crate::deployer::namespace::pipeline_namespace_name(&state.config, &slug, short_id),
+        |slug| state.config.project_namespace(&slug, "dev"),
     );
 
     // Delete running pods by label selector
@@ -3729,9 +3147,6 @@ pub async fn cancel_pipeline(state: &AppState, pipeline_id: Uuid) -> Result<(), 
             }
         }
     }
-
-    // Clean up the pipeline namespace
-    cleanup_pipeline_namespace(&state.kube, &namespace).await;
 
     Ok(())
 }
@@ -3901,7 +3316,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         assert_eq!(pod.metadata.name.as_deref(), Some("pl-test-build"));
@@ -3953,7 +3369,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -3990,7 +3407,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4020,7 +3438,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4050,7 +3469,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4077,7 +3497,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4108,7 +3529,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4133,7 +3555,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let labels = pod.metadata.labels.as_ref().unwrap();
@@ -4451,7 +3874,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4476,7 +3900,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4502,7 +3927,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4528,7 +3954,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -4588,7 +4015,7 @@ mod tests {
 
     #[test]
     fn volumes_without_secret_has_one() {
-        let (volumes, mounts) = build_volumes_and_mounts(None, None);
+        let (volumes, mounts) = build_volumes_and_mounts(None, None, None);
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].name, "workspace");
         assert_eq!(mounts.len(), 1);
@@ -4598,7 +4025,7 @@ mod tests {
 
     #[test]
     fn volumes_with_secret_has_two() {
-        let (volumes, mounts) = build_volumes_and_mounts(Some("my-secret"), None);
+        let (volumes, mounts) = build_volumes_and_mounts(Some("my-secret"), None, None);
         assert_eq!(volumes.len(), 2);
         assert_eq!(volumes[1].name, "docker-config");
         let secret_vol = volumes[1].secret.as_ref().unwrap();
@@ -4753,7 +4180,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4777,7 +4205,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4801,7 +4230,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let init = &pod.spec.unwrap().init_containers.unwrap()[0];
@@ -4868,7 +4298,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let container = &pod.spec.unwrap().containers[0];
@@ -4958,7 +4389,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let init = &pod.spec.unwrap().init_containers.unwrap()[0];
@@ -4985,7 +4417,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let init = &pod.spec.unwrap().init_containers.unwrap()[0];
@@ -5024,7 +4457,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -5053,7 +4487,8 @@ mod tests {
             git_secret_name: None,
             step_type: "imagebuild",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -5080,7 +4515,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -5107,7 +4543,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -5321,7 +4758,7 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_workspace_only() {
-        let (volumes, mounts) = build_volumes_and_mounts(None, None);
+        let (volumes, mounts) = build_volumes_and_mounts(None, None, None);
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].name, "workspace");
         assert_eq!(mounts.len(), 1);
@@ -5330,7 +4767,7 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_registry_secret() {
-        let (volumes, mounts) = build_volumes_and_mounts(Some("my-registry-secret"), None);
+        let (volumes, mounts) = build_volumes_and_mounts(Some("my-registry-secret"), None, None);
         assert_eq!(volumes.len(), 2);
         assert_eq!(volumes[1].name, "docker-config");
         assert_eq!(mounts.len(), 2);
@@ -5340,7 +4777,7 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_git_secret() {
-        let (volumes, mounts) = build_volumes_and_mounts(None, Some("git-token-secret"));
+        let (volumes, mounts) = build_volumes_and_mounts(None, Some("git-token-secret"), None);
         assert_eq!(volumes.len(), 2);
         assert_eq!(volumes[1].name, "git-auth");
         // git-auth is a volume only — no corresponding mount in step_mounts
@@ -5349,7 +4786,8 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_both() {
-        let (volumes, mounts) = build_volumes_and_mounts(Some("reg-secret"), Some("git-secret"));
+        let (volumes, mounts) =
+            build_volumes_and_mounts(Some("reg-secret"), Some("git-secret"), None);
         assert_eq!(volumes.len(), 3);
         assert_eq!(mounts.len(), 2);
     }
@@ -5539,7 +4977,8 @@ mod tests {
             git_secret_name: Some("pl-git-12345678"),
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -5581,7 +5020,8 @@ mod tests {
             git_secret_name: Some("pl-git-12345678"),
             step_type: "imagebuild",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6259,7 +5699,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6292,7 +5733,8 @@ mod tests {
             git_secret_name: None,
             step_type: "deploy_test",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6468,7 +5910,7 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_git_secret_has_correct_secret_name() {
-        let (volumes, _) = build_volumes_and_mounts(None, Some("pl-git-abcd1234"));
+        let (volumes, _) = build_volumes_and_mounts(None, Some("pl-git-abcd1234"), None);
         let git_vol = &volumes[1];
         assert_eq!(git_vol.name, "git-auth");
         let secret_source = git_vol.secret.as_ref().unwrap();
@@ -6802,7 +6244,8 @@ mod tests {
             git_secret_name: None,
             step_type: "gitops_sync",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6829,7 +6272,8 @@ mod tests {
             git_secret_name: None,
             step_type: "deploy_watch",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6858,7 +6302,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "custom-registry/git-clone:v3.0",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6945,7 +6390,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6971,7 +6417,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -6996,7 +6443,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -7025,7 +6473,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -7054,7 +6503,8 @@ mod tests {
             git_secret_name: Some("pl-git-abc123"),
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -7276,7 +6726,7 @@ mod tests {
 
     #[test]
     fn build_volumes_and_mounts_all_three_volumes() {
-        let (volumes, mounts) = build_volumes_and_mounts(Some("reg"), Some("git"));
+        let (volumes, mounts) = build_volumes_and_mounts(Some("reg"), Some("git"), None);
         // workspace + docker-config + git-auth
         assert_eq!(volumes.len(), 3);
         assert_eq!(volumes[0].name, "workspace");
@@ -7308,7 +6758,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let labels = pod.metadata.labels.unwrap();
@@ -7338,7 +6789,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -7364,7 +6816,8 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
         let spec = pod.spec.unwrap();
@@ -7421,329 +6874,58 @@ mod tests {
         );
     }
 
-    // -- sanitize_relative_path --
+    // -- proxy wrapping --
 
     #[test]
-    fn sanitize_relative_path_normal() {
+    fn build_volumes_and_mounts_with_proxy() {
+        let (volumes, mounts) = build_volumes_and_mounts(None, None, Some("/host/proxy"));
+        // workspace + proxy
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[1].name, "proxy");
+        let hp = volumes[1].host_path.as_ref().unwrap();
+        assert_eq!(hp.path, "/host/proxy");
+        assert_eq!(hp.type_.as_deref(), Some("Directory"));
+        // step mounts: workspace + proxy
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[1].name, "proxy");
+        assert_eq!(mounts[1].mount_path, "/proxy");
+        assert_eq!(mounts[1].read_only, Some(true));
+    }
+
+    #[test]
+    fn build_step_container_parts_without_proxy() {
+        let env = vec![env_var("FOO", "bar")];
+        let (cmd, args, result_env) =
+            build_step_container_parts("echo hi".into(), &env, None, "proj", "step");
+        assert_eq!(cmd, vec!["sh", "-c"]);
+        assert_eq!(args, vec!["echo hi"]);
+        assert_eq!(result_env.len(), 1);
+        assert!(find_env(&result_env, "PLATFORM_SERVICE_NAME").is_none());
+    }
+
+    #[test]
+    fn build_step_container_parts_with_proxy() {
+        let env = vec![env_var("FOO", "bar")];
+        let (cmd, args, result_env) =
+            build_step_container_parts("echo hi".into(), &env, Some("/p"), "myproj", "build");
+        assert_eq!(cmd, vec!["/proxy/platform-proxy"]);
+        assert_eq!(args, vec!["--wrap", "--", "/bin/sh", "-c", "echo hi"]);
         assert_eq!(
-            sanitize_relative_path("auth/LoginForm.png").unwrap(),
-            "auth/LoginForm.png"
+            find_env(&result_env, "PLATFORM_SERVICE_NAME").unwrap(),
+            "pipeline/myproj/build"
         );
+        assert_eq!(find_env(&result_env, "PROXY_HEALTH_PORT").unwrap(), "15020");
     }
 
     #[test]
-    fn sanitize_relative_path_strips_leading_slash() {
-        assert_eq!(
-            sanitize_relative_path("/auth/LoginForm.png").unwrap(),
-            "auth/LoginForm.png"
-        );
-    }
-
-    #[test]
-    fn sanitize_relative_path_rejects_parent_dir() {
-        assert!(sanitize_relative_path("../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn sanitize_relative_path_rejects_nested_traversal() {
-        assert!(sanitize_relative_path("foo/../../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn sanitize_relative_path_skips_dot() {
-        assert_eq!(
-            sanitize_relative_path("./auth/./LoginForm.png").unwrap(),
-            "auth/LoginForm.png"
-        );
-    }
-
-    #[test]
-    fn sanitize_relative_path_rejects_empty() {
-        assert!(sanitize_relative_path("").is_err());
-    }
-
-    #[test]
-    fn sanitize_relative_path_rejects_root_only() {
-        assert!(sanitize_relative_path("/").is_err());
-    }
-
-    // -- validate_artifact_config --
-
-    #[test]
-    fn validate_config_valid_minimal() {
-        let json = r#"{"groups": {"auth": {"label": "Auth", "items": {"f.png": {"label": "F"}}}}}"#;
-        assert!(validate_artifact_config(json.as_bytes(), "test").is_ok());
-    }
-
-    #[test]
-    fn validate_config_valid_nested_3_levels() {
-        let json = r#"{"groups": {
-            "l1": {"label": "Level 1", "groups": {
-                "l2": {"label": "Level 2", "groups": {
-                    "l3": {"label": "Level 3", "items": {"f.png": {"label": "F"}}}
-                }}
-            }}
-        }}"#;
-        assert!(validate_artifact_config(json.as_bytes(), "test").is_ok());
-    }
-
-    #[test]
-    fn validate_config_rejects_4_levels() {
-        let json = r#"{"groups": {
-            "l1": {"label": "Level 1", "groups": {
-                "l2": {"label": "Level 2", "groups": {
-                    "l3": {"label": "Level 3", "groups": {
-                        "l4": {"label": "Level 4", "items": {}}
-                    }}
-                }}
-            }}
-        }}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(
-            err.to_string().contains("nesting depth"),
-            "expected nesting depth error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_config_rejects_invalid_json() {
-        let err = validate_artifact_config(b"not json", "test").unwrap_err();
-        assert!(err.to_string().contains("not valid JSON"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_config_rejects_missing_groups() {
-        let json = r#"{"foo": "bar"}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(err.to_string().contains("missing root"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_config_rejects_missing_group_label() {
-        let json = r#"{"groups": {"auth": {"items": {}}}}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(
-            err.to_string().contains("missing required \"label\""),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_config_rejects_missing_item_label() {
-        let json = r#"{"groups": {"auth": {"label": "Auth", "items": {"f.png": {"meta": {}}}}}}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(
-            err.to_string().contains("missing required \"label\""),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_config_rejects_invalid_group_key() {
-        let json = r#"{"groups": {"UPPER CASE!": {"label": "Bad"}}}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(err.to_string().contains("invalid group key"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_config_rejects_meta_non_object() {
-        let json = r#"{"groups": {"auth": {"label": "Auth", "items": {"f.png": {"label": "F", "meta": "string"}}}}}"#;
-        let err = validate_artifact_config(json.as_bytes(), "test").unwrap_err();
-        assert!(
-            err.to_string().contains("meta must be an object"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_config_allows_empty_groups() {
-        let json = r#"{"groups": {}}"#;
-        assert!(validate_artifact_config(json.as_bytes(), "test").is_ok());
-    }
-
-    // -- unpack_and_store --
-
-    fn create_test_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut tar_buf = Vec::new();
-        {
-            let enc = flate2::write::GzEncoder::new(&mut tar_buf, flate2::Compression::fast());
-            let mut builder = tar::Builder::new(enc);
-            for (path, data) in files {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(data.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder.append_data(&mut header, path, *data).unwrap();
-            }
-            builder.into_inner().unwrap().finish().unwrap();
-        }
-        tar_buf
-    }
-
-    fn create_test_tar_gz_with_symlink(
-        files: &[(&str, &[u8])],
-        symlink_name: &str,
-        symlink_target: &str,
-    ) -> Vec<u8> {
-        let mut tar_buf = Vec::new();
-        {
-            let enc = flate2::write::GzEncoder::new(&mut tar_buf, flate2::Compression::fast());
-            let mut builder = tar::Builder::new(enc);
-            for (path, data) in files {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(data.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder.append_data(&mut header, path, *data).unwrap();
-            }
-            // Add symlink
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            header.set_mode(0o777);
-            header.set_cksum();
-            builder
-                .append_link(&mut header, symlink_name, symlink_target)
-                .unwrap();
-            builder.into_inner().unwrap().finish().unwrap();
-        }
-        tar_buf
-    }
-
-    #[test]
-    fn unpack_and_store_extracts_files() {
-        let tar_bytes = create_test_tar_gz(&[
-            ("auth/LoginForm.png", b"png1"),
-            ("auth/SignupForm.png", b"png2"),
-            ("dashboard/Main.png", b"png3"),
-        ]);
-
-        let files = extract_tar_files(&tar_bytes, 50 * 1024 * 1024, 500 * 1024 * 1024).unwrap();
-        assert_eq!(files.len(), 3);
-        assert_eq!(files[0].sanitized_path, "auth/LoginForm.png");
-        assert_eq!(files[0].content_type, "image/png");
-        assert_eq!(files[0].contents, b"png1");
-        assert_eq!(files[1].sanitized_path, "auth/SignupForm.png");
-        assert_eq!(files[2].sanitized_path, "dashboard/Main.png");
-    }
-
-    #[test]
-    fn unpack_and_store_skips_symlinks() {
-        let tar_bytes =
-            create_test_tar_gz_with_symlink(&[("real.png", b"data")], "link.png", "real.png");
-
-        // extract_tar_files skips symlinks
-        let files = extract_tar_files(&tar_bytes, 50 * 1024 * 1024, 500 * 1024 * 1024).unwrap();
-        assert_eq!(files.len(), 1, "symlink should be skipped");
-        assert_eq!(files[0].sanitized_path, "real.png");
-    }
-
-    #[test]
-    fn unpack_and_store_rejects_path_traversal() {
-        // The tar crate normalizes ".." paths during building, so we test
-        // sanitize_relative_path directly (which is what extract_tar_files calls).
-        // This verifies the security boundary without needing to craft a raw tar.
-        assert!(sanitize_relative_path("../evil.txt").is_err());
-        assert!(sanitize_relative_path("foo/../../etc/passwd").is_err());
-        // Also verify valid paths pass through extract_tar_files
-        let tar_bytes = create_test_tar_gz(&[("safe/file.txt", b"ok")]);
-        let files = extract_tar_files(&tar_bytes, 50 * 1024 * 1024, 500 * 1024 * 1024).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].sanitized_path, "safe/file.txt");
-    }
-
-    #[test]
-    fn unpack_and_store_enforces_file_size_limit() {
-        // Create a file that's 10 bytes, but set limit to 5
-        let tar_bytes = create_test_tar_gz(&[("big.txt", b"0123456789")]);
-
-        let result = extract_tar_files(&tar_bytes, 5, 500 * 1024 * 1024);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds size limit"),
-            "should reject oversized file"
-        );
-    }
-
-    #[test]
-    fn unpack_and_store_enforces_total_size_limit() {
-        // Two 10-byte files, total limit 15
-        let tar_bytes = create_test_tar_gz(&[("a.txt", b"0123456789"), ("b.txt", b"0123456789")]);
-
-        let result = extract_tar_files(&tar_bytes, 50 * 1024 * 1024, 15);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("total size exceeds"),
-            "should reject total size"
-        );
-    }
-
-    #[test]
-    fn unpack_and_store_enforces_file_count_limit() {
-        // Generate 1001 files would be expensive, so just verify the logic via extract_tar_files
-        // by creating a few files and setting a low limit
-        let tar_bytes = create_test_tar_gz(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
-
-        // We can't easily test 1000+ files, but the logic is in extract_tar_files
-        // where max_file_count = 1000. Just verify 3 files works.
-        let files = extract_tar_files(&tar_bytes, 50 * 1024 * 1024, 500 * 1024 * 1024).unwrap();
-        assert_eq!(files.len(), 3);
-    }
-
-    // -- infer_content_type --
-
-    #[test]
-    fn infer_content_type_png() {
-        assert_eq!(infer_content_type("foo.png"), "image/png");
-    }
-
-    #[test]
-    fn infer_content_type_jpg() {
-        assert_eq!(infer_content_type("bar.jpg"), "image/jpeg");
-    }
-
-    #[test]
-    fn infer_content_type_jpeg() {
-        assert_eq!(infer_content_type("bar.jpeg"), "image/jpeg");
-    }
-
-    #[test]
-    fn infer_content_type_unknown() {
-        assert_eq!(infer_content_type("baz.xyz"), "application/octet-stream");
-    }
-
-    #[test]
-    fn infer_content_type_svg() {
-        assert_eq!(infer_content_type("icon.svg"), "image/svg+xml");
-    }
-
-    #[test]
-    fn infer_content_type_json() {
-        assert_eq!(infer_content_type("config.json"), "application/json");
-    }
-
-    #[test]
-    fn infer_content_type_html() {
-        assert_eq!(infer_content_type("index.html"), "text/html");
-    }
-
-    // -- build_pod_spec artifact wrapping --
-
-    #[test]
-    fn build_pod_spec_artifact_wraps_script() {
+    fn build_pod_spec_with_proxy_wraps_command() {
         let pod = build_pod_spec(&PodSpecParams {
             pod_name: "pl-test",
             pipeline_id: Uuid::nil(),
             project_id: Uuid::nil(),
             step_name: "test",
             image: "alpine:3.19",
-            commands: &["echo a".into(), "echo b".into()],
+            commands: &["echo hi".into()],
             env_vars: &[],
             repo_clone_url: "http://platform:8080/owner/test.git",
             git_ref: "main",
@@ -7751,34 +6933,43 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: true,
+            proxy_binary_path: Some("/host/proxy"),
+            project_name: "my-project",
         });
 
-        let container = &pod.spec.unwrap().containers[0];
-        let script = &container.args.as_ref().unwrap()[0];
-        assert!(
-            script.contains("/tmp/.exit-code"),
-            "script should contain exit-code marker: {script}"
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(
+            container.command.as_ref().unwrap(),
+            &["/proxy/platform-proxy"]
         );
-        assert!(
-            script.contains("/tmp/.done"),
-            "script should contain done marker: {script}"
+        assert_eq!(
+            container.args.as_ref().unwrap(),
+            &["--wrap", "--", "/bin/sh", "-c", "echo hi"]
         );
-        assert!(
-            script.contains("echo a && echo b"),
-            "script should contain original commands: {script}"
-        );
+        // Proxy env vars present
+        let env = container.env.as_ref().unwrap();
+        let svc = env
+            .iter()
+            .find(|e| e.name == "PLATFORM_SERVICE_NAME")
+            .unwrap();
+        assert_eq!(svc.value.as_deref(), Some("pipeline/my-project/test"));
+        let port = env.iter().find(|e| e.name == "PROXY_HEALTH_PORT").unwrap();
+        assert_eq!(port.value.as_deref(), Some("15020"));
+        // Proxy volume is present
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(volumes.iter().any(|v| v.name == "proxy"));
     }
 
     #[test]
-    fn build_pod_spec_no_artifact_script_unchanged() {
+    fn build_pod_spec_without_proxy_uses_sh() {
         let pod = build_pod_spec(&PodSpecParams {
             pod_name: "pl-test",
             pipeline_id: Uuid::nil(),
             project_id: Uuid::nil(),
             step_name: "test",
             image: "alpine:3.19",
-            commands: &["echo a".into(), "echo b".into()],
+            commands: &["echo hi".into()],
             env_vars: &[],
             repo_clone_url: "http://platform:8080/owner/test.git",
             git_ref: "main",
@@ -7786,45 +6977,20 @@ mod tests {
             git_secret_name: None,
             step_type: "command",
             git_clone_image: "alpine/git:2.47.2",
-            has_artifacts: false,
+            proxy_binary_path: None,
+            project_name: "test",
         });
 
-        let container = &pod.spec.unwrap().containers[0];
-        let script = &container.args.as_ref().unwrap()[0];
-        assert_eq!(script, "echo a && echo b");
-        assert!(
-            !script.contains("/tmp/.exit-code"),
-            "script without artifacts should not have exit-code marker"
-        );
-    }
-
-    // -- extract_artifact_defs --
-
-    #[test]
-    fn extract_artifact_defs_from_step_config() {
-        let config = serde_json::json!({
-            "artifacts": [
-                {"name": "ui", "path": "output/", "type": "ui-comp"},
-                {"name": "flows", "path": "flows/", "type": "ui-flow", "config": "flows/config.json"}
-            ]
-        });
-        let defs = extract_artifact_defs(Some(&config));
-        assert_eq!(defs.len(), 2);
-        assert_eq!(defs[0].name, "ui");
-        assert_eq!(defs[0].artifact_type, "ui-comp");
-        assert_eq!(defs[1].config.as_deref(), Some("flows/config.json"));
-    }
-
-    #[test]
-    fn extract_artifact_defs_empty_when_no_config() {
-        let defs = extract_artifact_defs(None);
-        assert!(defs.is_empty());
-    }
-
-    #[test]
-    fn extract_artifact_defs_empty_when_no_artifacts_key() {
-        let config = serde_json::json!({"image_name": "app"});
-        let defs = extract_artifact_defs(Some(&config));
-        assert!(defs.is_empty());
+        let spec = pod.spec.unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(container.command.as_ref().unwrap(), &["sh", "-c"]);
+        assert_eq!(container.args.as_ref().unwrap(), &["echo hi"]);
+        // No proxy env vars
+        let env = container.env.as_ref().unwrap();
+        assert!(env.iter().all(|e| e.name != "PLATFORM_SERVICE_NAME"));
+        assert!(env.iter().all(|e| e.name != "PROXY_HEALTH_PORT"));
+        // No proxy volume
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(!volumes.iter().any(|v| v.name == "proxy"));
     }
 }
