@@ -132,6 +132,12 @@ pub struct Config {
     pub mesh_ca_root_ttl_days: u32,
     /// Path to prebuilt platform-proxy binary directory (dev/test only).
     pub proxy_binary_path: Option<String>,
+    /// Enable ACME (Let's Encrypt) automatic certificate provisioning (default: false).
+    pub acme_enabled: bool,
+    /// ACME directory URL (default: Let's Encrypt production).
+    pub acme_directory_url: String,
+    /// ACME contact email for account registration.
+    pub acme_contact_email: Option<String>,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -348,6 +354,12 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(365),
             proxy_binary_path: env::var("PLATFORM_PROXY_PATH").ok(),
+            acme_enabled: env::var("PLATFORM_ACME_ENABLED")
+                .ok()
+                .is_some_and(|v| v == "true"),
+            acme_directory_url: env::var("PLATFORM_ACME_DIRECTORY_URL")
+                .unwrap_or_else(|_| "https://acme-v02.api.letsencrypt.org/directory".into()),
+            acme_contact_email: env::var("PLATFORM_ACME_CONTACT_EMAIL").ok(),
         }
     }
 
@@ -445,6 +457,9 @@ impl Config {
             mesh_ca_cert_ttl_secs: 3600,
             mesh_ca_root_ttl_days: 365,
             proxy_binary_path: None,
+            acme_enabled: false,
+            acme_directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            acme_contact_email: None,
         }
     }
 }

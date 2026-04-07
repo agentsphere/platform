@@ -17,17 +17,19 @@ use super::router::{
     HeaderMatch, PathMatch, QueryMatch, RouteEntry, RouteRule, RouteSource, RoutingTable,
     StringMatch, WeightedBackend,
 };
-use super::{GatewayConfig, SharedRoutingTable};
+use super::{GatewayConfig, SharedRateLimitConfigs, SharedRoutingTable};
 
 /// Run the watcher loop.
 ///
 /// Watches `HTTPRoute` CRDs and `EndpointSlice` resources. On every change,
-/// rebuilds the full routing table and swaps it atomically.
+/// rebuilds the full routing table and swaps it atomically. Also extracts
+/// rate limit annotations and updates the shared rate limit config map.
 #[tracing::instrument(skip_all)]
 pub async fn run(
     kube_client: kube::Client,
     config: GatewayConfig,
     table: SharedRoutingTable,
+    rate_limit_configs: SharedRateLimitConfigs,
     mut shutdown: watch::Receiver<()>,
 ) {
     loop {
@@ -75,6 +77,7 @@ pub async fn run(
                                 &config,
                             );
                             table.store(std::sync::Arc::new(new_table));
+                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
                         }
                         Ok(Some(Event::Apply(obj))) => {
                             let key = route_key(&obj);
@@ -87,6 +90,7 @@ pub async fn run(
                                 &config,
                             );
                             table.store(std::sync::Arc::new(new_table));
+                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
                         }
                         Ok(Some(Event::Delete(obj))) => {
                             let key = route_key(&obj);
@@ -98,6 +102,7 @@ pub async fn run(
                                 &config,
                             );
                             table.store(std::sync::Arc::new(new_table));
+                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
                         }
                         Ok(None) => {
                             tracing::debug!("HTTPRoute watcher stream ended, restarting");
@@ -514,6 +519,45 @@ fn parse_backend(
         weight,
         endpoints,
     })
+}
+
+/// Update the shared rate limit config map from all known `HTTPRoute` objects.
+///
+/// For each route that has `platform.io/rate-limit` annotations, stores
+/// the parsed config keyed by route name (`metadata.name`).
+fn update_rate_limit_configs(
+    routes: &HashMap<String, DynamicObject>,
+    configs: &SharedRateLimitConfigs,
+    gateway_config: &GatewayConfig,
+) {
+    configs.clear();
+    for obj in routes.values() {
+        if !matches_parent_ref(
+            obj,
+            &gateway_config.gateway_name,
+            &gateway_config.gateway_namespace,
+        ) {
+            continue;
+        }
+        let name = obj.metadata.name.as_deref().unwrap_or("unknown");
+        if let Some(annotations) = &obj.metadata.annotations
+            && let Some(rl_config) = super::rate_limit::parse_annotations(annotations)
+        {
+            configs.insert(name.to_string(), rl_config);
+        }
+    }
+    tracing::debug!(
+        rate_limited_routes = configs.len(),
+        "updated rate limit configurations"
+    );
+}
+
+/// Extract annotations from an `HTTPRoute` for external use.
+/// Returns the annotations map if present.
+pub fn extract_route_annotations(
+    obj: &DynamicObject,
+) -> Option<&std::collections::BTreeMap<String, String>> {
+    obj.metadata.annotations.as_ref()
 }
 
 /// Parse a full `HTTPRoute` JSON into route entries for the routing table.

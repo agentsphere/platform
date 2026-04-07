@@ -103,6 +103,21 @@ pub struct WeightedBackend {
     pub endpoints: Vec<SocketAddr>,
 }
 
+/// Result of a successful route match, including the selected endpoint and metadata.
+#[derive(Debug, Clone)]
+pub struct MatchResult {
+    /// Selected backend endpoint address.
+    pub endpoint: SocketAddr,
+    /// Route name (from `HTTPRoute` `metadata.name`).
+    pub route_name: String,
+    /// Route namespace (from `HTTPRoute` `metadata.namespace`).
+    pub route_namespace: String,
+    /// Backend service name.
+    pub backend_service: String,
+    /// Backend service namespace.
+    pub backend_namespace: String,
+}
+
 impl RoutingTable {
     /// Create an empty, not-ready routing table.
     pub fn empty() -> Self {
@@ -144,41 +159,65 @@ impl RoutingTable {
         headers: &[(String, String)],
         query_params: &[(String, String)],
     ) -> Option<SocketAddr> {
+        self.match_request_full(hostname, path, method, headers, query_params)
+            .map(|m| m.endpoint)
+    }
+
+    /// Match an incoming request and return full match metadata.
+    ///
+    /// Returns the selected backend endpoint plus route/backend metadata for
+    /// observability (span attributes, rate limiting, etc.).
+    pub fn match_request_full(
+        &self,
+        hostname: &str,
+        path: &str,
+        method: &str,
+        headers: &[(String, String)],
+        query_params: &[(String, String)],
+    ) -> Option<MatchResult> {
         // Try exact hostname match first
-        if let Some(backend) =
-            self.try_match_hostname(hostname, path, method, headers, query_params)
+        if let Some(result) =
+            self.try_match_hostname_full(hostname, path, method, headers, query_params)
         {
-            return Some(backend);
+            return Some(result);
         }
 
         // Try wildcard hostname matches (e.g., *.example.com)
         if let Some(domain_suffix) = hostname.split_once('.').map(|(_, rest)| rest) {
             let wildcard = format!("*.{domain_suffix}");
-            if let Some(backend) =
-                self.try_match_hostname(&wildcard, path, method, headers, query_params)
+            if let Some(result) =
+                self.try_match_hostname_full(&wildcard, path, method, headers, query_params)
             {
-                return Some(backend);
+                return Some(result);
             }
         }
 
         // Try default/wildcard routes (empty hostname key)
-        self.try_match_hostname("", path, method, headers, query_params)
+        self.try_match_hostname_full("", path, method, headers, query_params)
     }
 
-    /// Try to match against routes for a specific hostname key.
-    fn try_match_hostname(
+    /// Try to match against routes for a specific hostname key (full metadata).
+    fn try_match_hostname_full(
         &self,
         hostname_key: &str,
         path: &str,
         method: &str,
         headers: &[(String, String)],
         query_params: &[(String, String)],
-    ) -> Option<SocketAddr> {
+    ) -> Option<MatchResult> {
         let routes = self.by_hostname.get(hostname_key)?;
         for route in routes {
             for rule in &route.rules {
-                if rule.matches(path, method, headers, query_params) {
-                    return rule.select_backend();
+                if rule.matches(path, method, headers, query_params)
+                    && let Some((endpoint, backend)) = rule.select_backend_full()
+                {
+                    return Some(MatchResult {
+                        endpoint,
+                        route_name: route.source.name.clone(),
+                        route_namespace: route.source.namespace.clone(),
+                        backend_service: backend.service.clone(),
+                        backend_namespace: backend.namespace.clone(),
+                    });
                 }
             }
         }
@@ -242,6 +281,11 @@ impl RouteRule {
 
     /// Select a backend endpoint using weighted random selection.
     fn select_backend(&self) -> Option<SocketAddr> {
+        self.select_backend_full().map(|(addr, _)| addr)
+    }
+
+    /// Select a backend endpoint and return the chosen backend metadata.
+    fn select_backend_full(&self) -> Option<(SocketAddr, &WeightedBackend)> {
         if self.backends.is_empty() {
             return None;
         }
@@ -254,7 +298,7 @@ impl RouteRule {
                 .backends
                 .iter()
                 .find(|b| !b.endpoints.is_empty())
-                .and_then(WeightedBackend::pick_endpoint);
+                .and_then(|b| b.pick_endpoint().map(|ep| (ep, b)));
         }
 
         let roll = rand::random_range(0..total_weight);
@@ -262,7 +306,7 @@ impl RouteRule {
         for backend in &self.backends {
             cumulative += backend.weight;
             if roll < cumulative && !backend.endpoints.is_empty() {
-                return backend.pick_endpoint();
+                return backend.pick_endpoint().map(|ep| (ep, backend));
             }
         }
 
@@ -270,7 +314,7 @@ impl RouteRule {
         self.backends
             .iter()
             .find(|b| !b.endpoints.is_empty())
-            .and_then(WeightedBackend::pick_endpoint)
+            .and_then(|b| b.pick_endpoint().map(|ep| (ep, b)))
     }
 }
 

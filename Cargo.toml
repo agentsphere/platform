@@ -168,6 +168,9 @@ regex = "1"
 # Concurrent hash map (gateway connection pool)
 dashmap = "6"
 
+# ACME HTTP-01 certificate provisioning (Let's Encrypt)
+instant-acme = "0.7"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 proptest = "1"

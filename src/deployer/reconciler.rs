@@ -1438,6 +1438,7 @@ mod tests {
             ops_repo_id: None,
             manifest_path: None,
             branch_slug: None,
+            target_hostname: None,
             project_name: "my-app".into(),
             namespace_slug: "my-app".into(),
             tracked_resources: Vec::new(),

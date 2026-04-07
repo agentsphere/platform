@@ -3,6 +3,8 @@
 //! Provides a SPIFFE-based certificate authority for mTLS between services.
 //! The root CA key is encrypted at rest using the platform secrets engine.
 
+#[allow(dead_code)]
+pub mod acme;
 pub mod ca;
 pub mod error;
 pub mod identity;
