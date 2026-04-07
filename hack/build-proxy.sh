@@ -53,4 +53,12 @@ case "${HOST_ARCH}" in
     ;;
 esac
 
-echo "  Binaries ready: ${PROXY_DIR}/{amd64,arm64}"
+# Create a `platform-proxy` symlink for the architecture that Kind nodes use.
+# Kind on macOS with Apple Silicon uses amd64 (Rosetta) by default.
+# The test manifests reference /proxy/platform-proxy (not /proxy/amd64).
+CLUSTER_ARCH="amd64"
+if docker exec platform-control-plane uname -m 2>/dev/null | grep -q aarch64; then
+  CLUSTER_ARCH="arm64"
+fi
+ln -sf "${CLUSTER_ARCH}" "${PROXY_DIR}/platform-proxy"
+echo "  Binaries ready: ${PROXY_DIR}/{amd64,arm64,platform-proxy → ${CLUSTER_ARCH}}"
