@@ -7365,6 +7365,117 @@ mod tests {
         assert_eq!(mounts[1].name, "docker-config");
     }
 
+    // -- proxy wrapping tests --
+
+    #[test]
+    fn build_pod_spec_with_proxy_wraps_command() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test-proxy",
+            pipeline_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            step_name: "build",
+            image: "rust:latest",
+            commands: &["cargo build".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/repo.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+            has_artifacts: false,
+            proxy_binary_path: Some("/tmp/proxy"),
+        });
+        let spec = pod.spec.as_ref().unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(
+            container.command.as_ref().unwrap(),
+            &["/proxy/platform-proxy"]
+        );
+        let args = container.args.as_ref().unwrap();
+        assert_eq!(args[0], "--wrap");
+        assert_eq!(args[1], "--");
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "-c");
+        assert!(args[4].contains("cargo build"));
+    }
+
+    #[test]
+    fn build_pod_spec_with_proxy_adds_volume() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test-vol",
+            pipeline_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            step_name: "build",
+            image: "rust:latest",
+            commands: &["echo hi".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/repo.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+            has_artifacts: false,
+            proxy_binary_path: Some("/tmp/proxy"),
+        });
+        let spec = pod.spec.as_ref().unwrap();
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes.iter().any(|v| v.name == "proxy"),
+            "proxy volume should exist"
+        );
+        let mounts = spec.containers[0].volume_mounts.as_ref().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.name == "proxy" && m.mount_path == "/proxy"),
+            "proxy mount should exist"
+        );
+    }
+
+    #[test]
+    fn build_pod_spec_without_proxy_normal_command() {
+        let pod = build_pod_spec(&PodSpecParams {
+            pod_name: "pl-test-noproxy",
+            pipeline_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            step_name: "build",
+            image: "rust:latest",
+            commands: &["echo hi".into()],
+            env_vars: &[],
+            repo_clone_url: "http://platform:8080/owner/repo.git",
+            git_ref: "main",
+            registry_secret: None,
+            git_secret_name: None,
+            step_type: "command",
+            git_clone_image: "alpine/git:2.47.2",
+            has_artifacts: false,
+            proxy_binary_path: None,
+        });
+        let spec = pod.spec.as_ref().unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(container.command.as_ref().unwrap(), &["sh", "-c"]);
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(
+            !volumes.iter().any(|v| v.name == "proxy"),
+            "no proxy volume without proxy_binary_path"
+        );
+    }
+
+    #[test]
+    fn build_volumes_and_mounts_with_proxy_path() {
+        let (volumes, mounts) = build_volumes_and_mounts(None, None, Some("/tmp/proxy"));
+        assert_eq!(volumes.len(), 2); // workspace + proxy
+        assert!(volumes.iter().any(|v| v.name == "proxy"));
+        assert_eq!(mounts.len(), 2); // workspace + proxy
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.name == "proxy" && m.mount_path == "/proxy")
+        );
+    }
+
     // -- pod spec labels validation --
 
     #[test]
