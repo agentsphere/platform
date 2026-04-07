@@ -1,23 +1,27 @@
 # asp — Agentic DevOps
 
-Unified AI-first platform — a single Rust binary replacing Gitea, Woodpecker, Authelia, OpenObserve, Maddy, and OpenBao with one cohesive service.
+A single Rust binary that gives AI coding agents (and the humans who supervise them) everything they need to ship software — git hosting, CI/CD, observability, secrets, and more.
 
-asp is developed by Steven Hooker and officially backed and distributed by AgentSphere GmbH.
+Built by Steven Hooker. Officially backed and distributed by AgentSphere GmbH.
 
-## What It Does
+## Capabilities
 
-Platform consolidates fragmented DevOps tooling into a single binary designed for AI agents (Claude Code) as primary users, with humans as auditors and monitors.
+- **Git hosting** — smart HTTP + SSH server, LFS, file browser, bare repo management
+- **Project management** — issues, merge requests, code review, webhooks, workspaces
+- **CI/CD pipelines** — `.platform.yaml` definitions, Kubernetes pod execution, log streaming
+- **Continuous deployment** — GitOps reconciler, Kustomize/Helm rendering, preview environments
+- **Service mesh** — process-wrapper proxy with automatic mTLS between in-cluster services
+- **TLS termination** — ACME certificate provisioning and external TLS for gateway ingress
+- **AI agent sessions** — ephemeral agent users, scoped identity, Claude CLI integration
+- **Observability** — OTLP ingest (traces, logs, metrics), Parquet cold storage, alerting
+- **Secrets management** — AES-256-GCM encrypted secrets, scoped access, injection into pipelines
+- **Notifications** — email (SMTP), webhooks (HMAC-signed), in-app alerts
+- **Auth & RBAC** — sessions, API tokens, passkeys (WebAuthn), roles, permissions, time-bounded delegation
+- **Container registry** — OCI-compliant push, pull, and manifest management
+- **Guided onboarding** — first-run setup, demo projects, CLI auth flow
+- **Web UI** — embedded Preact SPA for dashboards, project detail, observability views
 
-| Replaces | With |
-|----------|------|
-| Gitea | Git smart HTTP server + project management |
-| Woodpecker | Pipeline engine (K8s pod execution) |
-| Authelia | Built-in auth (sessions, API tokens, RBAC) |
-| OpenObserve | OTEL ingest + Parquet-backed log/trace/metric queries |
-| Maddy | Notification dispatch (email, webhooks, in-app) |
-| OpenBao | AES-256-GCM encrypted secrets in Postgres |
-
-**Kept as infrastructure**: PostgreSQL (CNPG), Valkey, MinIO, Traefik, OTel Collector.
+**Infrastructure dependencies**: PostgreSQL, Valkey, MinIO, Kubernetes.
 
 ## Architecture
 
@@ -166,4 +170,4 @@ Configuration is via environment variables. See `.env.example` for defaults:
 
 This software is licensed under the [Business Source License 1.1](LICENSE). You may use, modify, and self-host asp freely. Providing asp to third parties as a managed or hosted service requires a commercial license from AgentSphere GmbH.
 
-For commercial licensing inquiries, contact sales@agentsphere.de.
+For commercial licensing inquiries, contact sales@agentsphere.cloud.
