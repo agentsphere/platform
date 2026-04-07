@@ -74,18 +74,6 @@ metadata:
 spec:
   gatewayClassName: platform
   listeners:
-    - name: https
-      protocol: HTTPS
-      port: 443
-      tls:
-        mode: Terminate
-        certificateRefs: []
-      allowedRoutes:
-        namespaces:
-          from: Selector
-          selector:
-            matchLabels:
-              platform.io/managed-by: platform
     - name: http
       protocol: HTTP
       port: 80
