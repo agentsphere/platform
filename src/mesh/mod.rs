@@ -73,7 +73,7 @@ pub async fn sync_trust_bundles(state: AppState, mut shutdown: tokio::sync::watc
 /// each has an up-to-date `mesh-ca-bundle` `ConfigMap`. Returns the count
 /// of namespaces synced.
 #[tracing::instrument(skip(kube_client, ca_pem), err)]
-async fn sync_bundles_to_namespaces(
+pub async fn sync_bundles_to_namespaces(
     kube_client: &kube::Client,
     ca_pem: &str,
 ) -> Result<usize, anyhow::Error> {

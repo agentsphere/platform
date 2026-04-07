@@ -3,8 +3,11 @@
 mod helpers;
 
 use axum::http::StatusCode;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
+use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // CA init creates root cert in DB
@@ -273,4 +276,77 @@ async fn endpoints_return_503_when_disabled(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ---------------------------------------------------------------------------
+// Trust bundle synced to labeled namespace via ConfigMap
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn mesh_trust_bundle_synced_to_namespace(pool: PgPool) {
+    let (state, _token) = helpers::test_state(pool.clone()).await;
+
+    // Init mesh CA
+    let mut config = (*state.config).clone();
+    config.mesh_enabled = true;
+    config.mesh_ca_cert_ttl_secs = 3600;
+    config.mesh_ca_root_ttl_days = 365;
+
+    let ca = platform::mesh::MeshCa::init(&pool, &config)
+        .await
+        .expect("mesh CA init should succeed");
+    let ca_pem = ca.trust_bundle().to_owned();
+
+    // Create a test namespace with the platform.io/managed-by=platform label
+    let ns_name = format!("mesh-sync-{}", &Uuid::new_v4().to_string()[..8]);
+    let ns_api: Api<Namespace> = Api::all(state.kube.clone());
+    let ns = Namespace {
+        metadata: ObjectMeta {
+            name: Some(ns_name.clone()),
+            labels: Some(
+                [("platform.io/managed-by".to_string(), "platform".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    ns_api
+        .create(&PostParams::default(), &ns)
+        .await
+        .unwrap_or_else(|e| panic!("failed to create namespace {ns_name}: {e}"));
+
+    // Call the sync function
+    let count = platform::mesh::sync_bundles_to_namespaces(&state.kube, &ca_pem)
+        .await
+        .expect("sync_bundles_to_namespaces should succeed");
+    assert!(
+        count >= 1,
+        "should sync to at least one namespace, got {count}"
+    );
+
+    // Verify the ConfigMap exists in the test namespace
+    let cm_api: Api<ConfigMap> = Api::namespaced(state.kube.clone(), &ns_name);
+    let cm = cm_api
+        .get("mesh-ca-bundle")
+        .await
+        .expect("mesh-ca-bundle ConfigMap should exist");
+
+    let ca_data = cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("ca.pem"))
+        .expect("ConfigMap should have ca.pem key");
+    assert!(
+        ca_data.starts_with("-----BEGIN CERTIFICATE-----"),
+        "ca.pem should contain PEM certificate"
+    );
+    assert_eq!(
+        ca_data, &ca_pem,
+        "ConfigMap ca.pem should match the trust bundle"
+    );
+
+    // Cleanup
+    let _ = ns_api.delete(&ns_name, &DeleteParams::default()).await;
 }

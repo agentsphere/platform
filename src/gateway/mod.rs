@@ -64,13 +64,13 @@ pub async fn reconcile_gateway(state: AppState, mut shutdown: watch::Receiver<()
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ReconcileAction {
+pub enum ReconcileAction {
     NoOp,
     Created,
     Updated,
 }
 
-async fn reconcile_once(state: &AppState) -> anyhow::Result<ReconcileAction> {
+pub async fn reconcile_once(state: &AppState) -> anyhow::Result<ReconcileAction> {
     let config = &state.config;
     let ns = &config.gateway_namespace;
     let image = resolve_gateway_image(config);
