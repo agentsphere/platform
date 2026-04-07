@@ -15,11 +15,11 @@ build_for_target() {
   local target="$1" dest="$2"
   if command -v cross &>/dev/null; then
     echo "    cross build (${target})"
-    cross build --bin platform-proxy --release --target "${target}"
+    SQLX_OFFLINE=true cross build --bin platform-proxy --release --target "${target}"
     cp "${PROJECT_DIR}/target/${target}/release/platform-proxy" "${PROXY_DIR}/${dest}"
   else
     echo "    native build (no cross — ${dest} only works if host matches)"
-    cargo build --bin platform-proxy --release
+    SQLX_OFFLINE=true cargo build --bin platform-proxy --release
     cp "${PROJECT_DIR}/target/release/platform-proxy" "${PROXY_DIR}/${dest}"
   fi
   chmod +x "${PROXY_DIR}/${dest}"
