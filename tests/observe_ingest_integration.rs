@@ -397,9 +397,9 @@ async fn flush_shutdown_drains_remaining(pool: PgPool) {
 // Tests — Phase 5A: per-project OTLP auth enforcement
 // ---------------------------------------------------------------------------
 
-/// OTLP ingest rejects payloads missing `platform.project_id` with 400.
+/// System-level OTLP (no `platform.project_id`) is allowed for admins.
 #[sqlx::test(migrations = "./migrations")]
-async fn otlp_ingest_missing_project_id_returns_400(pool: PgPool) {
+async fn otlp_ingest_missing_project_id_allowed_for_admin(pool: PgPool) {
     let (state, admin_token) = test_state(pool.clone()).await;
 
     let (channels, _spans_rx, _logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
@@ -409,14 +409,27 @@ async fn otlp_ingest_missing_project_id_returns_400(pool: PgPool) {
     let span_id: [u8; 8] = [20; 8];
     let body = build_trace_request_no_project(&trace_id, span_id);
 
-    let (status, resp_bytes) = post_protobuf(&app, &admin_token, "/v1/traces", body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _resp_bytes) = post_protobuf(&app, &admin_token, "/v1/traces", body).await;
+    assert_eq!(status, StatusCode::OK);
+}
 
-    let resp_text = String::from_utf8_lossy(&resp_bytes);
-    assert!(
-        resp_text.contains("platform.project_id"),
-        "error should mention missing project_id attribute: {resp_text}"
-    );
+/// Non-admin user sending OTLP without `platform.project_id` gets 403.
+#[sqlx::test(migrations = "./migrations")]
+async fn otlp_ingest_missing_project_id_forbidden_for_non_admin(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+
+    let (channels, _spans_rx, _logs_rx, _metrics_rx) = platform::observe::ingest::create_channels();
+    let app = ingest_test_router(state, channels);
+
+    let (_uid, user_token) =
+        helpers::create_user(&app, &admin_token, "nonadmin-otlp", "nonadmin@test.com").await;
+
+    let trace_id: [u8; 16] = [10; 16];
+    let span_id: [u8; 8] = [20; 8];
+    let body = build_trace_request_no_project(&trace_id, span_id);
+
+    let (status, _resp_bytes) = post_protobuf(&app, &user_token, "/v1/traces", body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// OTLP ingest rejects invalid (non-UUID) `platform.project_id` with 400.

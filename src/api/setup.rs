@@ -58,9 +58,11 @@ pub fn router() -> Router<AppState> {
 async fn setup_status(
     State(state): State<AppState>,
 ) -> Result<Json<SetupStatusResponse>, ApiError> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.pool)
-        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE user_type IS DISTINCT FROM 'service_account'",
+    )
+    .fetch_one(&state.pool)
+    .await?;
 
     Ok(Json(SetupStatusResponse {
         needs_setup: count == 0,
@@ -72,10 +74,12 @@ async fn setup(
     State(state): State<AppState>,
     Json(body): Json<SetupRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // If users already exist, return 404 (no information leak)
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.pool)
-        .await?;
+    // If human users already exist, return 404 (no information leak)
+    let user_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE user_type IS DISTINCT FROM 'service_account'",
+    )
+    .fetch_one(&state.pool)
+    .await?;
 
     if user_count > 0 {
         return Err(ApiError::NotFound("not found".into()));

@@ -5,23 +5,29 @@ fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
 
-# Serialize tests that bind to PLATFORM_LISTEN_PORT (shared TCP port).
-# All tests using start_test_server / start_pipeline_server must be in this group.
+# Registry pull tests use start_test_server() which binds the fixed
+# PLATFORM_LISTEN_PORT (socat DaemonSet forwards to it). Must stay serial.
 [test-groups.serial-listen-port]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner) | test(executor_)"
+filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
 test-group = "serial-listen-port"
 
 [[profile.ci.overrides]]
-filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner) | test(executor_)"
+filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
 test-group = "serial-listen-port"
 
-# E2E demo pipeline tests also bind the same port.
-[test-groups.pipeline-server]
-max-threads = 1
+# Executor tests use start_pipeline_server() which binds ephemeral ports —
+# they CAN run in parallel. Cap at 8 to avoid overwhelming the Kind cluster
+# (each test spawns K8s pods + pipeline executor).
+[test-groups.executor-parallel]
+max-threads = 8
+
+[[profile.default.overrides]]
+filter = "test(executor_)"
+test-group = "executor-parallel"
 
 [[profile.ci.overrides]]
-filter = "test(demo_pipeline_mr_steps_not_filtered) | test(demo_pipeline_secrets_injected) | test(demo_pipeline_steps_terminal) | test(demo_pipeline_otel_token_created) | test(demo_full_lifecycle)"
-test-group = "pipeline-server"
+filter = "test(executor_)"
+test-group = "executor-parallel"

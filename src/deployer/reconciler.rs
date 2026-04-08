@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Secret;
@@ -14,7 +15,11 @@ use uuid::Uuid;
 use crate::store::AppState;
 
 use super::error::DeployerError;
+use super::image_inspect::{self, EntrypointCache};
 use super::{applier, ops_repo, renderer};
+
+/// Global entrypoint cache (1-hour TTL per entry, used across reconciler runs).
+static ENTRYPOINT_CACHE: LazyLock<EntrypointCache> = LazyLock::new(EntrypointCache::new);
 
 /// Fixed name for the registry pull secret created in every project namespace.
 pub const REGISTRY_PULL_SECRET_NAME: &str = "platform-registry-pull";
@@ -246,6 +251,7 @@ async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<()
         env_suffix(&release.environment),
         &release.project_id.to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         false,
     )
     .await?;
@@ -263,15 +269,32 @@ async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<()
 
     // Inject proxy wrapper if mesh is enabled
     let rendered = if state.config.mesh_enabled {
+        // Resolve entrypoints for containers missing explicit `command` fields
+        // so the proxy wrapper can wrap them.
+        let rendered = resolve_manifest_entrypoints(
+            &rendered,
+            &state.pool,
+            &state.minio,
+            state.config.registry_node_url.as_deref(),
+        )
+        .await;
+
+        // Use platform-runner-bare from the registry as init image (has curl)
+        let init_image = match state
+            .config
+            .registry_node_url
+            .as_deref()
+            .or(state.config.registry_url.as_deref())
+        {
+            Some(reg) => format!("{reg}/platform-runner-bare:v1"),
+            None => "busybox:stable".into(),
+        };
         applier::inject_proxy_wrapper(
             &rendered,
             &applier::ProxyInjectionConfig {
-                proxy_binary_path: if state.config.dev_mode {
-                    state.config.proxy_binary_path.clone()
-                } else {
-                    None
-                },
                 platform_api_url: state.config.platform_api_url.clone(),
+                platform_secret_name: secrets_name.clone(),
+                init_image,
             },
         )?
     } else {
@@ -1427,6 +1450,105 @@ async fn fire_webhook(state: &AppState, release: &PendingRelease, action: &str) 
         &state.webhook_semaphore,
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Entrypoint resolution for proxy wrapping
+// ---------------------------------------------------------------------------
+
+/// Resolve image entrypoints for containers missing an explicit `command` field.
+///
+/// Parses the rendered YAML, finds workload containers without `command`, resolves
+/// their image entrypoint via `image_inspect`, and injects the resolved command
+/// back into the manifest so `inject_proxy_wrapper` can wrap it.
+async fn resolve_manifest_entrypoints(
+    manifests_yaml: &str,
+    pool: &sqlx::PgPool,
+    minio: &opendal::Operator,
+    platform_registry_url: Option<&str>,
+) -> String {
+    let docs = renderer::split_yaml_documents(manifests_yaml);
+    let mut output_docs = Vec::with_capacity(docs.len());
+
+    for doc_str in &docs {
+        let Ok(mut doc) = serde_yaml::from_str::<serde_json::Value>(doc_str) else {
+            output_docs.push(doc_str.clone());
+            continue;
+        };
+
+        let kind = doc["kind"].as_str().unwrap_or_default().to_string();
+
+        let pod_spec_path = match kind.as_str() {
+            "Deployment" | "StatefulSet" | "DaemonSet" | "Job" => "/spec/template/spec",
+            "CronJob" => "/spec/jobTemplate/spec/template/spec",
+            _ => {
+                output_docs.push(doc_str.clone());
+                continue;
+            }
+        };
+
+        if let Some(spec) = doc.pointer_mut(pod_spec_path)
+            && let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut())
+        {
+            for container in containers.iter_mut() {
+                // Skip containers that already have a command
+                let has_command = container
+                    .get("command")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty());
+                if has_command {
+                    continue;
+                }
+
+                let Some(image) = container.get("image").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+
+                // Resolve entrypoint from the image
+                let resolved = image_inspect::resolve_entrypoint(
+                    image,
+                    pool,
+                    minio,
+                    platform_registry_url,
+                    &ENTRYPOINT_CACHE,
+                )
+                .await;
+
+                if let Some(ep) = resolved {
+                    let full_cmd = ep.full_command();
+                    if !full_cmd.is_empty() {
+                        tracing::info!(
+                            image = %image,
+                            command = ?full_cmd,
+                            "resolved image entrypoint for proxy wrapping"
+                        );
+                        container["command"] = serde_json::Value::Array(
+                            full_cmd
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        );
+                        // Clear args — they're now part of command
+                        if let Some(m) = container.as_object_mut() {
+                            m.remove("args");
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        image = %image,
+                        "could not resolve entrypoint — proxy wrapper will skip this container"
+                    );
+                }
+            }
+        }
+
+        match serde_yaml::to_string(&doc) {
+            Ok(yaml_str) => output_docs.push(yaml_str),
+            Err(_) => output_docs.push(doc_str.clone()),
+        }
+    }
+
+    output_docs.join("\n---\n")
 }
 
 // ---------------------------------------------------------------------------

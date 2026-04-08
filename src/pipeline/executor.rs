@@ -446,6 +446,7 @@ async fn ensure_pipeline_namespace(
         "pipeline",
         &project_id.to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         false,
     )
     .await
@@ -2621,6 +2622,7 @@ async fn execute_deploy_test_step(
         "test",
         &project_id.to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         false,
     )
     .await

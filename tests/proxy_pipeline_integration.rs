@@ -19,8 +19,9 @@ use sqlx::PgPool;
 
 fn proxy_config() -> ProxyInjectionConfig {
     ProxyInjectionConfig {
-        proxy_binary_path: Some("/opt/platform/proxy".to_string()),
         platform_api_url: "http://platform.platform.svc.cluster.local:8080".to_string(),
+        platform_secret_name: Some("test-platform-secret".into()),
+        init_image: "busybox:stable".into(),
     }
 }
 

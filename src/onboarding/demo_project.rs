@@ -1020,8 +1020,8 @@ mod tests {
     fn pr1_template_dev_image_has_playwright() {
         let files = demo_pr1_template_files();
         let f = files.iter().find(|f| f.path == "Dockerfile.dev").unwrap();
-        assert!(f.content.contains("playwright"));
-        assert!(f.content.contains("chromium"));
+        assert!(f.content.to_lowercase().contains("playwright"));
+        assert!(f.content.to_lowercase().contains("chromium"));
     }
 
     #[test]

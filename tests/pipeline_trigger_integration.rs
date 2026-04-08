@@ -1803,7 +1803,7 @@ async fn on_push_step_with_artifacts_stored_in_config(pool: PgPool) {
 
     assert_eq!(artifacts[0]["name"], "ui-components");
     assert_eq!(artifacts[0]["path"], ".platform/ui-previews/components/");
-    assert_eq!(artifacts[0]["artifact_type"], "ui-comp");
+    assert_eq!(artifacts[0]["type"], "ui-comp");
     assert_eq!(
         artifacts[0]["config"],
         ".platform/ui-previews/components/config.json"
@@ -1811,7 +1811,7 @@ async fn on_push_step_with_artifacts_stored_in_config(pool: PgPool) {
 
     assert_eq!(artifacts[1]["name"], "ui-flows");
     assert_eq!(artifacts[1]["path"], ".platform/ui-previews/flows/");
-    assert_eq!(artifacts[1]["artifact_type"], "ui-flow");
+    assert_eq!(artifacts[1]["type"], "ui-flow");
     // config not specified → should be null/absent
     assert!(
         artifacts[1]["config"].is_null()

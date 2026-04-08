@@ -21,6 +21,24 @@ pub struct ProxyCerts {
     pub not_after: DateTime<Utc>,
 }
 
+impl ProxyCerts {
+    /// Create an empty placeholder (no valid certs yet).
+    /// mTLS listeners will reject connections until real certs are swapped in.
+    pub fn empty() -> Self {
+        Self {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            ca_pem: String::new(),
+            not_after: Utc::now(),
+        }
+    }
+
+    /// Whether this cert bundle has been populated with real certs.
+    pub fn is_valid(&self) -> bool {
+        !self.cert_pem.is_empty()
+    }
+}
+
 /// Shared, hot-swappable certs handle.
 pub type SharedCerts = Arc<ArcSwap<ProxyCerts>>;
 

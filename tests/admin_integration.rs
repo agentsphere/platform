@@ -134,8 +134,8 @@ async fn admin_list_users(pool: PgPool) {
     let (status, body) = helpers::get_json(&app, &admin_token, "/api/users").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"].as_i64().unwrap(), 3); // admin + 2 users
-    assert_eq!(body["items"].as_array().unwrap().len(), 3);
+    assert_eq!(body["total"].as_i64().unwrap(), 4); // admin + otel-system + 2 users
+    assert_eq!(body["items"].as_array().unwrap().len(), 4);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -650,10 +650,10 @@ async fn admin_list_service_accounts(pool: PgPool) {
     let (status, body) = helpers::get_json(&app, &admin_token, "/api/admin/service-accounts").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"].as_i64().unwrap(), 1);
+    assert_eq!(body["total"].as_i64().unwrap(), 2); // otel-system + list-bot
     let items = body["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["name"], "list-bot");
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|i| i["name"] == "list-bot"));
 }
 
 #[sqlx::test(migrations = "./migrations")]

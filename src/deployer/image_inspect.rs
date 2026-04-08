@@ -103,23 +103,43 @@ pub async fn resolve_entrypoint(
 ) -> Option<ImageEntrypoint> {
     // 1. Cache hit
     if let Some(cached) = cache.get(image_ref) {
+        tracing::debug!("entrypoint cache hit");
         return Some(cached);
     }
 
     // 2. Parse the image ref
     let parsed = parse_image_ref(image_ref);
+    tracing::debug!(
+        registry = %parsed.registry,
+        repository = %parsed.repository,
+        reference = %parsed.reference,
+        platform_registry_url = ?platform_registry_url,
+        "parsed image ref"
+    );
 
     // 3. Try internal registry
-    let result = if is_internal_image(&parsed, platform_registry_url) {
+    let is_internal = is_internal_image(&parsed, platform_registry_url);
+    tracing::debug!(is_internal, "image classification");
+
+    let result = if is_internal {
         resolve_from_internal(&parsed, pool, minio).await
     } else {
         resolve_from_public(&parsed).await
     };
 
+    if result.is_none() {
+        tracing::debug!("entrypoint resolution returned None");
+    }
+
     // 4. Cache on success
     if let Some(ref ep) = result
         && !ep.is_empty()
     {
+        tracing::debug!(
+            entrypoint = ?ep.entrypoint,
+            cmd = ?ep.cmd,
+            "resolved entrypoint, caching"
+        );
         cache.insert(image_ref.to_string(), ep.clone());
     }
 
@@ -196,7 +216,10 @@ async fn resolve_from_internal(
             .await
             .ok()?;
 
-    let repo_id = repo_id?;
+    let Some(repo_id) = repo_id else {
+        tracing::debug!(repository = %parsed.repository, "repository not found in DB");
+        return None;
+    };
 
     // Find manifest by tag
     let manifest_digest: Option<String> = sqlx::query_scalar(
@@ -208,7 +231,11 @@ async fn resolve_from_internal(
     .await
     .ok()?;
 
-    let manifest_digest = manifest_digest?;
+    let Some(manifest_digest) = manifest_digest else {
+        tracing::debug!(tag = %parsed.reference, %repo_id, "tag not found in DB");
+        return None;
+    };
+    tracing::debug!(%manifest_digest, "found manifest digest");
 
     // Fetch manifest content
     let manifest_content: Option<Vec<u8>> = sqlx::query_scalar(
@@ -220,27 +247,55 @@ async fn resolve_from_internal(
     .await
     .ok()?;
 
-    let manifest_content = manifest_content?;
+    let Some(manifest_content) = manifest_content else {
+        tracing::debug!(%manifest_digest, "manifest content not found in DB");
+        return None;
+    };
 
     // Parse manifest to get config descriptor
-    let config_digest = extract_config_digest(&manifest_content)?;
+    let Some(config_digest) = extract_config_digest(&manifest_content) else {
+        tracing::debug!("failed to extract config digest from manifest");
+        return None;
+    };
+    tracing::debug!(%config_digest, "extracted config digest");
 
     // Fetch config blob from MinIO
-    let minio_path: Option<String> = sqlx::query_scalar(
-        "SELECT minio_path FROM registry_blobs b \
-         JOIN registry_blob_repository_links l ON l.blob_digest = b.digest \
+    let minio_path: Option<String> = match sqlx::query_scalar(
+        "SELECT b.minio_path FROM registry_blobs b \
+         JOIN registry_blob_links l ON l.blob_digest = b.digest \
          WHERE l.repository_id = $1 AND b.digest = $2",
     )
     .bind(repo_id)
     .bind(&config_digest)
     .fetch_optional(pool)
     .await
-    .ok()?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, %config_digest, "config blob DB query failed");
+            return None;
+        }
+    };
 
-    let minio_path = minio_path?;
-    let config_bytes = minio.read(&minio_path).await.ok()?.to_vec();
+    let Some(minio_path) = minio_path else {
+        tracing::debug!(%config_digest, "config blob not found in DB");
+        return None;
+    };
+    tracing::debug!(%minio_path, "fetching config from MinIO");
 
-    parse_image_config(&config_bytes)
+    let config_bytes = match minio.read(&minio_path).await {
+        Ok(buf) => buf.to_vec(),
+        Err(e) => {
+            tracing::debug!(error = %e, %minio_path, "failed to read config from MinIO");
+            return None;
+        }
+    };
+
+    let result = parse_image_config(&config_bytes);
+    if result.is_none() {
+        tracing::debug!("failed to parse image config JSON");
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

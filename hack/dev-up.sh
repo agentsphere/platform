@@ -128,6 +128,7 @@ PLATFORM_AGENT_RUNNER_DIR=/tmp/platform-e2e/${WORKTREE}/agent-runner
 
 # --- Proxy binary (worktree-scoped, for pipeline/agent pod wrapping) ---
 PLATFORM_PROXY_PATH=/tmp/platform-e2e/${WORKTREE}/proxy
+PLATFORM_PROXY_BINARY_DIR=/tmp/platform-e2e/${WORKTREE}/proxy
 
 # --- K8s config ---
 KUBECONFIG=${KUBECONFIG_PATH}
@@ -142,6 +143,9 @@ WEBAUTHN_RP_NAME=Platform
 
 PLATFORM_MCP_SERVERS_TARBALL=/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz
 PLATFORM_SEED_COMMANDS_PATH=${PROJECT_DIR}/seed-commands
+
+# --- Mesh proxy injection ---
+PLATFORM_MESH_ENABLED=true
 
 # --- Gateway auto-deployment ---
 PLATFORM_GATEWAY_AUTO_DEPLOY=true

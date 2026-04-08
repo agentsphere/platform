@@ -27,6 +27,7 @@
 //!   PROXY_SCRAPE_REDIS_URL    -- Redis/Valkey connection URL for INFO scraping
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::sync::{mpsc, watch};
@@ -37,8 +38,12 @@ use platform_proxy::proxy::{
     tcp_proxy, tls, traces,
 };
 
-/// Bootstrap mTLS certs if any mesh feature is enabled.
-async fn bootstrap_mtls(
+/// Start mTLS bootstrap with retry in the background.
+///
+/// Returns `SharedCerts` immediately. The certs are populated asynchronously
+/// once the platform API becomes available. mTLS listeners use `ArcSwap` to
+/// pick up the certs when they arrive — connections before that are plain TCP.
+fn spawn_mtls_bootstrap(
     config: &ProxyConfig,
     shutdown_rx: &watch::Receiver<()>,
 ) -> Option<tls::SharedCerts> {
@@ -47,21 +52,48 @@ async fn bootstrap_mtls(
     if !needs_mtls {
         return None;
     }
-    match tls::bootstrap_cert(config).await {
-        Ok(initial_certs) => {
-            let shared = Arc::new(ArcSwap::from_pointee(initial_certs));
-            tokio::spawn(tls::cert_renewal_loop(
-                config.clone(),
-                shared.clone(),
-                shutdown_rx.clone(),
-            ));
-            Some(shared)
+
+    // Create shared certs holder — starts empty, filled by background task
+    let shared = Arc::new(ArcSwap::from_pointee(tls::ProxyCerts::empty()));
+
+    let config = config.clone();
+    let certs = shared.clone();
+    let mut shutdown = shutdown_rx.clone();
+    let renewal_shutdown = shutdown_rx.clone();
+
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(2);
+        let max_backoff = Duration::from_secs(30);
+
+        loop {
+            match tls::bootstrap_cert(&config).await {
+                Ok(initial_certs) => {
+                    tracing::info!(
+                        not_after = %initial_certs.not_after,
+                        "mTLS certificates bootstrapped"
+                    );
+                    certs.store(Arc::new(initial_certs));
+                    // Start renewal loop
+                    tls::cert_renewal_loop(config, certs, renewal_shutdown).await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        retry_secs = backoff.as_secs(),
+                        "cert bootstrap failed, retrying"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.changed() => return,
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "cert bootstrap failed, running without mTLS");
-            None
-        }
-    }
+    });
+
+    Some(shared)
 }
 
 /// Start mesh (mTLS listeners, TCP proxies) and scraper components.
@@ -225,9 +257,10 @@ async fn main() {
         shutdown_rx.clone(),
     ));
 
-    let certs = bootstrap_mtls(&config, &shutdown_rx).await;
+    // Bootstrap mTLS in background (retries until platform API is available)
+    let certs = spawn_mtls_bootstrap(&config, &shutdown_rx);
 
-    // Start mTLS components + scraper
+    // Start mTLS components + scraper (listeners use ArcSwap, pick up certs when ready)
     start_mesh_components(
         &config,
         certs.as_ref(),
@@ -238,7 +271,7 @@ async fn main() {
         &shutdown_rx,
     );
 
-    // Spawn child process (if any)
+    // Spawn child process (if any) — starts immediately, doesn't wait for mTLS
     if child_args.is_empty() {
         tracing::info!("no child command specified, running in proxy-only mode");
         // Wait for shutdown signal
@@ -276,7 +309,7 @@ async fn main() {
                 let exit_code = child::wait_for_exit(&mut child, shutdown_tx).await;
 
                 // Give a brief moment for final flush
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
 
                 std::process::exit(exit_code);
             }

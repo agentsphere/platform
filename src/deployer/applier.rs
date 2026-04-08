@@ -470,7 +470,7 @@ pub fn inject_env_from_secret(
         output_docs.push(yaml_str);
     }
 
-    Ok(output_docs.join("---\n"))
+    Ok(output_docs.join("\n---\n"))
 }
 
 /// Inject `envFrom` into all `containers` and `initContainers` under the given
@@ -518,19 +518,23 @@ fn inject_env_from_to_container(container: &mut serde_json::Value, secret_name: 
 
 /// Configuration for proxy injection.
 pub struct ProxyInjectionConfig {
-    /// Dev mode: host path to proxy binary directory.
-    pub proxy_binary_path: Option<String>,
-    /// Platform API URL for OTLP export.
+    /// Platform API URL for proxy binary download and OTLP export.
     pub platform_api_url: String,
+    /// Name of the K8s Secret in the target namespace that contains `PLATFORM_API_TOKEN`.
+    /// Used by the init container to authenticate the proxy binary download.
+    pub platform_secret_name: Option<String>,
+    /// Image for the proxy download init container (e.g. `registry/platform-runner-bare:latest`).
+    /// Must have `curl` or `wget` available. Falls back to `busybox:stable` if unset.
+    pub init_image: String,
 }
 
 /// Inject platform-proxy wrapper into all containers in workload manifests.
 ///
 /// For each container in Deployment/StatefulSet/DaemonSet/Job/CronJob:
-/// 1. Wraps the container command with `/proxy/platform-proxy --wrap --`
-/// 2. Adds proxy volume mount at `/proxy` (read-only)
-/// 3. Adds proxy env vars (`PLATFORM_API_URL`, `PLATFORM_SERVICE_NAME`)
-/// 4. Adds proxy volume (`hostPath` from `proxy_binary_path`)
+/// 1. Adds an init container that downloads the proxy binary from the platform API
+/// 2. Wraps the container command with `/proxy/platform-proxy --wrap --`
+/// 3. Adds proxy volume mount at `/proxy` (read-only, emptyDir shared with init container)
+/// 4. Adds proxy env vars (`PLATFORM_API_URL`, `PLATFORM_SERVICE_NAME`)
 ///
 /// Containers without an explicit `command` require entrypoint resolution
 /// (handled separately by the caller before invoking this function).
@@ -571,7 +575,65 @@ pub fn inject_proxy_wrapper(
         output_docs.push(yaml_str);
     }
 
-    Ok(output_docs.join("---\n"))
+    Ok(output_docs.join("\n---\n"))
+}
+
+/// Build the init container that downloads the proxy binary from the platform API.
+fn build_proxy_init_container(config: &ProxyInjectionConfig) -> serde_json::Value {
+    // Download script: detect arch, download proxy binary via curl, make executable.
+    let download_script = r#"set -eu
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+echo "[proxy-init] Downloading platform-proxy ($ARCH)..."
+AUTH_HEADER=""
+if [ -n "${PLATFORM_API_TOKEN:-}" ]; then
+  AUTH_HEADER="Authorization: Bearer $PLATFORM_API_TOKEN"
+fi
+if command -v curl >/dev/null 2>&1; then
+  curl -sf ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+    "${PLATFORM_API_URL}/api/downloads/platform-proxy?arch=${ARCH}" \
+    -o /proxy/platform-proxy
+elif command -v wget >/dev/null 2>&1; then
+  wget -q ${AUTH_HEADER:+--header="$AUTH_HEADER"} \
+    "${PLATFORM_API_URL}/api/downloads/platform-proxy?arch=${ARCH}" \
+    -O /proxy/platform-proxy
+else
+  echo "[proxy-init] ERROR: need curl or wget" >&2; exit 1
+fi
+chmod +x /proxy/platform-proxy
+echo "[proxy-init] platform-proxy downloaded""#;
+
+    let mut env =
+        vec![serde_json::json!({"name": "PLATFORM_API_URL", "value": config.platform_api_url})];
+
+    // If we have a platform secret, pull PLATFORM_API_TOKEN from it
+    if let Some(ref secret_name) = config.platform_secret_name {
+        env.push(serde_json::json!({
+            "name": "PLATFORM_API_TOKEN",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_name,
+                    "key": "PLATFORM_API_TOKEN",
+                    "optional": true
+                }
+            }
+        }));
+    }
+
+    serde_json::json!({
+        "name": "proxy-init",
+        "image": config.init_image,
+        "command": ["sh", "-c"],
+        "args": [download_script],
+        "env": env,
+        "volumeMounts": [{
+            "name": "platform-proxy",
+            "mountPath": "/proxy"
+        }],
+        "resources": {
+            "requests": {"cpu": "50m", "memory": "32Mi"},
+            "limits": {"cpu": "200m", "memory": "64Mi"}
+        }
+    })
 }
 
 /// Inject proxy wrapping into all containers under a pod spec path.
@@ -585,24 +647,47 @@ fn inject_proxy_to_pod_spec(
         return;
     };
 
-    // Add proxy volume to the pod spec
-    let proxy_volume = if let Some(ref host_path) = config.proxy_binary_path {
-        serde_json::json!({
-            "name": "platform-proxy",
-            "hostPath": { "path": host_path, "type": "Directory" }
-        })
-    } else {
-        return; // No proxy binary path configured — skip injection
-    };
+    // Check if any container has a command to wrap (skip if none do)
+    let has_wrappable = spec
+        .get("containers")
+        .and_then(|v| v.as_array())
+        .is_some_and(|containers| {
+            containers.iter().any(|c| {
+                c.get("command")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty())
+            })
+        });
+    if !has_wrappable {
+        return;
+    }
+
+    // Add emptyDir proxy volume
+    let proxy_volume = serde_json::json!({
+        "name": "platform-proxy",
+        "emptyDir": { "sizeLimit": "50Mi" }
+    });
 
     let volumes = spec.get_mut("volumes").and_then(|v| v.as_array_mut());
     if let Some(vols) = volumes {
-        // Don't add if already present
         if !vols.iter().any(|v| v["name"] == "platform-proxy") {
             vols.push(proxy_volume);
         }
     } else {
         spec["volumes"] = serde_json::json!([proxy_volume]);
+    }
+
+    // Add proxy download init container
+    let init_container = build_proxy_init_container(config);
+    if let Some(init_containers) = spec
+        .get_mut("initContainers")
+        .and_then(|v| v.as_array_mut())
+    {
+        if !init_containers.iter().any(|c| c["name"] == "proxy-init") {
+            init_containers.push(init_container);
+        }
+    } else {
+        spec["initContainers"] = serde_json::json!([init_container]);
     }
 
     // Wrap each container
@@ -2204,8 +2289,9 @@ metadata:
 
     fn proxy_config() -> ProxyInjectionConfig {
         ProxyInjectionConfig {
-            proxy_binary_path: Some("/tmp/proxy".into()),
             platform_api_url: "http://platform:8080".into(),
+            platform_secret_name: Some("my-platform-secret".into()),
+            init_image: "busybox:stable".into(),
         }
     }
 
@@ -2257,11 +2343,16 @@ spec:
         let result = inject_proxy_wrapper(yaml, &proxy_config()).unwrap();
         let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
 
-        // Volume added
+        // emptyDir volume added (not hostPath)
         let volumes = doc["spec"]["template"]["spec"]["volumes"]
             .as_array()
             .unwrap();
-        assert!(volumes.iter().any(|v| v["name"] == "platform-proxy"));
+        let proxy_vol = volumes
+            .iter()
+            .find(|v| v["name"] == "platform-proxy")
+            .unwrap();
+        assert!(!proxy_vol["emptyDir"].is_null(), "should be emptyDir");
+        assert!(proxy_vol["hostPath"].is_null(), "must not use hostPath");
 
         // Mount added
         let mounts = doc["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
@@ -2272,6 +2363,12 @@ spec:
                 .iter()
                 .any(|m| m["name"] == "platform-proxy" && m["mountPath"] == "/proxy")
         );
+
+        // Init container added
+        let init_containers = doc["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        assert!(init_containers.iter().any(|c| c["name"] == "proxy-init"));
     }
 
     #[test]
@@ -2310,6 +2407,9 @@ spec:
         let container = &doc["spec"]["template"]["spec"]["containers"][0];
         // No command wrapping — original has no command
         assert!(container["command"].is_null());
+        // No init container or volume added either
+        assert!(doc["spec"]["template"]["spec"]["initContainers"].is_null());
+        assert!(doc["spec"]["template"]["spec"]["volumes"].is_null());
     }
 
     #[test]
@@ -2444,5 +2544,69 @@ spec:
             args,
             vec!["--wrap", "--", "docker-entrypoint.sh", "postgres"]
         );
+    }
+
+    #[test]
+    fn inject_proxy_multidoc_service_no_resources() {
+        // Reproduces the valkey.yaml template: Deployment + Service in one file.
+        // The Service must NOT get a `resources` field after round-trip.
+        let yaml = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-cache
+  template:
+    metadata:
+      labels:
+        app: demo-cache
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          command: ["docker-entrypoint.sh"]
+          args: ["valkey-server"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-cache
+spec:
+  selector:
+    app: demo-cache
+  ports:
+    - port: 6379
+      targetPort: 6379
+"#;
+        let result = inject_proxy_wrapper(yaml, &proxy_config()).unwrap();
+
+        // Re-split and verify Service doesn't have resources
+        let docs = crate::deployer::renderer::split_yaml_documents(&result);
+        for doc_str in &docs {
+            let doc: serde_json::Value = serde_yaml::from_str(doc_str).unwrap();
+            if doc["kind"] == "Service" {
+                assert!(
+                    doc.get("resources").is_none(),
+                    "Service should NOT have top-level resources field. Got:\n{doc_str}"
+                );
+                // Also check spec level
+                assert!(
+                    doc["spec"].get("resources").is_none(),
+                    "Service spec should NOT have resources field. Got:\n{doc_str}"
+                );
+            }
+        }
     }
 }

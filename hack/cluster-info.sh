@@ -50,10 +50,22 @@ else
     -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "172.18.0.1")
 fi
 
-# ── Find free port inside the cluster node ──────────────────────────────
+# ── Find free port inside the cluster node (in K8s NodePort range) ──────
 find_free_node_port() {
   docker exec "${NODE_CONTAINER}" \
-    python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()"
+    python3 -c "
+import socket, random
+while True:
+    port = random.randint(30000, 32767)
+    s = socket.socket()
+    try:
+        s.bind(('', port))
+        print(port)
+        s.close()
+        break
+    except OSError:
+        s.close()
+"
 }
 
 export NODE_IP NODE_CONTAINER KUBECONFIG_PATH PLATFORM_HOST

@@ -183,7 +183,7 @@ async fn deploy_preview_invalid_service_name(pool: PgPool) {
     let (status, body) = helpers::get_json(
         &app,
         &admin_token,
-        &format!("/deploy-preview/{project_id}/INVALID_SVC"),
+        &format!("/deploy-preview/{project_id}/INVALID_SVC/production"),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -200,7 +200,7 @@ async fn deploy_preview_nonexistent_project(pool: PgPool) {
     let (status, _) = helpers::get_json(
         &app,
         &admin_token,
-        &format!("/deploy-preview/{fake_id}/my-svc"),
+        &format!("/deploy-preview/{fake_id}/my-svc/production"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -218,7 +218,7 @@ async fn deploy_preview_private_project_non_member(pool: PgPool) {
     let (status, _) = helpers::get_json(
         &app,
         &user_token,
-        &format!("/deploy-preview/{project_id}/my-svc"),
+        &format!("/deploy-preview/{project_id}/my-svc/production"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -231,7 +231,11 @@ async fn deploy_preview_no_auth_returns_401(pool: PgPool) {
     let app = test_router(state);
 
     let fake_id = Uuid::new_v4();
-    let (status, _) =
-        helpers::get_json(&app, "", &format!("/deploy-preview/{fake_id}/my-svc")).await;
+    let (status, _) = helpers::get_json(
+        &app,
+        "",
+        &format!("/deploy-preview/{fake_id}/my-svc/production"),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

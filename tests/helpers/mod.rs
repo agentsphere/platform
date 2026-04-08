@@ -233,6 +233,10 @@ pub async fn test_state(pool: PgPool) -> (AppState, String) {
         mesh_ca_cert_ttl_secs: 3600,
         mesh_ca_root_ttl_days: 365,
         proxy_binary_path: std::env::var("PLATFORM_PROXY_PATH").ok(),
+        proxy_binary_dir: std::env::var("PLATFORM_PROXY_BINARY_DIR").map_or_else(
+            |_| "/tmp/test-platform-proxy".into(),
+            std::path::PathBuf::from,
+        ),
         gateway_auto_deploy: std::env::var("PLATFORM_GATEWAY_AUTO_DEPLOY")
             .ok()
             .is_some_and(|v| v == "true"),
@@ -624,11 +628,10 @@ impl Drop for ServerGuard {
     }
 }
 
-/// Start a real TCP server for integration tests that need pod connectivity.
+/// Start a real TCP server on the fixed `PLATFORM_LISTEN_PORT`.
 ///
-/// Binds to `PLATFORM_LISTEN_PORT` (set by `test-in-cluster.sh`).
-/// Returns `(state, admin_token, server_guard)`. The guard aborts the server
-/// task on drop so the port is released for subsequent tests.
+/// Used by registry pull tests where the K8s socat DaemonSet proxy forwards
+/// to this fixed port. **Must be serialized** — see `.config/nextest.toml`.
 pub async fn start_test_server(pool: PgPool) -> (AppState, String, ServerGuard) {
     let port: u16 = std::env::var("PLATFORM_LISTEN_PORT")
         .expect("PLATFORM_LISTEN_PORT must be set — run via: just test-integration")
@@ -653,16 +656,82 @@ pub async fn start_test_server(pool: PgPool) -> (AppState, String, ServerGuard) 
     (state, token, ServerGuard(handle.abort_handle()))
 }
 
-/// Start a real TCP server for pipeline executor tests.
+/// Start a real TCP server on an **ephemeral port** for pipeline executor tests.
 ///
-/// Binds to `PLATFORM_LISTEN_PORT` (same as `start_test_server`) so that K8s
-/// pods in Kind can reach the host via the address configured by the test script.
-/// **Must be serialized** via nextest test-groups to avoid port conflicts — see
-/// `.config/nextest.toml` `serial-listen-port` group.
-///
-/// Returns `(state, admin_token, server_guard)`.
+/// Binds to port 0 (OS-assigned), then updates `config.platform_api_url` and
+/// `config.registry_url` so that K8s pods spawned by the executor connect back
+/// to this test's unique port via `host.docker.internal`. This allows executor
+/// tests to run **in parallel** — no shared port, no serialization needed.
 pub async fn start_pipeline_server(pool: PgPool) -> (AppState, String, ServerGuard) {
-    start_test_server(pool).await
+    // Bind to port 0 — OS assigns a free ephemeral port
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        .expect("create socket");
+    socket.set_reuse_address(true).expect("set SO_REUSEADDR");
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    socket.bind(&addr.into()).expect("bind listener");
+    socket.listen(128).expect("listen");
+    socket.set_nonblocking(true).expect("set nonblocking");
+    let listener =
+        tokio::net::TcpListener::from_std(socket.into()).expect("convert to tokio listener");
+    let actual_port = listener.local_addr().expect("local_addr").port();
+
+    let (state, token) = test_state(pool).await;
+
+    // Extract host from PLATFORM_API_URL (e.g. "http://host.docker.internal:8080")
+    // and rebuild the URL with the actual ephemeral port.
+    let base_url =
+        std::env::var("PLATFORM_API_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+    let new_api_url = replace_port_in_url(&base_url, actual_port);
+
+    // Update config with the ephemeral port
+    let mut config = (*state.config).clone();
+    config.platform_api_url = new_api_url;
+    if let Some(ref reg) = config.registry_url {
+        config.registry_url = Some(replace_port_in_host_port(reg, actual_port));
+    }
+    let state = AppState {
+        config: Arc::new(config),
+        ..state
+    };
+
+    let app = test_router(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (state, token, ServerGuard(handle.abort_handle()))
+}
+
+/// Replace the port in a URL like `http://host:PORT/path` → `http://host:NEW/path`.
+fn replace_port_in_url(url: &str, new_port: u16) -> String {
+    // Find the last colon before any path (scheme has "://" so we skip that)
+    if let Some(authority_start) = url.find("://") {
+        let rest = &url[authority_start + 3..];
+        if let Some(colon) = rest.find(':') {
+            let host = &rest[..colon];
+            // After the port there may be a path
+            let after_port = &rest[colon + 1..];
+            let path_start = after_port.find('/').unwrap_or(after_port.len());
+            let path = &after_port[path_start..];
+            return format!(
+                "{}://{}:{}{}",
+                &url[..authority_start],
+                host,
+                new_port,
+                path
+            );
+        }
+    }
+    // Fallback: just append port
+    format!("{}:{}", url.trim_end_matches('/'), new_port)
+}
+
+/// Replace the port in a host:port string like `host:PORT` → `host:NEW`.
+fn replace_port_in_host_port(addr: &str, new_port: u16) -> String {
+    if let Some(colon) = addr.rfind(':') {
+        format!("{}:{}", &addr[..colon], new_port)
+    } else {
+        format!("{}:{}", addr, new_port)
+    }
 }
 
 /// Extract JSON body from a response.

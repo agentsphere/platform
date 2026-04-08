@@ -22,7 +22,7 @@ use uuid::Uuid;
 /// Create a unique test namespace and return its name.
 /// Caller is responsible for cleanup via `cleanup_namespace`.
 async fn create_test_namespace(kube: &kube::Client) -> String {
-    let name = format!("gw-test-{}", &Uuid::new_v4().to_string()[..8]);
+    let name = format!("platform-test-{}", &Uuid::new_v4().to_string()[..8]);
     let ns_api: Api<Namespace> = Api::all(kube.clone());
     let ns = Namespace {
         metadata: ObjectMeta {
@@ -61,6 +61,8 @@ async fn gateway_controller_creates_deployment(pool: PgPool) {
         let mut config = (*state.config).clone();
         config.gateway_auto_deploy = true;
         config.gateway_namespace = ns.clone();
+        config.gateway_http_node_port = 0;
+        config.gateway_tls_node_port = 0;
         config.registry_url = Some("test-registry.local:5000".to_string());
         let mut s = state;
         s.config = Arc::new(config);
@@ -105,6 +107,8 @@ async fn gateway_controller_creates_service(pool: PgPool) {
         let mut config = (*state.config).clone();
         config.gateway_auto_deploy = true;
         config.gateway_namespace = ns.clone();
+        config.gateway_http_node_port = 0;
+        config.gateway_tls_node_port = 0;
         config.registry_url = Some("test-registry.local:5000".to_string());
         let mut s = state;
         s.config = Arc::new(config);
@@ -157,6 +161,8 @@ async fn gateway_controller_noop_when_current(pool: PgPool) {
         let mut config = (*state.config).clone();
         config.gateway_auto_deploy = true;
         config.gateway_namespace = ns.clone();
+        config.gateway_http_node_port = 0;
+        config.gateway_tls_node_port = 0;
         config.registry_url = Some("test-registry.local:5000".to_string());
         let mut s = state;
         s.config = Arc::new(config);
@@ -192,6 +198,8 @@ async fn gateway_controller_updates_image(pool: PgPool) {
         let mut config = (*state.config).clone();
         config.gateway_auto_deploy = true;
         config.gateway_namespace = ns.clone();
+        config.gateway_http_node_port = 0;
+        config.gateway_tls_node_port = 0;
         config.registry_url = Some("old-registry.local:5000".to_string());
         let mut s = state;
         s.config = Arc::new(config);

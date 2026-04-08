@@ -97,11 +97,51 @@ async fn download_mcp_servers(
     Ok((StatusCode::OK, headers, data).into_response())
 }
 
+/// `GET /api/downloads/platform-proxy?arch=amd64`
+///
+/// Serves the cross-compiled platform-proxy binary for the requested architecture.
+/// Used by init containers in deployed pods to download the mesh sidecar proxy.
+#[tracing::instrument(skip(state, _auth), fields(arch = %params.arch), err)]
+async fn download_platform_proxy(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Query(params): Query<DownloadParams>,
+) -> Result<Response, ApiError> {
+    let arch = normalize_arch(&params.arch)?;
+    let binary_path = state.config.proxy_binary_dir.join(arch);
+
+    let data = tokio::fs::read(&binary_path).await.map_err(|e| {
+        ApiError::Internal(anyhow::anyhow!(
+            "platform-proxy binary not found for {arch}: {e}"
+        ))
+    })?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        "content-disposition",
+        HeaderValue::from_static("attachment; filename=\"platform-proxy\""),
+    );
+    headers.insert(
+        "cache-control",
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+
+    Ok((StatusCode::OK, headers, data).into_response())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/api/downloads/agent-runner",
             axum::routing::get(download_agent_runner),
+        )
+        .route(
+            "/api/downloads/platform-proxy",
+            axum::routing::get(download_platform_proxy),
         )
         .route(
             "/api/downloads/mcp-servers",

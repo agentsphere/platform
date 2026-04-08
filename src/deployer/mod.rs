@@ -7,7 +7,6 @@ pub mod analysis;
 pub mod applier;
 pub mod error;
 pub mod gateway;
-#[allow(dead_code)]
 pub mod image_inspect;
 pub mod namespace;
 pub mod ops_repo;

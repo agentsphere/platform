@@ -173,7 +173,12 @@ pub async fn read_dir_yaml_at_ref(
         let ext = std::path::Path::new(file)
             .extension()
             .and_then(|e| e.to_str());
-        if matches!(ext, Some("yaml" | "yml")) {
+        // Skip values/variables files — they're not K8s manifests
+        let basename = std::path::Path::new(file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if matches!(ext, Some("yaml" | "yml")) && !basename.starts_with("variables_") {
             if !combined.is_empty() {
                 combined.push_str("\n---\n");
             }

@@ -105,7 +105,7 @@ pub fn build_session_rbac(
 ///
 /// Creates: Namespace + `NetworkPolicy` (unless `dev_mode`) + `ServiceAccount` + `Role` + `RoleBinding`.
 /// All operations use server-side apply (idempotent).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[tracing::instrument(skip(kube_client), fields(%ns_name), err)]
 pub async fn ensure_session_namespace(
     kube_client: &kube::Client,
@@ -113,6 +113,7 @@ pub async fn ensure_session_namespace(
     session_id: &str,
     project_id: &str,
     platform_namespace: &str,
+    gateway_namespace: &str,
     services_namespace: Option<&str>,
     dev_mode: bool,
 ) -> Result<(), super::error::DeployerError> {
@@ -123,6 +124,7 @@ pub async fn ensure_session_namespace(
         "session",
         project_id,
         platform_namespace,
+        gateway_namespace,
         services_namespace.unwrap_or(platform_namespace),
         dev_mode,
     )
@@ -477,6 +479,17 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
             "podSelector": {},
             "policyTypes": ["Ingress", "Egress"],
             "ingress": [
+                // Allow all intra-namespace traffic (app ↔ db, test pod ↔ app, etc.)
+                {
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": ns_name
+                            }
+                        }
+                    }]
+                },
+                // Allow mTLS ingress from other platform-managed namespaces
                 {
                     "from": [{
                         "namespaceSelector": {
@@ -776,6 +789,7 @@ pub async fn ensure_namespace(
     env: &str,
     project_id: &str,
     platform_namespace: &str,
+    gateway_namespace: &str,
     dev_mode: bool,
 ) -> Result<(), super::error::DeployerError> {
     ensure_namespace_inner(
@@ -784,6 +798,7 @@ pub async fn ensure_namespace(
         env,
         project_id,
         platform_namespace,
+        gateway_namespace,
         None,
         dev_mode,
     )
@@ -794,12 +809,14 @@ pub async fn ensure_namespace(
 /// (where Valkey/Postgres/MinIO live) explicitly. In dev mode this differs
 /// from `platform_namespace` because services run in `{ns_prefix}` not in
 /// the platform's own namespace.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_namespace_with_services_ns(
     kube_client: &kube::Client,
     ns_name: &str,
     env: &str,
     project_id: &str,
     platform_namespace: &str,
+    gateway_namespace: &str,
     services_namespace: &str,
     dev_mode: bool,
 ) -> Result<(), super::error::DeployerError> {
@@ -809,18 +826,21 @@ pub async fn ensure_namespace_with_services_ns(
         env,
         project_id,
         platform_namespace,
+        gateway_namespace,
         Some(services_namespace),
         dev_mode,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_namespace_inner(
     kube_client: &kube::Client,
     ns_name: &str,
     env: &str,
     project_id: &str,
     platform_namespace: &str,
+    gateway_namespace: &str,
     _services_namespace: Option<&str>,
     dev_mode: bool,
 ) -> Result<(), super::error::DeployerError> {
@@ -871,6 +891,38 @@ async fn ensure_namespace_inner(
         "rolebindings",
         "platform-secrets-access",
         secrets_rb,
+    )
+    .await?;
+
+    // Create per-namespace RoleBinding for gateway access (HTTPRoutes + EndpointSlices)
+    let gateway_rb = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": "platform-gateway-access",
+            "namespace": ns_name
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "platform-gateway"
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": "platform-gateway",
+            "namespace": gateway_namespace
+        }]
+    });
+
+    apply_namespaced_object(
+        kube_client,
+        ns_name,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "RoleBinding",
+        "rolebindings",
+        "platform-gateway-access",
+        gateway_rb,
     )
     .await?;
 
@@ -1460,11 +1512,22 @@ mod tests {
     }
 
     #[test]
-    fn namespace_network_policy_has_mtls_ingress() {
+    fn namespace_network_policy_has_ingress_rules() {
         let np = build_namespace_network_policy("my-app", "platform");
         let ingress = np["spec"]["ingress"].as_array().unwrap();
-        assert_eq!(ingress.len(), 1);
-        let mtls_rule = &ingress[0];
+        assert_eq!(ingress.len(), 2, "expected 2 ingress rules (same-ns, mTLS)");
+
+        // First rule: same-namespace (all ports)
+        let same_ns_rule = &ingress[0];
+        let from_selector = &same_ns_rule["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"];
+        assert_eq!(from_selector, "my-app");
+        assert!(
+            same_ns_rule["ports"].is_null(),
+            "same-ns rule allows all ports"
+        );
+
+        // Second rule: mTLS from platform-managed namespaces (port 8443)
+        let mtls_rule = &ingress[1];
         let from_selector =
             &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(from_selector, "platform");

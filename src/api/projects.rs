@@ -221,6 +221,7 @@ pub async fn setup_project_infrastructure(
         "prod",
         &project_id_str,
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         svc_ns,
         false,
     )

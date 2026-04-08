@@ -57,6 +57,9 @@ pub struct Config {
     /// Directory containing cross-compiled agent-runner binaries.
     /// Expected layout: `{dir}/amd64`, `{dir}/arm64`
     pub agent_runner_dir: PathBuf,
+    /// Directory containing cross-compiled platform-proxy binaries.
+    /// Expected layout: `{dir}/amd64`, `{dir}/arm64`
+    pub proxy_binary_dir: PathBuf,
     /// Path to the MCP servers tarball served to agent pods at startup.
     /// Built by `just build` / `hack/build-agent-images.sh`.
     pub mcp_servers_tarball: PathBuf,
@@ -263,6 +266,8 @@ impl Config {
             valkey_agent_host,
             agent_runner_dir: env::var("PLATFORM_AGENT_RUNNER_DIR")
                 .map_or_else(|_| PathBuf::from("/data/agent-runner"), PathBuf::from),
+            proxy_binary_dir: env::var("PLATFORM_PROXY_BINARY_DIR")
+                .map_or_else(|_| PathBuf::from("/data/platform-proxy"), PathBuf::from),
             mcp_servers_tarball: env::var("PLATFORM_MCP_SERVERS_TARBALL")
                 .map_or_else(|_| PathBuf::from("/data/mcp-servers.tar.gz"), PathBuf::from),
             claude_cli_version: env::var("PLATFORM_CLAUDE_CLI_VERSION")
@@ -464,6 +469,7 @@ impl Config {
             max_cli_subprocesses: 10,
             valkey_agent_host: "localhost:6379".into(),
             agent_runner_dir: "/tmp/test-agent-runner".into(),
+            proxy_binary_dir: "/tmp/test-platform-proxy".into(),
             mcp_servers_tarball: "/tmp/test-mcp-servers.tar.gz".into(),
             claude_cli_version: "stable".into(),
             ns_prefix: None,

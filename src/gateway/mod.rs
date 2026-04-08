@@ -13,7 +13,8 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams, PostParams};
+use kube::discovery::ApiResource;
 use tokio::sync::watch;
 use tracing::Instrument;
 
@@ -24,6 +25,8 @@ const COMPONENT_LABEL: &str = "platform.io/component";
 const COMPONENT_VALUE: &str = "gateway";
 const MANAGED_BY_LABEL: &str = "platform.io/managed-by";
 const DEPLOY_NAME: &str = "platform-gateway";
+const SA_NAME: &str = "platform-gateway";
+const CLUSTER_ROLE_NAME: &str = "platform-gateway";
 
 /// Background task: ensure the platform gateway is running in the cluster.
 pub async fn reconcile_gateway(state: AppState, mut shutdown: watch::Receiver<()>) {
@@ -75,6 +78,9 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<ReconcileAction>
     let ns = &config.gateway_namespace;
     let image = resolve_gateway_image(config);
 
+    // Ensure RBAC: ServiceAccount + ClusterRole + per-namespace RoleBindings
+    ensure_gateway_rbac(state).await?;
+
     let deploy_api: Api<Deployment> = Api::namespaced(state.kube.clone(), ns);
     let action = if let Some(existing) = deploy_api.get_opt(DEPLOY_NAME).await? {
         maybe_update_image(&deploy_api, &existing, &image).await?
@@ -95,6 +101,139 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<ReconcileAction>
     }
 
     Ok(action)
+}
+
+/// Ensure the gateway `ServiceAccount`, `ClusterRole`, and per-namespace `RoleBinding`s exist.
+async fn ensure_gateway_rbac(state: &AppState) -> anyhow::Result<()> {
+    let config = &state.config;
+    let ns = &config.gateway_namespace;
+    let pp = PatchParams::apply("platform-gateway-controller").force();
+
+    // 1. ServiceAccount in gateway namespace
+    let sa_json = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": SA_NAME,
+            "namespace": ns
+        }
+    });
+    apply_dynamic(
+        &state.kube,
+        Some(ns),
+        "",
+        "v1",
+        "ServiceAccount",
+        "serviceaccounts",
+        SA_NAME,
+        sa_json,
+        &pp,
+    )
+    .await?;
+
+    // 2. ClusterRole with read-only access to httproutes + endpointslices + services
+    let cr_json = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": CLUSTER_ROLE_NAME },
+        "rules": [
+            {
+                "apiGroups": ["gateway.networking.k8s.io"],
+                "resources": ["httproutes"],
+                "verbs": ["get", "list", "watch"]
+            },
+            {
+                "apiGroups": ["discovery.k8s.io"],
+                "resources": ["endpointslices"],
+                "verbs": ["get", "list", "watch"]
+            },
+            {
+                "apiGroups": [""],
+                "resources": ["services"],
+                "verbs": ["get", "list", "watch"]
+            }
+        ]
+    });
+    apply_dynamic(
+        &state.kube,
+        None,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRole",
+        "clusterroles",
+        CLUSTER_ROLE_NAME,
+        cr_json,
+        &pp,
+    )
+    .await?;
+
+    // 3. ClusterRoleBinding — grants read-only cluster-wide access to httproutes,
+    //    endpointslices, and services so the gateway can watch any namespace dynamically.
+    let binding_json = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": CLUSTER_ROLE_NAME },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": CLUSTER_ROLE_NAME
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": SA_NAME,
+            "namespace": ns
+        }]
+    });
+    apply_dynamic(
+        &state.kube,
+        None,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRoleBinding",
+        "clusterrolebindings",
+        CLUSTER_ROLE_NAME,
+        binding_json,
+        &pp,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Generic server-side apply for a dynamic K8s object.
+#[allow(clippy::too_many_arguments)]
+async fn apply_dynamic(
+    kube_client: &kube::Client,
+    namespace: Option<&str>,
+    group: &str,
+    version: &str,
+    kind: &str,
+    plural: &str,
+    name: &str,
+    json_obj: serde_json::Value,
+    pp: &PatchParams,
+) -> anyhow::Result<()> {
+    let api_version = if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    };
+    let ar = ApiResource {
+        group: group.into(),
+        version: version.into(),
+        api_version,
+        kind: kind.into(),
+        plural: plural.into(),
+    };
+    let api: Api<DynamicObject> = if let Some(ns) = namespace {
+        Api::namespaced_with(kube_client.clone(), ns, &ar)
+    } else {
+        Api::all_with(kube_client.clone(), &ar)
+    };
+
+    let obj: DynamicObject = serde_json::from_value(json_obj)?;
+    api.patch(name, pp, &Patch::Apply(&obj)).await?;
+    Ok(())
 }
 
 async fn maybe_update_image(
@@ -130,10 +269,17 @@ async fn maybe_update_image(
 }
 
 fn resolve_gateway_image(config: &Config) -> String {
-    if let Some(ref registry_url) = config.registry_url {
-        format!("{registry_url}/platform-proxy:latest")
+    // Prefer registry_node_url (cluster-internal, e.g. localhost:5001) over
+    // registry_url (host-facing, e.g. host.docker.internal:49392) because the
+    // kubelet pulls images from inside the node, not from the host network.
+    let registry = config
+        .registry_node_url
+        .as_ref()
+        .or(config.registry_url.as_ref());
+    if let Some(url) = registry {
+        format!("{url}/platform-proxy:v1")
     } else {
-        "platform-proxy:latest".into()
+        "platform-proxy:v1".into()
     }
 }
 
@@ -161,6 +307,7 @@ fn build_deployment(config: &Config, image: &str) -> Deployment {
                     ..Default::default()
                 }),
                 spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                    service_account_name: Some(SA_NAME.into()),
                     containers: vec![container],
                     ..Default::default()
                 }),

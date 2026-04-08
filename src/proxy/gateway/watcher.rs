@@ -6,12 +6,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use kube::api::{Api, DynamicObject};
 use kube::discovery::ApiResource;
 use kube::runtime::watcher::{self, Event, watcher as kube_watcher};
 use tokio::sync::watch;
+
+type WatcherStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Event<DynamicObject>, watcher::Error>> + Send>>;
 
 use super::router::{
     HeaderMatch, PathMatch, QueryMatch, RouteEntry, RouteRule, RouteSource, RoutingTable,
@@ -33,7 +37,6 @@ pub async fn run(
     mut shutdown: watch::Receiver<()>,
 ) {
     loop {
-        // Watch HTTPRoutes
         let httproute_ar = ApiResource {
             group: "gateway.networking.k8s.io".into(),
             version: "v1".into(),
@@ -41,78 +44,111 @@ pub async fn run(
             kind: "HTTPRoute".into(),
             plural: "httproutes".into(),
         };
-        let httproute_api: Api<DynamicObject> = Api::all_with(kube_client.clone(), &httproute_ar);
-        let wc = watcher::Config::default();
-        let stream = kube_watcher(httproute_api, wc);
-        tokio::pin!(stream);
 
         // Accumulate all known HTTPRoutes
         let mut all_routes: HashMap<String, DynamicObject> = HashMap::new();
         // Track EndpointSlice data: service "namespace/name" -> Vec<SocketAddr>
-        let endpoint_cache = load_endpoint_slices(&kube_client).await;
+        let endpoint_cache =
+            load_endpoint_slices(&kube_client, &config.watch_namespaces).await;
 
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                event = stream.try_next() => {
-                    match event {
-                        Ok(Some(Event::Init)) => {
-                            // Beginning of initial list — clear accumulated routes
-                            all_routes.clear();
-                        }
-                        Ok(Some(Event::InitApply(obj))) => {
-                            // Object from initial list
-                            let key = route_key(&obj);
-                            all_routes.insert(key, obj);
-                        }
-                        Ok(Some(Event::InitDone)) => {
-                            // Initial list complete — build table and mark ready
+        let mut stream: WatcherStream = if config.watch_namespaces.is_empty() {
+            // No namespace filter — watch cluster-wide (requires ClusterRoleBinding)
+            let api = Api::all_with(kube_client.clone(), &httproute_ar);
+            Box::pin(kube_watcher(api, watcher::Config::default()))
+        } else {
+            // Per-namespace watches (works with namespace-scoped RoleBindings)
+            let streams: Vec<WatcherStream> = config
+                .watch_namespaces
+                .iter()
+                .map(|ns| {
+                    let api =
+                        Api::namespaced_with(kube_client.clone(), ns, &httproute_ar);
+                    Box::pin(kube_watcher(api, watcher::Config::default())) as WatcherStream
+                })
+                .collect();
+            Box::pin(futures_util::stream::select_all(streams))
+        };
+
+        if run_watcher_loop(
+            &mut stream,
+            &mut all_routes,
+            &endpoint_cache,
+            &config,
+            &table,
+            &rate_limit_configs,
+            &mut shutdown,
+        )
+        .await
+        {
+            return; // shutdown
+        }
+    }
+}
+
+/// Process watcher events in a loop. Returns `true` if shutdown was requested.
+async fn run_watcher_loop(
+    stream: &mut WatcherStream,
+    all_routes: &mut HashMap<String, DynamicObject>,
+    endpoint_cache: &HashMap<String, Vec<SocketAddr>>,
+    config: &GatewayConfig,
+    table: &SharedRoutingTable,
+    rate_limit_configs: &SharedRateLimitConfigs,
+    shutdown: &mut watch::Receiver<()>,
+) -> bool {
+    let mut init_done = false;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return true,
+            event = stream.next() => {
+                match event {
+                    Some(Ok(Event::Init)) => {
+                        // Beginning of initial list — clear accumulated routes.
+                        // With merged per-namespace streams, Init from one namespace
+                        // clears everything; the subsequent InitApply events from all
+                        // namespaces will repopulate. This is safe because the merged
+                        // stream replays all objects during its initial sync.
+                        all_routes.clear();
+                    }
+                    Some(Ok(Event::InitApply(obj))) => {
+                        let key = route_key(&obj);
+                        all_routes.insert(key, obj);
+                    }
+                    Some(Ok(Event::InitDone)) => {
+                        if !init_done {
+                            init_done = true;
                             tracing::info!(
                                 route_count = all_routes.len(),
                                 "initial HTTPRoute list complete"
                             );
-                            let new_table = build_routing_table(
-                                &all_routes,
-                                &endpoint_cache,
-                                &config,
-                            );
-                            table.store(std::sync::Arc::new(new_table));
-                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
                         }
-                        Ok(Some(Event::Apply(obj))) => {
-                            let key = route_key(&obj);
-                            tracing::debug!(route = %key, "HTTPRoute applied");
-                            all_routes.insert(key, obj);
-                            // Rebuild and swap
-                            let new_table = build_routing_table(
-                                &all_routes,
-                                &endpoint_cache,
-                                &config,
-                            );
-                            table.store(std::sync::Arc::new(new_table));
-                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
-                        }
-                        Ok(Some(Event::Delete(obj))) => {
-                            let key = route_key(&obj);
-                            tracing::debug!(route = %key, "HTTPRoute deleted");
-                            all_routes.remove(&key);
-                            let new_table = build_routing_table(
-                                &all_routes,
-                                &endpoint_cache,
-                                &config,
-                            );
-                            table.store(std::sync::Arc::new(new_table));
-                            update_rate_limit_configs(&all_routes, &rate_limit_configs, &config);
-                        }
-                        Ok(None) => {
-                            tracing::debug!("HTTPRoute watcher stream ended, restarting");
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "HTTPRoute watcher error, restarting");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            break;
-                        }
+                        let new_table = build_routing_table(all_routes, endpoint_cache, config);
+                        table.store(std::sync::Arc::new(new_table));
+                        update_rate_limit_configs(all_routes, rate_limit_configs, config);
+                    }
+                    Some(Ok(Event::Apply(obj))) => {
+                        let key = route_key(&obj);
+                        tracing::debug!(route = %key, "HTTPRoute applied");
+                        all_routes.insert(key, obj);
+                        let new_table = build_routing_table(all_routes, endpoint_cache, config);
+                        table.store(std::sync::Arc::new(new_table));
+                        update_rate_limit_configs(all_routes, rate_limit_configs, config);
+                    }
+                    Some(Ok(Event::Delete(obj))) => {
+                        let key = route_key(&obj);
+                        tracing::debug!(route = %key, "HTTPRoute deleted");
+                        all_routes.remove(&key);
+                        let new_table = build_routing_table(all_routes, endpoint_cache, config);
+                        table.store(std::sync::Arc::new(new_table));
+                        update_rate_limit_configs(all_routes, rate_limit_configs, config);
+                    }
+                    None => {
+                        tracing::debug!("HTTPRoute watcher stream ended, restarting");
+                        return false;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "HTTPRoute watcher error, restarting");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        return false;
                     }
                 }
             }
@@ -137,8 +173,14 @@ fn route_key(obj: &DynamicObject) -> String {
     format!("{ns}/{name}")
 }
 
-/// Load all `EndpointSlice` resources and build a service -> endpoints map.
-async fn load_endpoint_slices(kube_client: &kube::Client) -> HashMap<String, Vec<SocketAddr>> {
+/// Load `EndpointSlice` resources and build a service -> endpoints map.
+///
+/// When `watch_namespaces` is non-empty, loads per-namespace (works with
+/// namespace-scoped RoleBindings). Otherwise falls back to cluster-wide list.
+async fn load_endpoint_slices(
+    kube_client: &kube::Client,
+    watch_namespaces: &[String],
+) -> HashMap<String, Vec<SocketAddr>> {
     let es_ar = ApiResource {
         group: "discovery.k8s.io".into(),
         version: "v1".into(),
@@ -146,10 +188,31 @@ async fn load_endpoint_slices(kube_client: &kube::Client) -> HashMap<String, Vec
         kind: "EndpointSlice".into(),
         plural: "endpointslices".into(),
     };
-    let api: Api<DynamicObject> = Api::all_with(kube_client.clone(), &es_ar);
 
     let mut cache: HashMap<String, Vec<SocketAddr>> = HashMap::new();
 
+    if watch_namespaces.is_empty() {
+        // Cluster-wide (requires ClusterRoleBinding)
+        let api: Api<DynamicObject> = Api::all_with(kube_client.clone(), &es_ar);
+        list_endpoint_slices_into(&api, &mut cache).await;
+    } else {
+        // Per-namespace (works with namespace-scoped RoleBindings)
+        for ns in watch_namespaces {
+            let api: Api<DynamicObject> =
+                Api::namespaced_with(kube_client.clone(), ns, &es_ar);
+            list_endpoint_slices_into(&api, &mut cache).await;
+        }
+    }
+
+    tracing::info!(services = cache.len(), "loaded EndpointSlice cache");
+    cache
+}
+
+/// List endpoint slices from a single API and merge into cache.
+async fn list_endpoint_slices_into(
+    api: &Api<DynamicObject>,
+    cache: &mut HashMap<String, Vec<SocketAddr>>,
+) {
     match api.list(&kube::api::ListParams::default()).await {
         Ok(list) => {
             for es in list.items {
@@ -162,9 +225,6 @@ async fn load_endpoint_slices(kube_client: &kube::Client) -> HashMap<String, Vec
             tracing::warn!(error = %e, "failed to list EndpointSlices");
         }
     }
-
-    tracing::info!(services = cache.len(), "loaded EndpointSlice cache");
-    cache
 }
 
 /// Parse an `EndpointSlice` `DynamicObject` into (`service_key`, addresses).

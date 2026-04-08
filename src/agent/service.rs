@@ -120,6 +120,7 @@ pub async fn create_session(
         &session_id.to_string(),
         &project_id.to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.ns_prefix.as_deref(),
         state.config.dev_mode,
     )

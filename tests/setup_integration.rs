@@ -137,6 +137,7 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         mesh_ca_cert_ttl_secs: 3600,
         mesh_ca_root_ttl_days: 365,
         proxy_binary_path: None,
+        proxy_binary_dir: "/tmp/test-platform-proxy".into(),
         gateway_auto_deploy: false,
         gateway_http_port: 8080,
         gateway_tls_port: 8443,

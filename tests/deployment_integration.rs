@@ -6436,6 +6436,7 @@ async fn ensure_namespace_creates_ns_with_labels(pool: PgPool) {
         "dev",
         &Uuid::new_v4().to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
@@ -6468,6 +6469,7 @@ async fn ensure_namespace_is_idempotent(pool: PgPool) {
         "dev",
         &project_id,
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
@@ -6479,6 +6481,7 @@ async fn ensure_namespace_is_idempotent(pool: PgPool) {
         "dev",
         &project_id,
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
@@ -6541,6 +6544,7 @@ async fn delete_namespace_ok_when_managed(pool: PgPool) {
         "dev",
         &Uuid::new_v4().to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
@@ -6576,6 +6580,7 @@ async fn ensure_session_namespace_creates_all_objects(pool: PgPool) {
         &session_id,
         &project_id,
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         None, // services_namespace
         state.config.dev_mode,
     )
@@ -6653,6 +6658,7 @@ async fn ensure_session_namespace_with_different_services_ns(pool: PgPool) {
         &session_id,
         &project_id,
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         Some("other-services-ns"),
         state.config.dev_mode,
     )
@@ -6682,6 +6688,7 @@ async fn ensure_namespace_with_services_ns_creates_network_policy(pool: PgPool) 
         "dev",
         &Uuid::new_v4().to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         "services-ns",
         state.config.dev_mode,
     )
@@ -6714,6 +6721,7 @@ async fn ensure_network_policy_standalone(pool: PgPool) {
         "dev",
         &Uuid::new_v4().to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
@@ -6748,6 +6756,7 @@ async fn ensure_session_network_policy_standalone(pool: PgPool) {
         "session",
         &Uuid::new_v4().to_string(),
         &state.config.platform_namespace,
+        &state.config.gateway_namespace,
         state.config.dev_mode,
     )
     .await
