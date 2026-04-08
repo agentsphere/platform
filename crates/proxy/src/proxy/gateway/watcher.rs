@@ -174,7 +174,7 @@ fn route_key(obj: &DynamicObject) -> String {
 /// Load `EndpointSlice` resources and build a service -> endpoints map.
 ///
 /// When `watch_namespaces` is non-empty, loads per-namespace (works with
-/// namespace-scoped RoleBindings). Otherwise falls back to cluster-wide list.
+/// namespace-scoped `RoleBindings`). Otherwise falls back to cluster-wide list.
 async fn load_endpoint_slices(
     kube_client: &kube::Client,
     watch_namespaces: &[String],

@@ -523,9 +523,17 @@ pub struct ProxyInjectionConfig {
     /// Name of the K8s Secret in the target namespace that contains `PLATFORM_API_TOKEN`.
     /// Used by the init container to authenticate the proxy binary download.
     pub platform_secret_name: Option<String>,
-    /// Image for the proxy download init container (e.g. `registry/platform-runner-bare:latest`).
+    /// Image for the proxy download init container (e.g. `registry/platform-runner-bare:v1`).
     /// Must have `curl` or `wget` available. Falls back to `busybox:stable` if unset.
     pub init_image: String,
+    /// Image for the iptables init container (e.g. `registry/platform-proxy-init:v1`).
+    /// Shell-free distroless image with only iptables and the Rust binary.
+    /// Falls back to `init_image` if empty (with shell-based fallback script).
+    pub iptables_init_image: Option<String>,
+    /// Enable transparent proxy mode (iptables interception).
+    pub mesh_transparent: bool,
+    /// Enable strict mTLS (reject plaintext from non-kubelet IPs).
+    pub mesh_strict_mtls: bool,
 }
 
 /// Inject platform-proxy wrapper into all containers in workload manifests.
@@ -636,6 +644,70 @@ echo "[proxy-init] platform-proxy downloaded""#;
     })
 }
 
+/// Build the iptables init container that sets up REDIRECT rules for transparent proxy.
+///
+/// When `iptables_init_image` is set, uses the shell-free distroless image
+/// (`platform-proxy-init`) — no `/bin/sh`, just the static Rust binary + iptables.
+/// Falls back to a shell script on the generic init image otherwise.
+fn build_proxy_iptables_init_container(config: &ProxyInjectionConfig) -> serde_json::Value {
+    let security_context = serde_json::json!({
+        "capabilities": {
+            "add": ["NET_ADMIN", "NET_RAW"],
+            "drop": ["ALL"]
+        },
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "runAsUser": 0
+    });
+    let resources = serde_json::json!({
+        "requests": { "cpu": "10m", "memory": "16Mi" },
+        "limits": { "cpu": "100m", "memory": "32Mi" }
+    });
+
+    if let Some(ref image) = config.iptables_init_image {
+        // Distroless: entrypoint is /platform-proxy-init, no shell needed
+        serde_json::json!({
+            "name": "proxy-iptables",
+            "image": image,
+            "securityContext": security_context,
+            "resources": resources
+        })
+    } else {
+        // Fallback: shell-based script (requires iptables in the image)
+        let script = r#"set -eu
+apk add --no-cache iptables >/dev/null 2>&1 || true
+PROXY_INBOUND_PORT=${PROXY_INBOUND_PORT:-15006}
+PROXY_OUTBOUND_PORT=${PROXY_OUTBOUND_PORT:-15001}
+PROXY_HEALTH_PORT=${PROXY_HEALTH_PORT:-15020}
+PROXY_OUTBOUND_BIND=${PROXY_OUTBOUND_BIND:-127.0.0.6}
+
+iptables -t nat -N PLATFORM_INBOUND
+iptables -t nat -A PLATFORM_INBOUND -p tcp --dport ${PROXY_INBOUND_PORT} -j RETURN
+iptables -t nat -A PLATFORM_INBOUND -p tcp --dport ${PROXY_OUTBOUND_PORT} -j RETURN
+iptables -t nat -A PLATFORM_INBOUND -p tcp --dport ${PROXY_HEALTH_PORT} -j RETURN
+iptables -t nat -A PLATFORM_INBOUND -p tcp -j REDIRECT --to-ports ${PROXY_INBOUND_PORT}
+iptables -t nat -A PREROUTING -p tcp -j PLATFORM_INBOUND
+
+iptables -t nat -N PLATFORM_OUTPUT
+iptables -t nat -A PLATFORM_OUTPUT -s ${PROXY_OUTBOUND_BIND}/32 -j RETURN
+iptables -t nat -A PLATFORM_OUTPUT -o lo -d 127.0.0.1/32 -j RETURN
+iptables -t nat -A PLATFORM_OUTPUT -p tcp --dport 53 -j RETURN
+iptables -t nat -A PLATFORM_OUTPUT -p tcp -j REDIRECT --to-ports ${PROXY_OUTBOUND_PORT}
+iptables -t nat -A OUTPUT -p tcp -j PLATFORM_OUTPUT
+
+echo "[proxy-iptables] rules installed (inbound:${PROXY_INBOUND_PORT} outbound:${PROXY_OUTBOUND_PORT})"
+"#;
+        serde_json::json!({
+            "name": "proxy-iptables",
+            "image": config.init_image,
+            "command": ["sh", "-c"],
+            "args": [script],
+            "securityContext": security_context,
+            "resources": resources
+        })
+    }
+}
+
 /// Inject proxy wrapping into all containers under a pod spec path.
 fn inject_proxy_to_pod_spec(
     doc: &mut serde_json::Value,
@@ -688,6 +760,20 @@ fn inject_proxy_to_pod_spec(
         }
     } else {
         spec["initContainers"] = serde_json::json!([init_container]);
+    }
+
+    // Add iptables init container for transparent mode (after proxy-init)
+    if config.mesh_transparent {
+        let iptables_container = build_proxy_iptables_init_container(config);
+        if let Some(init_containers) = spec
+            .get_mut("initContainers")
+            .and_then(|v| v.as_array_mut())
+            && !init_containers
+                .iter()
+                .any(|c| c["name"] == "proxy-iptables")
+        {
+            init_containers.push(iptables_container);
+        }
     }
 
     // Wrap each container
@@ -760,11 +846,26 @@ fn inject_proxy_to_container(
 
     // Add proxy env vars
     let service_name = format!("{workload_name}/{container_name}");
-    let proxy_env = vec![
+    let mut proxy_env = vec![
         serde_json::json!({"name": "PLATFORM_API_URL", "value": config.platform_api_url}),
         serde_json::json!({"name": "PLATFORM_SERVICE_NAME", "value": service_name}),
         serde_json::json!({"name": "PROXY_HEALTH_PORT", "value": "15020"}),
     ];
+
+    // Transparent proxy env vars
+    if config.mesh_transparent {
+        proxy_env.push(serde_json::json!({"name": "PROXY_TRANSPARENT", "value": "true"}));
+        let mtls_mode = if config.mesh_strict_mtls {
+            "strict"
+        } else {
+            "permissive"
+        };
+        proxy_env.push(serde_json::json!({"name": "PROXY_MTLS_MODE", "value": mtls_mode}));
+        proxy_env.push(serde_json::json!({"name": "PROXY_INBOUND_PORT", "value": "15006"}));
+        proxy_env.push(serde_json::json!({"name": "PROXY_OUTBOUND_BIND", "value": "127.0.0.6"}));
+        proxy_env.push(serde_json::json!({"name": "PROXY_INTERNAL_CIDRS", "value": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"}));
+    }
+
     if let Some(env) = container.get_mut("env").and_then(|v| v.as_array_mut()) {
         for e in &proxy_env {
             let name = e["name"].as_str().unwrap_or_default();
@@ -2292,6 +2393,9 @@ metadata:
             platform_api_url: "http://platform:8080".into(),
             platform_secret_name: Some("my-platform-secret".into()),
             init_image: "busybox:stable".into(),
+            iptables_init_image: None,
+            mesh_transparent: false,
+            mesh_strict_mtls: false,
         }
     }
 
@@ -2608,5 +2712,224 @@ spec:
                 );
             }
         }
+    }
+
+    #[test]
+    fn inject_proxy_iptables_init_container_when_transparent() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        assert!(
+            result.contains("proxy-iptables"),
+            "should have iptables init container"
+        );
+        assert!(
+            result.contains("NET_ADMIN"),
+            "should have NET_ADMIN capability"
+        );
+        assert!(
+            result.contains("PROXY_TRANSPARENT"),
+            "should have transparent env var"
+        );
+    }
+
+    #[test]
+    fn inject_proxy_iptables_distroless_image() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        config.iptables_init_image = Some("registry/platform-proxy-init:v1".into());
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let inits = doc["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        let iptables = inits
+            .iter()
+            .find(|c| c["name"] == "proxy-iptables")
+            .unwrap();
+        assert_eq!(iptables["image"], "registry/platform-proxy-init:v1");
+        // Distroless: no command/args (ENTRYPOINT handles it)
+        assert!(
+            iptables.get("command").is_none(),
+            "distroless should have no command"
+        );
+        assert!(
+            iptables.get("args").is_none(),
+            "distroless should have no args"
+        );
+        assert_eq!(iptables["securityContext"]["runAsUser"], 0);
+    }
+
+    #[test]
+    fn inject_proxy_no_iptables_when_not_transparent() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let result = inject_proxy_wrapper(yaml, &proxy_config()).unwrap();
+        assert!(
+            !result.contains("proxy-iptables"),
+            "should NOT have iptables init container"
+        );
+        assert!(
+            !result.contains("PROXY_TRANSPARENT"),
+            "should NOT have transparent env var"
+        );
+    }
+
+    #[test]
+    fn inject_proxy_iptables_ordering() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let inits = doc["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inits[0]["name"], "proxy-init", "proxy-init should be first");
+        assert_eq!(
+            inits[1]["name"], "proxy-iptables",
+            "proxy-iptables should be second"
+        );
+    }
+
+    #[test]
+    fn inject_proxy_strict_mtls_env() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        config.mesh_strict_mtls = true;
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        assert!(result.contains("strict"), "should have strict mTLS mode");
+        // Verify it's specifically the PROXY_MTLS_MODE env var
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let mtls_env = env
+            .iter()
+            .find(|e| e["name"] == "PROXY_MTLS_MODE")
+            .expect("PROXY_MTLS_MODE env should exist");
+        assert_eq!(mtls_env["value"], "strict");
+    }
+
+    #[test]
+    fn inject_proxy_permissive_mtls_env() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        config.mesh_strict_mtls = false;
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let mtls_env = env
+            .iter()
+            .find(|e| e["name"] == "PROXY_MTLS_MODE")
+            .expect("PROXY_MTLS_MODE env should exist");
+        assert_eq!(mtls_env["value"], "permissive");
+    }
+
+    #[test]
+    fn inject_proxy_transparent_env_vars_complete() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let mut config = proxy_config();
+        config.mesh_transparent = true;
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let names: Vec<&str> = env.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"PROXY_TRANSPARENT"));
+        assert!(names.contains(&"PROXY_MTLS_MODE"));
+        assert!(names.contains(&"PROXY_INBOUND_PORT"));
+        assert!(names.contains(&"PROXY_OUTBOUND_BIND"));
+        assert!(names.contains(&"PROXY_INTERNAL_CIDRS"));
     }
 }

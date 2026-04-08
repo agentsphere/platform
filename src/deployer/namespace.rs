@@ -464,8 +464,8 @@ pub fn build_namespace_object(
 /// Build a `NetworkPolicy` for a session namespace.
 ///
 /// Build a namespace-level `NetworkPolicy` allowing egress to platform API (8080),
-/// DNS, same-namespace, mTLS (8443) to platform-managed namespaces, and public
-/// internet (blocking private ranges). Also allows ingress on 8443 from
+/// DNS, same-namespace, mTLS TCP to platform-managed namespaces, and public
+/// internet (blocking private ranges). Also allows ingress TCP from
 /// platform-managed namespaces for mTLS.
 fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
     json!({
@@ -489,7 +489,7 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
                         }
                     }]
                 },
-                // Allow mTLS ingress from other platform-managed namespaces
+                // Allow mTLS ingress from other platform-managed namespaces (all TCP for transparent proxy)
                 {
                     "from": [{
                         "namespaceSelector": {
@@ -498,7 +498,7 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 }
             ],
             "egress": [
@@ -547,7 +547,7 @@ fn build_namespace_network_policy(ns_name: &str, platform_namespace: &str) -> se
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 },
                 {
                     "to": [{
@@ -624,7 +624,7 @@ pub fn build_session_network_policy(
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 }
             ],
             "egress": [
@@ -661,7 +661,7 @@ pub fn build_session_network_policy(
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 },
                 {
                     "to": [{
@@ -687,9 +687,9 @@ pub fn build_session_network_policy(
 /// Allows:
 /// - Egress to the platform API namespace (port 8080)
 /// - Egress to kube-system DNS (port 53 UDP+TCP)
-/// - Egress to platform-managed namespaces on port 8443 (mTLS)
+/// - Egress to platform-managed namespaces (all TCP for transparent mesh proxy)
 /// - Egress to internet (blocking cluster-internal CIDRs)
-/// - Ingress from platform-managed namespaces on port 8443 (mTLS)
+/// - Ingress from platform-managed namespaces (all TCP for transparent mesh proxy)
 ///
 /// `ns_name` is the full namespace name (e.g. `my-app-dev` or `prefix-my-app-dev`).
 pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_json::Value {
@@ -716,7 +716,7 @@ pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_js
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 }
             ],
             "egress": [
@@ -756,7 +756,7 @@ pub fn build_network_policy(ns_name: &str, platform_namespace: &str) -> serde_js
                             }
                         }
                     }],
-                    "ports": [{"port": 8443, "protocol": "TCP"}]
+                    "ports": [{"protocol": "TCP"}]
                 },
                 {
                     "to": [{
@@ -1154,7 +1154,7 @@ mod tests {
         let types: Vec<&str> = policy_types.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(types.contains(&"Ingress"));
         assert!(types.contains(&"Egress"));
-        // Ingress allows mTLS on 8443 from platform-managed namespaces
+        // Ingress allows all TCP from platform-managed namespaces (for transparent proxy)
         let ingress = np["spec"]["ingress"].as_array().unwrap();
         assert_eq!(ingress.len(), 1);
         let mtls_rule = &ingress[0];
@@ -1162,20 +1162,28 @@ mod tests {
             &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(from_selector, "platform");
         let ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(ports[0]["port"], 8443);
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert!(
+            ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     #[test]
     fn network_policy_egress_mtls() {
         let np = build_network_policy("my-app", "platform");
         let egress = np["spec"]["egress"].as_array().unwrap();
-        // Third rule: mTLS egress to platform-managed namespaces
+        // Third rule: mTLS egress to platform-managed namespaces (all TCP)
         let mtls_rule = &egress[2];
         let to_selector =
             &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(to_selector, "platform");
         let ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(ports[0]["port"], 8443);
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert!(
+            ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     #[test]
@@ -1235,7 +1243,7 @@ mod tests {
         assert_eq!(
             ingress.len(),
             2,
-            "should have preview (8000) + mTLS (8443) ingress"
+            "should have preview (8000) + mesh (all TCP) ingress"
         );
         // First rule: preview proxy from platform namespace
         let preview_rule = &ingress[0];
@@ -1243,13 +1251,17 @@ mod tests {
         assert_eq!(ns_selector["kubernetes.io/metadata.name"], "platform");
         let ports = preview_rule["ports"].as_array().unwrap();
         assert_eq!(ports[0]["port"], 8000);
-        // Second rule: mTLS from platform-managed namespaces
+        // Second rule: mesh from platform-managed namespaces (all TCP)
         let mtls_rule = &ingress[1];
         let mtls_selector =
             &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(mtls_selector, "platform");
         let mtls_ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(mtls_ports[0]["port"], 8443);
+        assert_eq!(mtls_ports[0]["protocol"], "TCP");
+        assert!(
+            mtls_ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     #[test]
@@ -1268,22 +1280,30 @@ mod tests {
     fn session_network_policy_egress_includes_mtls() {
         let session_np = build_session_network_policy("my-app", "platform", "platform");
         let egress = session_np["spec"]["egress"].as_array().unwrap();
-        // Third rule (index 2): mTLS to platform-managed namespaces
+        // Third rule (index 2): mesh to platform-managed namespaces (all TCP)
         let mtls_rule = &egress[2];
         let to_selector =
             &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(to_selector, "platform");
         let ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(ports[0]["port"], 8443);
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert!(
+            ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     #[test]
     fn project_network_policy_allows_mtls_ingress_only() {
-        // Verify build_network_policy allows mTLS ingress on 8443
+        // Verify build_network_policy allows mesh ingress (all TCP)
         let np = build_network_policy("my-app", "platform");
         let ingress = np["spec"]["ingress"].as_array().unwrap();
-        assert_eq!(ingress.len(), 1, "only mTLS ingress should be allowed");
-        assert_eq!(ingress[0]["ports"][0]["port"], 8443);
+        assert_eq!(ingress.len(), 1, "only mesh ingress should be allowed");
+        assert_eq!(ingress[0]["ports"][0]["protocol"], "TCP");
+        assert!(
+            ingress[0]["ports"][0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     // -- build_session_rbac --
@@ -1515,7 +1535,7 @@ mod tests {
     fn namespace_network_policy_has_ingress_rules() {
         let np = build_namespace_network_policy("my-app", "platform");
         let ingress = np["spec"]["ingress"].as_array().unwrap();
-        assert_eq!(ingress.len(), 2, "expected 2 ingress rules (same-ns, mTLS)");
+        assert_eq!(ingress.len(), 2, "expected 2 ingress rules (same-ns, mesh)");
 
         // First rule: same-namespace (all ports)
         let same_ns_rule = &ingress[0];
@@ -1526,26 +1546,34 @@ mod tests {
             "same-ns rule allows all ports"
         );
 
-        // Second rule: mTLS from platform-managed namespaces (port 8443)
+        // Second rule: mesh from platform-managed namespaces (all TCP)
         let mtls_rule = &ingress[1];
         let from_selector =
             &mtls_rule["from"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(from_selector, "platform");
         let ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(ports[0]["port"], 8443);
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert!(
+            ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     #[test]
     fn namespace_network_policy_has_mtls_egress() {
         let np = build_namespace_network_policy("my-app", "platform");
         let egress = np["spec"]["egress"].as_array().unwrap();
-        // Fourth rule (index 3): mTLS egress
+        // Fourth rule (index 3): mesh egress (all TCP)
         let mtls_rule = &egress[3];
         let to_selector =
             &mtls_rule["to"][0]["namespaceSelector"]["matchLabels"]["platform.io/managed-by"];
         assert_eq!(to_selector, "platform");
         let ports = mtls_rule["ports"].as_array().unwrap();
-        assert_eq!(ports[0]["port"], 8443);
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert!(
+            ports[0].get("port").is_none(),
+            "mesh rules allow all TCP ports"
+        );
     }
 
     // -- build_session_rbac: all 3 rules, no networking.k8s.io --

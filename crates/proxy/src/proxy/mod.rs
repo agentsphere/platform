@@ -11,3 +11,4 @@ pub mod scraper;
 pub mod tcp_proxy;
 pub mod tls;
 pub mod traces;
+pub mod transparent;

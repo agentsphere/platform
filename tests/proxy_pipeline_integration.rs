@@ -22,6 +22,17 @@ fn proxy_config() -> ProxyInjectionConfig {
         platform_api_url: "http://platform.platform.svc.cluster.local:8080".to_string(),
         platform_secret_name: Some("test-platform-secret".into()),
         init_image: "busybox:stable".into(),
+        iptables_init_image: None,
+        mesh_transparent: false,
+        mesh_strict_mtls: false,
+    }
+}
+
+fn transparent_proxy_config() -> ProxyInjectionConfig {
+    ProxyInjectionConfig {
+        mesh_transparent: true,
+        mesh_strict_mtls: false,
+        ..proxy_config()
     }
 }
 
@@ -121,9 +132,9 @@ spec:
         .iter()
         .find(|v| v["name"].as_str() == Some("platform-proxy"))
         .expect("proxy volume should exist");
-    assert_eq!(
-        proxy_vol["hostPath"]["path"].as_str().unwrap(),
-        "/opt/platform/proxy"
+    assert!(
+        !proxy_vol["emptyDir"].is_null(),
+        "proxy volume should be emptyDir (init container downloads the binary)"
     );
 
     // Verify env vars were added
@@ -217,4 +228,177 @@ spec:
         .expect("service ports should be preserved");
     assert_eq!(svc_ports[0]["port"].as_i64().unwrap(), 80);
     assert_eq!(svc_ports[0]["targetPort"].as_i64().unwrap(), 80);
+}
+
+// ---------------------------------------------------------------------------
+// Transparent mode: iptables init container injected
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_injection_transparent_adds_iptables_init_container(_pool: PgPool) {
+    let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: demo-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    spec:
+      containers:
+        - name: web
+          image: myapp:latest
+          command: ["./server"]
+          ports:
+            - containerPort: 8080
+"#;
+
+    let config = transparent_proxy_config();
+    let result = inject_proxy_wrapper(manifest, &config).expect("injection should succeed");
+    let doc: serde_json::Value =
+        serde_yaml::from_str(&result).expect("result should be valid YAML");
+
+    // Should have 2 init containers: proxy-init then proxy-iptables
+    let init_containers = doc["spec"]["template"]["spec"]["initContainers"]
+        .as_array()
+        .expect("should have initContainers");
+    assert_eq!(
+        init_containers.len(),
+        2,
+        "should have proxy-init and proxy-iptables"
+    );
+    assert_eq!(init_containers[0]["name"], "proxy-init");
+    assert_eq!(init_containers[1]["name"], "proxy-iptables");
+
+    // iptables container should have NET_ADMIN capability
+    let iptables = &init_containers[1];
+    let caps = iptables["securityContext"]["capabilities"]["add"]
+        .as_array()
+        .expect("should have capabilities");
+    let cap_names: Vec<&str> = caps.iter().filter_map(|c| c.as_str()).collect();
+    assert!(cap_names.contains(&"NET_ADMIN"), "should have NET_ADMIN");
+    assert!(cap_names.contains(&"NET_RAW"), "should have NET_RAW");
+
+    // Should NOT allow privilege escalation
+    assert_eq!(
+        iptables["securityContext"]["allowPrivilegeEscalation"].as_bool(),
+        Some(false)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transparent mode: env vars added to containers
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_injection_transparent_adds_env_vars(_pool: PgPool) {
+    let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          image: myapp:latest
+          command: ["./server"]
+"#;
+
+    let config = transparent_proxy_config();
+    let result = inject_proxy_wrapper(manifest, &config).expect("injection should succeed");
+    let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+
+    let container = &doc["spec"]["template"]["spec"]["containers"][0];
+    let env = container["env"].as_array().expect("env should exist");
+
+    let env_map: std::collections::HashMap<&str, &str> = env
+        .iter()
+        .filter_map(|e| Some((e["name"].as_str()?, e["value"].as_str()?)))
+        .collect();
+
+    assert_eq!(env_map.get("PROXY_TRANSPARENT"), Some(&"true"));
+    assert_eq!(env_map.get("PROXY_MTLS_MODE"), Some(&"permissive"));
+    assert_eq!(env_map.get("PROXY_INBOUND_PORT"), Some(&"15006"));
+    assert_eq!(env_map.get("PROXY_OUTBOUND_BIND"), Some(&"127.0.0.6"));
+    assert!(env_map.contains_key("PROXY_INTERNAL_CIDRS"));
+}
+
+// ---------------------------------------------------------------------------
+// Transparent mode with strict mTLS
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_injection_transparent_strict_mtls(_pool: PgPool) {
+    let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          image: myapp:latest
+          command: ["./server"]
+"#;
+
+    let mut config = transparent_proxy_config();
+    config.mesh_strict_mtls = true;
+    let result = inject_proxy_wrapper(manifest, &config).expect("injection should succeed");
+    let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+
+    let container = &doc["spec"]["template"]["spec"]["containers"][0];
+    let env = container["env"].as_array().expect("env should exist");
+    let mtls_mode = env
+        .iter()
+        .find(|e| e["name"] == "PROXY_MTLS_MODE")
+        .expect("PROXY_MTLS_MODE should be set");
+    assert_eq!(mtls_mode["value"], "strict");
+}
+
+// ---------------------------------------------------------------------------
+// Non-transparent mode: no iptables, no transparent env vars
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn proxy_injection_non_transparent_no_iptables(_pool: PgPool) {
+    let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          image: myapp:latest
+          command: ["./server"]
+"#;
+
+    let config = proxy_config(); // mesh_transparent = false
+    let result = inject_proxy_wrapper(manifest, &config).expect("injection should succeed");
+    let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+
+    // Should have only 1 init container (proxy-init, no proxy-iptables)
+    let init_containers = doc["spec"]["template"]["spec"]["initContainers"]
+        .as_array()
+        .expect("should have initContainers");
+    assert_eq!(init_containers.len(), 1);
+    assert_eq!(init_containers[0]["name"], "proxy-init");
+
+    // Container should NOT have PROXY_TRANSPARENT env var
+    let container = &doc["spec"]["template"]["spec"]["containers"][0];
+    let env = container["env"].as_array().expect("env should exist");
+    assert!(
+        !env.iter().any(|e| e["name"] == "PROXY_TRANSPARENT"),
+        "should not have PROXY_TRANSPARENT in non-transparent mode"
+    );
 }

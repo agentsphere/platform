@@ -789,6 +789,12 @@ export function UiPreviewsTab({ projectId, defaultBranch }: { projectId: string;
   const imageUrl = (pipelineId: string, fileId: string) =>
     `/api/projects/${projectId}/pipelines/${pipelineId}/artifacts/${fileId}/view`;
 
+  const isDisplayableFile = (file: UiPreviewFile): boolean => {
+    if (file.content_type?.startsWith('image/')) return true;
+    const ext = file.relative_path.split('.').pop()?.toLowerCase();
+    return !!ext && ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico'].includes(ext);
+  };
+
   const findItemForFile = (artifact: UiPreviewArtifact, file: UiPreviewFile): UiPreviewItem | null => {
     if (!artifact.config) return null;
     const search = (groups: Record<string, UiPreviewGroup>): UiPreviewItem | null => {
@@ -870,7 +876,7 @@ export function UiPreviewsTab({ projectId, defaultBranch }: { projectId: string;
 
   const renderUncategorized = (artifact: UiPreviewArtifact) => {
     if (!artifact.config) {
-      const filtered = artifact.files.filter(f => passesMetaFilter(artifact, f));
+      const filtered = artifact.files.filter(f => isDisplayableFile(f) && passesMetaFilter(artifact, f));
       if (filtered.length === 0) return null;
       return (
         <div class="ui-preview-grid">
@@ -891,7 +897,7 @@ export function UiPreviewsTab({ projectId, defaultBranch }: { projectId: string;
       }
     };
     collectRefs(artifact.config.groups);
-    const uncategorized = artifact.files.filter(f => !referencedFiles.has(f.id) && passesMetaFilter(artifact, f));
+    const uncategorized = artifact.files.filter(f => !referencedFiles.has(f.id) && isDisplayableFile(f) && passesMetaFilter(artifact, f));
     if (uncategorized.length === 0) return null;
     const isCollapsed = collapsed.has('__uncategorized');
     return (
@@ -919,8 +925,8 @@ export function UiPreviewsTab({ projectId, defaultBranch }: { projectId: string;
     if (!compareData) return <div class="empty-state">Loading comparison...</div>;
     const baseFiles = new Map<string, { file: UiPreviewFile; artifact: UiPreviewArtifact }>();
     const headFiles = new Map<string, { file: UiPreviewFile; artifact: UiPreviewArtifact }>();
-    for (const a of compareData.base) { for (const f of a.files) baseFiles.set(f.relative_path, { file: f, artifact: a }); }
-    for (const a of compareData.head) { for (const f of a.files) headFiles.set(f.relative_path, { file: f, artifact: a }); }
+    for (const a of compareData.base) { for (const f of a.files) { if (isDisplayableFile(f)) baseFiles.set(f.relative_path, { file: f, artifact: a }); } }
+    for (const a of compareData.head) { for (const f of a.files) { if (isDisplayableFile(f)) headFiles.set(f.relative_path, { file: f, artifact: a }); } }
     const allPaths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
     if (allPaths.size === 0) return <div class="empty-state">No files to compare</div>;
     return (

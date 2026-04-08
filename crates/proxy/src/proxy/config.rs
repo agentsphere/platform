@@ -1,7 +1,27 @@
 //! Proxy configuration from environment variables and CLI args.
 
 use std::env;
+use std::net::IpAddr;
 use std::time::Duration;
+
+/// mTLS enforcement mode for transparent proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtlsMode {
+    /// Accept both mTLS and plaintext connections.
+    Permissive,
+    /// Reject plaintext except from kubelet/node IPs.
+    Strict,
+}
+
+impl MtlsMode {
+    /// Parse from string; anything other than `"strict"` is permissive.
+    pub fn from_str_value(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "strict" => Self::Strict,
+            _ => Self::Permissive,
+        }
+    }
+}
 
 /// Proxy configuration parsed from env vars and CLI args.
 #[derive(Debug, Clone)]
@@ -50,6 +70,20 @@ pub struct ProxyConfig {
     pub scrape_redis_url: Option<String>,
     /// Allow insecure TLS for scrape targets.
     pub scrape_tls_insecure: bool,
+
+    // --- Transparent proxy mode ---
+    /// Enable transparent proxy mode (iptables REDIRECT + `SO_ORIGINAL_DST`).
+    pub transparent: bool,
+    /// mTLS enforcement: permissive (default) or strict.
+    pub mtls_mode: MtlsMode,
+    /// Transparent inbound listener port (default 15006).
+    pub inbound_port: u16,
+    /// Source IP for forwarded connections to skip iptables re-interception (default 127.0.0.6).
+    pub outbound_bind_addr: IpAddr,
+    /// Internal CIDRs -- traffic to these destinations gets mTLS (default RFC1918).
+    pub internal_cidrs: Vec<(IpAddr, u8)>,
+    /// Node CIDRs -- kubelet IPs allowed plaintext even in strict mode.
+    pub node_cidrs: Vec<(IpAddr, u8)>,
 }
 
 /// Parsed CLI arguments before env var merging.
@@ -195,6 +229,20 @@ impl ProxyConfig {
             scrape_postgres_url: env::var("PROXY_SCRAPE_POSTGRES_URL").ok(),
             scrape_redis_url: env::var("PROXY_SCRAPE_REDIS_URL").ok(),
             scrape_tls_insecure: cli.scrape_tls_insecure,
+            transparent: env::var("PROXY_TRANSPARENT").is_ok_and(|v| v == "true" || v == "1"),
+            mtls_mode: MtlsMode::from_str_value(&env::var("PROXY_MTLS_MODE").unwrap_or_default()),
+            inbound_port: env_parse("PROXY_INBOUND_PORT", 15006),
+            outbound_bind_addr: env::var("PROXY_OUTBOUND_BIND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 6))),
+            internal_cidrs: super::transparent::parse_cidrs(
+                &env::var("PROXY_INTERNAL_CIDRS")
+                    .unwrap_or_else(|_| "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".into()),
+            ),
+            node_cidrs: super::transparent::parse_cidrs(
+                &env::var("PROXY_NODE_CIDRS").unwrap_or_default(),
+            ),
         };
 
         (config, cli.child_args)
@@ -289,4 +337,29 @@ mod tests {
 
     // service_name_from_child_binary test removed: env::remove_var is unsafe in Rust 2024 edition
     // and unsafe_code = "forbid". The fallback logic is exercised when PLATFORM_SERVICE_NAME is unset.
+
+    #[test]
+    fn defaults_transparent_mode() {
+        let args: Vec<String> = vec!["--wrap".into(), "--".into(), "app".into()];
+        let (config, _) = ProxyConfig::from_env_and_args(&args);
+        assert!(!config.transparent);
+        assert_eq!(config.mtls_mode, MtlsMode::Permissive);
+        assert_eq!(config.inbound_port, 15006);
+        // RFC1918 defaults
+        assert_eq!(config.internal_cidrs.len(), 3);
+        assert!(config.node_cidrs.is_empty());
+        assert_eq!(
+            config.outbound_bind_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 6))
+        );
+    }
+
+    #[test]
+    fn mtls_mode_parsing() {
+        assert_eq!(MtlsMode::from_str_value("strict"), MtlsMode::Strict);
+        assert_eq!(MtlsMode::from_str_value("STRICT"), MtlsMode::Strict);
+        assert_eq!(MtlsMode::from_str_value("permissive"), MtlsMode::Permissive);
+        assert_eq!(MtlsMode::from_str_value(""), MtlsMode::Permissive);
+        assert_eq!(MtlsMode::from_str_value("other"), MtlsMode::Permissive);
+    }
 }

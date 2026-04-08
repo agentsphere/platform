@@ -280,21 +280,26 @@ async fn handle_pending(state: &AppState, release: &PendingRelease) -> Result<()
         .await;
 
         // Use platform-runner-bare from the registry as init image (has curl)
-        let init_image = match state
+        let registry = state
             .config
             .registry_node_url
             .as_deref()
-            .or(state.config.registry_url.as_deref())
-        {
+            .or(state.config.registry_url.as_deref());
+        let init_image = match registry {
             Some(reg) => format!("{reg}/platform-runner-bare:v1"),
             None => "busybox:stable".into(),
         };
+        // Distroless iptables init image (shell-free, Rust binary + iptables only)
+        let iptables_init_image = registry.map(|reg| format!("{reg}/platform-proxy-init:v1"));
         applier::inject_proxy_wrapper(
             &rendered,
             &applier::ProxyInjectionConfig {
                 platform_api_url: state.config.platform_api_url.clone(),
                 platform_secret_name: secrets_name.clone(),
                 init_image,
+                iptables_init_image,
+                mesh_transparent: state.config.mesh_transparent,
+                mesh_strict_mtls: state.config.mesh_strict_mtls,
             },
         )?
     } else {

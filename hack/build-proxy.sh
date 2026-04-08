@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Build platform-proxy for linux/amd64 and linux/arm64 (dev/test use).
+# Build platform-proxy and platform-proxy-init for linux/amd64 and linux/arm64 (dev/test use).
 # Uses Docker for cross-compilation (produces Linux ELF binaries on any host).
-# The proxy is a separate crate (crates/proxy/) with no openssl dependency.
+# Both crates have no openssl dependency (pure rustls / no deps).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE="$(bash "${SCRIPT_DIR}/detect-worktree.sh")"
 PROXY_DIR="/tmp/platform-e2e/${WORKTREE}/proxy"
-mkdir -p "${PROXY_DIR}"
+PROXY_INIT_DIR="/tmp/platform-e2e/${WORKTREE}/proxy-init"
+mkdir -p "${PROXY_DIR}" "${PROXY_INIT_DIR}"
 
-echo "==> Building platform-proxy binaries (linux, via Docker)"
+echo "==> Building platform-proxy + platform-proxy-init binaries (linux, via Docker)"
 
-# Cross-compile inside Docker. The proxy crate has no openssl dependency
-# (pure rustls), so no libssl-dev needed for cross targets.
+# Cross-compile inside Docker. Both crates are pure Rust (no C deps beyond musl).
 docker run --rm \
   -v "${PROJECT_DIR}:/src" \
   -v "${PROXY_DIR}:/out" \
+  -v "${PROXY_INIT_DIR}:/out-init" \
   -v "platform-cross-proxy-registry:/usr/local/cargo/registry" \
   -v "platform-cross-proxy-git:/usr/local/cargo/git" \
   -v "platform-cross-proxy-target:/src/target" \
@@ -30,17 +31,19 @@ docker run --rm \
     SQLX_OFFLINE=true \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
       CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
-      cargo build -p platform-proxy --release --target aarch64-unknown-linux-musl && \
+      cargo build -p platform-proxy -p platform-proxy-init --release --target aarch64-unknown-linux-musl && \
     echo "==> Building amd64 (musl, static)..." && \
     SQLX_OFFLINE=true \
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc \
       CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
-      cargo build -p platform-proxy --release --target x86_64-unknown-linux-musl && \
+      cargo build -p platform-proxy -p platform-proxy-init --release --target x86_64-unknown-linux-musl && \
     cp target/aarch64-unknown-linux-musl/release/platform-proxy /out/arm64 && \
     cp target/x86_64-unknown-linux-musl/release/platform-proxy /out/amd64 && \
-    chmod +x /out/arm64 /out/amd64'
+    cp target/aarch64-unknown-linux-musl/release/platform-proxy-init /out-init/arm64 && \
+    cp target/x86_64-unknown-linux-musl/release/platform-proxy-init /out-init/amd64 && \
+    chmod +x /out/arm64 /out/amd64 /out-init/arm64 /out-init/amd64'
 
-# Create `platform-proxy` as a copy of the arch the Kind node uses.
+# Create arch-specific copies for the Kind node.
 CLUSTER_ARCH="amd64"
 if docker exec platform-control-plane uname -m 2>/dev/null | grep -q aarch64; then
   CLUSTER_ARCH="arm64"
@@ -48,4 +51,6 @@ fi
 cp "${PROXY_DIR}/${CLUSTER_ARCH}" "${PROXY_DIR}/platform-proxy"
 chmod +x "${PROXY_DIR}/platform-proxy"
 
-echo "  Binaries ready: ${PROXY_DIR}/{amd64,arm64,platform-proxy (${CLUSTER_ARCH})}"
+echo "  Binaries ready:"
+echo "    proxy:      ${PROXY_DIR}/{amd64,arm64,platform-proxy (${CLUSTER_ARCH})}"
+echo "    proxy-init: ${PROXY_INIT_DIR}/{amd64,arm64}"

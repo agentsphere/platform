@@ -90,7 +90,7 @@ async fn gateway_controller_creates_deployment(pool: PgPool) {
         .and_then(|s| s.containers.first())
         .and_then(|c| c.image.as_ref())
         .expect("container image should be set");
-    assert_eq!(image, "test-registry.local:5000/platform-proxy:latest");
+    assert_eq!(image, "test-registry.local:5000/platform-proxy:v1");
 
     cleanup_namespace(&state.kube, &ns).await;
 }
@@ -221,7 +221,7 @@ async fn gateway_controller_updates_image(pool: PgPool) {
         .and_then(|s| s.containers.first())
         .and_then(|c| c.image.as_ref())
         .unwrap();
-    assert_eq!(old_image, "old-registry.local:5000/platform-proxy:latest");
+    assert_eq!(old_image, "old-registry.local:5000/platform-proxy:v1");
 
     // Second reconcile with updated registry URL
     let state = {
@@ -246,7 +246,7 @@ async fn gateway_controller_updates_image(pool: PgPool) {
         .and_then(|s| s.containers.first())
         .and_then(|c| c.image.as_ref())
         .unwrap();
-    assert_eq!(new_image, "new-registry.local:5000/platform-proxy:latest");
+    assert_eq!(new_image, "new-registry.local:5000/platform-proxy:v1");
 
     cleanup_namespace(&state.kube, &ns).await;
 }

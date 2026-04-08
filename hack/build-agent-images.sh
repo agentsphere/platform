@@ -85,18 +85,20 @@ else
   echo "${RUNNER_CURRENT_CHECKSUM}" > "${RUNNER_CHECKSUM_FILE}"
 fi
 
-# ── Platform-proxy binary (cross-compiled, worktree-scoped) ─────────────
+# ── Platform-proxy + proxy-init binaries (cross-compiled, worktree-scoped) ──
 PROXY_DIR="/tmp/platform-e2e/${WORKTREE}/proxy"
-mkdir -p "${PROXY_DIR}"
-echo "  Platform-proxy binary (→ ${PROXY_DIR}):"
+PROXY_INIT_DIR="/tmp/platform-e2e/${WORKTREE}/proxy-init"
+mkdir -p "${PROXY_DIR}" "${PROXY_INIT_DIR}"
+echo "  Platform-proxy + proxy-init binaries (→ ${PROXY_DIR}, ${PROXY_INIT_DIR}):"
 PROXY_CHECKSUM_FILE="${PROXY_DIR}/.checksum"
 PROXY_CURRENT_CHECKSUM=$(
-  { find "${PROJECT_DIR}/crates/proxy/src" -name '*.rs' -exec shasum -a 256 {} +
-    shasum -a 256 "${PROJECT_DIR}/crates/proxy/Cargo.toml" "${PROJECT_DIR}/Cargo.lock"
+  { find "${PROJECT_DIR}/crates/proxy/src" "${PROJECT_DIR}/crates/proxy-init/src" -name '*.rs' -exec shasum -a 256 {} +
+    shasum -a 256 "${PROJECT_DIR}/crates/proxy/Cargo.toml" "${PROJECT_DIR}/crates/proxy-init/Cargo.toml" "${PROJECT_DIR}/Cargo.lock"
   } | sort | shasum -a 256 | awk '{print $1}'
 )
 
 if [[ "$FORCE" == "false" && -f "${PROXY_DIR}/amd64" && -f "${PROXY_DIR}/arm64" && \
+      -f "${PROXY_INIT_DIR}/amd64" && -f "${PROXY_INIT_DIR}/arm64" && \
       -f "${PROXY_CHECKSUM_FILE}" && "$(cat "${PROXY_CHECKSUM_FILE}")" == "${PROXY_CURRENT_CHECKSUM}" ]]; then
   echo "    cached"
 else
@@ -148,6 +150,39 @@ else
   fi
 fi
 
+# ── Platform-proxy-init OCI image (distroless iptables init container) ─
+echo "  Proxy-init seed image:"
+PROXY_INIT_TAR="${SEED_DIR}/platform-proxy-init.tar"
+PROXY_INIT_IMG_CHECKSUM_FILE="${SEED_DIR}/.platform-proxy-init-checksum"
+PROXY_INIT_IMG_CHECKSUM=$(
+  { shasum -a 256 "${PROJECT_DIR}/docker/Dockerfile.platform-proxy-init"
+    if [[ -f "${PROXY_INIT_DIR}/amd64" ]]; then shasum -a 256 "${PROXY_INIT_DIR}/amd64"; fi
+    if [[ -f "${PROXY_INIT_DIR}/arm64" ]]; then shasum -a 256 "${PROXY_INIT_DIR}/arm64"; fi
+  } | sort | shasum -a 256 | awk '{print $1}'
+)
+
+if [[ "$FORCE" == "false" && -f "${PROXY_INIT_TAR}" && -f "${PROXY_INIT_IMG_CHECKSUM_FILE}" && \
+      "$(cat "${PROXY_INIT_IMG_CHECKSUM_FILE}")" == "${PROXY_INIT_IMG_CHECKSUM}" ]]; then
+  echo "    cached"
+else
+  echo "    building OCI image..."
+  PROXY_INIT_BUILD_CTX=$(mktemp -d)
+  # Copy both arch binaries into the build context
+  if [[ -f "${PROXY_INIT_DIR}/amd64" && -f "${PROXY_INIT_DIR}/arm64" ]]; then
+    cp "${PROXY_INIT_DIR}/amd64" "${PROXY_INIT_BUILD_CTX}/platform-proxy-init-amd64"
+    cp "${PROXY_INIT_DIR}/arm64" "${PROXY_INIT_BUILD_CTX}/platform-proxy-init-arm64"
+    docker buildx build \
+      --builder platform-oci \
+      --file "${PROJECT_DIR}/docker/Dockerfile.platform-proxy-init" \
+      --output "type=oci,dest=${PROXY_INIT_TAR}" \
+      "${PROXY_INIT_BUILD_CTX}"
+    echo "${PROXY_INIT_IMG_CHECKSUM}" > "${PROXY_INIT_IMG_CHECKSUM_FILE}"
+  else
+    echo "    SKIP: proxy-init binaries not found"
+  fi
+  rm -rf "${PROXY_INIT_BUILD_CTX}"
+fi
+
 # ── MCP servers tarball ────────────────────────────────────────────────
 MCP_TARBALL="/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz"
 MCP_CHECKSUM_FILE="/tmp/platform-e2e/${WORKTREE}/.mcp-checksum"
@@ -176,5 +211,7 @@ echo "  Agent-runner: ${RUNNER_DIR}/"
 ls -lh "${RUNNER_DIR}/arm64" "${RUNNER_DIR}/amd64" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'
 echo "  Platform-proxy: ${PROXY_DIR}/"
 ls -lh "${PROXY_DIR}/arm64" "${PROXY_DIR}/amd64" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'
+echo "  Platform-proxy-init: ${PROXY_INIT_DIR}/"
+ls -lh "${PROXY_INIT_DIR}/arm64" "${PROXY_INIT_DIR}/amd64" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'
 echo "  MCP tarball: ${MCP_TARBALL}"
 ls -lh "${MCP_TARBALL}" 2>/dev/null | awk '{print "    " $NF " (" $5 ")"}'

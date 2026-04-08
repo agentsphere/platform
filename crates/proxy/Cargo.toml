@@ -65,7 +65,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Signal handling (PID 1 process wrapper)
-nix = { version = "0.29", features = ["signal", "process"] }
+nix = { version = "0.29", features = ["signal", "process", "net"] }
 
 # UUID
 uuid = { version = "1", features = ["v4"] }

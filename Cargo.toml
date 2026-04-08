@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/proxy"]
+members = [".", "crates/proxy", "crates/proxy-init"]
 
 [package]
 name = "platform"

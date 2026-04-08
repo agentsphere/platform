@@ -190,6 +190,36 @@ pub fn build_tls_acceptor(certs: &ProxyCerts) -> anyhow::Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Build a permissive `TlsAcceptor` that accepts but does not require client certs.
+///
+/// Used in transparent-proxy permissive mode: if the peer presents a cert it is
+/// validated against the CA trust bundle; if it sends none the handshake still
+/// succeeds.
+pub fn build_permissive_tls_acceptor(certs: &ProxyCerts) -> anyhow::Result<TlsAcceptor> {
+    let server_certs = load_certs_from_pem(&certs.cert_pem)?;
+    let server_key = load_key_from_pem(&certs.key_pem)?;
+
+    let ca_certs = load_certs_from_pem(&certs.ca_pem)?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &ca_certs {
+        root_store
+            .add(cert.clone())
+            .map_err(|e| anyhow::anyhow!("failed to add CA cert: {e}"))?;
+    }
+
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build permissive client verifier: {e}"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(server_certs, server_key)
+        .map_err(|e| anyhow::anyhow!("failed to build permissive TLS server config: {e}"))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Build a rustls `TlsConnector` for outbound mTLS origination.
 ///
 /// Presents the proxy's client cert to the upstream.

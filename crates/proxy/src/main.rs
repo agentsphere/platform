@@ -47,8 +47,10 @@ fn spawn_mtls_bootstrap(
     config: &ProxyConfig,
     shutdown_rx: &watch::Receiver<()>,
 ) -> Option<tls::SharedCerts> {
-    let needs_mtls =
-        config.tls_port.is_some() || config.outbound_port.is_some() || !config.tcp_ports.is_empty();
+    let needs_mtls = config.tls_port.is_some()
+        || config.outbound_port.is_some()
+        || !config.tcp_ports.is_empty()
+        || config.transparent;
     if !needs_mtls {
         return None;
     }
@@ -107,6 +109,22 @@ fn start_mesh_components(
     metric_tx: &mpsc::Sender<metrics::MetricRecord>,
     shutdown_rx: &watch::Receiver<()>,
 ) {
+    // Transparent mode -- replaces explicit inbound/outbound when enabled
+    if config.transparent {
+        if let Some(certs) = certs {
+            start_transparent_listeners(
+                config,
+                certs,
+                span_tx,
+                active_spans,
+                red_metrics,
+                metric_tx,
+                shutdown_rx,
+            );
+        }
+        return;
+    }
+
     // Inbound mTLS listener
     if let (Some(tls_port), Some(app_port), Some(certs)) = (config.tls_port, config.app_port, certs)
     {
@@ -174,6 +192,55 @@ fn start_mesh_components(
     }
 }
 
+/// Spawn transparent inbound + outbound listeners.
+#[allow(clippy::too_many_arguments)]
+fn start_transparent_listeners(
+    config: &ProxyConfig,
+    certs: &tls::SharedCerts,
+    span_tx: &mpsc::Sender<traces::SpanRecord>,
+    active_spans: &traces::SharedActiveSpans,
+    red_metrics: &Arc<metrics::RedMetrics>,
+    metric_tx: &mpsc::Sender<metrics::MetricRecord>,
+    shutdown_rx: &watch::Receiver<()>,
+) {
+    let inbound_params = inbound::TransparentInboundParams {
+        inbound_port: config.inbound_port,
+        mtls_mode: config.mtls_mode,
+        node_cidrs: config.node_cidrs.clone(),
+        outbound_bind_addr: config.outbound_bind_addr,
+        service_name: config.service_name.clone(),
+        certs: certs.clone(),
+        span_tx: span_tx.clone(),
+        active_spans: active_spans.clone(),
+        red_metrics: red_metrics.clone(),
+    };
+    tokio::spawn(inbound::run_transparent_inbound(
+        inbound_params,
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(metrics::flush_red_metrics(
+        red_metrics.clone(),
+        config.service_name.clone(),
+        metric_tx.clone(),
+        config.metrics_interval,
+        shutdown_rx.clone(),
+    ));
+
+    let outbound_port = config.outbound_port.unwrap_or(15001);
+    let outbound_params = outbound::TransparentOutboundParams {
+        outbound_port,
+        outbound_bind_addr: config.outbound_bind_addr,
+        internal_cidrs: config.internal_cidrs.clone(),
+        service_name: config.service_name.clone(),
+        certs: certs.clone(),
+        span_tx: span_tx.clone(),
+    };
+    tokio::spawn(outbound::run_transparent_outbound(
+        outbound_params,
+        shutdown_rx.clone(),
+    ));
+}
+
 /// Initialize tracing and run the gateway mode.
 async fn init_gateway_and_run(args: Vec<String>) {
     let gw_config = gateway::GatewayConfig::from_env();
@@ -211,6 +278,7 @@ async fn main() {
 
     tracing::info!(
         service = %config.service_name,
+        transparent = config.transparent,
         tls_port = ?config.tls_port,
         outbound_port = ?config.outbound_port,
         tcp_ports = ?config.tcp_ports,

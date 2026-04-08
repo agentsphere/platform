@@ -129,6 +129,10 @@ pub struct Config {
     pub registry_max_blob_size_bytes: u64,
     /// Enable the mesh CA module (default: false).
     pub mesh_enabled: bool,
+    /// Enable transparent proxy mode with iptables interception (default: true when `mesh_enabled`).
+    pub mesh_transparent: bool,
+    /// Enable strict mTLS mode — reject plaintext except from kubelets (default: false).
+    pub mesh_strict_mtls: bool,
     /// Leaf certificate TTL in seconds (default: 3600 = 1 hour).
     pub mesh_ca_cert_ttl_secs: u64,
     /// Root CA certificate validity in days (default: 365).
@@ -362,6 +366,17 @@ impl Config {
             mesh_enabled: env::var("PLATFORM_MESH_ENABLED")
                 .ok()
                 .is_some_and(|v| v == "true"),
+            mesh_transparent: env::var("PLATFORM_MESH_TRANSPARENT").map_or_else(
+                |_| {
+                    env::var("PLATFORM_MESH_ENABLED")
+                        .ok()
+                        .is_some_and(|v| v == "true")
+                },
+                |v| v == "true" || v == "1",
+            ),
+            mesh_strict_mtls: env::var("PLATFORM_MESH_STRICT")
+                .ok()
+                .is_some_and(|v| v == "true" || v == "1"),
             mesh_ca_cert_ttl_secs: env::var("PLATFORM_MESH_CERT_TTL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -500,6 +515,8 @@ impl Config {
             registry_http_body_limit_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
             registry_max_blob_size_bytes: 5_368_709_120,            // 5 GB
             mesh_enabled: false,
+            mesh_transparent: false,
+            mesh_strict_mtls: false,
             mesh_ca_cert_ttl_secs: 3600,
             mesh_ca_root_ttl_days: 365,
             proxy_binary_path: None,

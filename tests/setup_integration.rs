@@ -134,6 +134,8 @@ async fn setup_test_state(pool: PgPool) -> (platform::store::AppState, String) {
         max_artifact_file_bytes: 50 * 1024 * 1024,
         max_artifact_total_bytes: 500 * 1024 * 1024,
         mesh_enabled: false,
+        mesh_transparent: false,
+        mesh_strict_mtls: false,
         mesh_ca_cert_ttl_secs: 3600,
         mesh_ca_root_ttl_days: 365,
         proxy_binary_path: None,

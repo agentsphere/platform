@@ -1,0 +1,11 @@
+# Distroless-like init container for transparent proxy iptables setup.
+# Contains only iptables (+ required libs) and the static Rust binary.
+# Shell and package manager are removed to minimize attack surface.
+FROM alpine:3.21 AS base
+RUN apk add --no-cache iptables \
+    && rm -rf /bin/sh /bin/ash /sbin/apk /etc/apk /lib/apk /usr/share/apk \
+              /bin/busybox /usr/bin/scanelf /usr/bin/ssl_client
+
+ARG TARGETARCH=amd64
+COPY platform-proxy-init-${TARGETARCH} /platform-proxy-init
+ENTRYPOINT ["/platform-proxy-init"]
