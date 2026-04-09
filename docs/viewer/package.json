@@ -16,7 +16,7 @@
   "dependencies": {
     "d3-selection": "^3.0.0",
     "d3-zoom": "^3.0.0",
-    "marked": "^17.0.5",
+    "marked": "^18.0.0",
     "mermaid": "^11.4.0"
   }
 }
