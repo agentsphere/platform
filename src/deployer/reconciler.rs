@@ -940,14 +940,13 @@ async fn inject_platform_secret(
     namespace: &str,
 ) -> Option<String> {
     let mut env_data: BTreeMap<String, String> = BTreeMap::new();
+    let secret_name = format!("{namespace}-{}-platform", env_suffix(&release.environment));
 
-    inject_otel_env_vars(state, release, &mut env_data).await;
+    inject_otel_env_vars(state, release, &mut env_data, namespace, &secret_name).await;
 
     if env_data.is_empty() {
         return None;
     }
-
-    let secret_name = format!("{namespace}-{}-platform", env_suffix(&release.environment));
     apply_k8s_secret(
         state,
         namespace,
@@ -997,6 +996,8 @@ async fn inject_otel_env_vars(
     state: &AppState,
     release: &PendingRelease,
     env_data: &mut BTreeMap<String, String>,
+    namespace: &str,
+    secret_name: &str,
 ) {
     env_data.insert(
         "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
@@ -1016,7 +1017,7 @@ async fn inject_otel_env_vars(
     };
 
     if let Ok((otel_token, api_token)) =
-        ensure_scoped_tokens(state, release.project_id, scope).await
+        ensure_scoped_tokens_in_ns(state, release.project_id, scope, namespace, secret_name).await
     {
         env_data.insert(
             "OTEL_EXPORTER_OTLP_HEADERS".into(),
@@ -1044,6 +1045,17 @@ pub async fn ensure_scoped_tokens(
     project_id: Uuid,
     scope: &str,
 ) -> Result<(String, String), DeployerError> {
+    ensure_scoped_tokens_in_ns(state, project_id, scope, "", "").await
+}
+
+/// Like `ensure_scoped_tokens` but with namespace/secret context for token reuse.
+pub async fn ensure_scoped_tokens_in_ns(
+    state: &AppState,
+    project_id: Uuid,
+    scope: &str,
+    namespace: &str,
+    secret_name: &str,
+) -> Result<(String, String), DeployerError> {
     let owner = resolve_project_owner(state, project_id).await;
     let Some((owner_id, _)) = owner else {
         return Err(DeployerError::Other(anyhow::anyhow!(
@@ -1055,24 +1067,57 @@ pub async fn ensure_scoped_tokens(
     let otel_name = format!("otlp-{scope}-{proj8}");
     let api_name = format!("api-{scope}-{proj8}");
 
-    // Create OTEL token (observe:write)
-    let otel_token =
-        ensure_single_token(state, owner_id, project_id, &otel_name, &["observe:write"]).await?;
+    // Create or reuse OTEL token (observe:write)
+    let otel_token = ensure_single_token(
+        state,
+        &TokenParams {
+            owner_id,
+            project_id,
+            name: &otel_name,
+            scopes: &["observe:write"],
+            namespace,
+            secret_name,
+            secret_key: "OTEL_API_TOKEN",
+        },
+    )
+    .await?;
 
-    // Create API token (project:read — for flag evaluation)
-    let api_token =
-        ensure_single_token(state, owner_id, project_id, &api_name, &["project:read"]).await?;
+    // Create or reuse API token (project:read)
+    let api_token = ensure_single_token(
+        state,
+        &TokenParams {
+            owner_id,
+            project_id,
+            name: &api_name,
+            scopes: &["project:read"],
+            namespace,
+            secret_name,
+            secret_key: "PLATFORM_API_TOKEN",
+        },
+    )
+    .await?;
 
     Ok((otel_token, api_token))
 }
 
-/// Create or rotate a single scoped API token.
-async fn ensure_single_token(
-    state: &AppState,
+struct TokenParams<'a> {
     owner_id: Uuid,
     project_id: Uuid,
-    name: &str,
-    scopes: &[&str],
+    name: &'a str,
+    scopes: &'a [&'a str],
+    namespace: &'a str,
+    secret_name: &'a str,
+    secret_key: &'a str,
+}
+
+/// Ensure a scoped API token exists. Reuses existing valid tokens; only creates
+/// a new one if none exists or the existing one is expired.
+///
+/// Returns the raw token string. For existing tokens, reads the raw value from
+/// the K8s Secret (since we only store the hash in the DB).
+async fn ensure_single_token(
+    state: &AppState,
+    params: &TokenParams<'_>,
 ) -> Result<String, DeployerError> {
     // Check existing valid token with matching name
     let existing = sqlx::query_scalar::<_, Uuid>(
@@ -1081,35 +1126,56 @@ async fn ensure_single_token(
            AND (expires_at IS NULL OR expires_at > now())
          LIMIT 1",
     )
-    .bind(project_id)
-    .bind(name)
+    .bind(params.project_id)
+    .bind(params.name)
     .fetch_optional(&state.pool)
     .await?;
 
+    // Reuse existing token — read raw value from the K8s Secret
+    if existing.is_some() {
+        if let Some(raw) = read_secret_key(
+            &state.kube,
+            params.namespace,
+            params.secret_name,
+            params.secret_key,
+        )
+        .await
+        {
+            tracing::debug!(name = params.name, "reusing existing token");
+            return Ok(raw);
+        }
+        // Secret missing or key not found — fall through to create new token
+        tracing::debug!(
+            name = params.name,
+            "token exists in DB but not in K8s Secret, creating new"
+        );
+    }
+
     let (raw_token, hash) = crate::auth::token::generate_api_token();
     let expires = chrono::Utc::now() + chrono::Duration::days(365);
-    let scope_strs: Vec<String> = scopes
+    let scope_strs: Vec<String> = params
+        .scopes
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
 
     let mut tx = state.pool.begin().await?;
 
-    // Insert new token first (R3: no token gap)
+    // Insert new token
     sqlx::query(
         "INSERT INTO api_tokens (user_id, name, token_hash, scopes, project_id, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(owner_id)
-    .bind(name)
+    .bind(params.owner_id)
+    .bind(params.name)
     .bind(&hash)
     .bind(&scope_strs)
-    .bind(project_id)
+    .bind(params.project_id)
     .bind(expires)
     .execute(&mut *tx)
     .await?;
 
-    // Delete old token if exists
+    // Delete old token if exists (replaced by the new one)
     if let Some(old_id) = existing {
         sqlx::query("DELETE FROM api_tokens WHERE id = $1")
             .bind(old_id)
@@ -1120,6 +1186,20 @@ async fn ensure_single_token(
     tx.commit().await?;
 
     Ok(raw_token)
+}
+
+/// Read a single key from a K8s Secret, returning the decoded string value.
+async fn read_secret_key(
+    kube: &kube::Client,
+    namespace: &str,
+    secret_name: &str,
+    key: &str,
+) -> Option<String> {
+    let api: Api<Secret> = Api::namespaced(kube.clone(), namespace);
+    let secret = api.get(secret_name).await.ok()?;
+    let data = secret.data?;
+    let bytes = data.get(key)?;
+    String::from_utf8(bytes.0.clone()).ok()
 }
 
 /// Look up the stable image from the most recent completed release for the same target.

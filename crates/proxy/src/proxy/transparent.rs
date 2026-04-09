@@ -128,6 +128,11 @@ fn detect_http_prefix(data: &[u8]) -> bool {
 // CIDR Matching
 // ---------------------------------------------------------------------------
 
+/// Parse a comma-separated list of ports (e.g. `"5432,6379,3306"`).
+pub fn parse_ports(s: &str) -> Vec<u16> {
+    s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
+}
+
 /// Parse a comma-separated list of CIDR strings (e.g. `"10.0.0.0/8,172.16.0.0/12"`).
 ///
 /// Invalid entries are silently skipped.
@@ -193,21 +198,45 @@ pub fn cidr_contains(network: IpAddr, prefix_len: u8, ip: IpAddr) -> bool {
 // Outbound Socket Binding
 // ---------------------------------------------------------------------------
 
-/// Create a `TcpStream` connected to `dest`, bound to `bind_addr:0`.
+/// Default bypass source port range (above Linux's default ephemeral 32768-60999).
+pub const BYPASS_PORT_MIN: u16 = 61000;
+/// Upper bound of bypass source port range.
+pub const BYPASS_PORT_MAX: u16 = 65000;
+
+/// Create a `TcpStream` connected to `dest`, bound to a random source port in
+/// `port_range` so that iptables `--sport` RETURN rules skip re-intercepting it.
 ///
-/// Binding the source to a specific IP (e.g. `127.0.0.6`) prevents iptables
-/// OUTPUT REDIRECT rules from re-intercepting the connection.
-pub async fn bind_outbound_socket(dest: SocketAddr, bind_addr: IpAddr) -> io::Result<TcpStream> {
-    let socket = if dest.is_ipv4() {
-        let s = tokio::net::TcpSocket::new_v4()?;
-        s.bind(SocketAddr::new(bind_addr, 0))?;
-        s
-    } else {
-        let s = tokio::net::TcpSocket::new_v6()?;
-        s.bind(SocketAddr::new(bind_addr, 0))?;
-        s
-    };
-    socket.connect(dest).await
+/// Retries up to 10 times on `EADDRINUSE` (4001 ports in default range).
+pub async fn bind_outbound_socket(
+    dest: SocketAddr,
+    port_range: (u16, u16),
+) -> io::Result<TcpStream> {
+    let mut last_err = io::Error::new(io::ErrorKind::AddrInUse, "no attempts made");
+
+    for _ in 0..10 {
+        let port = rand::random_range(port_range.0..=port_range.1);
+        let bind_addr = if dest.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+        } else {
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port)
+        };
+
+        let socket = if dest.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+
+        match socket.bind(bind_addr) {
+            Ok(()) => return socket.connect(dest).await,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                last_err = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err)
 }
 
 // ---------------------------------------------------------------------------

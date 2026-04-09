@@ -321,8 +321,9 @@ spec:
     assert_eq!(env_map.get("PROXY_TRANSPARENT"), Some(&"true"));
     assert_eq!(env_map.get("PROXY_MTLS_MODE"), Some(&"permissive"));
     assert_eq!(env_map.get("PROXY_INBOUND_PORT"), Some(&"15006"));
-    assert_eq!(env_map.get("PROXY_OUTBOUND_BIND"), Some(&"127.0.0.6"));
     assert!(env_map.contains_key("PROXY_INTERNAL_CIDRS"));
+    // PROXY_OUTBOUND_BIND removed — bypass uses source port range now
+    assert!(!env_map.contains_key("PROXY_OUTBOUND_BIND"));
 }
 
 // ---------------------------------------------------------------------------

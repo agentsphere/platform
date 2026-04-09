@@ -207,7 +207,8 @@ fn start_transparent_listeners(
         inbound_port: config.inbound_port,
         mtls_mode: config.mtls_mode,
         node_cidrs: config.node_cidrs.clone(),
-        outbound_bind_addr: config.outbound_bind_addr,
+        bypass_port_range: config.bypass_port_range,
+        passthrough_ports: config.tcp_ports.clone(),
         service_name: config.service_name.clone(),
         certs: certs.clone(),
         span_tx: span_tx.clone(),
@@ -229,7 +230,8 @@ fn start_transparent_listeners(
     let outbound_port = config.outbound_port.unwrap_or(15001);
     let outbound_params = outbound::TransparentOutboundParams {
         outbound_port,
-        outbound_bind_addr: config.outbound_bind_addr,
+        bypass_port_range: config.bypass_port_range,
+        passthrough_ports: config.tcp_ports.clone(),
         internal_cidrs: config.internal_cidrs.clone(),
         service_name: config.service_name.clone(),
         certs: certs.clone(),

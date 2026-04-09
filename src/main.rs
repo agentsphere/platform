@@ -373,6 +373,11 @@ fn spawn_background_tasks(
     observe::ingest::IngestChannels,
 ) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    // Label the platform namespace so NetworkPolicies allow ingress from it
+    // (preview proxy, gateway, etc. need to reach deployed app pods).
+    tokio::spawn(label_platform_namespace(state.clone()));
+
     tokio::spawn(pipeline::executor::run(state.clone(), shutdown_rx.clone()));
     tokio::spawn(store::eventbus::run(state.clone(), shutdown_tx.subscribe()));
     tokio::spawn(deployer::reconciler::run(
@@ -416,6 +421,28 @@ fn spawn_background_tasks(
         ));
     }
     (shutdown_tx, observe_channels)
+}
+
+async fn label_platform_namespace(state: store::AppState) {
+    use k8s_openapi::api::core::v1::Namespace;
+    use kube::api::{Api, Patch, PatchParams};
+
+    let ns = &state.config.platform_namespace;
+    let api: Api<Namespace> = Api::all(state.kube.clone());
+    let patch = serde_json::json!({
+        "metadata": {
+            "labels": {
+                "platform.io/managed-by": "platform"
+            }
+        }
+    });
+    match api
+        .patch(ns, &PatchParams::apply("platform"), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => tracing::info!(%ns, "labeled platform namespace"),
+        Err(e) => tracing::warn!(error = %e, %ns, "failed to label platform namespace"),
+    }
 }
 
 async fn run_session_cleanup(

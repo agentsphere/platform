@@ -87,7 +87,8 @@ pub struct TransparentInboundParams {
     pub inbound_port: u16,
     pub mtls_mode: MtlsMode,
     pub node_cidrs: Vec<(IpAddr, u8)>,
-    pub outbound_bind_addr: IpAddr,
+    pub bypass_port_range: (u16, u16),
+    pub passthrough_ports: Vec<u16>,
     pub service_name: String,
     pub certs: SharedCerts,
     pub span_tx: mpsc::Sender<SpanRecord>,
@@ -151,6 +152,12 @@ async fn handle_transparent_inbound(
     let original_dst = transparent::get_original_dst(&stream)
         .await
         .map_err(|e| anyhow::anyhow!("get_original_dst failed: {e}"))?;
+
+    // TCP passthrough for known non-HTTP ports — skip TLS and strict mode
+    if params.passthrough_ports.contains(&original_dst.port()) {
+        let (read, write) = stream.into_split();
+        return forward_transparent_inbound(read, write, peer, original_dst, None, params).await;
+    }
 
     if transparent::is_tls_client_hello(&stream).await {
         handle_tls_inbound(stream, peer, original_dst, params).await
@@ -232,10 +239,10 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Connect to the original destination, binding to outbound_bind_addr to
+    // Connect to the original destination using a bypass source port to
     // prevent iptables from re-intercepting the packet.
     let mut upstream =
-        transparent::bind_outbound_socket(original_dst, params.outbound_bind_addr).await?;
+        transparent::bind_outbound_socket(original_dst, params.bypass_port_range).await?;
 
     // Read first chunk to detect protocol
     let mut buf = vec![0u8; 16384];

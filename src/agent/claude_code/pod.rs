@@ -405,6 +405,10 @@ fn build_env_vars(
             "PATH",
             "/workspace/.platform/bin:/workspace/.platform/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ),
+        // Isolate Claude config/memory to the ephemeral workspace so sessions
+        // never share state across projects or survive pod restart.
+        env_var("HOME", "/workspace/.platform"),
+        env_var("CLAUDE_CONFIG_DIR", "/workspace/.platform/.claude"),
         // Headless Claude CLI operation
         env_var("DISABLE_AUTOUPDATER", "1"),
         env_var("DISABLE_TELEMETRY", "1"),

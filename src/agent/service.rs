@@ -1100,6 +1100,14 @@ pub async fn send_manager_message(
         resolve_active_llm_provider(state, session.user_id).await;
 
     let mcp_path = format!("/tmp/manager-mcp-{session_id}.json");
+    // Isolate Claude config/memory per project so manager sessions from
+    // different projects never share persistent state (memory, history, etc.).
+    let config_dir = format!(
+        "/tmp/claude-config-{}",
+        session
+            .project_id
+            .map_or_else(|| session_id.to_string(), |pid| pid.to_string())
+    );
     let session_id_str = session_id.to_string();
     let message_owned = message.to_string();
     let valkey = state.valkey.clone();
@@ -1152,6 +1160,7 @@ pub async fn send_manager_message(
             permission_mode: Some("bypassPermissions".to_string()),
             max_turns: None, // Let Claude use as many turns as needed for MCP calls
             cwd: Some(std::path::PathBuf::from("/tmp")),
+            config_dir: Some(std::path::PathBuf::from(&config_dir)),
             oauth_token,
             anthropic_api_key: api_key,
             extra_env,

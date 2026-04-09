@@ -174,8 +174,9 @@ async fn handle_outbound_connection(
 /// Parameters for the transparent outbound proxy.
 pub struct TransparentOutboundParams {
     pub outbound_port: u16,
-    pub outbound_bind_addr: IpAddr,
+    pub bypass_port_range: (u16, u16),
     pub internal_cidrs: Vec<(IpAddr, u8)>,
+    pub passthrough_ports: Vec<u16>,
     pub service_name: String,
     pub certs: SharedCerts,
     pub span_tx: mpsc::Sender<SpanRecord>,
@@ -236,10 +237,16 @@ async fn handle_transparent_outbound(
         .await
         .map_err(|e| anyhow::anyhow!("outbound get_original_dst failed: {e}"))?;
 
+    // TCP passthrough for known non-HTTP ports (Postgres, Redis, etc.)
+    if params.passthrough_ports.contains(&original_dst.port()) {
+        let internal = transparent::is_internal_ip(original_dst.ip(), &params.internal_cidrs);
+        return handle_outbound_passthrough(app_stream, original_dst, params, internal).await;
+    }
+
     if transparent::is_internal_ip(original_dst.ip(), &params.internal_cidrs) {
         handle_outbound_internal(app_stream, original_dst, params).await
     } else {
-        handle_outbound_external(app_stream, original_dst, params).await
+        handle_outbound_passthrough(app_stream, original_dst, params, false).await
     }
 }
 
@@ -259,7 +266,7 @@ async fn handle_outbound_internal(
 
     // Establish mTLS to the destination (connect to same port -- the
     // destination's inbound transparent proxy will terminate TLS).
-    let upstream_tcp = transparent::bind_outbound_socket(dest, params.outbound_bind_addr).await?;
+    let upstream_tcp = transparent::bind_outbound_socket(dest, params.bypass_port_range).await?;
 
     let current_certs = params.certs.load();
     let connector = tls::build_tls_connector(&current_certs)?;
@@ -384,13 +391,16 @@ async fn outbound_tcp_internal(
     Ok(())
 }
 
-/// Outbound to an external service: raw TCP passthrough with CONNECTION span.
-async fn handle_outbound_external(
+/// Raw TCP passthrough — used for external destinations and internal passthrough
+/// ports (Postgres, Redis). The `internal` flag controls span tagging so
+/// observability dashboards correctly classify the traffic.
+async fn handle_outbound_passthrough(
     app_stream: TcpStream,
     dest: SocketAddr,
     params: &TransparentOutboundParams,
+    internal: bool,
 ) -> anyhow::Result<()> {
-    let upstream = transparent::bind_outbound_socket(dest, params.outbound_bind_addr).await?;
+    let upstream = transparent::bind_outbound_socket(dest, params.bypass_port_range).await?;
 
     let started_at = Utc::now();
     let start_time = Instant::now();
@@ -414,7 +424,7 @@ async fn handle_outbound_external(
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let total = bytes_in.load(Ordering::Relaxed) + bytes_out.load(Ordering::Relaxed);
 
-    let span = traces::build_connection_span(
+    let mut span = traces::build_connection_span(
         &trace_id,
         &span_id,
         &params.service_name,
@@ -422,6 +432,10 @@ async fn handle_outbound_external(
         i32::try_from(duration_ms).unwrap_or(i32::MAX),
         total,
     );
+    if internal && let Some(serde_json::Value::Object(ref mut map)) = span.attributes {
+        map.insert("mesh.internal".into(), serde_json::json!(true));
+        map.insert("mesh.passthrough".into(), serde_json::json!(true));
+    }
     let _ = params.span_tx.try_send(span);
     Ok(())
 }

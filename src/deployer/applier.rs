@@ -584,7 +584,14 @@ pub fn inject_proxy_wrapper(
 /// copies it to the shared emptyDir at `/proxy` and sets up iptables rules.
 /// No shell, no network downloads — just a file copy and iptables calls.
 fn build_proxy_init_container(config: &ProxyInjectionConfig) -> serde_json::Value {
-    serde_json::json!({
+    let mut env = Vec::<serde_json::Value>::new();
+
+    // Pass the platform API port so the init container can whitelist it in iptables
+    if let Some(port) = extract_port_from_url(&config.platform_api_url) {
+        env.push(serde_json::json!({"name": "PROXY_PLATFORM_API_PORT", "value": port}));
+    }
+
+    let mut container = serde_json::json!({
         "name": "proxy-init",
         "image": config.init_image,
         "volumeMounts": [{
@@ -604,7 +611,37 @@ fn build_proxy_init_container(config: &ProxyInjectionConfig) -> serde_json::Valu
             "requests": { "cpu": "10m", "memory": "16Mi" },
             "limits": { "cpu": "100m", "memory": "32Mi" }
         }
-    })
+    });
+
+    if !env.is_empty() {
+        container["env"] = serde_json::json!(env);
+    }
+
+    container
+}
+
+/// Extract the port from a URL string.
+///
+/// - `http://host:63577/path` → `Some("63577")`
+/// - `https://api.platform.io` → `Some("443")` (implicit)
+/// - `http://platform.svc:8080` → `Some("8080")`
+fn extract_port_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let host_port = after_scheme.split('/').next()?;
+    if let Some((_host, port)) = host_port.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(port.to_string());
+    }
+    // Implicit port from scheme
+    if url.starts_with("https://") {
+        Some("443".to_string())
+    } else if url.starts_with("http://") {
+        Some("80".to_string())
+    } else {
+        None
+    }
 }
 
 /// Inject proxy wrapping into all containers under a pod spec path.
@@ -746,7 +783,6 @@ fn inject_proxy_to_container(
     };
     proxy_env.push(serde_json::json!({"name": "PROXY_MTLS_MODE", "value": mtls_mode}));
     proxy_env.push(serde_json::json!({"name": "PROXY_INBOUND_PORT", "value": "15006"}));
-    proxy_env.push(serde_json::json!({"name": "PROXY_OUTBOUND_BIND", "value": "127.0.0.6"}));
     proxy_env.push(serde_json::json!({"name": "PROXY_INTERNAL_CIDRS", "value": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"}));
 
     if let Some(env) = container.get_mut("env").and_then(|v| v.as_array_mut()) {
@@ -2715,7 +2751,64 @@ spec:
         assert!(names.contains(&"PROXY_TRANSPARENT"));
         assert!(names.contains(&"PROXY_MTLS_MODE"));
         assert!(names.contains(&"PROXY_INBOUND_PORT"));
-        assert!(names.contains(&"PROXY_OUTBOUND_BIND"));
         assert!(names.contains(&"PROXY_INTERNAL_CIDRS"));
+        assert!(!names.contains(&"PROXY_OUTBOUND_BIND"));
+    }
+
+    #[test]
+    fn extract_port_from_url_explicit() {
+        assert_eq!(
+            extract_port_from_url("http://host.docker.internal:63577"),
+            Some("63577".into())
+        );
+        assert_eq!(
+            extract_port_from_url("http://platform.svc.cluster.local:8080/v1/logs"),
+            Some("8080".into())
+        );
+    }
+
+    #[test]
+    fn extract_port_from_url_implicit() {
+        assert_eq!(
+            extract_port_from_url("https://api.platform.io"),
+            Some("443".into())
+        );
+        assert_eq!(
+            extract_port_from_url("http://platform.local"),
+            Some("80".into())
+        );
+    }
+
+    #[test]
+    fn extract_port_from_url_invalid() {
+        assert_eq!(extract_port_from_url("not-a-url"), None);
+        assert_eq!(extract_port_from_url(""), None);
+    }
+
+    #[test]
+    fn init_container_has_platform_api_port_env() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          command: ["./app"]
+"#;
+        let config = proxy_config();
+        let result = inject_proxy_wrapper(yaml, &config).unwrap();
+        let doc: serde_json::Value = serde_yaml::from_str(&result).unwrap();
+        let init = &doc["spec"]["template"]["spec"]["initContainers"][0];
+        let env = init["env"].as_array().expect("init should have env");
+        let port_env = env
+            .iter()
+            .find(|e| e["name"] == "PROXY_PLATFORM_API_PORT")
+            .expect("should have PROXY_PLATFORM_API_PORT");
+        assert_eq!(port_env["value"], "8080");
     }
 }

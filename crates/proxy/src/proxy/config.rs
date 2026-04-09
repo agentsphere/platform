@@ -4,6 +4,9 @@ use std::env;
 use std::net::IpAddr;
 use std::time::Duration;
 
+/// Default TCP passthrough ports — known non-HTTP protocols that should skip mTLS.
+const DEFAULT_PASSTHROUGH_PORTS: &str = "5432,6379,3306,27017,9042,5672,4222";
+
 /// mTLS enforcement mode for transparent proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtlsMode {
@@ -78,8 +81,8 @@ pub struct ProxyConfig {
     pub mtls_mode: MtlsMode,
     /// Transparent inbound listener port (default 15006).
     pub inbound_port: u16,
-    /// Source IP for forwarded connections to skip iptables re-interception (default 127.0.0.6).
-    pub outbound_bind_addr: IpAddr,
+    /// Source port range for proxy outbound connections to bypass iptables (default 61000-65000).
+    pub bypass_port_range: (u16, u16),
     /// Internal CIDRs -- traffic to these destinations gets mTLS (default RFC1918).
     pub internal_cidrs: Vec<(IpAddr, u8)>,
     /// Node CIDRs -- kubelet IPs allowed plaintext even in strict mode.
@@ -180,6 +183,12 @@ fn resolve_service_name(child_args: &[String]) -> String {
 }
 
 /// Read an env var, parse it, or return a default.
+/// Parse a port range string like `"61000:65000"` into `(u16, u16)`.
+fn parse_port_range(s: &str) -> Option<(u16, u16)> {
+    let (lo, hi) = s.split_once(':')?;
+    Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
@@ -222,7 +231,14 @@ impl ProxyConfig {
             outbound_port: env::var("PROXY_OUTBOUND_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            tcp_ports: cli.tcp_ports,
+            tcp_ports: if cli.tcp_ports.is_empty() {
+                super::transparent::parse_ports(
+                    &env::var("PROXY_TCP_PORTS")
+                        .unwrap_or_else(|_| DEFAULT_PASSTHROUGH_PORTS.into()),
+                )
+            } else {
+                cli.tcp_ports
+            },
             namespace: env::var("PROXY_NAMESPACE").unwrap_or_else(|_| "default".into()),
             scrape_type: cli.scrape_type,
             scrape_url: cli.scrape_url,
@@ -232,10 +248,13 @@ impl ProxyConfig {
             transparent: env::var("PROXY_TRANSPARENT").is_ok_and(|v| v == "true" || v == "1"),
             mtls_mode: MtlsMode::from_str_value(&env::var("PROXY_MTLS_MODE").unwrap_or_default()),
             inbound_port: env_parse("PROXY_INBOUND_PORT", 15006),
-            outbound_bind_addr: env::var("PROXY_OUTBOUND_BIND")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 6))),
+            bypass_port_range: parse_port_range(
+                &env::var("PROXY_BYPASS_PORT_RANGE").unwrap_or_default(),
+            )
+            .unwrap_or((
+                super::transparent::BYPASS_PORT_MIN,
+                super::transparent::BYPASS_PORT_MAX,
+            )),
             internal_cidrs: super::transparent::parse_cidrs(
                 &env::var("PROXY_INTERNAL_CIDRS")
                     .unwrap_or_else(|_| "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16".into()),
@@ -330,7 +349,9 @@ mod tests {
         assert_eq!(config.batch_size, 500);
         assert!(config.tls_port.is_none());
         assert!(config.outbound_port.is_none());
-        assert!(config.tcp_ports.is_empty());
+        // Default passthrough ports (Postgres, Redis, MySQL, etc.)
+        assert!(config.tcp_ports.contains(&5432));
+        assert!(config.tcp_ports.contains(&6379));
         assert!(config.scrape_type.is_none());
         assert_eq!(child, vec!["app"]);
     }
@@ -348,10 +369,7 @@ mod tests {
         // RFC1918 defaults
         assert_eq!(config.internal_cidrs.len(), 3);
         assert!(config.node_cidrs.is_empty());
-        assert_eq!(
-            config.outbound_bind_addr,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 6))
-        );
+        assert_eq!(config.bypass_port_range, (61000, 65000));
     }
 
     #[test]
