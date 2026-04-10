@@ -212,6 +212,23 @@ impl TaskRegistry {
         }
     }
 
+    /// Check if a named task is healthy (not stale).
+    /// Returns `true` if the task is not registered (startup race).
+    pub fn is_healthy(&self, name: &str) -> bool {
+        let tasks = self
+            .tasks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tasks.get(name) {
+            Some(hb) => {
+                let elapsed = Instant::now().duration_since(hb.last_beat);
+                let stale_threshold = std::time::Duration::from_secs(hb.expected_interval_secs * 3);
+                elapsed <= stale_threshold
+            }
+            None => true, // Not registered yet — assume healthy
+        }
+    }
+
     /// Build a snapshot of all tasks' health.
     pub fn snapshot(&self) -> Vec<BackgroundTaskHealth> {
         let Ok(map) = self.tasks.read() else {
@@ -640,5 +657,22 @@ mod tests {
         };
         let debug = format!("{failure:?}");
         assert!(debug.contains("pipeline"));
+    }
+
+    #[test]
+    fn task_registry_is_healthy_unregistered() {
+        let registry = TaskRegistry::new();
+        assert!(
+            registry.is_healthy("nonexistent"),
+            "unregistered tasks are healthy by default"
+        );
+    }
+
+    #[test]
+    fn task_registry_is_healthy_fresh_heartbeat() {
+        let registry = TaskRegistry::new();
+        registry.register("test", 30);
+        registry.heartbeat("test");
+        assert!(registry.is_healthy("test"));
     }
 }

@@ -696,63 +696,83 @@ pub async fn evaluate_all(
 ) -> Result<(), anyhow::Error> {
     let rules = sqlx::query(
         "SELECT id, name, query, condition, threshold, for_seconds, severity, project_id \
-         FROM alert_rules WHERE enabled = true",
+         FROM alert_rules WHERE enabled = true ORDER BY id LIMIT 500",
     )
     .fetch_all(&state.pool)
     .await?;
 
+    if rules.len() >= 500 {
+        tracing::warn!("alert rule limit reached (500) — some rules may not be evaluated");
+    }
+
+    let rule_timeout = std::time::Duration::from_secs(10);
     for rule in &rules {
         let rule_id: Uuid = rule.get("id");
         let rule_name: String = rule.get("name");
-        let rule_query: String = rule.get("query");
-        let rule_condition: String = rule.get("condition");
-        let rule_threshold: Option<f64> = rule.get("threshold");
-        let rule_for_seconds: i32 = rule.get("for_seconds");
-        let rule_severity: String = rule.get("severity");
-        let rule_project_id: Option<Uuid> = rule.get("project_id");
 
-        let aq = match parse_alert_query(&rule_query) {
-            Ok(q) => q,
-            Err(e) => {
-                tracing::warn!(rule_id = %rule_id, error = %e, "invalid alert query");
-                continue;
+        match tokio::time::timeout(rule_timeout, evaluate_one_rule(state, alert_states, rule)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    rule_id = %rule_id, rule_name = %rule_name,
+                    error = %e, "alert rule evaluation failed"
+                );
             }
-        };
-
-        let value = evaluate_metric(
-            &state.pool,
-            &aq.metric_name,
-            aq.labels.as_ref(),
-            &aq.aggregation,
-            aq.window_secs,
-        )
-        .await;
-
-        let value = match value {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(rule_id = %rule_id, error = %e, "metric evaluation failed");
-                continue;
+            Err(_elapsed) => {
+                tracing::warn!(
+                    rule_id = %rule_id, rule_name = %rule_name,
+                    "alert rule evaluation timed out (10s)"
+                );
             }
-        };
-
-        let condition_met = check_condition(&rule_condition, rule_threshold, value);
-
-        let now = Utc::now();
-        let as_entry = alert_states.entry(rule_id).or_insert(AlertState {
-            first_triggered: None,
-            firing: false,
-        });
-
-        let rule_info = AlertRuleInfo {
-            id: rule_id,
-            name: &rule_name,
-            severity: &rule_severity,
-            project_id: rule_project_id,
-            for_seconds: rule_for_seconds,
-        };
-        handle_alert_state(state, condition_met, value, now, as_entry, &rule_info).await;
+        }
     }
+
+    Ok(())
+}
+
+/// Evaluate a single alert rule: parse query, fetch metric, check condition, handle state.
+async fn evaluate_one_rule(
+    state: &AppState,
+    alert_states: &mut HashMap<Uuid, AlertState>,
+    rule: &sqlx::postgres::PgRow,
+) -> Result<(), anyhow::Error> {
+    let rule_id: Uuid = rule.get("id");
+    let rule_name: String = rule.get("name");
+    let rule_query: String = rule.get("query");
+    let rule_condition: String = rule.get("condition");
+    let rule_threshold: Option<f64> = rule.get("threshold");
+    let rule_for_seconds: i32 = rule.get("for_seconds");
+    let rule_severity: String = rule.get("severity");
+    let rule_project_id: Option<Uuid> = rule.get("project_id");
+
+    let aq = parse_alert_query(&rule_query)?;
+
+    let value = evaluate_metric(
+        &state.pool,
+        &aq.metric_name,
+        aq.labels.as_ref(),
+        &aq.aggregation,
+        aq.window_secs,
+    )
+    .await?;
+
+    let condition_met = check_condition(&rule_condition, rule_threshold, value);
+
+    let now = Utc::now();
+    let as_entry = alert_states.entry(rule_id).or_insert(AlertState {
+        first_triggered: None,
+        firing: false,
+    });
+
+    let rule_info = AlertRuleInfo {
+        id: rule_id,
+        name: &rule_name,
+        severity: &rule_severity,
+        project_id: rule_project_id,
+        for_seconds: rule_for_seconds,
+    };
+    handle_alert_state(state, condition_met, value, now, as_entry, &rule_info).await;
 
     Ok(())
 }

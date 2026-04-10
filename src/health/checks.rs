@@ -358,25 +358,37 @@ async fn build_snapshot(state: &AppState, start_time: Instant) -> HealthSnapshot
     }
 }
 
-/// Quick readiness check: only Postgres + Valkey.
+/// Quick readiness check: `Postgres` + `Valkey` + `MinIO`.
 pub async fn is_ready(state: &AppState) -> bool {
     if let Ok(snap) = state.health.read() {
-        // If we have a recent snapshot, use it
         let age = Utc::now() - snap.checked_at;
-        if age.num_seconds() < 60 {
-            return snap
-                .subsystems
-                .iter()
-                .any(|s| s.name == "postgres" && s.status == SubsystemStatus::Healthy)
-                && snap
-                    .subsystems
-                    .iter()
-                    .any(|s| s.name == "valkey" && s.status == SubsystemStatus::Healthy);
+        // 15s cache — must be ≤ K8s probe period
+        if age.num_seconds() < 15 {
+            let required = ["postgres", "valkey", "minio"];
+            return required.iter().all(|name| {
+                snap.subsystems.iter().any(|s| {
+                    s.name == *name
+                        && matches!(
+                            s.status,
+                            SubsystemStatus::Healthy | SubsystemStatus::Degraded
+                        )
+                })
+            });
         }
     }
-    // Fallback: run live probes
-    let (pg, vk) = tokio::join!(check_postgres(&state.pool), check_valkey(&state.valkey),);
-    pg.status == SubsystemStatus::Healthy && vk.status == SubsystemStatus::Healthy
+    // Stale or missing snapshot — run live probes
+    let (pg, vk, minio) = tokio::join!(
+        check_postgres(&state.pool),
+        check_valkey(&state.valkey),
+        check_minio(&state.minio),
+    );
+    let ok = |s: &SubsystemCheck| {
+        matches!(
+            s.status,
+            SubsystemStatus::Healthy | SubsystemStatus::Degraded
+        )
+    };
+    ok(&pg) && ok(&vk) && ok(&minio)
 }
 
 #[cfg(test)]

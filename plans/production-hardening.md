@@ -180,6 +180,9 @@ let valkey = tokio::time::timeout(
 - **Unit**: `Config::validate()` passes in dev mode with missing master key
 - **Unit**: `validate_master_key()` rejects short/invalid hex strings
 
+> **Status: COMPLETE** — `Config::validate()` added, `validate_master_key()` added, `.expect()` replaced
+> with `?` + `.context()`, 30s startup timeout on Postgres/Valkey connections.
+
 ---
 
 ## 2. Health Check Improvements
@@ -328,6 +331,9 @@ pub async fn is_ready(state: &AppState) -> bool {
 - **Integration**: Kill MinIO, verify `/readyz` returns 503
 - **Integration**: Verify `/healthz` returns 200 when all tasks are alive
 - **Unit**: `TaskRegistry::is_healthy()` returns false when heartbeat is stale
+
+> **Status: COMPLETE** — `is_healthy()` on `TaskRegistry`, `/healthz` checks critical tasks,
+> MinIO added to `/readyz`, cache TTL reduced to 15s, `Degraded` counts as ready.
 
 ---
 
@@ -543,6 +549,10 @@ let channels = ingest::create_channels(state.config.observe_buffer_capacity);
 - **Unit**: Verify config parsing for new env vars
 - **Integration**: Existing tests pass (defaults match current values)
 
+> **Status: COMPLETE** — 3 config fields added (`webhook_max_concurrent`, `manager_session_max_per_user`,
+> `observe_buffer_capacity`). Wired to `main.rs`, `agent/service.rs`, `observe/ingest.rs`.
+> `create_channels_with_capacity()` added, `create_channels()` kept for tests.
+
 ---
 
 ## 5. Observe Retention Batching
@@ -623,6 +633,8 @@ lock.
 
 - **Integration**: Insert 100 old records, run retention, verify all deleted
 - **Unit**: Verify batch loop exits when fewer than batch_size rows deleted
+
+> **Status: COMPLETE** — Batched ctid-based DELETE with 50K rows/batch, 100ms yield between batches.
 
 ---
 
@@ -808,6 +820,8 @@ if rules.len() >= 500 {
 - **Unit**: Verify timeout fires on slow rule (mock a never-completing query)
 - **Integration**: Existing alert tests pass with timeout wrapper
 
+> **Status: COMPLETE** — 10s per-rule timeout, LIMIT 500, `evaluate_one_rule()` extracted.
+
 ---
 
 ## 8. UI Asset Compression Header
@@ -869,6 +883,8 @@ should happen after body limits are checked but before timeout starts counting
 - **Manual**: Verify `curl -H "Accept-Encoding: gzip" /index.html` returns
   `Content-Encoding: gzip` header
 - **Integration**: Verify UI assets still load correctly in browser
+
+> **Status: COMPLETE** — `CompressionLayer::new()` added after `DefaultBodyLimit`.
 
 ---
 
@@ -978,34 +994,20 @@ DROP INDEX IF EXISTS idx_pipelines_project_status;
 
 ---
 
-## Implementation Order
+## Implementation Status
 
-```
-1. Safe production startup (1 hr)      — high value, low risk
-   ↓
-2. Health check improvements (1 hr)    — enables better K8s orchestration
-   ↓
-3. Rate limiting gaps (30 min)         — one-line additions per endpoint
-   ↓
-4. Resource limit configurability (1 hr) — config plumbing + wire-through
-   ↓
-8. UI compression (15 min)             — single layer addition
-   ↓
-9. Unbounded query pagination (15 min) — trivial SQL changes
-   ↓
-10. Composite index (15 min)           — migration only
-   ↓
-5. Observe retention batching (1 hr)   — careful with DELETE logic
-   ↓
-6. Metric write batching (2 hr)        — UNNEST queries, test carefully
-   ↓
-7. Alert evaluation hardening (1 hr)   — timeout + extract helper
-```
-
-Total: ~8-9 hours.
-
-After each section, run `just test-unit`. After all sections complete, run
-`just ci-full`.
+| Section | Status | Notes |
+|---------|--------|-------|
+| 3. Rate limiting gaps | **COMPLETE** | 5 endpoints protected |
+| 6. Metric write batching | **COMPLETE** | UNNEST batch queries |
+| 9. Unbounded query pagination | **COMPLETE** | LIMIT 200 |
+| 10. Composite index | **COMPLETE** | `idx_pipelines_project_status` |
+| 5. Observe retention batching | **COMPLETE** | ctid-based batch DELETE, 50K rows/batch, 100ms yield |
+| 7. Alert evaluation hardening | **COMPLETE** | 10s per-rule timeout, LIMIT 500, `evaluate_one_rule()` extracted |
+| 8. UI compression | **COMPLETE** | `CompressionLayer` added after `DefaultBodyLimit` |
+| 1. Safe production startup | **COMPLETE** | `Config::validate()`, `validate_master_key()`, startup timeout 30s |
+| 2. Health check improvements | **COMPLETE** | `TaskRegistry::is_healthy()`, MinIO in readiness, 15s cache TTL |
+| 4. Resource limit configurability | **COMPLETE** | 3 new config fields wired through |
 
 ---
 

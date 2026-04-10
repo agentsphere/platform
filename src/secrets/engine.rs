@@ -22,6 +22,17 @@ pub fn parse_master_key(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(key)
 }
 
+/// Validate master key format without panicking.
+/// Returns `Ok(())` if the key is a valid 64-char hex string (32 bytes).
+pub fn validate_master_key(key: &str) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.len() != 64 {
+        return Err(format!("expected 64 hex characters, got {}", trimmed.len()));
+    }
+    hex::decode(trimmed).map_err(|e| format!("not valid hex: {e}"))?;
+    Ok(())
+}
+
 /// Derive a deterministic dev-mode key (NOT for production).
 pub fn dev_master_key() -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -1278,5 +1289,30 @@ mod tests {
         let debug = format!("{meta:?}");
         assert!(debug.contains("SecretMetadata"));
         assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn validate_master_key_valid() {
+        let hex_key = "aa".repeat(32);
+        assert!(validate_master_key(&hex_key).is_ok());
+    }
+
+    #[test]
+    fn validate_master_key_too_short() {
+        let err = validate_master_key("aabb").unwrap_err();
+        assert!(err.contains("64 hex characters"));
+    }
+
+    #[test]
+    fn validate_master_key_invalid_hex() {
+        let bad = "zz".repeat(32);
+        let err = validate_master_key(&bad).unwrap_err();
+        assert!(err.contains("hex"));
+    }
+
+    #[test]
+    fn validate_master_key_trims_whitespace() {
+        let hex_key = format!("  {}  ", "aa".repeat(32));
+        assert!(validate_master_key(&hex_key).is_ok());
     }
 }

@@ -36,7 +36,8 @@ pub fn spawn_background_tasks(
     cancel: tokio_util::sync::CancellationToken,
     tracker: &tokio_util::task::TaskTracker,
 ) -> ingest::IngestChannels {
-    let (channels, spans_rx, logs_rx, metrics_rx) = ingest::create_channels();
+    let (channels, spans_rx, logs_rx, metrics_rx) =
+        ingest::create_channels_with_capacity(state.config.observe_buffer_capacity);
 
     tracker.spawn(ingest::flush_spans(
         state.pool.clone(),
@@ -73,21 +74,51 @@ pub fn spawn_background_tasks(
                             ("log_entries", "timestamp"),
                             ("metric_samples", "timestamp"),
                         ] {
-                            let sql = format!("DELETE FROM {table} WHERE {col} < $1");
-                            match sqlx::query(&sql).bind(cutoff).execute(&pool).await {
-                                Ok(result) => {
-                                    if result.rows_affected() > 0 {
-                                        tracing::info!(
+                            // Batched deletion to avoid long table locks
+                            let batch_size: i64 = 50_000;
+                            let mut total_deleted: u64 = 0;
+                            loop {
+                                let sql = format!(
+                                    "DELETE FROM {table} WHERE ctid IN (\
+                                        SELECT ctid FROM {table} WHERE {col} < $1 LIMIT $2\
+                                    )"
+                                );
+                                match sqlx::query(&sql)
+                                    .bind(cutoff)
+                                    .bind(batch_size)
+                                    .execute(&pool)
+                                    .await
+                                {
+                                    Ok(result) => {
+                                        let deleted = result.rows_affected();
+                                        total_deleted += deleted;
+                                        #[allow(clippy::cast_sign_loss)]
+                                        if deleted < batch_size as u64 {
+                                            break;
+                                        }
+                                        // Yield between batches to let other queries through
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(100),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
                                             table,
-                                            rows = result.rows_affected(),
-                                            retention_days,
-                                            "purged old observability data"
+                                            error = %e,
+                                            "retention cleanup batch failed"
                                         );
+                                        break;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(table, error = %e, "retention cleanup failed");
-                                }
+                            }
+                            if total_deleted > 0 {
+                                tracing::info!(
+                                    table,
+                                    rows = total_deleted,
+                                    retention_days,
+                                    "purged old observability data"
+                                );
                             }
                         }
                     }

@@ -4,11 +4,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::IntoResponse;
 use tokio::signal;
 use tower::ServiceBuilder;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -90,9 +92,25 @@ async fn main() -> anyhow::Result<()> {
 
     let mut cfg = config::Config::load();
 
+    // Validate configuration before connecting to anything
+    let (warnings, errors) = cfg.validate();
+    for w in &warnings {
+        tracing::warn!("{w}");
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            tracing::error!("{e}");
+        }
+        anyhow::bail!(
+            "startup aborted: {} configuration error(s). Fix the errors above and restart.",
+            errors.len()
+        );
+    }
+
     // Validate master key for secrets engine
     if let Some(ref mk) = cfg.master_key {
-        secrets::engine::parse_master_key(mk).expect("PLATFORM_MASTER_KEY is invalid");
+        secrets::engine::parse_master_key(mk)
+            .context("PLATFORM_MASTER_KEY is invalid (passed validation but failed parse)")?;
         tracing::info!("secrets engine master key loaded");
     } else if cfg.dev_mode {
         // Random dev key — secrets won't survive restart
@@ -126,16 +144,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Connect to Postgres and run migrations
-    let pool = store::pool::connect(
-        &cfg.database_url,
-        cfg.db_max_connections,
-        cfg.db_acquire_timeout_secs,
+    // Connect to Postgres and run migrations (with startup timeout)
+    let startup_timeout = std::time::Duration::from_secs(30);
+    let pool = tokio::time::timeout(
+        startup_timeout,
+        store::pool::connect(
+            &cfg.database_url,
+            cfg.db_max_connections,
+            cfg.db_acquire_timeout_secs,
+        ),
     )
-    .await?;
+    .await
+    .context("timed out connecting to Postgres (30s)")??;
 
-    // Connect to Valkey
-    let valkey = store::valkey::connect(&cfg.valkey_url, cfg.valkey_pool_size).await?;
+    // Connect to Valkey (with startup timeout)
+    let valkey = tokio::time::timeout(
+        startup_timeout,
+        store::valkey::connect(&cfg.valkey_url, cfg.valkey_pool_size),
+    )
+    .await
+    .context("timed out connecting to Valkey (30s)")??;
 
     // Create MinIO operator (opendal S3 backend)
     let minio = {
@@ -208,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         task_registry: Arc::new(health::TaskRegistry::new()),
         cli_auth_manager: Arc::new(onboarding::claude_auth::CliAuthManager::new()),
         audit_tx: audit::AuditLog::new(pool.clone()),
-        webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
+        webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.webhook_max_concurrent)),
         mesh_ca,
     };
 
@@ -266,9 +294,24 @@ async fn main() -> anyhow::Result<()> {
     let long_timeout = std::time::Duration::from_secs(1800); // 30 min for git/registry
 
     // Build router
+    let live_state = state.clone();
     let ready_state = state.clone();
     let app = axum::Router::new()
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/healthz",
+            axum::routing::get(move || {
+                let s = live_state.clone();
+                async move {
+                    let critical = ["pipeline_executor", "deployer_reconciler"];
+                    let all_alive = critical.iter().all(|name| s.task_registry.is_healthy(name));
+                    if all_alive {
+                        (axum::http::StatusCode::OK, "ok")
+                    } else {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "critical task stale")
+                    }
+                }
+            }),
+        )
         .route(
             "/readyz",
             axum::routing::get(move || {
@@ -320,6 +363,8 @@ async fn main() -> anyhow::Result<()> {
         .fallback(ui::static_handler)
         // Default body limit: 10 MB for API endpoints.
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        // Compress responses (gzip) when client sends Accept-Encoding: gzip
+        .layer(CompressionLayer::new())
         // Global request timeout
         .layer(
             ServiceBuilder::new()

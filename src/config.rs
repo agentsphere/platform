@@ -165,6 +165,12 @@ pub struct Config {
     pub git_http_timeout_secs: u64,
     /// Global HTTP request timeout in seconds (default 300 = 5 min).
     pub request_timeout_secs: u64,
+    /// Maximum concurrent webhook deliveries (default 50).
+    pub webhook_max_concurrent: usize,
+    /// Maximum running manager sessions per user (default 10).
+    pub manager_session_max_per_user: i64,
+    /// Observe ingest buffer capacity per signal type (default 10,000).
+    pub observe_buffer_capacity: usize,
 }
 
 fn parse_cors_origins(s: &str) -> Vec<String> {
@@ -440,7 +446,70 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            webhook_max_concurrent: env::var("PLATFORM_WEBHOOK_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+            manager_session_max_per_user: env::var("PLATFORM_MANAGER_SESSION_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            observe_buffer_capacity: env::var("PLATFORM_OBSERVE_BUFFER_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
         }
+    }
+
+    /// Validate configuration for production readiness.
+    /// Returns a list of warnings and a list of fatal errors.
+    pub fn validate(&self) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        if self.dev_mode {
+            warnings.push("PLATFORM_DEV=true — dev mode enabled. DO NOT use in production.".into());
+        }
+
+        if !self.dev_mode {
+            if self.master_key.is_none() {
+                errors.push(
+                    "PLATFORM_MASTER_KEY is required in production. \
+                     Set it to a 64-character hex string (32 bytes)."
+                        .into(),
+                );
+            }
+            if self.minio_access_key == "platform" && self.minio_secret_key == "devdevdev" {
+                errors.push(
+                    "MinIO credentials are still set to dev defaults \
+                     (platform/devdevdev). Set MINIO_ACCESS_KEY and \
+                     MINIO_SECRET_KEY to production values."
+                        .into(),
+                );
+            }
+            if !self.secure_cookies {
+                warnings.push(
+                    "PLATFORM_SECURE_COOKIES=false — session cookies lack \
+                     Secure flag. Set to true when behind HTTPS."
+                        .into(),
+                );
+            }
+            if self.cors_origins.is_empty() {
+                warnings.push(
+                    "PLATFORM_CORS_ORIGINS is empty — all cross-origin \
+                     requests will be denied."
+                        .into(),
+                );
+            }
+        }
+
+        if let Some(ref mk) = self.master_key
+            && let Err(e) = crate::secrets::engine::validate_master_key(mk)
+        {
+            errors.push(format!("PLATFORM_MASTER_KEY is invalid: {e}"));
+        }
+
+        (warnings, errors)
     }
 
     /// Derive a project's K8s namespace: `{ns_prefix}-{slug}-{env}` or `{slug}-{env}`.
@@ -553,6 +622,9 @@ impl Config {
             valkey_pool_size: 6,
             git_http_timeout_secs: 600,
             request_timeout_secs: 300,
+            webhook_max_concurrent: 50,
+            manager_session_max_per_user: 10,
+            observe_buffer_capacity: 10_000,
         }
     }
 }
@@ -1002,5 +1074,83 @@ mod tests {
         assert!(!config.trust_proxy_headers);
         assert!(config.dev_mode);
         assert!(config.cli_spawn_enabled);
+    }
+
+    #[test]
+    fn validate_dev_mode_passes_without_master_key() {
+        let config = Config {
+            dev_mode: true,
+            ..Config::test_default()
+        };
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty(), "dev mode should not require master key");
+        assert!(
+            warnings.iter().any(|w| w.contains("dev mode")),
+            "should warn about dev mode"
+        );
+    }
+
+    #[test]
+    fn validate_prod_fails_without_master_key() {
+        let config = Config {
+            dev_mode: false,
+            minio_access_key: "real-key".into(),
+            minio_secret_key: "real-secret".into(),
+            ..Config::test_default()
+        };
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("PLATFORM_MASTER_KEY")),
+            "should require master key in production"
+        );
+    }
+
+    #[test]
+    fn validate_prod_fails_with_default_minio_creds() {
+        let config = Config {
+            dev_mode: false,
+            master_key: Some("a".repeat(64)),
+            minio_access_key: "platform".into(),
+            minio_secret_key: "devdevdev".into(),
+            ..Config::test_default()
+        };
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("MinIO credentials")),
+            "should reject dev MinIO creds in production"
+        );
+    }
+
+    #[test]
+    fn validate_prod_warns_insecure_cookies() {
+        let config = Config {
+            dev_mode: false,
+            master_key: Some("a".repeat(64)),
+            minio_access_key: "real".into(),
+            minio_secret_key: "real".into(),
+            secure_cookies: false,
+            ..Config::test_default()
+        };
+        let (warnings, _) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("PLATFORM_SECURE_COOKIES")),
+            "should warn about insecure cookies in production"
+        );
+    }
+
+    #[test]
+    fn validate_invalid_master_key_format() {
+        let config = Config {
+            dev_mode: true,
+            master_key: Some("too-short".into()),
+            ..Config::test_default()
+        };
+        let (_, errors) = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("invalid")),
+            "should reject invalid master key format"
+        );
     }
 }

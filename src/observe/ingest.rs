@@ -62,15 +62,23 @@ pub struct IngestChannels {
 }
 
 /// Create ingest channels and return (senders, receivers).
-pub fn create_channels() -> (
+/// `buffer_capacity` overrides the default `BUFFER_CAPACITY` when non-zero.
+pub fn create_channels_with_capacity(
+    buffer_capacity: usize,
+) -> (
     IngestChannels,
     mpsc::Receiver<SpanRecord>,
     mpsc::Receiver<LogEntryRecord>,
     mpsc::Receiver<MetricRecord>,
 ) {
-    let (spans_tx, spans_rx) = mpsc::channel(BUFFER_CAPACITY);
-    let (logs_tx, logs_rx) = mpsc::channel(BUFFER_CAPACITY);
-    let (metrics_tx, metrics_rx) = mpsc::channel(BUFFER_CAPACITY);
+    let cap = if buffer_capacity > 0 {
+        buffer_capacity
+    } else {
+        BUFFER_CAPACITY
+    };
+    let (spans_tx, spans_rx) = mpsc::channel(cap);
+    let (logs_tx, logs_rx) = mpsc::channel(cap);
+    let (metrics_tx, metrics_rx) = mpsc::channel(cap);
     (
         IngestChannels {
             spans_tx,
@@ -81,6 +89,17 @@ pub fn create_channels() -> (
         logs_rx,
         metrics_rx,
     )
+}
+
+/// Create ingest channels with default buffer capacity (used in tests).
+#[cfg(test)]
+pub fn create_channels() -> (
+    IngestChannels,
+    mpsc::Receiver<SpanRecord>,
+    mpsc::Receiver<LogEntryRecord>,
+    mpsc::Receiver<MetricRecord>,
+) {
+    create_channels_with_capacity(BUFFER_CAPACITY)
 }
 
 // ---------------------------------------------------------------------------

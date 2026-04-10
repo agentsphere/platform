@@ -940,7 +940,8 @@ pub async fn create_manager_session(
 ) -> Result<Uuid, AgentError> {
     let session_id = Uuid::new_v4();
 
-    // 1. Enforce session limit (max 10 running manager sessions per user)
+    // 1. Enforce session limit per user (configurable, default 10)
+    let max_sessions = state.config.manager_session_max_per_user;
     let running_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM agent_sessions WHERE user_id = $1 AND execution_mode = 'manager' AND status = 'running'",
     )
@@ -948,7 +949,7 @@ pub async fn create_manager_session(
     .fetch_one(&state.pool)
     .await?;
 
-    if running_count.0 >= 10 {
+    if running_count.0 >= max_sessions {
         // Auto-reap oldest stopped/failed manager session
         sqlx::query(
             "DELETE FROM agent_sessions WHERE id = (
@@ -968,7 +969,7 @@ pub async fn create_manager_session(
         .bind(user_id)
         .fetch_one(&state.pool)
         .await?;
-        if recheck.0 >= 10 {
+        if recheck.0 >= max_sessions {
             return Err(AgentError::TooManySessions);
         }
     }
