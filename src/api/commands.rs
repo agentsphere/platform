@@ -639,6 +639,7 @@ async fn list_workspace_commands(
         WHERE (workspace_id = $1 AND project_id IS NULL)
            OR (project_id IS NULL AND workspace_id IS NULL)
         ORDER BY workspace_id IS NULL ASC, name ASC
+        LIMIT 200
         "#,
         id,
     )

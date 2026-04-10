@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use helpers::{create_user, test_router, test_state};
+use platform::observe::store::{MetricRecord, write_metrics};
 
 // ---------------------------------------------------------------------------
 // Store-level helpers
@@ -3069,4 +3070,132 @@ async fn all_new_endpoints_require_permission(pool: PgPool) {
             "expected 403 for unprivileged user on {endpoint}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metric series project isolation
+// ---------------------------------------------------------------------------
+
+/// Two projects writing the same metric name get separate series rows.
+#[sqlx::test(migrations = "./migrations")]
+async fn metrics_different_projects_get_separate_series(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let proj_a = helpers::create_project(&app, &admin_token, "metrics-iso-a", "private").await;
+    let proj_b = helpers::create_project(&app, &admin_token, "metrics-iso-b", "private").await;
+
+    let now = Utc::now();
+    let metrics = vec![
+        MetricRecord {
+            name: "http_requests_total".into(),
+            labels: serde_json::json!({}),
+            metric_type: "counter".into(),
+            unit: None,
+            project_id: Some(proj_a),
+            value: 100.0,
+            timestamp: now,
+        },
+        MetricRecord {
+            name: "http_requests_total".into(),
+            labels: serde_json::json!({}),
+            metric_type: "counter".into(),
+            unit: None,
+            project_id: Some(proj_b),
+            value: 200.0,
+            timestamp: now,
+        },
+    ];
+    write_metrics(&pool, &metrics)
+        .await
+        .expect("write_metrics should succeed");
+
+    // Verify two distinct series exist
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM metric_series WHERE name = 'http_requests_total'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 2, "each project should have its own series");
+
+    // Verify project_ids and values are correct
+    let series: Vec<(Option<Uuid>, Option<f64>)> = sqlx::query_as(
+        "SELECT project_id, last_value FROM metric_series \
+         WHERE name = 'http_requests_total' ORDER BY last_value",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(series[0].0, Some(proj_a));
+    assert_eq!(series[0].1, Some(100.0));
+    assert_eq!(series[1].0, Some(proj_b));
+    assert_eq!(series[1].1, Some(200.0));
+}
+
+/// Same project writing the same metric twice updates (upserts) the existing series.
+#[sqlx::test(migrations = "./migrations")]
+async fn metrics_same_project_upserts_series(pool: PgPool) {
+    let (state, admin_token) = test_state(pool.clone()).await;
+    let app = test_router(state.clone());
+
+    let proj = helpers::create_project(&app, &admin_token, "metrics-upsert", "private").await;
+
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(1);
+
+    // First write
+    write_metrics(
+        &pool,
+        &[MetricRecord {
+            name: "cpu_usage".into(),
+            labels: serde_json::json!({"host": "a"}),
+            metric_type: "gauge".into(),
+            unit: Some("percent".into()),
+            project_id: Some(proj),
+            value: 50.0,
+            timestamp: t1,
+        }],
+    )
+    .await
+    .unwrap();
+
+    // Second write — same series, different value
+    write_metrics(
+        &pool,
+        &[MetricRecord {
+            name: "cpu_usage".into(),
+            labels: serde_json::json!({"host": "a"}),
+            metric_type: "gauge".into(),
+            unit: Some("percent".into()),
+            project_id: Some(proj),
+            value: 75.0,
+            timestamp: t2,
+        }],
+    )
+    .await
+    .unwrap();
+
+    // Should still be one series, with last_value updated
+    let row: (i64, Option<f64>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(last_value) FROM metric_series \
+         WHERE name = 'cpu_usage' AND project_id = $1",
+    )
+    .bind(proj)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, 1, "should have exactly one series");
+    assert_eq!(row.1, Some(75.0), "last_value should be updated");
+
+    // Should have two samples
+    let sample_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM metric_samples ms \
+         JOIN metric_series ser ON ser.id = ms.series_id \
+         WHERE ser.name = 'cpu_usage' AND ser.project_id = $1",
+    )
+    .bind(proj)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sample_count.0, 2);
 }

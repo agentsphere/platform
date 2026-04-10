@@ -516,6 +516,18 @@ async fn update_user(
         require_admin(&state, &auth).await?;
     }
 
+    // Rate limit password changes: 5 per hour per user
+    if body.password.is_some() {
+        crate::auth::rate_limit::check_rate(
+            &state.valkey,
+            "password_change",
+            &auth.user_id.to_string(),
+            5,
+            3600,
+        )
+        .await?;
+    }
+
     // Validate inputs
     if let Some(ref dn) = body.display_name {
         validation::check_length("display_name", dn, 1, 255)?;
@@ -646,6 +658,16 @@ async fn create_api_token(
     auth: AuthUser,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Rate limit: 20 token creations per hour per user
+    crate::auth::rate_limit::check_rate(
+        &state.valkey,
+        "token_create",
+        &auth.user_id.to_string(),
+        20,
+        3600,
+    )
+    .await?;
+
     validation::check_length("name", &body.name, 1, 255)?;
 
     let (raw_token, token_hash) = token::generate_api_token();

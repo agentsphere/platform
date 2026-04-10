@@ -84,6 +84,7 @@ pub async fn write_spans(pool: &PgPool, spans: &[SpanRecord]) -> Result<(), Obse
         upsert_trace(pool, span).await?;
     }
 
+    let ids: Vec<Uuid> = spans.iter().map(|_| Uuid::now_v7()).collect();
     let trace_ids: Vec<&str> = spans.iter().map(|s| s.trace_id.as_str()).collect();
     let span_ids: Vec<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
     let parent_ids: Vec<Option<&str>> = spans.iter().map(|s| s.parent_span_id.as_deref()).collect();
@@ -102,18 +103,19 @@ pub async fn write_spans(pool: &PgPool, spans: &[SpanRecord]) -> Result<(), Obse
 
     sqlx::query(
         r"
-        INSERT INTO spans (trace_id, span_id, parent_span_id, name, service, kind, status,
+        INSERT INTO spans (id, trace_id, span_id, parent_span_id, name, service, kind, status,
                            attributes, events, duration_ms, started_at, finished_at,
                            project_id, session_id, user_id)
         SELECT * FROM UNNEST(
-            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-            $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::int[],
-            $11::timestamptz[], $12::timestamptz[],
-            $13::uuid[], $14::uuid[], $15::uuid[]
+            $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+            $7::text[], $8::text[], $9::jsonb[], $10::jsonb[], $11::int[],
+            $12::timestamptz[], $13::timestamptz[],
+            $14::uuid[], $15::uuid[], $16::uuid[]
         )
         ON CONFLICT (span_id) DO NOTHING
         ",
     )
+    .bind(&ids)
     .bind(&trace_ids)
     .bind(&span_ids)
     .bind(&parent_ids)
@@ -138,15 +140,17 @@ pub async fn write_spans(pool: &PgPool, spans: &[SpanRecord]) -> Result<(), Obse
 /// Upsert the trace row when a root span arrives.
 async fn upsert_trace(pool: &PgPool, span: &SpanRecord) -> Result<(), ObserveError> {
     let is_root = span.parent_span_id.is_none();
+    let id = Uuid::now_v7();
     if !is_root {
         // Ensure trace row exists even for non-root spans
         sqlx::query(
             r"
-            INSERT INTO traces (trace_id, root_span, service, status, started_at, project_id, session_id, user_id)
-            VALUES ($1, $2, $3, 'unset', $4, $5, $6, $7)
+            INSERT INTO traces (id, trace_id, root_span, service, status, started_at, project_id, session_id, user_id)
+            VALUES ($1, $2, $3, $4, 'unset', $5, $6, $7, $8)
             ON CONFLICT (trace_id) DO NOTHING
             ",
         )
+        .bind(id)
         .bind(&span.trace_id)
         .bind(&span.name)
         .bind(&span.service)
@@ -161,9 +165,9 @@ async fn upsert_trace(pool: &PgPool, span: &SpanRecord) -> Result<(), ObserveErr
 
     sqlx::query(
         r"
-        INSERT INTO traces (trace_id, root_span, service, status, duration_ms, started_at, finished_at,
+        INSERT INTO traces (id, trace_id, root_span, service, status, duration_ms, started_at, finished_at,
                             project_id, session_id, user_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (trace_id) DO UPDATE SET
             root_span = EXCLUDED.root_span,
             status = EXCLUDED.status,
@@ -171,6 +175,7 @@ async fn upsert_trace(pool: &PgPool, span: &SpanRecord) -> Result<(), ObserveErr
             finished_at = EXCLUDED.finished_at
         ",
     )
+    .bind(id)
     .bind(&span.trace_id)
     .bind(&span.name)
     .bind(&span.service)
@@ -194,6 +199,7 @@ pub async fn write_logs(pool: &PgPool, logs: &[LogEntryRecord]) -> Result<(), Ob
         return Ok(());
     }
 
+    let ids: Vec<Uuid> = logs.iter().map(|_| Uuid::now_v7()).collect();
     let timestamps: Vec<DateTime<Utc>> = logs.iter().map(|l| l.timestamp).collect();
     let trace_ids: Vec<Option<&str>> = logs.iter().map(|l| l.trace_id.as_deref()).collect();
     let span_ids: Vec<Option<&str>> = logs.iter().map(|l| l.span_id.as_deref()).collect();
@@ -208,14 +214,15 @@ pub async fn write_logs(pool: &PgPool, logs: &[LogEntryRecord]) -> Result<(), Ob
 
     sqlx::query(
         r"
-        INSERT INTO log_entries (timestamp, trace_id, span_id, project_id, session_id, user_id,
+        INSERT INTO log_entries (id, timestamp, trace_id, span_id, project_id, session_id, user_id,
                                  service, level, source, message, attributes)
         SELECT * FROM UNNEST(
-            $1::timestamptz[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::uuid[],
-            $7::text[], $8::text[], $9::text[], $10::text[], $11::jsonb[]
+            $1::uuid[], $2::timestamptz[], $3::text[], $4::text[], $5::uuid[], $6::uuid[], $7::uuid[],
+            $8::text[], $9::text[], $10::text[], $11::text[], $12::jsonb[]
         )
         ",
     )
+    .bind(&ids)
     .bind(&timestamps)
     .bind(&trace_ids)
     .bind(&span_ids)
@@ -233,51 +240,84 @@ pub async fn write_logs(pool: &PgPool, logs: &[LogEntryRecord]) -> Result<(), Ob
     Ok(())
 }
 
-/// Batch upsert metric series and insert samples.
+/// Batch upsert metric series and insert samples using UNNEST.
+///
+/// Uses 2 queries total regardless of batch size (was 2N with sequential approach).
 #[tracing::instrument(skip(pool, metrics), fields(count = metrics.len()), err)]
 pub async fn write_metrics(pool: &PgPool, metrics: &[MetricRecord]) -> Result<(), ObserveError> {
     if metrics.is_empty() {
         return Ok(());
     }
 
+    // Step 1: Collect arrays for batch upsert of metric_series.
+    let mut names: Vec<&str> = Vec::with_capacity(metrics.len());
+    let mut labels: Vec<&JsonValue> = Vec::with_capacity(metrics.len());
+    let mut metric_types: Vec<&str> = Vec::with_capacity(metrics.len());
+    let mut units: Vec<Option<&str>> = Vec::with_capacity(metrics.len());
+    let mut project_ids: Vec<Option<Uuid>> = Vec::with_capacity(metrics.len());
+    let mut last_values: Vec<f64> = Vec::with_capacity(metrics.len());
+
     for m in metrics {
-        write_single_metric(pool, m).await?;
+        names.push(&m.name);
+        labels.push(&m.labels);
+        metric_types.push(&m.metric_type);
+        units.push(m.unit.as_deref());
+        project_ids.push(m.project_id);
+        last_values.push(m.value);
     }
 
-    Ok(())
-}
+    // Guard: UNNEST requires all arrays to be the same length.
+    // A length mismatch would silently misalign rows (wrong value → wrong series).
+    debug_assert_eq!(names.len(), labels.len());
+    debug_assert_eq!(names.len(), project_ids.len());
 
-async fn write_single_metric(pool: &PgPool, m: &MetricRecord) -> Result<(), ObserveError> {
-    // Upsert series, get id
-    let series_id: Uuid = sqlx::query_scalar(
+    // Batch upsert: single round-trip for all series.
+    // ON CONFLICT matches the UNIQUE (name, labels, project_id) constraint.
+    let series_ids: Vec<(Uuid,)> = sqlx::query_as(
         r"
         INSERT INTO metric_series (name, labels, metric_type, unit, project_id, last_value)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (name, labels)
-        DO UPDATE SET last_value = EXCLUDED.last_value, updated_at = now()
+        SELECT * FROM UNNEST(
+            $1::text[], $2::jsonb[], $3::text[], $4::text[], $5::uuid[], $6::double precision[]
+        )
+        ON CONFLICT (name, labels, project_id)
+        DO UPDATE SET
+            last_value = EXCLUDED.last_value,
+            metric_type = EXCLUDED.metric_type,
+            unit = EXCLUDED.unit,
+            updated_at = now()
         RETURNING id
         ",
     )
-    .bind(&m.name)
-    .bind(&m.labels)
-    .bind(&m.metric_type)
-    .bind(&m.unit)
-    .bind(m.project_id)
-    .bind(m.value)
-    .fetch_one(pool)
+    .bind(&names)
+    .bind(&labels)
+    .bind(&metric_types)
+    .bind(&units)
+    .bind(&project_ids)
+    .bind(&last_values)
+    .fetch_all(pool)
     .await?;
 
-    // Insert sample
+    // Step 2: Batch insert all samples — single round-trip.
+    let mut sample_series_ids: Vec<Uuid> = Vec::with_capacity(metrics.len());
+    let mut sample_timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(metrics.len());
+    let mut sample_values: Vec<f64> = Vec::with_capacity(metrics.len());
+
+    for (i, m) in metrics.iter().enumerate() {
+        sample_series_ids.push(series_ids[i].0);
+        sample_timestamps.push(m.timestamp);
+        sample_values.push(m.value);
+    }
+
     sqlx::query(
         r"
         INSERT INTO metric_samples (series_id, timestamp, value)
-        VALUES ($1, $2, $3)
+        SELECT * FROM UNNEST($1::uuid[], $2::timestamptz[], $3::double precision[])
         ON CONFLICT (series_id, timestamp) DO UPDATE SET value = EXCLUDED.value
         ",
     )
-    .bind(series_id)
-    .bind(m.timestamp)
-    .bind(m.value)
+    .bind(&sample_series_ids)
+    .bind(&sample_timestamps)
+    .bind(&sample_values)
     .execute(pool)
     .await?;
 

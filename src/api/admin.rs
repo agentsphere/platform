@@ -182,7 +182,7 @@ async fn list_roles(
 
     let roles = sqlx::query_as!(
         RoleResponse,
-        "SELECT id, name, description, is_system, created_at FROM roles ORDER BY name"
+        "SELECT id, name, description, is_system, created_at FROM roles ORDER BY name LIMIT 200"
     )
     .fetch_all(&state.pool)
     .await?;

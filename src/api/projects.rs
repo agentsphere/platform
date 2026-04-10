@@ -400,6 +400,16 @@ async fn create_project(
     auth: AuthUser,
     Json(body): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Rate limit: 10 project creations per hour per user
+    crate::auth::rate_limit::check_rate(
+        &state.valkey,
+        "project_create",
+        &auth.user_id.to_string(),
+        10,
+        3600,
+    )
+    .await?;
+
     // Project-scoped tokens cannot create new projects
     if auth.boundary_project_id.is_some() {
         return Err(ApiError::Forbidden);

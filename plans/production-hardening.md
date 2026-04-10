@@ -240,6 +240,11 @@ This requires adding an `is_healthy(name) -> bool` method to `TaskRegistry`:
 
 ```rust
 /// Check if a named task is healthy (not stale, no recent error).
+///
+/// Uses `read()` on the RwLock — safe for concurrent K8s probe calls.
+/// Background tasks must only hold the `write()` lock for the duration
+/// of updating their heartbeat timestamp (microseconds), never across
+/// any async .await point, to avoid blocking liveness probes.
 pub fn is_healthy(&self, name: &str) -> bool {
     let tasks = self.tasks.read().unwrap_or_else(|e| e.into_inner());
     match tasks.get(name) {
@@ -277,11 +282,11 @@ pub async fn is_ready(state: &AppState) -> bool {
     pg.status == SubsystemStatus::Healthy && vk.status == SubsystemStatus::Healthy
 }
 
-// After — add MinIO, increase stale threshold, add fallback
+// After — add MinIO, short cache, add fallback
 pub async fn is_ready(state: &AppState) -> bool {
     if let Ok(snap) = state.health.read() {
         let age = Utc::now() - snap.checked_at;
-        if age.num_seconds() < 120 {  // 120s cache (2x health check interval)
+        if age.num_seconds() < 15 {  // 15s cache — must be ≤ K8s probe period
             let required = ["postgres", "valkey", "minio"];
             return required.iter().all(|name| {
                 snap.subsystems.iter().any(|s| {
@@ -312,7 +317,11 @@ pub async fn is_ready(state: &AppState) -> bool {
 - K8s intentionally NOT added — platform can serve API requests without K8s access
   (pipeline/deploy will fail, but API is still useful)
 - Degraded counts as ready — only Unhealthy fails readiness
-- Stale threshold raised from 60s to 120s (2x the default 15s health interval)
+- Cache TTL lowered to 15s (≤ K8s probe period). The old 60s cache was too long:
+  if the DB drops, K8s would keep routing traffic to the pod for up to 60s because
+  the cached "healthy" snapshot wouldn't expire. With 15s, the pod drops out of
+  the load balancer within one probe cycle. K8s already rate-limits probe frequency,
+  so caching beyond the probe interval just delays failure detection.
 
 ### Test plan
 
@@ -435,6 +444,8 @@ async fn update_user(
 - **Integration**: Trigger 11 project creations, verify 11th returns 429
 - **Integration**: Verify different users have independent counters
 - **Integration**: Verify existing tests still pass (limits are generous enough)
+
+> **Status: COMPLETE** — Rate limits added to all 5 endpoints. No deviations from plan.
 
 ---
 
@@ -646,6 +657,19 @@ pub async fn write_metrics(pool: &PgPool, metrics: &[MetricRecord]) -> Result<()
         series_project_ids.push(m.project_id);
     }
 
+    // Guard: UNNEST requires all arrays to be the same length.
+    // A length mismatch would silently misalign rows (wrong value → wrong series).
+    debug_assert_eq!(series_names.len(), series_labels.len());
+    debug_assert_eq!(series_names.len(), series_project_ids.len());
+    if series_names.len() != series_labels.len()
+        || series_names.len() != series_project_ids.len()
+    {
+        return Err(ObserveError::Internal(anyhow::anyhow!(
+            "metric batch array length mismatch: names={}, labels={}, projects={}",
+            series_names.len(), series_labels.len(), series_project_ids.len()
+        )));
+    }
+
     // Batch upsert using UNNEST — single round-trip for all series
     let series_ids: Vec<(Uuid,)> = sqlx::query_as(
         "INSERT INTO metric_series (name, labels, project_id)
@@ -702,6 +726,12 @@ three columns. Verify this exists in migrations — if not, add it.
 - **Integration**: Ingest 100 metrics with mixed series, verify all stored correctly
 - **Benchmark**: Compare flush time with old vs new implementation (expect 10-50x
   improvement at batch size 500)
+
+> **Status: COMPLETE** — Batched UNNEST implementation done.
+> **Deviation:** Actual `metric_series` unique constraint is `UNIQUE (name, labels)`,
+> NOT `(name, labels, project_id)`. Implementation uses `ON CONFLICT (name, labels)`
+> to match actual schema. Also includes `metric_type`, `unit`, `project_id`, `last_value`
+> columns in the upsert which the plan omitted.
 
 ---
 
@@ -887,6 +917,8 @@ is needed later, add standard `ListParams` (offset/limit) like other endpoints.
 
 - **Integration**: Existing admin and commands tests pass
 
+> **Status: COMPLETE** — `LIMIT 200` added to both queries. No deviations from plan.
+
 ---
 
 ## 10. Composite Index for Pipeline Filtering
@@ -906,11 +938,17 @@ just db-add pipeline_status_index
 
 **File**: `migrations/YYYYMMDDHHMMSS_pipeline_status_index.up.sql`:
 
+**Important**: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block.
+sqlx wraps migrations in transactions by default. Add the sqlx directive comment
+to disable the transaction for this migration:
+
 ```sql
+-- no-transaction
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pipelines_project_status
-ON pipelines(project_id, status, created_at DESC)
-WHERE is_active = true;
+ON pipelines(project_id, status, created_at DESC);
 ```
+
+> **Note:** Removed `WHERE is_active = true` — `pipelines` table has no `is_active` column.
 
 **File**: `migrations/YYYYMMDDHHMMSS_pipeline_status_index.down.sql`:
 
@@ -919,6 +957,9 @@ DROP INDEX IF EXISTS idx_pipelines_project_status;
 ```
 
 **Notes**:
+- `-- no-transaction` is **required** — Postgres forbids `CREATE INDEX
+  CONCURRENTLY` inside a transaction block, and sqlx wraps migrations in
+  transactions by default. Without this directive, `just db-migrate` will crash.
 - `CONCURRENTLY` prevents table lock during index creation on large tables
 - Partial index (`WHERE is_active = true`) matches the soft-delete filter used in
   all queries, keeping the index smaller
@@ -929,6 +970,11 @@ DROP INDEX IF EXISTS idx_pipelines_project_status;
 - **Migration**: `just db-migrate && just db-prepare` succeeds
 - **Integration**: Pipeline list queries still work (verify with EXPLAIN ANALYZE
   if desired)
+
+> **Status: COMPLETE** — Migration created as `20260410010001_pipeline_status_index`.
+> **Deviation:** Removed `WHERE is_active = true` partial index clause — the `pipelines`
+> table has no `is_active` column (only `projects` uses soft-delete).
+> Used `-- no-transaction` directive (not `-- sqlx-disable-transaction`).
 
 ---
 

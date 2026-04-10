@@ -784,3 +784,15 @@ pub struct ListResponse<T: serde::Serialize> {
 - Pre-commit hooks enforce `rustfmt --check` and `clippy`
 - Never commit `.env` (gitignored), update `.env.example` for new vars
 - Commit `Cargo.lock` (binary project)
+
+
+
+## Agent Worktree Rules
+
+**CRITICAL: Never use the `claude -w` or `--worktree` flag to spawn new sessions or agents.** The built-in worktree flag branches from `origin/main` instead of local `main`, which will cause the agent to lose unpushed local commits and files.
+
+If you need to spawn a sub-agent or work in an isolated environment, you MUST create the git worktree manually using the local main branch as the base:
+
+1. Create the worktree and branch: `git worktree add -b <new-branch> .claude/worktrees/<name> main`
+2. Navigate to it: `cd .claude/worktrees/<name>`
+3. Launch the agent normally: `claude`

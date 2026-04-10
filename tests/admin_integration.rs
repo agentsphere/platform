@@ -6,6 +6,7 @@ mod helpers;
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // E3: Admin Integration Tests (14 tests)
@@ -885,4 +886,49 @@ async fn admin_get_service_account_by_id(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "get SA failed: {body}");
     assert_eq!(body["name"], "sa-get-test");
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate global role assignment returns 409 (NULLS NOT DISTINCT)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn duplicate_global_role_returns_conflict(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool.clone()).await;
+    let app = helpers::test_router(state);
+
+    // Create a user
+    let (user_id, _user_token) =
+        helpers::create_user(&app, &admin_token, "duprole", "duprole@test.com").await;
+
+    // Look up the "viewer" role (global, project_id = NULL)
+    let row: (Uuid,) = sqlx::query_as("SELECT id FROM roles WHERE name = 'viewer'")
+        .fetch_one(&pool)
+        .await
+        .expect("viewer role");
+    let role_id = row.0;
+
+    // First assignment — should succeed
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{user_id}/roles"),
+        json!({ "role_id": role_id, "project_id": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Second identical assignment — should return 409
+    let (status, _) = helpers::post_json(
+        &app,
+        &admin_token,
+        &format!("/api/admin/users/{user_id}/roles"),
+        json!({ "role_id": role_id, "project_id": null }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "duplicate global role should be rejected"
+    );
 }

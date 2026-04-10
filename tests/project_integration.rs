@@ -378,3 +378,39 @@ async fn delete_project_requires_permission(pool: PgPool) {
         helpers::delete_json(&app, &user_token, &format!("/api/projects/{project_id}")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// ---------------------------------------------------------------------------
+// Soft-delete name reuse
+// ---------------------------------------------------------------------------
+
+/// After soft-deleting a project, recreating with the same name succeeds.
+#[sqlx::test(migrations = "./migrations")]
+async fn recreate_project_after_soft_delete(pool: PgPool) {
+    let (state, admin_token) = helpers::test_state(pool).await;
+    let app = helpers::test_router(state);
+
+    // Create project
+    let id1 = helpers::create_project(&app, &admin_token, "recycle-name", "private").await;
+
+    // Soft-delete
+    let (status, _) =
+        helpers::delete_json(&app, &admin_token, &format!("/api/projects/{id1}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Recreate with same name — should succeed
+    let (status, body) = helpers::post_json(
+        &app,
+        &admin_token,
+        "/api/projects",
+        serde_json::json!({ "name": "recycle-name" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "recreate after delete should work: {body}"
+    );
+
+    let id2: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(id1, id2, "new project should have a different id");
+}

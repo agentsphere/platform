@@ -121,7 +121,7 @@ clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 # URL parsing (webhook SSRF validation)
 url = "2"

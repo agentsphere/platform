@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, is_system, created_at FROM roles ORDER BY name",
+  "query": "SELECT id, name, description, is_system, created_at FROM roles ORDER BY name LIMIT 200",
   "describe": {
     "columns": [
       {
@@ -40,5 +40,5 @@
       false
     ]
   },
-  "hash": "a4dcc40cbe81eea42b3de42d05826a3f142a9fa7ddfe587a1b7633fc934f37d4"
+  "hash": "0c069eca8f69c53f747720c109e3356a707fb0d3d3a557fe2de29455c742f3f5"
 }

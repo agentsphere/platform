@@ -190,6 +190,16 @@ async fn trigger_pipeline(
     Path(id): Path<Uuid>,
     Json(body): Json<TriggerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Rate limit: 60 pipeline triggers per hour per user
+    crate::auth::rate_limit::check_rate(
+        &state.valkey,
+        "pipeline_trigger",
+        &auth.user_id.to_string(),
+        60,
+        3600,
+    )
+    .await?;
+
     require_project_write(&state, &auth, id).await?;
     validation::check_branch_name(&body.git_ref)?;
 

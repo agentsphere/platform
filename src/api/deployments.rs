@@ -469,6 +469,16 @@ async fn create_release(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateReleaseRequest>,
 ) -> Result<(StatusCode, Json<ReleaseResponse>), ApiError> {
+    // Rate limit: 30 releases per hour per user
+    crate::auth::rate_limit::check_rate(
+        &state.valkey,
+        "release_create",
+        &auth.user_id.to_string(),
+        30,
+        3600,
+    )
+    .await?;
+
     require_deploy_promote(&state, &auth, id).await?;
     validation::check_length("image_ref", &body.image_ref, 1, 2048)?;
 
