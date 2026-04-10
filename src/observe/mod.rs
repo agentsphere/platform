@@ -9,6 +9,7 @@ pub mod error;
 pub mod ingest;
 pub mod k8s_watcher;
 pub mod parquet;
+pub mod partitions;
 pub mod proto;
 pub mod query;
 pub mod store;
@@ -99,6 +100,7 @@ pub fn spawn_background_tasks(
         state.clone(),
         shutdown_rx.clone(),
     ));
+    tokio::spawn(partitions::run(state.pool.clone(), shutdown_rx.clone()));
 
     // K8s watcher: stream pod/deployment state into metric_samples
     let ns = state.config.platform_namespace.clone();

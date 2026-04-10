@@ -112,7 +112,7 @@ pub async fn write_spans(pool: &PgPool, spans: &[SpanRecord]) -> Result<(), Obse
             $12::timestamptz[], $13::timestamptz[],
             $14::uuid[], $15::uuid[], $16::uuid[]
         )
-        ON CONFLICT (span_id) DO NOTHING
+        ON CONFLICT (span_id, started_at) DO NOTHING
         ",
     )
     .bind(&ids)

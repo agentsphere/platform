@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE pipeline_steps SET status = 'skipped', finished_at = now()\n        WHERE pipeline_id = $1 AND step_order > $2 AND status = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "58b92bfb38fc32615f2088cec37e1d08deefbd728c2cf0920b82fff36613bcce"
+}

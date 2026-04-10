@@ -543,7 +543,7 @@ async fn run_steps_sequential(
                 "step skipped (condition not matched)"
             );
             sqlx::query!(
-                "UPDATE pipeline_steps SET status = 'skipped' WHERE id = $1",
+                "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE id = $1",
                 step.id
             )
             .execute(&state.pool)
@@ -642,7 +642,7 @@ async fn run_steps_dag(
                     "step skipped (condition not matched)"
                 );
                 sqlx::query!(
-                    "UPDATE pipeline_steps SET status = 'skipped' WHERE id = $1",
+                    "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE id = $1",
                     step.id
                 )
                 .execute(&state.pool)
@@ -762,7 +762,7 @@ async fn run_steps_dag(
             for &s_idx in &skipped {
                 if !completed.contains(&s_idx) {
                     let _ = sqlx::query!(
-                        "UPDATE pipeline_steps SET status = 'skipped' WHERE id = $1 AND status = 'pending'",
+                        "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE id = $1 AND status = 'pending'",
                         steps[s_idx].id
                     )
                     .execute(&state.pool)
@@ -994,7 +994,7 @@ async fn execute_single_step(
             let status = if exit_code == 0 { "success" } else { "failure" };
             let log_ref = format!("logs/pipelines/{pipeline_id}/{}.log", step.name);
             sqlx::query!(
-                r#"UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, log_ref = $5 WHERE id = $1"#,
+                r#"UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, log_ref = $5, finished_at = now() WHERE id = $1"#,
                 step.id, status, exit_code, duration_ms, log_ref,
             )
             .execute(&state.pool)
@@ -1021,7 +1021,7 @@ async fn execute_single_step(
         Err(e) => {
             tracing::error!(error = %e, step = %step.name, "step execution error");
             sqlx::query!(
-                "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+                "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2, finished_at = now() WHERE id = $1",
                 step.id,
                 duration_ms,
             )
@@ -2682,7 +2682,7 @@ async fn execute_deploy_test_step(
         tracing::error!(%msg, "deploy_test manifest read failed");
         let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
         sqlx::query!(
-            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2, finished_at = now() WHERE id = $1",
             step.id,
             duration_ms,
         )
@@ -2719,7 +2719,7 @@ async fn execute_deploy_test_step(
         tracing::error!(error = %e, %ns_name, "failed to apply deploy manifests");
         let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
         sqlx::query!(
-            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2, finished_at = now() WHERE id = $1",
             step.id,
             duration_ms,
         )
@@ -2735,7 +2735,7 @@ async fn execute_deploy_test_step(
         capture_deployment_logs(state, &ns_name, pipeline_id, &step.name).await;
         let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
         sqlx::query!(
-            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2, finished_at = now() WHERE id = $1",
             step.id,
             duration_ms,
         )
@@ -2758,7 +2758,7 @@ async fn execute_deploy_test_step(
         capture_deployment_logs(state, &ns_name, pipeline_id, &step.name).await;
         let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
         sqlx::query!(
-            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2 WHERE id = $1",
+            "UPDATE pipeline_steps SET status = 'failure', duration_ms = $2, finished_at = now() WHERE id = $1",
             step.id,
             duration_ms,
         )
@@ -2892,7 +2892,7 @@ async fn execute_deploy_test_step(
     let status = if exit_code == 0 { "success" } else { "failure" };
     let log_ref = format!("logs/pipelines/{pipeline_id}/{}-test.log", step.name);
     sqlx::query!(
-        r#"UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, log_ref = $5 WHERE id = $1"#,
+        r#"UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, log_ref = $5, finished_at = now() WHERE id = $1"#,
         step.id,
         status,
         exit_code,
@@ -3140,7 +3140,7 @@ async fn execute_gitops_sync_step(
     };
 
     sqlx::query(
-        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4 WHERE id = $1",
+        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, finished_at = now() WHERE id = $1",
     )
     .bind(step.id)
     .bind(status)
@@ -3472,7 +3472,7 @@ async fn execute_deploy_watch_step(
     };
 
     sqlx::query(
-        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4 WHERE id = $1",
+        "UPDATE pipeline_steps SET status = $2, exit_code = $3, duration_ms = $4, finished_at = now() WHERE id = $1",
     )
     .bind(step.id)
     .bind(status)
@@ -3607,7 +3607,7 @@ async fn is_cancelled(pool: &PgPool, pipeline_id: Uuid) -> Result<bool, Pipeline
 
 async fn skip_remaining_steps(pool: &PgPool, pipeline_id: Uuid) -> Result<(), PipelineError> {
     sqlx::query!(
-        "UPDATE pipeline_steps SET status = 'skipped' WHERE pipeline_id = $1 AND status = 'pending'",
+        "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE pipeline_id = $1 AND status = 'pending'",
         pipeline_id,
     )
     .execute(pool)
@@ -3622,7 +3622,7 @@ async fn skip_remaining_after(
 ) -> Result<(), PipelineError> {
     sqlx::query!(
         r#"
-        UPDATE pipeline_steps SET status = 'skipped'
+        UPDATE pipeline_steps SET status = 'skipped', finished_at = now()
         WHERE pipeline_id = $1 AND step_order > $2 AND status = 'pending'
         "#,
         pipeline_id,

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c829e964d384440753e3750b89789c2d9d8e1be75f4ce48a1a207bd8e7f143d9"
+}
