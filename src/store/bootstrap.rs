@@ -126,6 +126,12 @@ const SYSTEM_ROLES: &[RoleDef] = &[
         ],
         is_system: false,
     },
+    RoleDef {
+        name: "otlp-ingest",
+        description: "Service account: OTLP telemetry ingestion",
+        permissions: &["observe:write", "project:read"],
+        is_system: true,
+    },
 ];
 
 struct PermDef {

@@ -33,6 +33,8 @@ pub struct ProxyConfig {
     pub api_url: String,
     /// Bearer token for platform API auth.
     pub api_token: String,
+    /// Dedicated OTLP bearer token (observe:write scope). Falls back to `api_token`.
+    pub otlp_token: String,
     /// Project UUID for resource attribution.
     pub project_id: Option<String>,
     /// Service name (default: wrapped binary name).
@@ -218,6 +220,9 @@ impl ProxyConfig {
             api_url: env::var("PLATFORM_API_URL")
                 .unwrap_or_else(|_| "http://platform.platform.svc.cluster.local:8080".into()),
             api_token: env::var("PLATFORM_API_TOKEN").unwrap_or_default(),
+            otlp_token: env::var("OTEL_API_TOKEN")
+                .or_else(|_| env::var("PLATFORM_API_TOKEN"))
+                .unwrap_or_default(),
             project_id: env::var("PLATFORM_PROJECT_ID").ok(),
             service_name,
             session_id: env::var("PLATFORM_SESSION_ID").ok(),

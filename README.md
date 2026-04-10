@@ -1,6 +1,6 @@
 # asp — Agentic DevOps
 
-A single Rust binary that gives AI coding agents (and the humans who supervise them) everything they need to ship software — git hosting, CI/CD, observability, secrets, and more.
+A platform that gives AI coding agents (and the humans who supervise them) everything they need to ship software — git hosting, CI/CD, observability, secrets, service mesh, and more. Five purpose-built binaries, zero off-the-shelf middleware.
 
 Built by Steven Hooker. Officially backed and distributed by AgentSphere GmbH.
 
@@ -10,43 +10,134 @@ Built by Steven Hooker. Officially backed and distributed by AgentSphere GmbH.
 - **Project management** — issues, merge requests, code review, webhooks, workspaces
 - **CI/CD pipelines** — `.platform.yaml` definitions, Kubernetes pod execution, log streaming
 - **Continuous deployment** — GitOps reconciler, Kustomize/Helm rendering, preview environments
-- **Service mesh** — process-wrapper proxy with automatic mTLS between in-cluster services
-- **TLS termination** — ACME certificate provisioning and external TLS for gateway ingress
-- **AI agent sessions** — ephemeral agent users, scoped identity, Claude CLI integration
+- **Service mesh** — transparent proxy with automatic mTLS (SPIFFE), replaces Envoy
+- **Ingress gateway** — HTTPRoute-driven routing, ACME TLS provisioning, traffic splitting
+- **AI agent sessions** — ephemeral pods with Claude CLI, MCP servers, scoped identity
 - **Observability** — OTLP ingest (traces, logs, metrics), Parquet cold storage, alerting
 - **Secrets management** — AES-256-GCM encrypted secrets, scoped access, injection into pipelines
-- **Notifications** — email (SMTP), webhooks (HMAC-signed), in-app alerts
-- **Auth & RBAC** — sessions, API tokens, passkeys (WebAuthn), roles, permissions, time-bounded delegation
-- **Container registry** — OCI-compliant push, pull, and manifest management
-- **Guided onboarding** — first-run setup, demo projects, CLI auth flow
+- **Container registry** — OCI-compliant push, pull, manifest management, backed by MinIO
+- **Auth & RBAC** — sessions, API tokens, passkeys (WebAuthn), roles, delegation, SPIFFE mesh CA
 - **Web UI** — embedded Preact SPA for dashboards, project detail, observability views
-
-**Infrastructure dependencies**: PostgreSQL, Valkey, MinIO, Kubernetes.
 
 ## Architecture
 
-15 modules in a single crate (~72K LOC):
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           Kubernetes Cluster                               │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     PLATFORM (control plane)                         │  │
+│  │               Rust binary — Axum HTTP + SSH server                   │  │
+│  │                                                                      │  │
+│  │  API · Git · Pipelines · Deployer · Agents · Observe · Registry     │  │
+│  │  Auth/RBAC · Secrets · Notify · Mesh CA · Gateway controller        │  │
+│  │  Preact SPA (embedded) · Background tasks (9 loops)                 │  │
+│  └─────┬──────────┬──────────┬──────────────────────────────────────────┘  │
+│        │          │          │                                              │
+│  ┌─────▼───┐ ┌───▼────┐ ┌──▼─────┐                                       │
+│  │Postgres │ │ Valkey  │ │ MinIO  │                                       │
+│  │ (state) │ │ (cache, │ │ (blobs,│                                       │
+│  │         │ │ pub/sub)│ │ images)│                                       │
+│  └─────────┘ └────────┘ └────────┘                                       │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     GATEWAY (ingress)                                │  │
+│  │               platform-proxy --gateway                               │  │
+│  │                                                                      │  │
+│  │  HTTPRoute CRD watcher · TLS termination (ACME + mesh CA)          │  │
+│  │  Host/path routing · Rate limiting · Connection pooling              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     AGENT PODS (per session)                         │  │
+│  │                                                                      │  │
+│  │  init: git-clone → setup (MCP + Claude CLI) → proxy-init (iptables) │  │
+│  │  ┌──────────────┐  ┌─────────────┐  ┌─────────────────────────────┐ │  │
+│  │  │ agent-runner  │  │  browser    │  │  platform-proxy (sidecar)   │ │  │
+│  │  │ Claude CLI    │  │  Playwright │  │  mTLS · logs · metrics      │ │  │
+│  │  │ MCP servers   │  │  (optional) │  │  transparent interception   │ │  │
+│  │  └──────────────┘  └─────────────┘  └─────────────────────────────┘ │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     PIPELINE PODS (per step)                         │  │
+│  │                                                                      │  │
+│  │  init: git-clone · Kaniko (image builds)                            │  │
+│  │  Shell commands · Artifact upload · Log streaming                    │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     DEPLOYED WORKLOADS                                │  │
+│  │                                                                      │  │
+│  │  Per-project namespaces · Preview envs (branch-scoped, TTL)         │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ app container → platform-proxy --wrap (sidecar)                │  │  │
+│  │  │                 mTLS · stdout/stderr capture · process metrics  │  │  │
+│  │  └────────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Binaries
+
+| Binary | Crate | Image | Role |
+|--------|-------|-------|------|
+| **platform** | `src/` | `platform` | Control plane — API, git, background tasks, embedded UI |
+| **agent-runner** | `cli/agent-runner/` | `platform-runner` | Runs inside agent pods — wraps Claude CLI, manages MCP servers, Valkey pub/sub |
+| **platform-proxy** | `crates/proxy/` | `platform-proxy` | Mesh sidecar (mTLS, logs, metrics), process wrapper, or ingress gateway |
+| **proxy-init** | `crates/proxy-init/` | `platform-proxy-init` | Init container — copies proxy binary, sets up iptables redirect rules |
+| **claude-mock** | `cli/claude-mock/` | — | Test harness — mocks Claude CLI for integration tests |
+
+### Infrastructure
+
+| Service | Role | Accessed via |
+|---------|------|--------------|
+| **PostgreSQL** | Primary state — users, projects, pipelines, deployments, observability | SQLx (compile-time checked) |
+| **Valkey** | Cache (permissions, rate limits), pub/sub (agent sessions), per-session ACLs | Fred client pool |
+| **MinIO** | Object storage — OCI image blobs, Parquet files, pipeline artifacts, Git LFS | OpenDAL (S3 API) |
+| **Kubernetes** | Pod orchestration — agent sessions, pipeline steps, deployer workloads, gateway | kube-rs |
+
+### Spawned Pods
+
+The platform dynamically creates and manages several types of Kubernetes pods:
+
+- **Agent pods** — one per session. Init containers clone the repo, install MCP servers and Claude CLI, and configure iptables for transparent proxy. Main container runs the agent-runner binary wrapping Claude Code. Optional browser sidecar (Playwright) for UI/test roles. Network proxy sidecar for mesh mTLS.
+- **Pipeline pods** — one per pipeline step. Git clone init, then shell commands or Kaniko for image builds. Logs streamed back to platform via OTLP.
+- **Gateway pod** — single deployment, auto-reconciled. Runs `platform-proxy --gateway`, watches HTTPRoute CRDs, terminates TLS (ACME or mesh CA), routes traffic by host/path.
+- **Deployed workloads** — user applications managed by the GitOps reconciler. Each gets a `platform-proxy --wrap` sidecar for mTLS, log capture, and process metrics.
+
+### MCP Servers
+
+7 Node.js servers in `mcp/servers/` provide tool interfaces for Claude agents inside pods:
+
+`platform-core` · `platform-admin` · `platform-issues` · `platform-pipeline` · `platform-deploy` · `platform-observe` · `platform-browser`
+
+### Modules
+
+15 modules in the main crate (~72K LOC):
 
 ```
 src/
-├── auth/        — password hashing, sessions, API tokens, passkeys
-├── rbac/        — roles, permissions, time-bounded delegation
-├── api/         — HTTP handlers (Axum)
-├── git/         — git smart HTTP, SSH, LFS, file browser
+├── auth/        — password hashing, sessions, API tokens, passkeys, rate limiting
+├── rbac/        — roles, permissions, time-bounded delegation, Valkey-cached resolution
+├── api/         — 30+ HTTP handler modules (Axum), wired via .merge()
+├── git/         — smart HTTP + SSH server, LFS, file browser, post-receive hooks
 ├── pipeline/    — .platform.yaml parsing, K8s pod execution, log streaming
-├── deployer/    — continuous reconciliation (desired vs current state)
-├── agent/       — session lifecycle, ephemeral agent users, Claude CLI
-├── observe/     — OTLP ingest, Parquet storage, queries, alerts
-├── secrets/     — AES-256-GCM encryption, scoped access, request flow
-├── notify/      — email (lettre), webhooks, in-app notifications
-├── store/       — Postgres pool, Valkey client, MinIO operator, K8s client
-├── registry/    — OCI container registry (push, pull, manifests)
+├── deployer/    — GitOps reconciler, Kustomize rendering, K8s applier, preview envs
+├── agent/       — session lifecycle, ephemeral identity, Claude Code provider, pod specs
+├── observe/     — OTLP ingest, Parquet storage, query API, alerts, K8s event correlation
+├── secrets/     — AES-256-GCM encryption engine, scoped access, request flow
+├── notify/      — email (lettre SMTP), webhooks (HMAC-SHA256), in-app notifications
+├── store/       — Postgres pool, Valkey pool, MinIO operator, K8s client, bootstrap
+├── registry/    — OCI container registry (push, pull, manifests, GC), backed by MinIO
+├── mesh/        — SPIFFE mesh CA, leaf cert issuance, ACME (Let's Encrypt), trust bundles
+├── gateway/     — auto-deploys ingress gateway, reconciles Deployment + Service + RBAC
 ├── workspace/   — workspace management and membership
 ├── onboarding/  — first-run setup, demo projects, Claude CLI auth
-└── ui           — embedded Preact SPA (rust-embed)
+└── ui.rs        — embedded Preact SPA (rust-embed)
 ```
 
-See `docs/architecture.md` for the full architecture.
+See `docs/architecture.md` for data flows, schema overview, and background task inventory.
 
 ## Tech Stack
 

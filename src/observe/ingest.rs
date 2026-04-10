@@ -166,12 +166,13 @@ async fn check_otlp_project_auth(
         // Check project scope boundary (scoped tokens)
         auth.check_project_scope(*pid)?;
 
-        let allowed = resolver::has_permission(
+        let allowed = resolver::has_permission_scoped(
             &state.pool,
             &state.valkey,
             auth.user_id,
             Some(*pid),
             Permission::ObserveWrite,
+            auth.token_scopes.as_deref(),
         )
         .await
         .map_err(|e| ApiError::Internal(e.context("OTLP project auth check")))?;
@@ -197,8 +198,10 @@ pub async fn ingest_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &auth.user_id.to_string(), 1000, 60)
-        .await?;
+    let rate_id = auth
+        .boundary_project_id
+        .map_or_else(|| auth.user_id.to_string(), |pid| pid.to_string());
+    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &rate_id, 10_000, 60).await?;
 
     let body = maybe_decompress(&headers, body)?;
     let request = proto::ExportTraceServiceRequest::decode(body)
@@ -242,8 +245,10 @@ pub async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &auth.user_id.to_string(), 1000, 60)
-        .await?;
+    let rate_id = auth
+        .boundary_project_id
+        .map_or_else(|| auth.user_id.to_string(), |pid| pid.to_string());
+    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &rate_id, 10_000, 60).await?;
 
     let body = maybe_decompress(&headers, body)?;
     let request = proto::ExportLogsServiceRequest::decode(body)
@@ -286,8 +291,10 @@ pub async fn ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &auth.user_id.to_string(), 1000, 60)
-        .await?;
+    let rate_id = auth
+        .boundary_project_id
+        .map_or_else(|| auth.user_id.to_string(), |pid| pid.to_string());
+    crate::auth::rate_limit::check_rate(&state.valkey, "otlp", &rate_id, 10_000, 60).await?;
 
     let body = maybe_decompress(&headers, body)?;
     let request = proto::ExportMetricsServiceRequest::decode(body)

@@ -540,6 +540,37 @@ async fn handle_promoting(state: &AppState, release: &PendingRelease) -> Result<
         } else {
             rendered
         };
+
+        // Re-inject proxy wrapper (same as handle_pending)
+        let rendered = if state.config.mesh_enabled {
+            let rendered = resolve_manifest_entrypoints(
+                &rendered,
+                &state.pool,
+                &state.minio,
+                state.config.registry_node_url.as_deref(),
+            )
+            .await;
+            let init_image = match state
+                .config
+                .registry_node_url
+                .as_deref()
+                .or(state.config.registry_url.as_deref())
+            {
+                Some(reg) => format!("{reg}/platform-proxy-init:v1"),
+                None => "platform-proxy-init:v1".into(),
+            };
+            applier::inject_proxy_wrapper(
+                &rendered,
+                &applier::ProxyInjectionConfig {
+                    platform_api_url: state.config.platform_api_url.clone(),
+                    init_image,
+                    mesh_strict_mtls: state.config.mesh_strict_mtls,
+                },
+            )?
+        } else {
+            rendered
+        };
+
         let _ = applier::apply_with_tracking(&state.kube, &rendered, &ns, Some(release.id)).await;
     }
 
@@ -1056,12 +1087,7 @@ pub async fn ensure_scoped_tokens_in_ns(
     namespace: &str,
     secret_name: &str,
 ) -> Result<(String, String), DeployerError> {
-    let owner = resolve_project_owner(state, project_id).await;
-    let Some((owner_id, _)) = owner else {
-        return Err(DeployerError::Other(anyhow::anyhow!(
-            "project owner not found"
-        )));
-    };
+    let owner_id = ensure_project_service_account(state, project_id).await?;
 
     let proj8 = &project_id.to_string()[..8];
     let otel_name = format!("otlp-{scope}-{proj8}");
@@ -1214,6 +1240,51 @@ async fn lookup_stable_image(pool: &sqlx::PgPool, target_id: Uuid) -> Option<Str
     .await
     .ok()
     .flatten()
+}
+
+/// Create or reuse a per-project service account for OTLP ingestion.
+///
+/// Uses an atomic upsert (`ON CONFLICT`) to avoid TOCTOU races when
+/// multiple reconciler threads process the same project concurrently.
+async fn ensure_project_service_account(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<Uuid, DeployerError> {
+    let slug = sqlx::query_scalar::<_, String>(
+        "SELECT namespace_slug FROM projects WHERE id = $1 AND is_active = true",
+    )
+    .bind(project_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let sa_name = format!("sa-{slug}");
+    let sa_email = format!("{sa_name}@platform.local");
+
+    // Atomic upsert — DO UPDATE forces RETURNING to fire even on conflict
+    let sa_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO users (id, name, email, password_hash, user_type, is_active)
+         VALUES ($1, $2, $3, '!disabled', 'service_account', true)
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&sa_name)
+    .bind(&sa_email)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Assign otlp-ingest role scoped to project (idempotent)
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role_id, project_id)
+         SELECT $1, id, $2 FROM roles WHERE name = 'otlp-ingest'
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(sa_id)
+    .bind(project_id)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(sa_id)
 }
 
 async fn resolve_project_owner(state: &AppState, project_id: Uuid) -> Option<(Uuid, String)> {
@@ -1401,7 +1472,22 @@ async fn render_manifests(
             .as_deref()
             .or(ops_path.as_deref())
             .unwrap_or("deploy/");
-        let sha = ops_repo::get_head_sha(&repo_path).await?;
+
+        // For staging environment, read from the staging branch where gitops_sync
+        // committed both manifests and values. Otherwise use the default branch.
+        let values_branch = if release.environment == "staging" {
+            "staging"
+        } else {
+            &branch
+        };
+        let sha = ops_repo::get_branch_sha(&repo_path, values_branch)
+            .await
+            .unwrap_or_else(|_| String::new());
+        let sha = if sha.is_empty() {
+            ops_repo::get_head_sha(&repo_path).await?
+        } else {
+            sha
+        };
 
         // If manifest_path ends with '/', read all YAML files from the directory;
         // otherwise read a single file.
@@ -1415,8 +1501,8 @@ async fn render_manifests(
                 .map_err(|e| DeployerError::RenderFailed(e.to_string()))?
         };
 
-        // Read values
-        let ops_values = ops_repo::read_values(&repo_path, &branch, &release.environment)
+        // Read values from the environment-specific branch (matches eventbus logic)
+        let ops_values = ops_repo::read_values(&repo_path, values_branch, &release.environment)
             .await
             .unwrap_or_else(|_| serde_json::json!({}));
 

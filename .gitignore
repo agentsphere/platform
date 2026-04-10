@@ -14,6 +14,9 @@ docs/viewer/dist/
 ui/dist/
 ui/test-results/
 
+# Dev server log
+server.log
+
 # IDE
 .idea/
 .vscode/

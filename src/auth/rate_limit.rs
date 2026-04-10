@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use fred::interfaces::KeysInterface;
+use fred::types::ExpireOptions;
 
 use crate::error::ApiError;
 
-/// Sliding-window rate limiter backed by Valkey.
+/// Fixed-window rate limiter backed by Valkey.
 ///
-/// Increments a counter keyed on `rate:{prefix}:{identifier}` with a TTL of
-/// `window_secs`. Returns `Err(ApiError::TooManyRequests)` when the counter
-/// exceeds `max_attempts`.
+/// Increments a counter keyed on `rate:{prefix}:{identifier}`. Sets the TTL
+/// only on the first request (`EXPIRE NX`) so the window is anchored to the
+/// first hit — not reset on every request. Returns
+/// `Err(ApiError::TooManyRequests)` when the counter exceeds `max_attempts`.
 pub async fn check_rate(
     valkey: &fred::clients::Pool,
     prefix: &str,
@@ -21,12 +23,12 @@ pub async fn check_rate(
 
     let count: u64 = valkey.incr(&key).await.map_err(ApiError::from)?;
 
-    // A64: Always set EXPIRE after INCR to avoid TOCTOU race. If the process
-    // crashed between INCR (count==1) and a conditional EXPIRE, the key would
-    // persist forever. EXPIRE is idempotent — calling it on every request just
-    // resets the TTL, which is acceptable for a sliding-window limiter.
+    // NX: only set the TTL if none exists yet. This anchors the window to the
+    // first request instead of sliding it forward on every hit. Worst case on
+    // crash between INCR and EXPIRE: a single orphaned counter (harmless,
+    // evicted by Valkey memory policy).
     let _: () = valkey
-        .expire(&key, window_secs, None)
+        .expire(&key, window_secs, Some(ExpireOptions::NX))
         .await
         .map_err(ApiError::from)?;
 

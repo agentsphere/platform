@@ -86,12 +86,12 @@ dev-down-all:
     rm -f .env.dev
     echo "All dev environments stopped"
 
-# Run server in dev mode (uses .env.dev from dev-up)
+# Run server in dev mode (uses .env.dev from dev-up), logs to server.log
 [group('dev')]
 dev:
     @if [ ! -f .env.dev ]; then echo "ERROR: .env.dev not found. Run: just dev-up"; exit 1; fi
     @grep -E '^PLATFORM_(GIT_REPOS|OPS_REPOS|SEED_IMAGES)_PATH=' .env.dev | cut -d= -f2 | xargs mkdir -p
-    cargo run
+    cargo run 2>&1 | tee server.log
 
 # Run server with custom env file
 [group('dev')]

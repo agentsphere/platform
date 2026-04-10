@@ -80,7 +80,7 @@ impl GatewayConfig {
                 .unwrap_or_default(),
             log_level: env::var("PROXY_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             otlp_endpoint: env::var("PROXY_OTLP_ENDPOINT").ok(),
-            otlp_token: env::var("PROXY_OTLP_TOKEN").ok(),
+            otlp_token: env::var("OTEL_API_TOKEN").ok(),
         }
     }
 }

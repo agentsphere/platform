@@ -303,10 +303,10 @@ async fn main() {
     // RED metrics for HTTP proxy traffic
     let red_metrics = Arc::new(metrics::RedMetrics::new());
 
-    // Start OTLP exporter
+    // Start OTLP exporter — uses dedicated OTLP token (observe:write scope)
     let exporter = otlp::OtlpExporter::new(
         config.api_url.clone(),
-        config.api_token.clone(),
+        config.otlp_token.clone(),
         config.project_id.clone(),
         config.service_name.clone(),
         config.session_id.clone(),
