@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::error::CliError;
 use crate::messages::{CliMessage, SystemMessage};
-use crate::pubsub::{cli_message_to_event, PubSubClient, PubSubInput};
+use crate::pubsub::{PubSubClient, PubSubInput, cli_message_to_event};
 use crate::render;
 use crate::transport::{CliSpawnOptions, SubprocessTransport};
 
@@ -28,7 +28,7 @@ pub(crate) async fn wait_for_init(
     }
 }
 
-/// Publish a WaitingForInput event via pub/sub.
+/// Publish a `WaitingForInput` event via pub/sub.
 async fn publish_waiting(ps: &PubSubClient) {
     let event = crate::pubsub::PubSubEvent {
         kind: crate::pubsub::PubSubKind::WaitingForInput,
@@ -42,6 +42,16 @@ async fn publish_waiting(ps: &PubSubClient) {
 async fn publish_completed(ps: &PubSubClient, message: &str) {
     let event = crate::pubsub::PubSubEvent {
         kind: crate::pubsub::PubSubKind::Completed,
+        message: message.into(),
+        metadata: None,
+    };
+    ps.publish_event(&event).await.ok();
+}
+
+/// Publish an error event via pub/sub.
+async fn publish_error(ps: &PubSubClient, message: &str) {
+    let event = crate::pubsub::PubSubEvent {
+        kind: crate::pubsub::PubSubKind::Error,
         message: message.into(),
         metadata: None,
     };
@@ -68,25 +78,21 @@ async fn wait_for_input(
             line = async {
                 if *stdin_alive { stdin_rx.recv().await } else { std::future::pending().await }
             } => {
-                match line {
-                    Some(text) => {
-                        let trimmed = text.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if matches!(trimmed, "exit" | "/exit" | "quit" | "/quit") {
-                            return None;
-                        }
-                        return Some(text);
+                if let Some(text) = line {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        continue;
                     }
-                    None => {
-                        *stdin_alive = false;
-                        if has_pubsub {
-                            continue;
-                        }
+                    if matches!(trimmed, "exit" | "/exit" | "quit" | "/quit") {
                         return None;
                     }
+                    return Some(text);
                 }
+                *stdin_alive = false;
+                if has_pubsub {
+                    continue;
+                }
+                return None;
             }
             input = async {
                 match pubsub_rx.as_mut() {
@@ -105,7 +111,6 @@ async fn wait_for_input(
                     Some(PubSubInput::Control { .. }) => {
                         // Control messages (interrupt) are only meaningful during
                         // an active turn — ignore while waiting for input.
-                        continue;
                     }
                     None => return None,
                 }
@@ -114,7 +119,7 @@ async fn wait_for_input(
                 eprintln!("\n[info] Ctrl-C, exiting...");
                 return None;
             }
-            _ = async {
+            () = async {
                 #[cfg(unix)]
                 sigterm.recv().await;
                 #[cfg(not(unix))]
@@ -133,7 +138,7 @@ async fn wait_for_input(
 /// `false` if the session should end (EOF, error result, read error).
 async fn stream_turn_responses(
     transport: &SubprocessTransport,
-    pubsub: &Option<PubSubClient>,
+    pubsub: Option<&PubSubClient>,
 ) -> Result<bool> {
     loop {
         let msg = transport.recv().await;
@@ -141,13 +146,13 @@ async fn stream_turn_responses(
             Ok(Some(ref m)) => {
                 render::render_message(m);
 
-                if let Some(ref ps) = pubsub {
-                    if let Some(event) = cli_message_to_event(m) {
-                        ps.publish_event(&event).await.ok();
-                    }
+                if let Some(ps) = pubsub
+                    && let Some(event) = cli_message_to_event(m)
+                {
+                    ps.publish_event(&event).await.ok();
                 }
 
-                if let CliMessage::Result(ref r) = m {
+                if let CliMessage::Result(r) = m {
                     render::notify_desktop(if r.is_error {
                         render::Notification::AgentError
                     } else {
@@ -191,21 +196,17 @@ pub async fn run(
     let has_pubsub = pubsub.is_some();
 
     // Subscribe to pubsub input once (persists across turns)
-    let mut pubsub_rx = if let Some(ref ps) = pubsub {
-        Some(ps.subscribe_input().await?)
-    } else {
-        None
-    };
+    let mut pubsub_rx = pubsub.as_ref().map(PubSubClient::subscribe_input);
 
     let mut cli_session_id: Option<String> = None;
     let mut stdin_alive = true;
     let mut pending_prompt = initial_prompt;
 
     // If no initial prompt and pubsub active, publish WaitingForInput immediately
-    if pending_prompt.is_none() {
-        if let Some(ref ps) = pubsub {
-            publish_waiting(ps).await;
-        }
+    if pending_prompt.is_none()
+        && let Some(ref ps) = pubsub
+    {
+        publish_waiting(ps).await;
     }
 
     loop {
@@ -218,7 +219,7 @@ pub async fn run(
                 publish_waiting(ps).await;
             }
 
-            match wait_for_input(
+            if let Some(text) = wait_for_input(
                 &mut stdin_rx,
                 &mut pubsub_rx,
                 &mut stdin_alive,
@@ -229,19 +230,13 @@ pub async fn run(
             )
             .await
             {
-                Some(text) => text,
-                None => {
-                    // Signal or all input sources closed — publish error and exit
-                    if let Some(ref ps) = pubsub {
-                        let event = crate::pubsub::PubSubEvent {
-                            kind: crate::pubsub::PubSubKind::Error,
-                            message: "Session terminated".into(),
-                            metadata: None,
-                        };
-                        ps.publish_event(&event).await.ok();
-                    }
-                    break;
+                text
+            } else {
+                // Signal or all input sources closed — publish error and exit
+                if let Some(ref ps) = pubsub {
+                    publish_error(ps, "Session terminated").await;
                 }
+                break;
             }
         };
 
@@ -258,12 +253,7 @@ pub async fn run(
             Err(e) => {
                 eprintln!("[error] failed to spawn CLI: {e}");
                 if let Some(ref ps) = pubsub {
-                    let event = crate::pubsub::PubSubEvent {
-                        kind: crate::pubsub::PubSubKind::Error,
-                        message: format!("Failed to spawn CLI: {e}"),
-                        metadata: None,
-                    };
-                    ps.publish_event(&event).await.ok();
+                    publish_error(ps, &format!("Failed to spawn CLI: {e}")).await;
                 }
                 break;
             }
@@ -279,34 +269,25 @@ pub async fn run(
             Err(e) => {
                 eprintln!("[error] CLI init failed: {e}");
                 if let Some(ref ps) = pubsub {
-                    let event = crate::pubsub::PubSubEvent {
-                        kind: crate::pubsub::PubSubKind::Error,
-                        message: format!("CLI init failed: {e}"),
-                        metadata: None,
-                    };
-                    ps.publish_event(&event).await.ok();
+                    publish_error(ps, &format!("CLI init failed: {e}")).await;
                 }
                 break;
             }
         };
 
         render::render_message(&CliMessage::System(sys.clone()));
-
-        // Capture session ID for --resume on subsequent turns
         cli_session_id = Some(sys.session_id.clone());
 
         // Publish init event
-        if let Some(ref ps) = pubsub {
-            if let Some(event) = cli_message_to_event(&CliMessage::System(sys)) {
-                if let Err(e) = ps.publish_event(&event).await {
-                    eprintln!("[warn] failed to publish init event: {e}");
-                }
-            }
+        if let Some(ref ps) = pubsub
+            && let Some(event) = cli_message_to_event(&CliMessage::System(sys))
+            && let Err(e) = ps.publish_event(&event).await
+        {
+            eprintln!("[warn] failed to publish init event: {e}");
         }
 
         // Phase D: Stream responses until Result or EOF
-        let should_continue = stream_turn_responses(&transport, &pubsub).await?;
-        // transport dropped here — CLI process cleaned up
+        let should_continue = stream_turn_responses(&transport, pubsub.as_ref()).await?;
 
         if !should_continue {
             if let Some(ref ps) = pubsub {
@@ -315,9 +296,7 @@ pub async fn run(
             break;
         }
 
-        // One-shot mode (--one-shot): exit after the first successful turn.
-        // Used by worker agents spawned by a manager (create-app flow).
-        // Interactive sessions stay alive for follow-up messages via pub/sub.
+        // One-shot mode: exit after the first successful turn.
         if one_shot {
             if let Some(ref ps) = pubsub {
                 publish_completed(ps, "Agent completed").await;
@@ -337,7 +316,7 @@ mod tests {
     use tokio::io::{BufReader, BufWriter};
     use tokio::sync::Mutex;
 
-    use crate::pubsub::{dispatch_input, PubSubInput};
+    use crate::pubsub::{PubSubInput, dispatch_input};
 
     /// Spawn `sh -c 'exec cat'` as a mock transport.
     async fn spawn_cat_transport() -> SubprocessTransport {
@@ -582,9 +561,8 @@ mod tests {
     /// Test run() exits cleanly when the process exits after init (EOF path).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_exits_on_eof_after_init() {
-        let script = mock_cli_script(&[
-            r#"{"type":"system","subtype":"init","session_id":"eof-test"}"#,
-        ]);
+        let script =
+            mock_cli_script(&[r#"{"type":"system","subtype":"init","session_id":"eof-test"}"#]);
         let opts = CliSpawnOptions {
             cli_path: Some(script.path().to_path_buf()),
             ..Default::default()
@@ -653,7 +631,7 @@ mod tests {
             alive: std::sync::atomic::AtomicBool::new(true),
         };
 
-        let result = stream_turn_responses(&transport, &None).await.unwrap();
+        let result = stream_turn_responses(&transport, None).await.unwrap();
         assert!(result);
     }
 
@@ -683,7 +661,7 @@ mod tests {
             alive: std::sync::atomic::AtomicBool::new(true),
         };
 
-        let result = stream_turn_responses(&transport, &None).await.unwrap();
+        let result = stream_turn_responses(&transport, None).await.unwrap();
         assert!(!result);
     }
 }

@@ -84,9 +84,9 @@ fn convert_system(sys: &SystemMessage) -> PubSubEvent {
 
 /// Convert an assistant message to a pub/sub event.
 ///
-/// Emits ONE event per message using priority: thinking > tool_calls > text.
+/// Emits ONE event per message using priority: thinking > `tool_calls` > text.
 /// If thinking is present, it returns immediately (matching the platform's
-/// `cli_message_to_progress()` behavior). This means text/tool_use blocks
+/// `cli_message_to_progress()` behavior). This means `text`/`tool_use` blocks
 /// in the same message are not emitted. This is intentional — the platform
 /// sends one progress event per CLI message.
 fn convert_assistant(a: &AssistantMessage) -> Option<PubSubEvent> {
@@ -209,14 +209,15 @@ fn extract_result_preview(block: &serde_json::Value) -> Option<String> {
         s.to_owned()
     } else if let Some(arr) = content.as_array() {
         // Content can be an array of blocks; take first text block
-        arr.iter()
-            .find_map(|b| {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_owned())
-                } else {
-                    None
-                }
-            })?
+        arr.iter().find_map(|b| {
+            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(std::borrow::ToOwned::to_owned)
+            } else {
+                None
+            }
+        })?
     } else {
         return None;
     };
@@ -277,12 +278,22 @@ impl PubSubClient {
     pub async fn connect(url: &str, session_id: &str) -> anyhow::Result<Self> {
         let config = Config::from_url(url)?;
         // Debug: test raw TCP before fred connect
-        let host = config.server.hosts().first().map(|s| s.to_string()).unwrap_or_default();
-        eprintln!("[debug] valkey: connecting to {host}, username={:?}", config.username);
+        let host = config
+            .server
+            .hosts()
+            .first()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+        eprintln!(
+            "[debug] valkey: connecting to {host}, username={:?}",
+            config.username
+        );
         match tokio::time::timeout(
             std::time::Duration::from_secs(3),
             tokio::net::TcpStream::connect(&host),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(_)) => eprintln!("[debug] valkey: TCP connect OK"),
             Ok(Err(e)) => eprintln!("[debug] valkey: TCP connect error: {e}"),
             Err(_) => eprintln!("[debug] valkey: TCP connect timeout (3s)"),
@@ -317,21 +328,19 @@ impl PubSubClient {
     /// Subscribe to the input channel and return a receiver for parsed messages.
     ///
     /// Spawns a background task that:
-    /// 1. Creates a dedicated subscriber client (clone_new)
+    /// 1. Creates a dedicated subscriber client (`clone_new`)
     /// 2. Subscribes to `session:{id}:input`
     /// 3. Parses incoming JSON into `PubSubInput` (rejects messages > 1 MB)
     /// 4. Forwards via mpsc channel
     /// 5. Reconnects with exponential backoff on disconnect
-    pub async fn subscribe_input(
-        &self,
-    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<PubSubInput>> {
+    pub fn subscribe_input(&self) -> tokio::sync::mpsc::Receiver<PubSubInput> {
         let (tx, rx) = tokio::sync::mpsc::channel::<PubSubInput>(32);
         let channel = self.input_channel();
         let client = self.client.clone();
 
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(500);
             const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut backoff = std::time::Duration::from_millis(500);
 
             loop {
                 // Create a dedicated subscriber connection
@@ -394,7 +403,7 @@ impl PubSubClient {
             }
         });
 
-        Ok(rx)
+        rx
     }
 }
 
@@ -528,7 +537,12 @@ mod tests {
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "progress_update");
-        assert!(json["message"].as_str().unwrap().contains("Status: working"));
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Status: working")
+        );
     }
 
     #[test]
@@ -1271,7 +1285,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut rx = client.subscribe_input().await.unwrap();
+        let mut rx = client.subscribe_input();
 
         // Publish from a separate connection
         let pub_client = PubSubClient::connect(&url, "test-sub-session")

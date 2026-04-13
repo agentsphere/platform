@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Steven Hooker. Exclusively licensed to and distributed by AgentSphere GmbH.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::fmt::Write;
+
 use colored::Colorize;
 
 use crate::messages::{AssistantMessage, CliMessage, ResultMessage, SystemMessage, UserMessage};
@@ -10,8 +12,8 @@ use crate::messages::{AssistantMessage, CliMessage, ResultMessage, SystemMessage
 /// - System → stderr, dimmed
 /// - Assistant thinking → stderr, dimmed
 /// - Assistant text → **stdout** (allows piping)
-/// - Assistant tool_use → stderr, cyan
-/// - User tool_result → stderr, blue (content truncated at 200 chars)
+/// - Assistant `tool_use` → stderr, cyan
+/// - User `tool_result` → stderr, blue (content truncated at 200 chars)
 /// - Result success → stderr, green
 /// - Result error → stderr, red
 pub fn render_message(msg: &CliMessage) {
@@ -87,32 +89,32 @@ fn render_result(r: &ResultMessage) {
             .unwrap_or("Agent completed successfully");
         let mut detail = String::new();
         if let Some(cost) = r.total_cost_usd {
-            detail.push_str(&format!(" cost=${cost:.4}"));
+            let _ = write!(detail, " cost=${cost:.4}");
         }
         if let Some(turns) = r.num_turns {
-            detail.push_str(&format!(" turns={turns}"));
+            let _ = write!(detail, " turns={turns}");
         }
         if let Some(ms) = r.duration_ms {
-            detail.push_str(&format!(" duration={ms}ms"));
+            let _ = write!(detail, " duration={ms}ms");
         }
         eprintln!("{} {}{}", "done:".green().bold(), msg, detail.dimmed());
     }
 }
 
-/// Desktop notification kinds — closed enum prevents AppleScript injection.
+/// Desktop notification kinds — closed enum prevents `AppleScript` injection.
+#[derive(Clone, Copy)]
 pub enum Notification {
     AgentCompleted,
     AgentError,
 }
 
 impl Notification {
-    fn title(&self) -> &'static str {
+    fn title(self) -> &'static str {
         match self {
-            Self::AgentCompleted => "agent-runner",
-            Self::AgentError => "agent-runner",
+            Self::AgentCompleted | Self::AgentError => "agent-runner",
         }
     }
-    fn body(&self) -> &'static str {
+    fn body(self) -> &'static str {
         match self {
             Self::AgentCompleted => "Agent turn completed",
             Self::AgentError => "Agent completed with error",

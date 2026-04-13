@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::control::ControlRequest;
 use crate::error::CliError;
-use crate::messages::{parse_cli_message, CliMessage, CliUserInput};
+use crate::messages::{CliMessage, CliUserInput, parse_cli_message};
 
 /// Subprocess transport for the Claude CLI NDJSON protocol.
 ///
@@ -133,7 +133,7 @@ impl SubprocessTransport {
                 let mut collected = String::new();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.is_empty() {
-                        eprintln!("[stderr] {}", line);
+                        eprintln!("[stderr] {line}");
                         if collected.len() < 4096 && !collected.is_empty() {
                             collected.push('\n');
                         }
@@ -257,7 +257,7 @@ impl SubprocessTransport {
 
         let stderr = if let Some(task) = self.stderr_task.take() {
             task.await.unwrap_or_else(|e| {
-                eprintln!("[warn] stderr capture task panicked: {}", e);
+                eprintln!("[warn] stderr capture task panicked: {e}");
                 String::new()
             })
         } else {
@@ -325,12 +325,12 @@ fn find_claude_cli(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     }
 
     // 3. PATH lookup
-    if let Ok(output) = std::process::Command::new("which").arg("claude").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+    if let Ok(output) = std::process::Command::new("which").arg("claude").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
 
@@ -486,6 +486,18 @@ pub(crate) fn build_env(opts: &CliSpawnOptions) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(unsafe_code)]
+    fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::set_var(key, val) }
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env(key: &str) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::remove_var(key) }
+    }
 
     #[test]
     fn find_cli_explicit_path_exists() {
@@ -673,9 +685,10 @@ mod tests {
             ..Default::default()
         };
         let env = build_env(&opts);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == "my-oauth-token"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == "my-oauth-token")
+        );
         // API key should NOT be present when oauth token is set
         assert!(env.iter().all(|(k, _)| k != "ANTHROPIC_API_KEY"));
     }
@@ -687,9 +700,10 @@ mod tests {
             ..Default::default()
         };
         let env = build_env(&opts);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-key"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-key")
+        );
         // OAuth token should NOT be present when only API key is set
         assert!(env.iter().all(|(k, _)| k != "CLAUDE_CODE_OAUTH_TOKEN"));
     }
@@ -702,9 +716,10 @@ mod tests {
             ..Default::default()
         };
         let env = build_env(&opts);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == "oauth-tok"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == "oauth-tok")
+        );
         assert!(env.iter().all(|(k, _)| k != "ANTHROPIC_API_KEY"));
     }
 
@@ -728,9 +743,10 @@ mod tests {
             ..Default::default()
         };
         let env = build_env(&opts);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/tmp/claude-config"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/tmp/claude-config")
+        );
     }
 
     #[test]
@@ -743,9 +759,10 @@ mod tests {
             ..Default::default()
         };
         let env = build_env(&opts);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "CUSTOM_VAR" && v == "custom_value"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CUSTOM_VAR" && v == "custom_value")
+        );
         assert!(env.iter().any(|(k, v)| k == "ANOTHER" && v == "val"));
     }
 
@@ -1074,15 +1091,15 @@ mod tests {
     #[serial_test::serial]
     fn find_cli_from_env_var() {
         let backup = std::env::var("CLAUDE_CLI_PATH").ok();
-        std::env::set_var("CLAUDE_CLI_PATH", "/usr/bin/env");
+        set_env("CLAUDE_CLI_PATH", "/usr/bin/env");
 
         let result = find_claude_cli(None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), PathBuf::from("/usr/bin/env"));
 
         match backup {
-            Some(v) => std::env::set_var("CLAUDE_CLI_PATH", v),
-            None => std::env::remove_var("CLAUDE_CLI_PATH"),
+            Some(v) => set_env("CLAUDE_CLI_PATH", v),
+            None => remove_env("CLAUDE_CLI_PATH"),
         }
     }
 
@@ -1090,15 +1107,15 @@ mod tests {
     #[serial_test::serial]
     fn find_cli_env_var_nonexistent_path_falls_through() {
         let backup = std::env::var("CLAUDE_CLI_PATH").ok();
-        std::env::set_var("CLAUDE_CLI_PATH", "/nonexistent/path/to/claude");
+        set_env("CLAUDE_CLI_PATH", "/nonexistent/path/to/claude");
 
         // Should fall through to PATH lookup / npm paths
         let _result = find_claude_cli(None);
         // Just verify it doesn't panic; result depends on whether `claude` is on PATH
 
         match backup {
-            Some(v) => std::env::set_var("CLAUDE_CLI_PATH", v),
-            None => std::env::remove_var("CLAUDE_CLI_PATH"),
+            Some(v) => set_env("CLAUDE_CLI_PATH", v),
+            None => remove_env("CLAUDE_CLI_PATH"),
         }
     }
 

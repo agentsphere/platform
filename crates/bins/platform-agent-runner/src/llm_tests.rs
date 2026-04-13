@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use crate::messages::CliMessage;
-use crate::pubsub::{cli_message_to_event, PubSubKind};
+use crate::pubsub::{PubSubKind, cli_message_to_event};
 use crate::transport::{CliSpawnOptions, SubprocessTransport};
 
 // ---------------------------------------------------------------------------

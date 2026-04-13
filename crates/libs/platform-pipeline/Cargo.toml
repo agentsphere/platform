@@ -1,0 +1,75 @@
+[package]
+name = "platform-pipeline"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+
+[dependencies]
+# Platform crates
+platform-types = { path = "../../foundation/platform-types", features = ["kube"] }
+platform-k8s = { path = "../platform-k8s" }
+platform-auth = { path = "../platform-auth" }
+platform-secrets = { path = "../platform-secrets" }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Kubernetes
+kube = { version = "3", default-features = false, features = ["client", "ws"] }
+k8s-openapi = { version = "0.27", features = ["v1_32"] }
+
+# Cache / pubsub
+fred = { version = "10", features = ["subscriber-client"] }
+
+# Object storage
+opendal = { version = "0.55", features = ["services-s3"] }
+
+# Async
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "process", "io-util"] }
+tokio-util = { version = "0.7" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Misc
+tracing = "0.1"
+base64 = "0.22"
+futures = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.10"
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+kube = { version = "3", default-features = false, features = ["client"] }
+k8s-openapi = { version = "0.27", features = ["v1_32"] }
+fred = { version = "10", features = ["subscriber-client"] }
+opendal = { version = "0.55", features = ["services-memory"] }
+tokio-util = { version = "0.7" }
+platform-k8s = { path = "../platform-k8s" }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"

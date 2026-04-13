@@ -18,7 +18,7 @@
 #   MOCK_CLI_SLOW            — Sleep this many seconds before responding (simulate latency).
 #
 # Used by: platform integration tests, agent-runner tests, E2E tests.
-# Location: cli/claude-mock/claude
+# Location: tests/fixtures/claude-mock/claude
 # Replaces: tests/fixtures/mock-claude-cli.sh (which only handled --print)
 
 set -euo pipefail

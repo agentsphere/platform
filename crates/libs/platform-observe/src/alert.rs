@@ -310,6 +310,144 @@ pub async fn handle_alert_state(
 }
 
 // ---------------------------------------------------------------------------
+// Evaluation loop — background task
+// ---------------------------------------------------------------------------
+
+/// Run the alert evaluation loop until shutdown.
+pub async fn evaluate_alerts_loop(
+    pool: sqlx::PgPool,
+    valkey: fred::clients::Pool,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tracing::info!("alert evaluator started");
+    let mut alert_states: std::collections::HashMap<Uuid, AlertState> =
+        std::collections::HashMap::new();
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::info!("alert evaluator shutting down");
+                break;
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                match evaluate_all(&pool, &valkey, &mut alert_states).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "alert evaluation cycle failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::implicit_hasher)]
+async fn evaluate_all(
+    pool: &sqlx::PgPool,
+    valkey: &fred::clients::Pool,
+    alert_states: &mut std::collections::HashMap<Uuid, AlertState>,
+) -> Result<(), anyhow::Error> {
+    use sqlx::Row;
+
+    let rules = sqlx::query(
+        "SELECT id, name, query, condition, threshold, for_seconds, severity, project_id \
+         FROM alert_rules WHERE enabled = true ORDER BY id LIMIT 500",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rules.len() >= 500 {
+        tracing::warn!("alert rule limit reached (500) — some rules may not be evaluated");
+    }
+
+    let rule_timeout = std::time::Duration::from_secs(10);
+    for rule in &rules {
+        let rule_id: Uuid = rule.get("id");
+        let rule_name: String = rule.get("name");
+
+        match tokio::time::timeout(
+            rule_timeout,
+            evaluate_one_rule(pool, valkey, alert_states, rule),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    rule_id = %rule_id, rule_name = %rule_name,
+                    error = %e, "alert rule evaluation failed"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    rule_id = %rule_id, rule_name = %rule_name,
+                    "alert rule evaluation timed out (10s)"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn evaluate_one_rule(
+    pool: &sqlx::PgPool,
+    valkey: &fred::clients::Pool,
+    alert_states: &mut std::collections::HashMap<Uuid, AlertState>,
+    rule: &sqlx::postgres::PgRow,
+) -> Result<(), anyhow::Error> {
+    use sqlx::Row;
+
+    let rule_id: Uuid = rule.get("id");
+    let rule_name: String = rule.get("name");
+    let rule_query: String = rule.get("query");
+    let rule_condition: String = rule.get("condition");
+    let rule_threshold: Option<f64> = rule.get("threshold");
+    let rule_for_seconds: i32 = rule.get("for_seconds");
+    let rule_severity: String = rule.get("severity");
+    let rule_project_id: Option<Uuid> = rule.get("project_id");
+
+    let aq = parse_alert_query(&rule_query)?;
+
+    let value = evaluate_metric(
+        pool,
+        &aq.metric_name,
+        aq.labels.as_ref(),
+        &aq.aggregation,
+        aq.window_secs,
+    )
+    .await?;
+
+    let condition_met = check_condition(&rule_condition, rule_threshold, value);
+
+    let now = Utc::now();
+    let as_entry = alert_states.entry(rule_id).or_insert(AlertState {
+        first_triggered: None,
+        firing: false,
+    });
+
+    let rule_info = AlertRuleInfo {
+        id: rule_id,
+        name: &rule_name,
+        severity: &rule_severity,
+        project_id: rule_project_id,
+        for_seconds: rule_for_seconds,
+    };
+    handle_alert_state(
+        pool,
+        valkey,
+        condition_met,
+        value,
+        now,
+        as_entry,
+        &rule_info,
+    )
+    .await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

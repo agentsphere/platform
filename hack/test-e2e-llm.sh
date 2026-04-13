@@ -76,7 +76,7 @@ kubectl create clusterrolebinding "${NS_PREFIX}-runner" \
 
 # Copy mock CLIs for worker pods (pod init containers use these)
 mkdir -p /tmp/platform-e2e
-cp "${PROJECT_DIR}/cli/claude-mock/claude" "/tmp/platform-e2e/mock-claude-cli.sh"
+cp "${PROJECT_DIR}/tests/fixtures/claude-mock/claude" "/tmp/platform-e2e/mock-claude-cli.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli.sh"
 cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli-git.sh" "/tmp/platform-e2e/mock-claude-cli-git.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli-git.sh"

@@ -91,6 +91,18 @@ pub fn resolve_mcp_config() -> Option<serde_json::Value> {
 mod tests {
     use super::*;
 
+    #[allow(unsafe_code)]
+    fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::set_var(key, val) }
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env(key: &str) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::remove_var(key) }
+    }
+
     fn test_ctx() -> McpContext<'static> {
         McpContext {
             platform_api_url: "http://platform:8080",
@@ -181,8 +193,8 @@ mod tests {
     fn test_resolve_mcp_config_returns_some_when_both_set() {
         let url_backup = std::env::var("PLATFORM_API_URL").ok();
         let token_backup = std::env::var("PLATFORM_API_TOKEN").ok();
-        std::env::set_var("PLATFORM_API_URL", "http://platform:8080");
-        std::env::set_var("PLATFORM_API_TOKEN", "tok-abc");
+        set_env("PLATFORM_API_URL", "http://platform:8080");
+        set_env("PLATFORM_API_TOKEN", "tok-abc");
 
         let config = resolve_mcp_config();
         assert!(config.is_some());
@@ -194,12 +206,12 @@ mod tests {
         assert_eq!(core["env"]["PLATFORM_API_TOKEN"], "tok-abc");
 
         match url_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_URL", v),
-            None => std::env::remove_var("PLATFORM_API_URL"),
+            Some(v) => set_env("PLATFORM_API_URL", v),
+            None => remove_env("PLATFORM_API_URL"),
         }
         match token_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_TOKEN", v),
-            None => std::env::remove_var("PLATFORM_API_TOKEN"),
+            Some(v) => set_env("PLATFORM_API_TOKEN", v),
+            None => remove_env("PLATFORM_API_TOKEN"),
         }
     }
 
@@ -208,18 +220,18 @@ mod tests {
     fn test_resolve_mcp_config_returns_none_when_url_missing() {
         let url_backup = std::env::var("PLATFORM_API_URL").ok();
         let token_backup = std::env::var("PLATFORM_API_TOKEN").ok();
-        std::env::remove_var("PLATFORM_API_URL");
-        std::env::set_var("PLATFORM_API_TOKEN", "tok-abc");
+        remove_env("PLATFORM_API_URL");
+        set_env("PLATFORM_API_TOKEN", "tok-abc");
 
         assert!(resolve_mcp_config().is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_URL", v),
-            None => std::env::remove_var("PLATFORM_API_URL"),
+            Some(v) => set_env("PLATFORM_API_URL", v),
+            None => remove_env("PLATFORM_API_URL"),
         }
         match token_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_TOKEN", v),
-            None => std::env::remove_var("PLATFORM_API_TOKEN"),
+            Some(v) => set_env("PLATFORM_API_TOKEN", v),
+            None => remove_env("PLATFORM_API_TOKEN"),
         }
     }
 
@@ -228,18 +240,18 @@ mod tests {
     fn test_resolve_mcp_config_returns_none_when_token_missing() {
         let url_backup = std::env::var("PLATFORM_API_URL").ok();
         let token_backup = std::env::var("PLATFORM_API_TOKEN").ok();
-        std::env::set_var("PLATFORM_API_URL", "http://platform:8080");
-        std::env::remove_var("PLATFORM_API_TOKEN");
+        set_env("PLATFORM_API_URL", "http://platform:8080");
+        remove_env("PLATFORM_API_TOKEN");
 
         assert!(resolve_mcp_config().is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_URL", v),
-            None => std::env::remove_var("PLATFORM_API_URL"),
+            Some(v) => set_env("PLATFORM_API_URL", v),
+            None => remove_env("PLATFORM_API_URL"),
         }
         match token_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_TOKEN", v),
-            None => std::env::remove_var("PLATFORM_API_TOKEN"),
+            Some(v) => set_env("PLATFORM_API_TOKEN", v),
+            None => remove_env("PLATFORM_API_TOKEN"),
         }
     }
 
@@ -248,18 +260,18 @@ mod tests {
     fn test_resolve_mcp_config_returns_none_when_url_empty() {
         let url_backup = std::env::var("PLATFORM_API_URL").ok();
         let token_backup = std::env::var("PLATFORM_API_TOKEN").ok();
-        std::env::set_var("PLATFORM_API_URL", "");
-        std::env::set_var("PLATFORM_API_TOKEN", "tok-abc");
+        set_env("PLATFORM_API_URL", "");
+        set_env("PLATFORM_API_TOKEN", "tok-abc");
 
         assert!(resolve_mcp_config().is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_URL", v),
-            None => std::env::remove_var("PLATFORM_API_URL"),
+            Some(v) => set_env("PLATFORM_API_URL", v),
+            None => remove_env("PLATFORM_API_URL"),
         }
         match token_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_TOKEN", v),
-            None => std::env::remove_var("PLATFORM_API_TOKEN"),
+            Some(v) => set_env("PLATFORM_API_TOKEN", v),
+            None => remove_env("PLATFORM_API_TOKEN"),
         }
     }
 
@@ -268,18 +280,18 @@ mod tests {
     fn test_resolve_mcp_config_returns_none_when_token_empty() {
         let url_backup = std::env::var("PLATFORM_API_URL").ok();
         let token_backup = std::env::var("PLATFORM_API_TOKEN").ok();
-        std::env::set_var("PLATFORM_API_URL", "http://platform:8080");
-        std::env::set_var("PLATFORM_API_TOKEN", "");
+        set_env("PLATFORM_API_URL", "http://platform:8080");
+        set_env("PLATFORM_API_TOKEN", "");
 
         assert!(resolve_mcp_config().is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_URL", v),
-            None => std::env::remove_var("PLATFORM_API_URL"),
+            Some(v) => set_env("PLATFORM_API_URL", v),
+            None => remove_env("PLATFORM_API_URL"),
         }
         match token_backup {
-            Some(v) => std::env::set_var("PLATFORM_API_TOKEN", v),
-            None => std::env::remove_var("PLATFORM_API_TOKEN"),
+            Some(v) => set_env("PLATFORM_API_TOKEN", v),
+            None => remove_env("PLATFORM_API_TOKEN"),
         }
     }
 

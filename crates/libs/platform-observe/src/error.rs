@@ -18,6 +18,15 @@ pub enum ObserveError {
     Db(#[from] sqlx::Error),
 
     #[error(transparent)]
+    Storage(#[from] opendal::Error),
+
+    #[error(transparent)]
+    Arrow(#[from] arrow::error::ArrowError),
+
+    #[error(transparent)]
+    Parquet(#[from] parquet::errors::ParquetError),
+
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
@@ -29,7 +38,8 @@ impl From<ObserveError> for ApiError {
             }
             ObserveError::BackpressureFull => Self::ServiceUnavailable("ingest buffer full".into()),
             ObserveError::Db(e) => Self::from(e),
-            ObserveError::Other(_) => Self::Internal(err.into()),
+            ObserveError::Storage(e) => Self::from(e),
+            _ => Self::Internal(err.into()),
         }
     }
 }
@@ -69,6 +79,28 @@ mod tests {
         let err = ObserveError::Db(sqlx::Error::RowNotFound);
         let api_err: ApiError = err.into();
         assert_eq!(api_err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn arrow_error_maps_to_internal() {
+        let err = ObserveError::Arrow(arrow::error::ArrowError::InvalidArgumentError(
+            "test".into(),
+        ));
+        let api_err: ApiError = err.into();
+        assert_eq!(
+            api_err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn parquet_error_maps_to_internal() {
+        let err = ObserveError::Parquet(parquet::errors::ParquetError::General("test".into()));
+        let api_err: ApiError = err.into();
+        assert_eq!(
+            api_err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

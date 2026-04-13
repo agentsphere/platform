@@ -120,6 +120,99 @@ pub trait TaskHeartbeat: Send + Sync {
     fn report_error(&self, name: &str, message: &str);
 }
 
+/// Trait for auto-merging open MRs after a successful pipeline.
+///
+/// Decouples the pipeline executor from the merge request API implementation.
+pub trait MergeRequestHandler: Send + Sync {
+    /// Attempt to auto-merge any open MRs for the given project.
+    fn try_auto_merge(&self, project_id: Uuid) -> impl Future<Output = ()> + Send;
+}
+
+/// Trait for `GitOps` operations (ops repo read/write/sync).
+///
+/// Decouples the pipeline executor from the deployer's ops repo implementation.
+pub trait OpsRepoManager: Send + Sync {
+    /// Read a file from a git repo at a given ref.
+    fn read_file(
+        &self,
+        repo_path: &std::path::Path,
+        git_ref: &str,
+        file: &str,
+    ) -> impl Future<Output = Option<String>> + Send;
+
+    /// Sync an ops repo from a project source repo.
+    fn sync_from_project(
+        &self,
+        project_id: Uuid,
+        source: &std::path::Path,
+        branch: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Write a file to a git repo and commit.
+    fn write_file(
+        &self,
+        repo_path: &std::path::Path,
+        branch: &str,
+        file: &str,
+        content: &[u8],
+        msg: &str,
+    ) -> impl Future<Output = anyhow::Result<String>> + Send;
+
+    /// Read all YAML files in a directory from a git repo at a given ref.
+    fn read_dir_yaml(
+        &self,
+        repo_path: &std::path::Path,
+        git_ref: &str,
+        dir: &str,
+    ) -> impl Future<Output = Option<String>> + Send;
+
+    /// Commit key=value pairs to an ops repo.
+    fn commit_values(
+        &self,
+        ops_path: &std::path::Path,
+        branch: &str,
+        values: &[(&str, &str)],
+        msg: &str,
+    ) -> impl Future<Output = anyhow::Result<String>> + Send;
+}
+
+/// Trait for rendering manifests and applying them to K8s.
+///
+/// Decouples the pipeline executor from the deployer's renderer + applier.
+#[cfg(feature = "kube")]
+pub trait ManifestApplier: Send + Sync {
+    /// Render manifests with variables and apply to a K8s namespace.
+    fn render_and_apply(
+        &self,
+        kube: &kube::Client,
+        manifest: &str,
+        vars: &serde_json::Value,
+        namespace: &str,
+        tracking: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Trait for providing registry credentials and scoped tokens.
+///
+/// Decouples the pipeline executor from the deployer's registry/reconciler.
+#[cfg(feature = "kube")]
+pub trait RegistryCredentialProvider: Send + Sync {
+    /// Ensure a pull secret exists in a namespace for a project.
+    fn ensure_pull_secret(
+        &self,
+        kube: &kube::Client,
+        ns: &str,
+        project_id: Uuid,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Ensure scoped tokens exist for a project with a given scope.
+    fn ensure_scoped_tokens(
+        &self,
+        project_id: Uuid,
+        scope: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +284,95 @@ mod tests {
         fn register(&self, _name: &str, _expected_interval_secs: u64) {}
         fn heartbeat(&self, _name: &str) {}
         fn report_error(&self, _name: &str, _message: &str) {}
+    }
+
+    struct MockMergeRequestHandler;
+    impl MergeRequestHandler for MockMergeRequestHandler {
+        async fn try_auto_merge(&self, _project_id: Uuid) {}
+    }
+
+    struct MockOpsRepoManager;
+    impl OpsRepoManager for MockOpsRepoManager {
+        async fn read_file(
+            &self,
+            _repo_path: &std::path::Path,
+            _git_ref: &str,
+            _file: &str,
+        ) -> Option<String> {
+            None
+        }
+        async fn sync_from_project(
+            &self,
+            _project_id: Uuid,
+            _source: &std::path::Path,
+            _branch: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn write_file(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _file: &str,
+            _content: &[u8],
+            _msg: &str,
+        ) -> anyhow::Result<String> {
+            Ok("abc123".into())
+        }
+        async fn read_dir_yaml(
+            &self,
+            _repo_path: &std::path::Path,
+            _git_ref: &str,
+            _dir: &str,
+        ) -> Option<String> {
+            None
+        }
+        async fn commit_values(
+            &self,
+            _ops_path: &std::path::Path,
+            _branch: &str,
+            _values: &[(&str, &str)],
+            _msg: &str,
+        ) -> anyhow::Result<String> {
+            Ok("abc123".into())
+        }
+    }
+
+    #[cfg(feature = "kube")]
+    struct MockManifestApplier;
+    #[cfg(feature = "kube")]
+    impl ManifestApplier for MockManifestApplier {
+        async fn render_and_apply(
+            &self,
+            _kube: &kube::Client,
+            _manifest: &str,
+            _vars: &serde_json::Value,
+            _namespace: &str,
+            _tracking: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "kube")]
+    struct MockRegistryCredentialProvider;
+    #[cfg(feature = "kube")]
+    impl RegistryCredentialProvider for MockRegistryCredentialProvider {
+        async fn ensure_pull_secret(
+            &self,
+            _kube: &kube::Client,
+            _ns: &str,
+            _project_id: Uuid,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn ensure_scoped_tokens(
+            &self,
+            _project_id: Uuid,
+            _scope: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -282,5 +464,65 @@ mod tests {
         tracker.register("test-task", 60);
         tracker.heartbeat("test-task");
         tracker.report_error("test-task", "connection refused");
+    }
+
+    #[tokio::test]
+    async fn mock_merge_request_handler_works() {
+        let handler = MockMergeRequestHandler;
+        handler.try_auto_merge(Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn mock_ops_repo_manager_works() {
+        let mgr = MockOpsRepoManager;
+        assert!(
+            mgr.read_file(std::path::Path::new("/repos/test"), "main", "values.yaml")
+                .await
+                .is_none()
+        );
+        mgr.sync_from_project(Uuid::nil(), std::path::Path::new("/repos/test"), "main")
+            .await
+            .unwrap();
+        let sha = mgr
+            .write_file(
+                std::path::Path::new("/repos/test"),
+                "main",
+                "config.yaml",
+                b"data",
+                "update",
+            )
+            .await
+            .unwrap();
+        assert_eq!(sha, "abc123");
+        assert!(
+            mgr.read_dir_yaml(std::path::Path::new("/repos/test"), "main", "base/")
+                .await
+                .is_none()
+        );
+        let sha = mgr
+            .commit_values(
+                std::path::Path::new("/repos/ops"),
+                "main",
+                &[("image", "app:v2")],
+                "bump",
+            )
+            .await
+            .unwrap();
+        assert_eq!(sha, "abc123");
+    }
+
+    #[cfg(feature = "kube")]
+    #[tokio::test]
+    async fn mock_manifest_applier_works() {
+        // ManifestApplier requires a kube::Client which needs a real cluster,
+        // so we only verify the trait compiles with the mock.
+        let _applier = MockManifestApplier;
+    }
+
+    #[cfg(feature = "kube")]
+    #[tokio::test]
+    async fn mock_registry_credential_provider_works() {
+        // RegistryCredentialProvider requires a kube::Client, verify trait compiles.
+        let _provider = MockRegistryCredentialProvider;
     }
 }

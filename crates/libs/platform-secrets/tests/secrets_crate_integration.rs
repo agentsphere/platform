@@ -1044,3 +1044,315 @@ async fn pg_secrets_resolver_trait(pool: PgPool) {
         .unwrap();
     assert_eq!(val, "v=trait-val");
 }
+
+// ===========================================================================
+// Coverage gap tests — error paths & edge cases
+// ===========================================================================
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_global_secret_not_found(pool: PgPool) {
+    let key = dev_key();
+    let err = engine::resolve_global_secret(&pool, &key, "NO_SUCH_GLOBAL", "all")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not found"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_secret_hierarchical_not_found(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+    let (ws_id, project_id) = seed_project(&pool, owner).await;
+
+    let err = engine::resolve_secret_hierarchical(
+        &pool,
+        &key,
+        project_id,
+        Some(ws_id),
+        Some("staging"),
+        "NONEXISTENT_HIER",
+        "all",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("not found"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_secrets_for_env_unclosed_pattern(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+    let (_, project_id) = seed_project(&pool, owner).await;
+
+    // Unclosed ${{ secrets.NAME (no closing " }}") — should leave template unchanged
+    let result =
+        engine::resolve_secrets_for_env(&pool, &key, project_id, "all", "val=${{ secrets.UNCLOSED")
+            .await
+            .unwrap();
+    assert_eq!(result, "val=${{ secrets.UNCLOSED");
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn llm_provider_create_invalid_provider_type(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+    let vars = std::collections::HashMap::from([("KEY".to_string(), "val".to_string())]);
+
+    let err = llm_providers::create_config(&pool, &key, user_id, "openai", "Bad", &vars, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid provider_type"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn llm_provider_create_invalid_env_vars(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+    // bedrock requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+    let vars =
+        std::collections::HashMap::from([("AWS_ACCESS_KEY_ID".to_string(), "k".to_string())]);
+
+    let err = llm_providers::create_config(&pool, &key, user_id, "bedrock", "Bad", &vars, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("AWS_SECRET_ACCESS_KEY"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn llm_provider_update_invalid_env_vars(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+
+    let vars = std::collections::HashMap::from([
+        ("AWS_ACCESS_KEY_ID".to_string(), "key".to_string()),
+        ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+    ]);
+    let config_id =
+        llm_providers::create_config(&pool, &key, user_id, "bedrock", "Valid", &vars, None)
+            .await
+            .unwrap();
+
+    // Update with missing required key
+    let bad_vars =
+        std::collections::HashMap::from([("AWS_ACCESS_KEY_ID".to_string(), "k".to_string())]);
+    let err =
+        llm_providers::update_config(&pool, &key, config_id, user_id, &bad_vars, None, "Updated")
+            .await
+            .unwrap_err();
+    assert!(err.to_string().contains("AWS_SECRET_ACCESS_KEY"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn llm_provider_update_validation_status(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+
+    let vars = std::collections::HashMap::from([(
+        "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+        "proj".to_string(),
+    )]);
+    let config_id =
+        llm_providers::create_config(&pool, &key, user_id, "vertex", "Test", &vars, None)
+            .await
+            .unwrap();
+
+    llm_providers::update_validation_status(&pool, config_id, user_id, "valid")
+        .await
+        .expect("update_validation_status");
+
+    let list = llm_providers::list_configs(&pool, user_id).await.unwrap();
+    let config = list.iter().find(|c| c.id == config_id).unwrap();
+    assert_eq!(config.validation_status, "valid");
+    assert!(config.last_validated_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Non-UTF-8 error paths (requires raw DB writes to bypass encrypt)
+// ---------------------------------------------------------------------------
+
+/// Encrypt raw bytes (including invalid UTF-8) and insert directly into `secrets`,
+/// bypassing the text-based `create_secret` which always stores valid UTF-8 input.
+async fn insert_binary_secret(
+    pool: &PgPool,
+    key: &[u8; 32],
+    project_id: Option<Uuid>,
+    name: &str,
+    raw_bytes: &[u8],
+    scope: &str,
+    created_by: Uuid,
+) {
+    let encrypted = engine::encrypt(raw_bytes, key).unwrap();
+    sqlx::query(
+        "INSERT INTO secrets (project_id, workspace_id, environment, name, encrypted_value, scope, created_by)
+         VALUES ($1, NULL, NULL, $2, $3, $4, $5)",
+    )
+    .bind(project_id)
+    .bind(name)
+    .bind(&encrypted)
+    .bind(scope)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .expect("insert binary secret");
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_secret_non_utf8_error(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+    let (_, project_id) = seed_project(&pool, owner).await;
+
+    // Store invalid UTF-8 bytes directly
+    insert_binary_secret(
+        &pool,
+        &key,
+        Some(project_id),
+        "BIN_SECRET",
+        &[0xFF, 0xFE],
+        "all",
+        owner,
+    )
+    .await;
+
+    let err = engine::resolve_secret(&pool, &key, project_id, "BIN_SECRET", "all")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_global_secret_non_utf8_error(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+
+    insert_binary_secret(&pool, &key, None, "BIN_GLOBAL", &[0xFF, 0xFE], "all", owner).await;
+
+    let err = engine::resolve_global_secret(&pool, &key, "BIN_GLOBAL", "all")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn resolve_secret_hierarchical_non_utf8_error(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+    let (ws_id, project_id) = seed_project(&pool, owner).await;
+
+    insert_binary_secret(
+        &pool,
+        &key,
+        Some(project_id),
+        "BIN_HIER",
+        &[0xFF, 0xFE],
+        "all",
+        owner,
+    )
+    .await;
+
+    let err = engine::resolve_secret_hierarchical(
+        &pool,
+        &key,
+        project_id,
+        Some(ws_id),
+        None,
+        "BIN_HIER",
+        "all",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn query_scoped_secrets_non_utf8_error(pool: PgPool) {
+    let key = dev_key();
+    let owner = seed_user(&pool).await;
+    let (_, project_id) = seed_project(&pool, owner).await;
+
+    insert_binary_secret(
+        &pool,
+        &key,
+        Some(project_id),
+        "BAD_KEY",
+        &[0xFF, 0xFE],
+        "all",
+        owner,
+    )
+    .await;
+
+    // UTF-8 error propagates via `?` in the Ok(plaintext) branch
+    let err = engine::query_scoped_secrets(&pool, &key, project_id, &["all"], None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn cli_creds_non_utf8_credential_error(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+
+    // Store non-UTF-8 bytes directly in cli_credentials
+    let encrypted = engine::encrypt(&[0xFF, 0xFE], &key).unwrap();
+    sqlx::query(
+        "INSERT INTO cli_credentials (user_id, auth_type, encrypted_data)
+         VALUES ($1, 'oauth', $2)",
+    )
+    .bind(user_id)
+    .bind(&encrypted)
+    .execute(&pool)
+    .await
+    .expect("insert binary cli credential");
+
+    let result = cli_creds::get_decrypted_credential(&pool, &key, user_id).await;
+    let err = result.err().expect("should fail with non-UTF-8 error");
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn user_keys_non_utf8_key_error(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+
+    // Store non-UTF-8 bytes directly in user_provider_keys
+    let encrypted = engine::encrypt(&[0xFF, 0xFE], &key).unwrap();
+    sqlx::query(
+        "INSERT INTO user_provider_keys (user_id, provider, encrypted_key, key_suffix)
+         VALUES ($1, 'anthropic', $2, '...xx')",
+    )
+    .bind(user_id)
+    .bind(&encrypted)
+    .execute(&pool)
+    .await
+    .expect("insert binary user key");
+
+    let err = user_keys::get_user_key(&pool, &key, user_id, "anthropic")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn llm_provider_get_config_corrupted_blob(pool: PgPool) {
+    let key = dev_key();
+    let user_id = seed_user(&pool).await;
+
+    // Insert a config with valid encryption but invalid JSON inside
+    let encrypted = engine::encrypt(b"not-json", &key).unwrap();
+    let config_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO llm_provider_configs (id, user_id, provider_type, label, encrypted_config)
+         VALUES ($1, $2, 'bedrock', 'Corrupt', $3)",
+    )
+    .bind(config_id)
+    .bind(user_id)
+    .bind(&encrypted)
+    .execute(&pool)
+    .await
+    .expect("insert corrupted config");
+
+    let result = llm_providers::get_config(&pool, &key, config_id, user_id).await;
+    let err = result.err().expect("should fail with parse error");
+    assert!(err.to_string().contains("failed to parse encrypted config"));
+}

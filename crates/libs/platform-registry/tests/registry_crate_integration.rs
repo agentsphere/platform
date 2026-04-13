@@ -996,3 +996,217 @@ async fn access_token_scopes_passed_to_checker(pool: PgPool) {
         "wrong scope should deny"
     );
 }
+
+// ===========================================================================
+// Seed tests
+// ===========================================================================
+
+/// Create a minimal valid OCI tarball on disk with proper digests.
+fn create_test_oci_tarball(path: &std::path::Path) {
+    use sha2::{Digest, Sha256};
+
+    let mut builder = tar::Builder::new(Vec::new());
+
+    // oci-layout
+    let oci_layout = br#"{"imageLayoutVersion": "1.0.0"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(oci_layout.len() as u64);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "oci-layout", &oci_layout[..])
+        .unwrap();
+
+    // Config blob
+    let config_content = b"{}";
+    let config_hex = hex::encode(Sha256::digest(config_content));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(config_content.len() as u64);
+    header.set_cksum();
+    builder
+        .append_data(
+            &mut header,
+            format!("blobs/sha256/{config_hex}"),
+            &config_content[..],
+        )
+        .unwrap();
+
+    // Manifest referencing the config
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{config_hex}"),
+            "size": config_content.len()
+        },
+        "layers": []
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = hex::encode(Sha256::digest(&manifest_bytes));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest_bytes.len() as u64);
+    header.set_cksum();
+    builder
+        .append_data(
+            &mut header,
+            format!("blobs/sha256/{manifest_hex}"),
+            &manifest_bytes[..],
+        )
+        .unwrap();
+
+    // index.json referencing the manifest
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{manifest_hex}"),
+            "size": manifest_bytes.len()
+        }]
+    });
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(index_bytes.len() as u64);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "index.json", &index_bytes[..])
+        .unwrap();
+
+    builder.finish().unwrap();
+    let tar_bytes = builder.into_inner().unwrap();
+    std::fs::write(path, tar_bytes).unwrap();
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn seed_image_imports_oci_tarball(pool: PgPool) {
+    let minio = minio_memory();
+    let repo_name = format!("seed-{}", Uuid::new_v4());
+    let repo_id = seed_repo(&pool, &repo_name, None).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tarball = dir.path().join("test.tar");
+    create_test_oci_tarball(&tarball);
+
+    let result = platform_registry::seed_image(&pool, &minio, repo_id, &tarball, "v1")
+        .await
+        .expect("seed_image should succeed");
+
+    match result {
+        platform_registry::SeedResult::Imported {
+            manifest_digest,
+            blob_count,
+        } => {
+            assert!(manifest_digest.starts_with("sha256:"));
+            assert!(blob_count >= 2, "should import config + manifest blobs");
+        }
+        platform_registry::SeedResult::AlreadyExists => {
+            panic!("should not already exist");
+        }
+    }
+
+    // Verify tag was created in DB
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM registry_tags WHERE repository_id = $1 AND name = 'v1'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "tag should exist after import");
+
+    // Verify manifest was created
+    let manifest_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM registry_manifests WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(manifest_count >= 1, "manifest should be imported");
+
+    // Verify blobs were stored in minio
+    let blob_links: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM registry_blob_links WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        blob_links >= 2,
+        "blob links should exist for config + manifest"
+    );
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn seed_image_idempotent_returns_already_exists(pool: PgPool) {
+    let minio = minio_memory();
+    let repo_name = format!("seed-{}", Uuid::new_v4());
+    let repo_id = seed_repo(&pool, &repo_name, None).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tarball = dir.path().join("test.tar");
+    create_test_oci_tarball(&tarball);
+
+    // First import
+    let result1 = platform_registry::seed_image(&pool, &minio, repo_id, &tarball, "v1")
+        .await
+        .expect("first seed should succeed");
+    assert!(matches!(
+        result1,
+        platform_registry::SeedResult::Imported { .. }
+    ));
+
+    // Second import — same tag → AlreadyExists
+    let result2 = platform_registry::seed_image(&pool, &minio, repo_id, &tarball, "v1")
+        .await
+        .expect("second seed should succeed");
+    assert!(matches!(
+        result2,
+        platform_registry::SeedResult::AlreadyExists
+    ));
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn seed_all_scans_directory(pool: PgPool) {
+    let minio = minio_memory();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tarball = dir.path().join("my-image.tar");
+    create_test_oci_tarball(&tarball);
+
+    // seed_all scans directory, derives repo name from filename stem
+    platform_registry::seed_all(&pool, &minio, dir.path())
+        .await
+        .expect("seed_all should succeed");
+
+    // Verify repository was auto-created with name "my-image"
+    let repo_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM registry_repositories WHERE name = 'my-image'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(repo_count, 1, "repo 'my-image' should be auto-created");
+
+    // Verify tag "v1" was created
+    let tag_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM registry_tags t
+         JOIN registry_repositories r ON r.id = t.repository_id
+         WHERE r.name = 'my-image' AND t.name = 'v1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tag_count, 1, "tag v1 should exist for my-image");
+}
+
+#[sqlx::test(migrations = "../../../migrations")]
+async fn seed_all_skips_nonexistent_directory(pool: PgPool) {
+    let minio = minio_memory();
+
+    // Non-existent path should be a no-op (not an error)
+    platform_registry::seed_all(
+        &pool,
+        &minio,
+        std::path::Path::new("/nonexistent/seed/path"),
+    )
+    .await
+    .expect("seed_all with nonexistent path should succeed (no-op)");
+}

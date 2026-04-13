@@ -21,7 +21,16 @@ pub use error::ApiError;
 pub use events::PlatformEvent;
 pub use permission::Permission;
 pub use traits::{
-    AuditLogger, NotificationDispatcher, NotifyParams, SecretsResolver, TaskHeartbeat,
-    WebhookDispatcher, WorkspaceMembershipChecker,
+    AuditLogger, MergeRequestHandler, NotificationDispatcher, NotifyParams, OpsRepoManager,
+    SecretsResolver, TaskHeartbeat, WebhookDispatcher, WorkspaceMembershipChecker,
 };
+#[cfg(feature = "kube")]
+pub use traits::{ManifestApplier, RegistryCredentialProvider};
 pub use user_type::UserType;
+
+/// Generic paginated list response.
+#[derive(Debug, serde::Serialize)]
+pub struct ListResponse<T: serde::Serialize> {
+    pub items: Vec<T>,
+    pub total: i64,
+}

@@ -216,8 +216,9 @@ _crate_all := "-p platform-types -p platform-auth -p platform-observe -p platfor
 _crate_lib := "-p platform-types -p platform-auth -p platform-observe -p platform-secrets -p platform-k8s -p platform-git -p platform-registry -p platform-agent -p platform-k8s-watcher -p platform-proxy"
 # Crates with integration tests (need DB + Valkey from .env.dev)
 _crate_int := "-p platform-auth -p platform-observe -p platform-secrets -p platform-types -p platform-registry"
-# Crates with K8s integration tests (need Kind cluster)
-_crate_k8s := "-p platform-k8s"
+# K8s integration tests use `#[ignore = "requires K8s"]` — scanned across ALL crates
+# (--run-ignored ignored-only is the filter, not the package list)
+_crate_k8s := _crate_all
 
 # Unit tests for workspace crates
 # just crate-test-unit                        → all crates

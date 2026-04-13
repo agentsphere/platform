@@ -18,8 +18,7 @@ const DEBOUNCE_MS: u64 = 500;
 /// Resolve the progress file path from env or default.
 fn resolve_path() -> PathBuf {
     std::env::var("PROGRESS_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRESS_PATH))
+        .map_or_else(|_| PathBuf::from(DEFAULT_PROGRESS_PATH), PathBuf::from)
 }
 
 /// Read the progress file, returning `None` if it doesn't exist or is empty.
@@ -65,18 +64,17 @@ async fn run_watcher(
     let (tx, mut rx) = mpsc::channel::<()>(16);
 
     // Set up file watcher (runs on a blocking thread internally).
-    let target_name = progress_path
-        .file_name()
-        .map(|n| n.to_os_string());
+    let target_name = progress_path.file_name().map(std::ffi::OsStr::to_os_string);
 
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     // Only trigger for our target file
-                    let matches = event.paths.iter().any(|p| {
-                        p.file_name() == target_name.as_deref()
-                    });
+                    let matches = event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == target_name.as_deref());
                     if matches {
                         let _ = tx.try_send(());
                     }

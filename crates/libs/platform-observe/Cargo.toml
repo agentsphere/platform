@@ -5,14 +5,15 @@ edition = "2024"
 license = "BUSL-1.1"
 
 [dependencies]
-platform-types = { path = "../../foundation/platform-types" }
+platform-types = { path = "../../foundation/platform-types", features = ["opendal"] }
+platform-auth = { path = "../platform-auth" }
 
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # HTTP
-axum = { version = "0.8", default-features = false, features = ["json"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1"] }
 bytes = "1"
 
 # Serialization
@@ -44,6 +45,16 @@ hex = "0.4"
 
 # Compression
 flate2 = "1"
+
+# Object storage (MinIO)
+opendal = { version = "0.55", features = ["services-s3"] }
+
+# Parquet / Arrow
+arrow = { version = "57", features = ["json"] }
+parquet = { version = "57", features = ["async"] }
+
+# SSE streaming
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

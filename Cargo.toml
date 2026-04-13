@@ -11,7 +11,11 @@ members = [
     "crates/libs/platform-git",
     "crates/libs/platform-registry",
     "crates/libs/platform-agent",
+    "crates/libs/platform-pipeline",
+    "crates/libs/platform-ops-repo",
+    "crates/libs/platform-deployer",
     # bins — standalone deployable binaries
+    "crates/bins/platform-agent-runner",
     "crates/bins/platform-ingest",
     "crates/bins/platform-k8s-watcher",
     "crates/bins/platform-proxy",

@@ -98,6 +98,8 @@ pub enum PlatformEvent {
         project_id: Uuid,
         flags: Vec<(String, serde_json::Value, Option<String>)>,
     },
+    /// A pipeline was created and is queued for execution.
+    PipelineQueued { pipeline_id: Uuid, project_id: Uuid },
     /// A code branch was pushed (triggers pipeline, webhooks, MR sync).
     CodePushed {
         project_id: Uuid,
@@ -319,6 +321,10 @@ mod tests {
                 project_id: Uuid::nil(),
                 flags: vec![],
             },
+            PlatformEvent::PipelineQueued {
+                pipeline_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+            },
             PlatformEvent::CodePushed {
                 project_id: Uuid::nil(),
                 user_id: Uuid::nil(),
@@ -466,6 +472,18 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn platform_event_serde_roundtrip_pipeline_queued() {
+        let event = PlatformEvent::PipelineQueued {
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"PipelineQueued""#));
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, PlatformEvent::PipelineQueued { .. }));
     }
 
     #[test]

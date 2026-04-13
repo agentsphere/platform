@@ -19,7 +19,7 @@ mod llm_tests;
 
 use std::io::Write;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Parser;
 
 use pubsub::PubSubClient;
@@ -97,8 +97,9 @@ struct Cli {
     #[arg(long)]
     cwd: Option<std::path::PathBuf>,
 
-    /// Path to the `claude` binary (overrides CLAUDE_CLI_PATH)
+    /// Path to the `claude` binary (overrides `CLAUDE_CLI_PATH`)
     #[arg(long)]
+    #[allow(clippy::struct_field_names)]
     cli_path: Option<std::path::PathBuf>,
 
     /// Additional KEY=VALUE env vars to pass to the CLI (repeatable)
@@ -109,7 +110,7 @@ struct Cli {
     #[arg(long)]
     dangerously_skip_permissions: bool,
 
-    /// Disable MCP server integration even when PLATFORM_API_TOKEN is set.
+    /// Disable MCP server integration even when `PLATFORM_API_TOKEN` is set.
     #[arg(long)]
     no_mcp: bool,
 
@@ -129,15 +130,15 @@ enum AuthToken {
 }
 
 fn resolve_auth() -> anyhow::Result<AuthToken> {
-    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        if !token.is_empty() {
-            return Ok(AuthToken::OAuth(token));
-        }
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(AuthToken::OAuth(token));
     }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Ok(AuthToken::ApiKey(key));
-        }
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(AuthToken::ApiKey(key));
     }
     bail!(
         "no auth credentials found.\n\
@@ -249,6 +250,57 @@ fn write_secrets_env_file() {
 }
 
 // ---------------------------------------------------------------------------
+// Initial prompt resolution
+// ---------------------------------------------------------------------------
+
+fn resolve_initial_prompt(
+    cli_prompt: Option<String>,
+    has_pubsub: bool,
+) -> anyhow::Result<Option<String>> {
+    if let Some(prompt) = cli_prompt {
+        return Ok(Some(prompt));
+    }
+    if has_pubsub {
+        // Pod mode: no prompt needed — agent starts idle, waits for pub/sub input
+        return Ok(None);
+    }
+    eprintln!("Enter your prompt (then press Enter):");
+    eprint!("> ");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read initial prompt from stdin")?;
+    let trimmed = line.trim().to_owned();
+    if trimmed.is_empty() {
+        bail!("no initial prompt provided");
+    }
+    Ok(Some(trimmed))
+}
+
+// ---------------------------------------------------------------------------
+// MCP config resolution
+// ---------------------------------------------------------------------------
+
+fn resolve_mcp_config_path(
+    no_mcp: bool,
+    config_dir: Option<&tempfile::TempDir>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if no_mcp {
+        eprintln!("[info] MCP disabled via --no-mcp");
+        return Ok(None);
+    }
+    if let Some(mcp_config) = mcp::resolve_mcp_config() {
+        let mcp_dir = config_dir.map_or_else(std::env::temp_dir, |d| d.path().to_path_buf());
+        let path =
+            mcp::write_mcp_config(&mcp_dir, &mcp_config).context("failed to write MCP config")?;
+        eprintln!("[info] MCP config written to {}", path.display());
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -269,8 +321,6 @@ async fn main() -> anyhow::Result<()> {
     let pubsub_config = resolve_pubsub()?;
 
     // 4. Config dir isolation
-    //    - Pod mode (pub/sub): use temp dir for security isolation
-    //    - REPL mode (local): use default ~/.claude/ so OAuth credentials work
     let config_dir = if pubsub_config.is_some() {
         Some(tempfile::TempDir::new().context("failed to create temp config dir")?)
     } else {
@@ -294,46 +344,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 6. Resolve initial prompt
-    //    In pod mode (pubsub active), prompt is optional — agent starts idle
-    //    and waits for messages via pub/sub.
-    //    In local REPL mode, prompt is required (read from -p flag or stdin).
-    let initial_prompt = if let Some(prompt) = cli.prompt {
-        Some(prompt)
-    } else if pubsub_config.is_some() {
-        // Pod mode: no prompt needed — agent starts idle, waits for pub/sub input
-        None
-    } else {
-        eprintln!("Enter your prompt (then press Enter):");
-        eprint!("> ");
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .context("failed to read initial prompt from stdin")?;
-        let trimmed = line.trim().to_owned();
-        if trimmed.is_empty() {
-            bail!("no initial prompt provided");
-        }
-        Some(trimmed)
-    };
+    let initial_prompt = resolve_initial_prompt(cli.prompt, pubsub_config.is_some())?;
 
-    // 7. Generate MCP config (if platform vars available and not disabled)
-    let mcp_config_path = if !cli.no_mcp {
-        if let Some(mcp_config) = mcp::resolve_mcp_config() {
-            let mcp_dir = config_dir
-                .as_ref()
-                .map(|d| d.path().to_path_buf())
-                .unwrap_or_else(std::env::temp_dir);
-            let path = mcp::write_mcp_config(&mcp_dir, &mcp_config)
-                .context("failed to write MCP config")?;
-            eprintln!("[info] MCP config written to {}", path.display());
-            Some(path)
-        } else {
-            None
-        }
-    } else {
-        eprintln!("[info] MCP disabled via --no-mcp");
-        None
-    };
+    // 7. Generate MCP config
+    let mcp_config_path = resolve_mcp_config_path(cli.no_mcp, config_dir.as_ref())?;
 
     // 8. Build spawn options
     let allowed_tools = cli
@@ -347,11 +361,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let is_pod_mode = pubsub_config.is_some();
-
-    // Resolve initial_session_id from SESSION_ID env var (pod mode sets this)
-    let initial_session_id = pubsub_config
-        .as_ref()
-        .map(|ps| ps.session_id.clone());
+    let initial_session_id = pubsub_config.as_ref().map(|ps| ps.session_id.clone());
 
     let opts = CliSpawnOptions {
         cli_path: cli.cli_path,
@@ -372,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // 9. Spawn stdin reader and pass channel to REPL
+    // 9. Spawn stdin reader
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
     tokio::spawn(async move {
         let stdin = tokio::io::stdin();
@@ -388,11 +398,8 @@ async fn main() -> anyhow::Result<()> {
     // 10. Spawn progress file watcher (pub/sub mode only)
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let _progress_handle = if let Some(ref ps_config) = pubsub_config {
-        // Create a second pub/sub client for the watcher (separate connection)
         match PubSubClient::connect(&ps_config.url, &ps_config.session_id).await {
-            Ok(watcher_client) => {
-                Some(progress_watcher::spawn(watcher_client, shutdown_rx))
-            }
+            Ok(watcher_client) => Some(progress_watcher::spawn(watcher_client, shutdown_rx)),
             Err(e) => {
                 eprintln!("[warn] progress watcher pub/sub connect failed: {e}");
                 None
@@ -402,13 +409,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // 11. Run per-turn spawn REPL (opts are cloned per turn)
+    // 11. Run per-turn spawn REPL
     repl::run(opts, pubsub, initial_prompt, stdin_rx, cli.one_shot).await?;
 
-    // Signal progress watcher to shut down
     let _ = shutdown_tx.send(true);
-
-    // config_dir is dropped here (auto-cleanup)
     Ok(())
 }
 
@@ -417,6 +421,20 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serial_test::serial;
+
+    // Edition 2024 makes env::set_var/remove_var unsafe (not thread-safe).
+    // Our tests use #[serial] so concurrent access is impossible.
+    #[allow(unsafe_code)]
+    fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::set_var(key, val) }
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env(key: &str) {
+        // SAFETY: tests are #[serial] — no concurrent env access
+        unsafe { std::env::remove_var(key) }
+    }
 
     // -- Auth resolution tests --
 
@@ -437,18 +455,18 @@ mod tests {
     fn no_auth_fails() {
         let oauth_backup = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok();
         let api_backup = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        remove_env("CLAUDE_CODE_OAUTH_TOKEN");
+        remove_env("ANTHROPIC_API_KEY");
 
         let result = resolve_auth();
         assert!(result.is_err());
 
         // Restore
         if let Some(v) = oauth_backup {
-            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", v);
+            set_env("CLAUDE_CODE_OAUTH_TOKEN", v);
         }
         if let Some(v) = api_backup {
-            std::env::set_var("ANTHROPIC_API_KEY", v);
+            set_env("ANTHROPIC_API_KEY", v);
         }
     }
 
@@ -457,20 +475,20 @@ mod tests {
     fn oauth_takes_precedence() {
         let oauth_backup = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok();
         let api_backup = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-val");
-        std::env::set_var("ANTHROPIC_API_KEY", "api-val");
+        set_env("CLAUDE_CODE_OAUTH_TOKEN", "oauth-val");
+        set_env("ANTHROPIC_API_KEY", "api-val");
 
         let result = resolve_auth().unwrap();
         assert!(matches!(result, AuthToken::OAuth(ref t) if t == "oauth-val"));
 
         // Restore
         match oauth_backup {
-            Some(v) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", v),
-            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(v) => set_env("CLAUDE_CODE_OAUTH_TOKEN", v),
+            None => remove_env("CLAUDE_CODE_OAUTH_TOKEN"),
         }
         match api_backup {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            Some(v) => set_env("ANTHROPIC_API_KEY", v),
+            None => remove_env("ANTHROPIC_API_KEY"),
         }
     }
 
@@ -480,19 +498,19 @@ mod tests {
     fn auth_empty_oauth_falls_to_api_key() {
         let oauth_backup = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok();
         let api_backup = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "");
-        std::env::set_var("ANTHROPIC_API_KEY", "api-val");
+        set_env("CLAUDE_CODE_OAUTH_TOKEN", "");
+        set_env("ANTHROPIC_API_KEY", "api-val");
 
         let result = resolve_auth().unwrap();
         assert!(matches!(result, AuthToken::ApiKey(ref k) if k == "api-val"));
 
         match oauth_backup {
-            Some(v) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", v),
-            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(v) => set_env("CLAUDE_CODE_OAUTH_TOKEN", v),
+            None => remove_env("CLAUDE_CODE_OAUTH_TOKEN"),
         }
         match api_backup {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            Some(v) => set_env("ANTHROPIC_API_KEY", v),
+            None => remove_env("ANTHROPIC_API_KEY"),
         }
     }
 
@@ -502,19 +520,19 @@ mod tests {
     fn auth_empty_both_fails() {
         let oauth_backup = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok();
         let api_backup = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "");
-        std::env::set_var("ANTHROPIC_API_KEY", "");
+        set_env("CLAUDE_CODE_OAUTH_TOKEN", "");
+        set_env("ANTHROPIC_API_KEY", "");
 
         let result = resolve_auth();
         assert!(result.is_err());
 
         match oauth_backup {
-            Some(v) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", v),
-            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(v) => set_env("CLAUDE_CODE_OAUTH_TOKEN", v),
+            None => remove_env("CLAUDE_CODE_OAUTH_TOKEN"),
         }
         match api_backup {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            Some(v) => set_env("ANTHROPIC_API_KEY", v),
+            None => remove_env("ANTHROPIC_API_KEY"),
         }
     }
 
@@ -525,8 +543,8 @@ mod tests {
     fn valkey_without_session_id_fails() {
         let url_backup = std::env::var("VALKEY_URL").ok();
         let sid_backup = std::env::var("SESSION_ID").ok();
-        std::env::set_var("VALKEY_URL", "redis://localhost:6379");
-        std::env::remove_var("SESSION_ID");
+        set_env("VALKEY_URL", "redis://localhost:6379");
+        remove_env("SESSION_ID");
 
         let result = resolve_pubsub();
         assert!(result.is_err());
@@ -534,11 +552,11 @@ mod tests {
         assert!(err.to_string().contains("SESSION_ID"));
 
         match url_backup {
-            Some(v) => std::env::set_var("VALKEY_URL", v),
-            None => std::env::remove_var("VALKEY_URL"),
+            Some(v) => set_env("VALKEY_URL", v),
+            None => remove_env("VALKEY_URL"),
         }
         if let Some(v) = sid_backup {
-            std::env::set_var("SESSION_ID", v);
+            set_env("SESSION_ID", v);
         }
     }
 
@@ -547,19 +565,19 @@ mod tests {
     fn session_id_without_valkey_ok() {
         let url_backup = std::env::var("VALKEY_URL").ok();
         let sid_backup = std::env::var("SESSION_ID").ok();
-        std::env::remove_var("VALKEY_URL");
-        std::env::set_var("SESSION_ID", "test-123");
+        remove_env("VALKEY_URL");
+        set_env("SESSION_ID", "test-123");
 
         let result = resolve_pubsub().unwrap();
         assert!(result.is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("VALKEY_URL", v),
-            None => std::env::remove_var("VALKEY_URL"),
+            Some(v) => set_env("VALKEY_URL", v),
+            None => remove_env("VALKEY_URL"),
         }
         match sid_backup {
-            Some(v) => std::env::set_var("SESSION_ID", v),
-            None => std::env::remove_var("SESSION_ID"),
+            Some(v) => set_env("SESSION_ID", v),
+            None => remove_env("SESSION_ID"),
         }
     }
 
@@ -568,8 +586,8 @@ mod tests {
     fn valkey_with_session_id() {
         let url_backup = std::env::var("VALKEY_URL").ok();
         let sid_backup = std::env::var("SESSION_ID").ok();
-        std::env::set_var("VALKEY_URL", "redis://localhost:6379");
-        std::env::set_var("SESSION_ID", "test-456");
+        set_env("VALKEY_URL", "redis://localhost:6379");
+        set_env("SESSION_ID", "test-456");
 
         let result = resolve_pubsub().unwrap();
         assert!(result.is_some());
@@ -578,12 +596,12 @@ mod tests {
         assert_eq!(config.session_id, "test-456");
 
         match url_backup {
-            Some(v) => std::env::set_var("VALKEY_URL", v),
-            None => std::env::remove_var("VALKEY_URL"),
+            Some(v) => set_env("VALKEY_URL", v),
+            None => remove_env("VALKEY_URL"),
         }
         match sid_backup {
-            Some(v) => std::env::set_var("SESSION_ID", v),
-            None => std::env::remove_var("SESSION_ID"),
+            Some(v) => set_env("SESSION_ID", v),
+            None => remove_env("SESSION_ID"),
         }
     }
 
@@ -593,19 +611,19 @@ mod tests {
     fn pubsub_empty_valkey_url_returns_none() {
         let url_backup = std::env::var("VALKEY_URL").ok();
         let sid_backup = std::env::var("SESSION_ID").ok();
-        std::env::set_var("VALKEY_URL", "");
-        std::env::set_var("SESSION_ID", "test-789");
+        set_env("VALKEY_URL", "");
+        set_env("SESSION_ID", "test-789");
 
         let result = resolve_pubsub().unwrap();
         assert!(result.is_none());
 
         match url_backup {
-            Some(v) => std::env::set_var("VALKEY_URL", v),
-            None => std::env::remove_var("VALKEY_URL"),
+            Some(v) => set_env("VALKEY_URL", v),
+            None => remove_env("VALKEY_URL"),
         }
         match sid_backup {
-            Some(v) => std::env::set_var("SESSION_ID", v),
-            None => std::env::remove_var("SESSION_ID"),
+            Some(v) => set_env("SESSION_ID", v),
+            None => remove_env("SESSION_ID"),
         }
     }
 
@@ -615,8 +633,8 @@ mod tests {
     fn pubsub_empty_session_id_fails() {
         let url_backup = std::env::var("VALKEY_URL").ok();
         let sid_backup = std::env::var("SESSION_ID").ok();
-        std::env::set_var("VALKEY_URL", "redis://localhost:6379");
-        std::env::set_var("SESSION_ID", "");
+        set_env("VALKEY_URL", "redis://localhost:6379");
+        set_env("SESSION_ID", "");
 
         let result = resolve_pubsub();
         assert!(result.is_err());
@@ -624,12 +642,12 @@ mod tests {
         assert!(err.to_string().contains("SESSION_ID"));
 
         match url_backup {
-            Some(v) => std::env::set_var("VALKEY_URL", v),
-            None => std::env::remove_var("VALKEY_URL"),
+            Some(v) => set_env("VALKEY_URL", v),
+            None => remove_env("VALKEY_URL"),
         }
         match sid_backup {
-            Some(v) => std::env::set_var("SESSION_ID", v),
-            None => std::env::remove_var("SESSION_ID"),
+            Some(v) => set_env("SESSION_ID", v),
+            None => remove_env("SESSION_ID"),
         }
     }
 
@@ -713,10 +731,12 @@ mod tests {
     fn extra_env_reserved_var_rejected() {
         let result = parse_extra_env(&["ANTHROPIC_API_KEY=x".into()]);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ANTHROPIC_API_KEY"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ANTHROPIC_API_KEY")
+        );
     }
 
     #[test]

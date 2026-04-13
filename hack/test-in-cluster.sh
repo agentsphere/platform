@@ -222,10 +222,10 @@ export PLATFORM_SEED_IMAGES_PATH="/tmp/platform-e2e/${WORKTREE}/seed-images"
 export PLATFORM_AGENT_RUNNER_DIR="${RUNNER_DIR}"
 export PLATFORM_PROXY_PATH="/tmp/platform-e2e/${WORKTREE}/proxy"
 export PLATFORM_MCP_SERVERS_TARBALL="/tmp/platform-e2e/${WORKTREE}/mcp-servers.tar.gz"
-export CLAUDE_CLI_PATH="${PROJECT_DIR}/cli/claude-mock/claude"
+export CLAUDE_CLI_PATH="${PROJECT_DIR}/tests/fixtures/claude-mock/claude"
 
 # Copy mock CLIs to shared mount so they're accessible inside cluster pods
-cp "${PROJECT_DIR}/cli/claude-mock/claude" "/tmp/platform-e2e/mock-claude-cli.sh"
+cp "${PROJECT_DIR}/tests/fixtures/claude-mock/claude" "/tmp/platform-e2e/mock-claude-cli.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli.sh"
 cp "${PROJECT_DIR}/tests/fixtures/mock-claude-cli-git.sh" "/tmp/platform-e2e/mock-claude-cli-git.sh"
 chmod +x "/tmp/platform-e2e/mock-claude-cli-git.sh"
