@@ -6,10 +6,13 @@
 # per test run. Runs tests natively with cargo nextest.
 #
 # Usage:
-#   bash hack/test-in-cluster.sh                          # integration tests
-#   bash hack/test-in-cluster.sh --filter '*_integration' # specific filter
+#   bash hack/test-in-cluster.sh                          # API handler tests (default)
+#   bash hack/test-in-cluster.sh --type api               # API handler tests
+#   bash hack/test-in-cluster.sh --type integration       # library integration tests
+#   bash hack/test-in-cluster.sh --type contract          # contract tests
 #   bash hack/test-in-cluster.sh --type e2e               # E2E tests
-#   bash hack/test-in-cluster.sh --type total              # all tiers with coverage
+#   bash hack/test-in-cluster.sh --type total             # all tiers with coverage
+#   bash hack/test-in-cluster.sh --filter '*_api'         # specific filter
 #   bash hack/test-in-cluster.sh --threads 4              # custom parallelism
 #   bash hack/test-in-cluster.sh --coverage               # with coverage instrumentation
 #   bash hack/test-in-cluster.sh --coverage --lcov out.lcov  # coverage → LCOV file
@@ -21,11 +24,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-TEST_FILTER="*_integration"
-TEST_TYPE="integration"   # "integration", "e2e", or "total"
+TEST_FILTER=""
+TEST_TYPE="api"   # "integration", "api", "contract", "e2e", or "total"
 TEST_THREADS=""
 FILTER_EXPR=""
-
 
 # Coverage options
 COVERAGE_MODE=false
@@ -54,9 +56,16 @@ if [[ "$TEST_TYPE" == "total" ]]; then
   COV_CLEAN=true
 fi
 
-# For E2E, override default filter (not for total — tiers are run separately)
-if [[ "$TEST_TYPE" == "e2e" && "$TEST_FILTER" == "*_integration" ]]; then
-  TEST_FILTER="e2e_*"
+# Set default TEST_FILTER per type (unless --filter was explicitly given)
+if [[ -z "$TEST_FILTER" ]]; then
+  case "$TEST_TYPE" in
+    integration) TEST_FILTER="*_integration" ;;
+    api)         TEST_FILTER="*_api" ;;
+    contract)    TEST_FILTER="*_contract" ;;
+    e2e)         TEST_FILTER="e2e_*" ;;
+    total)       TEST_FILTER="" ;;  # handled separately below
+    *)           echo "Unknown test type: $TEST_TYPE"; exit 1 ;;
+  esac
 fi
 
 # ── Namespace ID ──────────────────────────────────────────────────────────
@@ -309,7 +318,7 @@ COV_REPORT_IGNORE_REGEX='(proto\.rs|ui\.rs|main\.rs)'
 
 # ── Run tests ─────────────────────────────────────────────────────────────
 if [[ "$TEST_TYPE" == "total" ]]; then
-  # Combined coverage: unit + integration (no E2E — use cov-all for that)
+  # Combined coverage: unit + api + contract + integration
   # Track failures but continue through all tiers to generate the report
   TIER_FAILURES=0
 
@@ -321,9 +330,25 @@ if [[ "$TEST_TYPE" == "total" ]]; then
     || TIER_FAILURES=$((TIER_FAILURES + 1))
 
   echo ""
+  echo "==> Running API tests (coverage, no report)"
+  cargo llvm-cov nextest --no-report --test '*_api' \
+    --profile api \
+    --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
+    2>&1 | tee -a "${OUTPUT_FILE}" \
+    || TIER_FAILURES=$((TIER_FAILURES + 1))
+
+  echo ""
+  echo "==> Running contract tests (coverage, no report)"
+  cargo llvm-cov nextest --no-report --test '*_contract' \
+    --profile contract \
+    --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
+    2>&1 | tee -a "${OUTPUT_FILE}" \
+    || TIER_FAILURES=$((TIER_FAILURES + 1))
+
+  echo ""
   echo "==> Running integration tests (coverage, no report)"
   cargo llvm-cov nextest --no-report --test '*_integration' \
-    --profile integration --test-threads 32 \
+    --profile integration \
     --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
     2>&1 | tee -a "${OUTPUT_FILE}" \
     || TIER_FAILURES=$((TIER_FAILURES + 1))
@@ -358,14 +383,10 @@ else
     NEXTEST_ARGS+=(-E "${FILTER_EXPR}")
   fi
 
+  # Thread counts baked into nextest profiles (integration=32, api=32, e2e=2, k8s=4).
+  # Only override if --threads explicitly passed on CLI.
   if [[ -n "$TEST_THREADS" ]]; then
     NEXTEST_ARGS+=(--test-threads "${TEST_THREADS}")
-  elif [[ "$TEST_TYPE" == "e2e" ]]; then
-    NEXTEST_ARGS+=(--test-threads 2)
-  elif [[ "$TEST_TYPE" == "integration" ]]; then
-    # Each #[sqlx::test] creates a fresh DB + pool (~10 connections).
-    # Postgres max_connections=300 → safe up to ~30 concurrent tests.
-    NEXTEST_ARGS+=(--test-threads 32)
   fi
 
   if [[ "$TEST_TYPE" == "e2e" ]]; then
@@ -373,13 +394,13 @@ else
   fi
 
   # Use the matching nextest profile for each test type
-  if [[ "$TEST_TYPE" == "integration" || "$TEST_FILTER" == *"_integration"* ]]; then
-    NEXTEST_ARGS+=(--profile integration)
-  elif [[ "$TEST_TYPE" == "e2e" ]]; then
-    NEXTEST_ARGS+=(--profile default --no-fail-fast)
-  else
-    NEXTEST_ARGS+=(--profile default --no-fail-fast)
-  fi
+  case "$TEST_TYPE" in
+    integration) NEXTEST_ARGS+=(--profile integration) ;;
+    api)         NEXTEST_ARGS+=(--profile api) ;;
+    contract)    NEXTEST_ARGS+=(--profile contract) ;;
+    e2e)         NEXTEST_ARGS+=(--profile e2e --no-fail-fast) ;;
+    *)           NEXTEST_ARGS+=(--profile default --no-fail-fast) ;;
+  esac
 
   TEST_EXIT=0
   if $COVERAGE_MODE; then

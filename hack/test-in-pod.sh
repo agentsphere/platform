@@ -5,10 +5,13 @@
 # forwarding, it connects to ephemeral services via K8s DNS.
 #
 # Usage:
-#   bash hack/test-in-pod.sh                          # integration tests
-#   bash hack/test-in-pod.sh --filter '*_integration' # specific filter
+#   bash hack/test-in-pod.sh                          # API handler tests (default)
+#   bash hack/test-in-pod.sh --type api               # API handler tests
+#   bash hack/test-in-pod.sh --type integration       # library integration tests
+#   bash hack/test-in-pod.sh --type contract          # contract tests
 #   bash hack/test-in-pod.sh --type e2e               # E2E tests
 #   bash hack/test-in-pod.sh --type total             # all tiers with coverage
+#   bash hack/test-in-pod.sh --filter '*_api'         # specific filter
 #   bash hack/test-in-pod.sh --threads 4              # custom parallelism
 #   bash hack/test-in-pod.sh --coverage               # with coverage instrumentation
 #   bash hack/test-in-pod.sh --coverage --lcov out.lcov  # coverage → LCOV file
@@ -16,9 +19,10 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-TEST_FILTER="*_integration"
-TEST_TYPE="integration"   # "integration", "e2e", or "total"
+TEST_FILTER=""
+TEST_TYPE="api"   # "integration", "api", "contract", "e2e", or "total"
 TEST_THREADS=""
+FILTER_EXPR=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -38,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --lcov)         LCOV_PATH="$2"; shift 2 ;;
     --cov-no-report) COV_NO_REPORT=true; COVERAGE_MODE=true; shift ;;
     --cov-clean)    COV_CLEAN=true; shift ;;
+    --expr)         FILTER_EXPR="$2"; shift 2 ;;
     *)              echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -48,9 +53,16 @@ if [[ "$TEST_TYPE" == "total" ]]; then
   COV_CLEAN=true
 fi
 
-# For E2E, override default filter (not for total — tiers are run separately)
-if [[ "$TEST_TYPE" == "e2e" && "$TEST_FILTER" == "*_integration" ]]; then
-  TEST_FILTER="e2e_*"
+# Set default TEST_FILTER per type (unless --filter was explicitly given)
+if [[ -z "$TEST_FILTER" ]]; then
+  case "$TEST_TYPE" in
+    integration) TEST_FILTER="*_integration" ;;
+    api)         TEST_FILTER="*_api" ;;
+    contract)    TEST_FILTER="*_contract" ;;
+    e2e)         TEST_FILTER="e2e_*" ;;
+    total)       TEST_FILTER="" ;;  # handled separately below
+    *)           echo "Unknown test type: $TEST_TYPE"; exit 1 ;;
+  esac
 fi
 
 # ── Namespace ID ──────────────────────────────────────────────────────────
@@ -177,7 +189,7 @@ COV_REPORT_IGNORE_REGEX='(proto\.rs|ui\.rs|main\.rs)'
 
 # ── Run tests ─────────────────────────────────────────────────────────────
 if [[ "$TEST_TYPE" == "total" ]]; then
-  # Combined coverage: unit + integration + E2E in one instrumented build
+  # Combined coverage: unit + api + contract + integration + E2E
   # Track failures but continue through all tiers to generate the report
   TIER_FAILURES=0
 
@@ -188,15 +200,30 @@ if [[ "$TEST_TYPE" == "total" ]]; then
     || TIER_FAILURES=$((TIER_FAILURES + 1))
 
   echo ""
+  echo "==> Running API tests (coverage, no report)"
+  cargo llvm-cov nextest --no-report --test '*_api' \
+    --profile api \
+    --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
+    || TIER_FAILURES=$((TIER_FAILURES + 1))
+
+  echo ""
+  echo "==> Running contract tests (coverage, no report)"
+  cargo llvm-cov nextest --no-report --test '*_contract' \
+    --profile contract \
+    --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
+    || TIER_FAILURES=$((TIER_FAILURES + 1))
+
+  echo ""
   echo "==> Running integration tests (coverage, no report)"
   cargo llvm-cov nextest --no-report --test '*_integration' \
+    --profile integration \
     --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
     || TIER_FAILURES=$((TIER_FAILURES + 1))
 
   echo ""
   echo "==> Running E2E tests (coverage, no report)"
   cargo llvm-cov nextest --no-report --test 'e2e_*' \
-    --run-ignored ignored-only --test-threads 2 \
+    --profile e2e --run-ignored ignored-only \
     --ignore-filename-regex "${COV_IGNORE_REGEX}" --no-fail-fast \
     || TIER_FAILURES=$((TIER_FAILURES + 1))
 
@@ -221,15 +248,28 @@ else
   # Single tier run
   NEXTEST_ARGS=(--test "${TEST_FILTER}")
 
+  if [[ -n "$FILTER_EXPR" ]]; then
+    NEXTEST_ARGS+=(-E "${FILTER_EXPR}")
+  fi
+
+  # Thread counts baked into nextest profiles (integration=32, api=32, e2e=2, k8s=4).
+  # Only override if --threads explicitly passed on CLI.
   if [[ -n "$TEST_THREADS" ]]; then
     NEXTEST_ARGS+=(--test-threads "${TEST_THREADS}")
-  elif [[ "$TEST_TYPE" == "e2e" ]]; then
-    NEXTEST_ARGS+=(--test-threads 2)
   fi
 
   if [[ "$TEST_TYPE" == "e2e" ]]; then
     NEXTEST_ARGS+=(--run-ignored ignored-only)
   fi
+
+  # Use the matching nextest profile for each test type
+  case "$TEST_TYPE" in
+    integration) NEXTEST_ARGS+=(--profile integration) ;;
+    api)         NEXTEST_ARGS+=(--profile api) ;;
+    contract)    NEXTEST_ARGS+=(--profile contract) ;;
+    e2e)         NEXTEST_ARGS+=(--profile e2e --no-fail-fast) ;;
+    *)           NEXTEST_ARGS+=(--profile default --no-fail-fast) ;;
+  esac
 
   if $COVERAGE_MODE; then
     COV_ARGS=(--ignore-filename-regex "${COV_IGNORE_REGEX}")

@@ -2,23 +2,32 @@
 # Nextest profiles — file-based test tier selection
 # ---------------------------------------------------------------------------
 #
-# Tiers:
-#   default       → unit tests only (--lib), excludes integration + K8s binaries
-#   integration   → DB/Valkey/MinIO integration tests (*_integration.rs)
+# Tiers (7 total):
+#   default       → unit tests only (--lib), excludes all named tiers
+#   integration   → Library integration tests (*_integration.rs in crates/)
 #   k8s           → K8s integration tests (*_k8s.rs), requires Kind cluster
+#   contract      → FE-BE contract tests (*_contract.rs)
+#   api           → HTTP handler tests (*_api.rs in root tests/)
+#   e2e           → Multi-endpoint user journeys (e2e_*.rs)
+#   llm           → Real Claude CLI tests (llm_*.rs + #[ignore] tests)
 #
 # File naming convention:
-#   tests/*_integration.rs  → DB/Valkey tier (cargo nextest run --profile integration)
-#   tests/*_k8s.rs          → K8s tier       (cargo nextest run --profile k8s)
+#   crates/*/tests/*_integration.rs → library integration (--profile integration)
+#   crates/*/tests/*_k8s.rs         → K8s integration    (--profile k8s)
+#   tests/*_contract.rs             → contract            (--profile contract)
+#   tests/*_api.rs                  → HTTP handler        (--profile api)
+#   tests/e2e_*.rs                  → E2E journeys        (--profile e2e)
+#   tests/llm_*.rs                  → LLM                 (--profile llm)
 #
 # The binary() filter matches test binary names (= test file stems).
 
 [profile.default]
 # Bare `cargo nextest run` excludes heavy tests — safe for local TDD loop
-default-filter = "not binary(~_integration) and not binary(~_k8s)"
+default-filter = "not binary(~_integration) and not binary(~_k8s) and not binary(~_contract) and not binary(~_api) and not binary(~e2e_) and not binary(~llm)"
 
 [profile.integration]
 default-filter = "binary(~_integration)"
+test-threads = 32
 retries = 1
 fail-fast = false
 
@@ -29,6 +38,23 @@ path = "junit.xml"
 default-filter = "binary(~_k8s)"
 # K8s tests are heavy — limit concurrency to avoid overwhelming Kind cluster
 test-threads = 4
+
+[profile.contract]
+default-filter = "binary(~_contract)"
+
+[profile.api]
+default-filter = "binary(~_api)"
+test-threads = 32
+retries = 1
+fail-fast = false
+
+[profile.api.junit]
+path = "junit.xml"
+
+[profile.e2e]
+default-filter = "binary(~e2e_)"
+test-threads = 2
+fail-fast = false
 
 [profile.llm]
 # LLM tests: real Claude CLI with Anthropic credentials.
@@ -65,6 +91,14 @@ test-group = "serial-listen-port"
 filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
 test-group = "serial-listen-port"
 
+[[profile.api.overrides]]
+filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
+test-group = "serial-listen-port"
+
+[[profile.e2e.overrides]]
+filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
+test-group = "serial-listen-port"
+
 # Executor tests use start_pipeline_server() which binds ephemeral ports —
 # they CAN run in parallel. Cap at 8 to avoid overwhelming the Kind cluster
 # (each test spawns K8s pods + pipeline executor).
@@ -79,6 +113,14 @@ test-group = "executor-parallel"
 filter = "test(executor_)"
 test-group = "executor-parallel"
 
+[[profile.api.overrides]]
+filter = "test(executor_)"
+test-group = "executor-parallel"
+
 [[profile.k8s.overrides]]
+filter = "test(executor_)"
+test-group = "executor-parallel"
+
+[[profile.e2e.overrides]]
 filter = "test(executor_)"
 test-group = "executor-parallel"
