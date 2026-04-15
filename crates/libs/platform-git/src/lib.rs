@@ -65,6 +65,8 @@ pub use db_services::{
     PgBranchProtectionProvider, PgGitAccessControl, PgGitAuthenticator, PgPostReceiveHandler,
     PgProjectResolver,
 };
+// Note: PostReceiveSideEffects trait removed — PgPostReceiveHandler now publishes
+// PlatformEvent variants directly via Valkey, handled by the eventbus.
 pub use error::{GpgKeyError, SshError, SshKeyError};
 pub use hooks::{PostReceiveParams, RefUpdate};
 pub use lock::repo_lock;

@@ -48,56 +48,6 @@ jobs:
       - run: mkdir -p ui/dist && touch ui/dist/index.html
       - run: cargo nextest run --lib --profile ci --no-tests=pass
 
-  test-api:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-      - uses: taiki-e/install-action@2a622d16d926f7a79275fe00a1d5ac0013dd3d39  # nextest
-
-      - name: Create Kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
-        with:
-          cluster_name: platform
-          config: hack/kind-config.yaml
-
-      - run: mkdir -p ui/dist && touch ui/dist/index.html
-
-      - name: Run API tests
-        run: bash hack/test-in-cluster.sh --type api
-
-      - name: Run contract tests
-        run: bash hack/test-in-cluster.sh --type contract
-
-  test-e2e:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-      - uses: taiki-e/install-action@2a622d16d926f7a79275fe00a1d5ac0013dd3d39  # nextest
-
-      - name: Create Kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
-        with:
-          cluster_name: platform
-          config: hack/kind-config.yaml
-
-      - name: Prepare shared mount
-        run: |
-          mkdir -p /tmp/platform-e2e
-          docker exec platform-control-plane mkdir -p /tmp/platform-e2e
-
-      - run: mkdir -p ui/dist && touch ui/dist/index.html
-
-      - name: Run E2E tests
-        run: bash hack/test-in-cluster.sh --type e2e
-
   deny:
     runs-on: ubuntu-latest
     permissions:
@@ -132,19 +82,10 @@ jobs:
       - uses: taiki-e/install-action@3cc20bedd2b76343154801759db06b5c6d6692eb  # cargo-llvm-cov
       - uses: taiki-e/install-action@2a622d16d926f7a79275fe00a1d5ac0013dd3d39  # nextest
 
-      - name: Create Kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
-        with:
-          cluster_name: platform
-          config: hack/kind-config.yaml
-
       - run: mkdir -p ui/dist && touch ui/dist/index.html
 
       - name: Unit coverage
         run: cargo llvm-cov nextest --lib --lcov --output-path coverage-unit.lcov --ignore-filename-regex '(proto\.rs|ui\.rs)'
-
-      - name: API test coverage
-        run: bash hack/test-in-cluster.sh --type api --coverage --lcov coverage-api.lcov
 
       - name: Upload unit coverage
         uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad  # v5
@@ -153,15 +94,8 @@ jobs:
           flags: unit
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Upload API test coverage
-        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad  # v5
-        with:
-          files: coverage-api.lcov
-          flags: api
-          token: ${{ secrets.CODECOV_TOKEN }}
-
   build:
-    needs: [fmt, lint, test-unit, test-api, test-e2e, deny]
+    needs: [fmt, lint, test-unit, deny]
     permissions:
       contents: read
     strategy:

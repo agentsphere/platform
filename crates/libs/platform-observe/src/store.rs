@@ -190,28 +190,43 @@ pub async fn write_metrics(pool: &PgPool, metrics: &[MetricRecord]) -> Result<()
         return Ok(());
     }
 
-    // Step 1: Collect arrays for batch upsert of metric_series.
-    let mut names: Vec<&str> = Vec::with_capacity(metrics.len());
-    let mut labels: Vec<&JsonValue> = Vec::with_capacity(metrics.len());
-    let mut metric_types: Vec<&str> = Vec::with_capacity(metrics.len());
-    let mut units: Vec<Option<&str>> = Vec::with_capacity(metrics.len());
-    let mut project_ids: Vec<Option<Uuid>> = Vec::with_capacity(metrics.len());
-    let mut last_values: Vec<f64> = Vec::with_capacity(metrics.len());
+    // Step 1: Deduplicate series — Postgres ON CONFLICT DO UPDATE cannot hit
+    // the same row twice in one statement, so we must collapse metrics that
+    // share (name, labels, project_id) before the upsert.
+    use std::collections::HashMap;
+    type SeriesKey<'a> = (&'a str, &'a JsonValue, Option<Uuid>);
+
+    let mut series_map: HashMap<SeriesKey<'_>, usize> = HashMap::new();
+    let mut dedup_names: Vec<&str> = Vec::new();
+    let mut dedup_labels: Vec<&JsonValue> = Vec::new();
+    let mut dedup_metric_types: Vec<&str> = Vec::new();
+    let mut dedup_units: Vec<Option<&str>> = Vec::new();
+    let mut dedup_project_ids: Vec<Option<Uuid>> = Vec::new();
+    let mut dedup_last_values: Vec<f64> = Vec::new();
+    // Maps each input metric → its deduplicated series index.
+    let mut metric_to_series: Vec<usize> = Vec::with_capacity(metrics.len());
 
     for m in metrics {
-        names.push(&m.name);
-        labels.push(&m.labels);
-        metric_types.push(&m.metric_type);
-        units.push(m.unit.as_deref());
-        project_ids.push(m.project_id);
-        last_values.push(m.value);
+        let key: SeriesKey<'_> = (&m.name, &m.labels, m.project_id);
+        let idx = if let Some(&idx) = series_map.get(&key) {
+            // Update last_value to the latest in the batch.
+            dedup_last_values[idx] = m.value;
+            idx
+        } else {
+            let idx = dedup_names.len();
+            series_map.insert(key, idx);
+            dedup_names.push(&m.name);
+            dedup_labels.push(&m.labels);
+            dedup_metric_types.push(&m.metric_type);
+            dedup_units.push(m.unit.as_deref());
+            dedup_project_ids.push(m.project_id);
+            dedup_last_values.push(m.value);
+            idx
+        };
+        metric_to_series.push(idx);
     }
 
-    // Guard: UNNEST requires all arrays to be the same length.
-    debug_assert_eq!(names.len(), labels.len());
-    debug_assert_eq!(names.len(), project_ids.len());
-
-    // Batch upsert: single round-trip for all series.
+    // Batch upsert: single round-trip for unique series.
     let series_ids: Vec<(Uuid,)> = sqlx::query_as(
         r"
         INSERT INTO metric_series (name, labels, metric_type, unit, project_id, last_value)
@@ -227,24 +242,36 @@ pub async fn write_metrics(pool: &PgPool, metrics: &[MetricRecord]) -> Result<()
         RETURNING id
         ",
     )
-    .bind(&names)
-    .bind(&labels)
-    .bind(&metric_types)
-    .bind(&units)
-    .bind(&project_ids)
-    .bind(&last_values)
+    .bind(&dedup_names)
+    .bind(&dedup_labels)
+    .bind(&dedup_metric_types)
+    .bind(&dedup_units)
+    .bind(&dedup_project_ids)
+    .bind(&dedup_last_values)
     .fetch_all(pool)
     .await?;
 
-    // Step 2: Batch insert all samples — single round-trip.
+    // Step 2: Batch insert all samples — one row per metric data point.
+    // Dedup only exact (series_id, timestamp) duplicates within the batch —
+    // Postgres ON CONFLICT DO UPDATE cannot hit the same row twice.
+    // Different timestamps for the same series are always preserved.
+    let mut sample_seen: HashMap<(Uuid, DateTime<Utc>), usize> = HashMap::new();
     let mut sample_series_ids: Vec<Uuid> = Vec::with_capacity(metrics.len());
     let mut sample_timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(metrics.len());
     let mut sample_values: Vec<f64> = Vec::with_capacity(metrics.len());
 
     for (i, m) in metrics.iter().enumerate() {
-        sample_series_ids.push(series_ids[i].0);
-        sample_timestamps.push(m.timestamp);
-        sample_values.push(m.value);
+        let sid = series_ids[metric_to_series[i]].0;
+        let key = (sid, m.timestamp);
+        if let Some(&idx) = sample_seen.get(&key) {
+            // Exact duplicate timestamp — keep latest value.
+            sample_values[idx] = m.value;
+        } else {
+            sample_seen.insert(key, sample_series_ids.len());
+            sample_series_ids.push(sid);
+            sample_timestamps.push(m.timestamp);
+            sample_values.push(m.value);
+        }
     }
 
     sqlx::query(

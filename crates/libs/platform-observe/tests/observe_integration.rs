@@ -1119,7 +1119,17 @@ async fn flush_spans_drains_and_writes(pool: PgPool) {
     // Spawn the flush loop
     let flush_cancel = cancel.clone();
     let flush_pool = pool.clone();
-    let handle = tokio::spawn(ingest::flush_spans(flush_pool, spans_rx, flush_cancel));
+    let flush_valkey = valkey_pool().await;
+    let alert_router = std::sync::Arc::new(tokio::sync::RwLock::new(
+        platform_observe::alert::AlertRouter::empty(),
+    ));
+    let handle = tokio::spawn(ingest::flush_spans(
+        flush_pool,
+        flush_valkey,
+        alert_router,
+        spans_rx,
+        flush_cancel,
+    ));
 
     // Wait for flush to process (interval is 1s, give it 1.5s)
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -1154,9 +1164,13 @@ async fn flush_logs_drains_and_publishes(pool: PgPool) {
     let flush_cancel = cancel.clone();
     let flush_pool = pool.clone();
     let flush_valkey = valkey.clone();
+    let alert_router = std::sync::Arc::new(tokio::sync::RwLock::new(
+        platform_observe::alert::AlertRouter::empty(),
+    ));
     let handle = tokio::spawn(ingest::flush_logs(
         flush_pool,
         flush_valkey,
+        alert_router,
         logs_rx,
         flush_cancel,
     ));
@@ -1191,7 +1205,17 @@ async fn flush_metrics_drains_and_writes(pool: PgPool) {
     // Spawn the flush loop
     let flush_cancel = cancel.clone();
     let flush_pool = pool.clone();
-    let handle = tokio::spawn(ingest::flush_metrics(flush_pool, metrics_rx, flush_cancel));
+    let flush_valkey = valkey_pool().await;
+    let alert_router = std::sync::Arc::new(tokio::sync::RwLock::new(
+        platform_observe::alert::AlertRouter::empty(),
+    ));
+    let handle = tokio::spawn(ingest::flush_metrics(
+        flush_pool,
+        flush_valkey,
+        alert_router,
+        metrics_rx,
+        flush_cancel,
+    ));
 
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 

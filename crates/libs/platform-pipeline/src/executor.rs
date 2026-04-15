@@ -383,12 +383,14 @@ async fn finalize_pipeline<Svc: PipelineServices>(
         .execute(&state.pool)
         .await?;
 
-    if all_succeeded {
-        // NOTE: detect_and_write_deployment() and detect_and_publish_dev_image()
-        // are no longer called here. GitOps handoff and dev image publication are
-        // now explicit pipeline steps (gitops_sync and imagebuild).
-        // Only auto-merge remains as a finalize-time side effect.
-        state.services.try_auto_merge(project_id).await;
+    // Publish PipelineCompleted event (eventbus handles auto-merge on success)
+    let completed_event = platform_types::events::PlatformEvent::PipelineCompleted {
+        pipeline_id,
+        project_id,
+        status: final_status_str.to_string(),
+    };
+    if let Err(e) = platform_types::events::publish(&state.valkey, &completed_event).await {
+        tracing::warn!(error = %e, "failed to publish PipelineCompleted event");
     }
 
     fire_build_webhook(state, project_id, pipeline_id, final_status_str).await;

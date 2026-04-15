@@ -4,10 +4,12 @@
 //! Concrete [`PipelineServices`] implementation that delegates to individual
 //! trait implementations.
 //!
-//! Composes [`MergeRequestHandler`], [`WebhookDispatcher`], [`OpsRepoManager`],
-//! [`ManifestApplier`], and [`RegistryCredentialProvider`] into a single
-//! `PipelineServices` impl, avoiding 5+ generic type parameters on every
-//! executor function.
+//! Composes [`WebhookDispatcher`], [`OpsRepoManager`], [`ManifestApplier`],
+//! and [`RegistryCredentialProvider`] into a single `PipelineServices` impl,
+//! avoiding 4+ generic type parameters on every executor function.
+//!
+//! Auto-merge (formerly `MergeRequestHandler`) is now handled via
+//! `PlatformEvent::PipelineCompleted` events dispatched by the eventbus.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,8 +17,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use platform_types::{
-    ManifestApplier, MergeRequestHandler, OpsRepoManager, RegistryCredentialProvider,
-    WebhookDispatcher,
+    ManifestApplier, OpsRepoManager, RegistryCredentialProvider, WebhookDispatcher,
 };
 
 use crate::state::PipelineServices;
@@ -26,15 +27,13 @@ use crate::state::PipelineServices;
 ///
 /// All inner services are wrapped in `Arc` for cheap cloning (required by the
 /// `Clone` bound on `PipelineServices`).
-pub struct ConcretePipelineServices<M, W, O, A, R>
+pub struct ConcretePipelineServices<W, O, A, R>
 where
-    M: MergeRequestHandler,
     W: WebhookDispatcher,
     O: OpsRepoManager,
     A: ManifestApplier,
     R: RegistryCredentialProvider,
 {
-    pub merge_handler: Arc<M>,
     pub webhook_dispatcher: Arc<W>,
     pub ops_repo: Arc<O>,
     pub applier: Arc<A>,
@@ -43,9 +42,8 @@ where
 
 // Manual Clone impl: all fields are Arc<T>, which is always Clone
 // regardless of whether T is Clone.
-impl<M, W, O, A, R> Clone for ConcretePipelineServices<M, W, O, A, R>
+impl<W, O, A, R> Clone for ConcretePipelineServices<W, O, A, R>
 where
-    M: MergeRequestHandler,
     W: WebhookDispatcher,
     O: OpsRepoManager,
     A: ManifestApplier,
@@ -53,7 +51,6 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            merge_handler: self.merge_handler.clone(),
             webhook_dispatcher: self.webhook_dispatcher.clone(),
             ops_repo: self.ops_repo.clone(),
             applier: self.applier.clone(),
@@ -62,23 +59,20 @@ where
     }
 }
 
-impl<M, W, O, A, R> ConcretePipelineServices<M, W, O, A, R>
+impl<W, O, A, R> ConcretePipelineServices<W, O, A, R>
 where
-    M: MergeRequestHandler,
     W: WebhookDispatcher,
     O: OpsRepoManager,
     A: ManifestApplier,
     R: RegistryCredentialProvider,
 {
     pub fn new(
-        merge_handler: Arc<M>,
         webhook_dispatcher: Arc<W>,
         ops_repo: Arc<O>,
         applier: Arc<A>,
         registry: Arc<R>,
     ) -> Self {
         Self {
-            merge_handler,
             webhook_dispatcher,
             ops_repo,
             applier,
@@ -87,18 +81,13 @@ where
     }
 }
 
-impl<M, W, O, A, R> PipelineServices for ConcretePipelineServices<M, W, O, A, R>
+impl<W, O, A, R> PipelineServices for ConcretePipelineServices<W, O, A, R>
 where
-    M: MergeRequestHandler + 'static,
     W: WebhookDispatcher + 'static,
     O: OpsRepoManager + 'static,
     A: ManifestApplier + 'static,
     R: RegistryCredentialProvider + 'static,
 {
-    async fn try_auto_merge(&self, project_id: Uuid) {
-        self.merge_handler.try_auto_merge(project_id).await;
-    }
-
     async fn fire_webhooks(&self, project_id: Uuid, event_name: &str, payload: &serde_json::Value) {
         self.webhook_dispatcher
             .fire_webhooks(project_id, event_name, payload)
@@ -190,10 +179,8 @@ mod tests {
     async fn mock_pipeline_services_is_valid() {
         // Verify MockPipelineServices satisfies PipelineServices bounds.
         let mock = MockPipelineServices::default();
-        mock.try_auto_merge(Uuid::nil()).await;
         mock.fire_webhooks(Uuid::nil(), "push", &serde_json::json!({}))
             .await;
-        assert!(mock.auto_merge_calls.lock().unwrap().len() == 1);
         assert!(mock.webhook_calls.lock().unwrap().len() == 1);
     }
 }

@@ -2,28 +2,29 @@
 # Nextest profiles — file-based test tier selection
 # ---------------------------------------------------------------------------
 #
+# All profiles match workspace-wide across ALL crates (not just root).
+# The binary() filter matches test binary names (= test file stems).
+#
 # Tiers (7 total):
 #   default       → unit tests only (--lib), excludes all named tiers
-#   integration   → Library integration tests (*_integration.rs in crates/)
+#   integration   → Library integration tests (*_integration.rs)
 #   k8s           → K8s integration tests (*_k8s.rs), requires Kind cluster
 #   contract      → FE-BE contract tests (*_contract.rs)
-#   api           → HTTP handler tests (*_api.rs in root tests/)
+#   api           → HTTP handler tests (*_api.rs)
 #   e2e           → Multi-endpoint user journeys (e2e_*.rs)
 #   llm           → Real Claude CLI tests (llm_*.rs + #[ignore] tests)
 #
-# File naming convention:
+# File naming convention (in any crate's tests/ directory):
 #   crates/*/tests/*_integration.rs → library integration (--profile integration)
 #   crates/*/tests/*_k8s.rs         → K8s integration    (--profile k8s)
-#   tests/*_contract.rs             → contract            (--profile contract)
-#   tests/*_api.rs                  → HTTP handler        (--profile api)
-#   tests/e2e_*.rs                  → E2E journeys        (--profile e2e)
-#   tests/llm_*.rs                  → LLM                 (--profile llm)
-#
-# The binary() filter matches test binary names (= test file stems).
+#   crates/*/tests/*_contract.rs    → contract            (--profile contract)
+#   crates/*/tests/*_api.rs         → HTTP handler        (--profile api)
+#   crates/*/tests/e2e_*.rs         → E2E journeys        (--profile e2e)
+#   crates/*/tests/llm_*.rs         → LLM                 (--profile llm)
 
 [profile.default]
 # Bare `cargo nextest run` excludes heavy tests — safe for local TDD loop
-default-filter = "not binary(~_integration) and not binary(~_k8s) and not binary(~_contract) and not binary(~_api) and not binary(~e2e_) and not binary(~llm)"
+default-filter = "not binary(~_integration) and not binary(~_k8s)"
 
 [profile.integration]
 default-filter = "binary(~_integration)"
@@ -39,11 +40,17 @@ default-filter = "binary(~_k8s)"
 # K8s tests are heavy — limit concurrency to avoid overwhelming Kind cluster
 test-threads = 4
 
+# contract/api/e2e/llm profiles — currently 0 matching binaries.
+# Re-add with binary() filters when crate-level tests are added:
+#   *_contract.rs → contract, *_api.rs → api, e2e_*.rs → e2e, llm_*.rs → llm
+
 [profile.contract]
-default-filter = "binary(~_contract)"
+# Matches *_contract.rs test binaries in any crate
+default-filter = "all()"
 
 [profile.api]
-default-filter = "binary(~_api)"
+# Matches *_api.rs test binaries in any crate
+default-filter = "all()"
 test-threads = 32
 retries = 1
 fail-fast = false
@@ -52,18 +59,16 @@ fail-fast = false
 path = "junit.xml"
 
 [profile.e2e]
-default-filter = "binary(~e2e_)"
+# Matches e2e_*.rs test binaries in any crate
+default-filter = "all()"
 test-threads = 2
 fail-fast = false
 
 [profile.llm]
 # LLM tests: real Claude CLI with Anthropic credentials.
-# Two sources:
-#   - tests/llm_*.rs  (main binary integration tests, file-based selection)
-#   - src/llm_tests.rs (platform-agent-runner inline tests, use #[ignore])
-# We select both: file-named binaries + ignored tests with llm_ prefix.
+# src/llm_tests.rs (platform-agent-runner inline tests, use #[ignore])
 # NOTE: --run-ignored ignored-only must be passed on CLI (not a profile key).
-default-filter = "binary(~llm) or test(~llm_)"
+default-filter = "test(~llm_)"
 # LLM tests hit a real API — run sequentially to stay within rate limits
 test-threads = 1
 
@@ -92,6 +97,10 @@ filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_imag
 test-group = "serial-listen-port"
 
 [[profile.api.overrides]]
+filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
+test-group = "serial-listen-port"
+
+[[profile.k8s.overrides]]
 filter = "test(pull_platform_runner_image) | test(pull_platform_runner_bare_image) | test(auto_setup_downloads_agent_runner)"
 test-group = "serial-listen-port"
 

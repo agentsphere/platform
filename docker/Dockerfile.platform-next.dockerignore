@@ -1,0 +1,14 @@
+# Keep context small — only whitelist what the build needs
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates/
+!migrations/
+
+# UI sources (built inside the image)
+!ui/
+
+# Exclude build artifacts in whitelisted dirs
+**/target/
+**/node_modules/

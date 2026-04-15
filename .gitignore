@@ -6,6 +6,8 @@ cli/*/target/
 # Environment
 .env*
 
+archive/
+
 # Node / UI
 ui/node_modules/
 mcp/node_modules/

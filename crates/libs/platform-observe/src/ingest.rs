@@ -154,14 +154,14 @@ pub async fn check_otlp_project_auth(
         }
     }
 
-    // System-level metrics (no project_id) require admin permission
+    // System-level metrics (no project_id) require observe:write at global scope
     if has_system_metrics {
-        let is_admin = checker
-            .has_permission(auth.user_id, None, Permission::AdminConfig)
+        let allowed = checker
+            .has_permission(auth.user_id, None, Permission::ObserveWrite)
             .await
             .map_err(|e| ApiError::Internal(e.context("OTLP system auth check")))?;
 
-        if !is_admin {
+        if !allowed {
             return Err(ApiError::Forbidden);
         }
     }
@@ -447,9 +447,12 @@ pub fn try_send_metric(channels: &IngestChannels, record: MetricRecord) -> Resul
 // Background flush tasks
 // ---------------------------------------------------------------------------
 
-/// Drain the spans channel and batch-write to Postgres.
+/// Drain the spans channel, batch-write to Postgres, and XADD matching
+/// samples to the alert stream for span/trace alert rules.
 pub async fn flush_spans(
     pool: sqlx::PgPool,
+    valkey: fred::clients::Pool,
+    alert_router: std::sync::Arc<tokio::sync::RwLock<crate::alert::AlertRouter>>,
     mut rx: mpsc::Receiver<SpanRecord>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -461,12 +464,12 @@ pub async fn flush_spans(
             () = cancel.cancelled() => {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    drain_spans(&pool, &mut rx, &mut buffer),
+                    drain_spans(&pool, &valkey, &alert_router, &mut rx, &mut buffer),
                 ).await;
                 break;
             }
             _ = interval.tick() => {
-                drain_spans(&pool, &mut rx, &mut buffer).await;
+                drain_spans(&pool, &valkey, &alert_router, &mut rx, &mut buffer).await;
             }
         }
     }
@@ -474,6 +477,8 @@ pub async fn flush_spans(
 
 async fn drain_spans(
     pool: &sqlx::PgPool,
+    valkey: &fred::clients::Pool,
+    alert_router: &tokio::sync::RwLock<crate::alert::AlertRouter>,
     rx: &mut mpsc::Receiver<SpanRecord>,
     buffer: &mut Vec<SpanRecord>,
 ) {
@@ -483,18 +488,26 @@ async fn drain_spans(
             Err(_) => break,
         }
     }
-    if !buffer.is_empty() {
-        if let Err(e) = crate::store::write_spans(pool, buffer).await {
-            tracing::error!(error = %e, count = buffer.len(), "failed to flush spans");
-        }
-        buffer.clear();
+    if buffer.is_empty() {
+        return;
     }
+
+    if let Err(e) = crate::store::write_spans(pool, buffer).await {
+        tracing::error!(error = %e, count = buffer.len(), "failed to flush spans");
+        buffer.clear();
+        return;
+    }
+
+    xadd_span_alert_samples(valkey, alert_router, buffer).await;
+    buffer.clear();
 }
 
-/// Drain the logs channel, batch-write, and publish to Valkey for live tail.
+/// Drain the logs channel, batch-write, publish to Valkey for live tail,
+/// and XADD matching samples to the alert stream for log alert rules.
 pub async fn flush_logs(
     pool: sqlx::PgPool,
     valkey: fred::clients::Pool,
+    alert_router: std::sync::Arc<tokio::sync::RwLock<crate::alert::AlertRouter>>,
     mut rx: mpsc::Receiver<LogEntryRecord>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -506,12 +519,12 @@ pub async fn flush_logs(
             () = cancel.cancelled() => {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    drain_and_publish_logs(&pool, &valkey, &mut rx, &mut buffer),
+                    drain_and_publish_logs(&pool, &valkey, &alert_router, &mut rx, &mut buffer),
                 ).await;
                 break;
             }
             _ = interval.tick() => {
-                drain_and_publish_logs(&pool, &valkey, &mut rx, &mut buffer).await;
+                drain_and_publish_logs(&pool, &valkey, &alert_router, &mut rx, &mut buffer).await;
             }
         }
     }
@@ -520,6 +533,7 @@ pub async fn flush_logs(
 async fn drain_and_publish_logs(
     pool: &sqlx::PgPool,
     valkey: &fred::clients::Pool,
+    alert_router: &tokio::sync::RwLock<crate::alert::AlertRouter>,
     rx: &mut mpsc::Receiver<LogEntryRecord>,
     buffer: &mut Vec<LogEntryRecord>,
 ) {
@@ -553,7 +567,11 @@ async fn drain_and_publish_logs(
 
     if let Err(e) = crate::store::write_logs(pool, buffer).await {
         tracing::error!(error = %e, count = buffer.len(), "failed to flush logs");
+        buffer.clear();
+        return;
     }
+
+    xadd_log_alert_samples(valkey, alert_router, buffer).await;
     buffer.clear();
 }
 
@@ -668,6 +686,112 @@ async fn xadd_alert_samples(
 
     if has_matches && let Err(e) = pipeline.all::<()>().await {
         tracing::debug!(error = %e, "failed to XADD alert samples (best-effort)");
+    }
+}
+
+/// Route log records through the `AlertRouter` and XADD matching samples
+/// to the `alert:samples` Valkey stream. Best-effort — failures are logged.
+async fn xadd_log_alert_samples(
+    valkey: &fred::clients::Pool,
+    alert_router: &tokio::sync::RwLock<crate::alert::AlertRouter>,
+    buffer: &[LogEntryRecord],
+) {
+    use fred::interfaces::StreamsInterface;
+
+    let router = alert_router.read().await;
+    if !router.has_log_rules() {
+        return;
+    }
+
+    let pipeline = valkey.next().pipeline();
+    let mut has_matches = false;
+
+    for record in buffer {
+        let matches = router.matching_log_rules(
+            &record.level,
+            &record.message,
+            &record.service,
+            record.project_id,
+        );
+
+        for (rule_id, value) in matches {
+            has_matches = true;
+            let rule_str = rule_id.to_string();
+            let ts_ms = record.timestamp.timestamp_millis().to_string();
+            let val_str = value.to_string();
+            let fields: Vec<(&str, &str)> = vec![
+                ("r", rule_str.as_str()),
+                ("t", ts_ms.as_str()),
+                ("v", val_str.as_str()),
+            ];
+            let _: Result<(), _> = pipeline
+                .xadd::<(), _, _, _, _>(
+                    crate::alert::ALERT_STREAM_KEY,
+                    false,
+                    None::<()>,
+                    "*",
+                    fields,
+                )
+                .await;
+        }
+    }
+
+    if has_matches && let Err(e) = pipeline.all::<()>().await {
+        tracing::debug!(error = %e, "failed to XADD log alert samples (best-effort)");
+    }
+}
+
+/// Route span records through the `AlertRouter` and XADD matching samples
+/// to the `alert:samples` Valkey stream. Best-effort — failures are logged.
+async fn xadd_span_alert_samples(
+    valkey: &fred::clients::Pool,
+    alert_router: &tokio::sync::RwLock<crate::alert::AlertRouter>,
+    buffer: &[SpanRecord],
+) {
+    use fred::interfaces::StreamsInterface;
+
+    let router = alert_router.read().await;
+    if !router.has_span_rules() {
+        return;
+    }
+
+    let pipeline = valkey.next().pipeline();
+    let mut has_matches = false;
+
+    for record in buffer {
+        let input = crate::alert::SpanAlertInput {
+            name: &record.name,
+            service: &record.service,
+            status: &record.status,
+            duration_ms: record.duration_ms.map(f64::from),
+            is_root: record.parent_span_id.is_none(),
+        };
+
+        let matches = router.matching_span_rules(&input, record.project_id);
+        for (rule_id, value) in matches {
+            has_matches = true;
+            let rule_str = rule_id.to_string();
+            let ts_ms = record.started_at.timestamp_millis().to_string();
+            let val_str = value.to_string();
+            let fields: Vec<(&str, &str)> = vec![
+                ("r", rule_str.as_str()),
+                ("t", ts_ms.as_str()),
+                ("v", val_str.as_str()),
+            ];
+            let _: Result<(), _> = pipeline
+                .xadd::<(), _, _, _, _>(
+                    crate::alert::ALERT_STREAM_KEY,
+                    false,
+                    None::<()>,
+                    "*",
+                    fields,
+                )
+                .await;
+        }
+    }
+
+    if has_matches && let Err(e) = pipeline.all::<()>().await {
+        tracing::debug!(error = %e, "failed to XADD span alert samples (best-effort)");
     }
 }
 
@@ -1143,7 +1267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_otlp_auth_system_metrics_admin_allowed() {
+    async fn check_otlp_auth_system_metrics_observe_write_allowed() {
         let auth = make_auth(Uuid::new_v4());
         let attrs: Vec<proto::KeyValue> = vec![]; // no project_id → system metrics
         let result = check_otlp_project_auth(&auth, &AllowAllChecker, &[attrs.as_slice()]).await;
@@ -1151,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_otlp_auth_system_metrics_non_admin_denied() {
+    async fn check_otlp_auth_system_metrics_no_observe_write_denied() {
         let auth = make_auth(Uuid::new_v4());
         let attrs: Vec<proto::KeyValue> = vec![];
         let result = check_otlp_project_auth(&auth, &DenyAllChecker, &[attrs.as_slice()]).await;

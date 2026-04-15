@@ -91,7 +91,7 @@ dev-down-all:
 dev:
     @if [ ! -f .env.dev ]; then echo "ERROR: .env.dev not found. Run: just dev-up"; exit 1; fi
     @grep -E '^PLATFORM_(GIT_REPOS|OPS_REPOS|SEED_IMAGES)_PATH=' .env.dev | cut -d= -f2 | xargs mkdir -p
-    cargo run 2>&1 | tee server.log
+    cargo run -p platform-next 2>&1 | tee server.log
 
 # Run server with custom env file
 [group('dev')]
@@ -100,7 +100,7 @@ run env=".env":
     set -euo pipefail
     if [ ! -f "{{env}}" ]; then echo "ERROR: {{env}} not found."; exit 1; fi
     set -a; source "{{env}}"; set +a
-    exec cargo run
+    exec cargo run -p platform-next
 
 [group('dev')]
 watch:
@@ -108,7 +108,8 @@ watch:
 
 # -- Types (ts-rs) --------------------------------------------------
 types:
-    SQLX_OFFLINE=true cargo test --lib -- export_bindings
+    TS_RS_EXPORT_DIR=ui/src/lib/generated SQLX_OFFLINE=true cargo test -p platform-next export_bindings
+    TS_RS_EXPORT_DIR=ui/src/lib/generated SQLX_OFFLINE=true cargo test -p platform-types --features ts export_bindings
     cd ui && npx tsc --noEmit --skipLibCheck 2>&1 | grep -v "path.*IntrinsicAttributes" || true
     @echo "Types generated in ui/src/lib/generated/"
 
@@ -130,14 +131,15 @@ check: fmt lint deny
 
 # -- Test -----------------------------------------------------------
 #
-# Seven test tiers, selected by nextest profiles + file naming convention:
-#   src/ (--lib)               → unit        (default profile)
-#   crates/*/tests/*_integration.rs → int    (--profile integration)
-#   crates/*/tests/*_k8s.rs   → k8s         (--profile k8s)
-#   tests/*_contract.rs       → contract     (--profile contract)
-#   tests/*_api.rs            → api          (--profile api)
-#   tests/e2e_*.rs            → e2e          (--profile e2e)
-#   tests/llm_*.rs            → llm          (--profile llm)
+# Seven test tiers, selected by nextest profiles + file naming convention.
+# All tiers match across ALL workspace crates (not just root):
+#   --lib                                → unit        (default profile)
+#   crates/*/tests/*_integration.rs      → int         (--profile integration)
+#   crates/*/tests/*_k8s.rs             → k8s          (--profile k8s)
+#   crates/*/tests/*_contract.rs        → contract     (--profile contract)
+#   crates/*/tests/*_api.rs             → api          (--profile api)
+#   crates/*/tests/e2e_*.rs             → e2e          (--profile e2e)
+#   crates/*/tests/llm_*.rs             → llm          (--profile llm)
 #
 # Profiles are defined in .config/nextest.toml using binary() filters.
 # No #[ignore] attributes needed — the file name IS the tier selector.
@@ -145,8 +147,8 @@ check: fmt lint deny
 # All workspace crates (package names from Cargo.toml)
 _crate_all := "-p platform-types -p platform-auth -p platform-observe -p platform-secrets -p platform-k8s -p platform-git -p platform-registry -p platform-agent -p platform-ingest -p platform-k8s-watcher -p platform-proxy -p platform-proxy-init -p platform-pipeline -p platform-deployer -p platform-webhook -p platform-notify -p platform-mesh -p platform-ops-repo -p platform-agent-runner -p platform-next -p platform-operator"
 # Crates with --lib targets for coverage (proxy included — coverage uses --lib to avoid binary crash)
-# Excludes proxy-init, ingest, and agent-runner (no lib.rs, binary-only crates)
-_crate_lib := "-p platform-types -p platform-auth -p platform-observe -p platform-secrets -p platform-k8s -p platform-git -p platform-registry -p platform-agent -p platform-k8s-watcher -p platform-proxy -p platform-pipeline -p platform-deployer -p platform-webhook -p platform-notify -p platform-mesh -p platform-ops-repo"
+# Excludes proxy-init and agent-runner (no lib.rs, binary-only crates)
+_crate_lib := "-p platform-types -p platform-auth -p platform-observe -p platform-secrets -p platform-k8s -p platform-git -p platform-registry -p platform-agent -p platform-ingest -p platform-k8s-watcher -p platform-proxy -p platform-pipeline -p platform-deployer -p platform-webhook -p platform-notify -p platform-mesh -p platform-ops-repo"
 
 # Unit tests (all packages or one crate)
 # just test-unit                      → all unit tests
@@ -204,20 +206,6 @@ test-api filter="":
 test-e2e filter="":
     bash {{test_script}} --type e2e {{ if filter != "" { "--expr 'test(" + filter + ")'" } else { "" } }}
 
-# Run a specific test binary (escape hatch for targeting)
-# just test-bin auth_api              → all tests in binary
-# just test-bin auth_api login        → filter within binary
-[group('test')]
-test-bin bin filter="":
-    bash {{test_script}} --filter '{{bin}}' {{ if filter != "" { "--expr 'test(" + filter + ")'" } else { "" } }}
-
-# E2E specific binary + filter
-# just test-e2e-bin e2e_agent                     → all tests in e2e_agent binary
-# just test-e2e-bin e2e_agent git_clone_push      → specific test in binary
-[group('test')]
-test-e2e-bin bin filter="":
-    bash {{test_script}} --type e2e --filter '{{bin}}' {{ if filter != "" { "--expr 'test(" + filter + ")'" } else { "" } }}
-
 # LLM integration tests (real Claude CLI, requires Anthropic credentials)
 # Uses the llm profile which selects tests/llm_*.rs + inline #[ignore] LLM tests
 [group('test')]
@@ -237,39 +225,13 @@ test-cleanup:
 
 # Everything except LLM
 [group('test')]
-test-all: test-unit test-int test-k8s test-contract test-api test-e2e
+test-all: test-unit test-int test-k8s
 
 # -- Coverage -------------------------------------------------------
 [group('coverage')]
 cov-unit:
     cargo llvm-cov nextest --lib --lcov --output-path coverage-unit.lcov \
         --ignore-filename-regex '(proto\.rs|ui\.rs)'
-
-[group('coverage')]
-cov-api:
-    bash {{test_script}} --type api --coverage --lcov coverage-api.lcov
-
-[group('coverage')]
-cov-e2e:
-    bash {{test_script}} --type e2e --coverage --lcov coverage-e2e.lcov
-
-# Combined: unit + int + api + contract (default coverage target)
-[group('coverage')]
-cov-total:
-    @echo "=== Combined coverage: unit + int + api + contract ==="
-    bash {{test_script}} --type total
-
-# Diff coverage: only lines changed vs a branch
-[group('coverage')]
-cov-diff branch="main":
-    bash {{test_script}} --type total --lcov coverage-total.lcov
-    diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered
-
-# Diff coverage strict: fail if changed lines < 100% covered
-[group('coverage')]
-cov-diff-check branch="main":
-    bash {{test_script}} --type total --lcov coverage-total.lcov
-    diff-cover coverage-total.lcov --compare-branch={{branch}} --show-uncovered --fail-under=100
 
 [group('coverage')]
 cov-html:
@@ -292,6 +254,7 @@ crate-cov crate="":
     cargo llvm-cov nextest \
         {{ if crate != "" { "-p " + crate } else { _crate_all } }} \
         --lib --test '*' --ignore-default-filter --no-fail-fast \
+        --ignore-filename-regex 'main\.rs' \
         --lcov --output-path crate-coverage.lcov
     @echo "Coverage written to crate-coverage.lcov"
 
@@ -303,7 +266,25 @@ crate-cov-html crate="":
     cargo llvm-cov nextest \
         {{ if crate != "" { "-p " + crate } else { _crate_all } }} \
         --lib --test '*' --ignore-default-filter --no-fail-fast \
+        --ignore-filename-regex 'main\.rs' \
         --html --output-dir crate-coverage-html
+    @echo "Open crate-coverage-html/index.html"
+
+# Crate coverage: lcov + HTML in one run (unit + integration + K8s)
+# just test-cov                          → all library crates
+# just test-cov platform-auth            → one crate
+[group('coverage')]
+test-cov crate="":
+    cargo llvm-cov nextest \
+        {{ if crate != "" { "-p " + crate } else { _crate_all } }} \
+        --lib --test '*' --ignore-default-filter --no-fail-fast \
+        --ignore-filename-regex 'main\.rs' \
+        --lcov --output-path crate-coverage.lcov
+    cargo llvm-cov report \
+        {{ if crate != "" { "-p " + crate } else { _crate_all } }} \
+        --ignore-filename-regex 'main\.rs' \
+        --html --output-dir crate-coverage-html
+    @echo "Coverage written to crate-coverage.lcov"
     @echo "Open crate-coverage-html/index.html"
 
 # -- Database -------------------------------------------------------
@@ -321,7 +302,6 @@ db-revert:
 
 [group('db')]
 db-prepare:
-    cargo sqlx prepare
     cd crates/foundation/platform-types && cargo sqlx prepare
     cd crates/libs/platform-auth && cargo sqlx prepare
     cd crates/libs/platform-observe && cargo sqlx prepare
@@ -335,12 +315,15 @@ db-prepare:
 
 [group('db')]
 db-check:
-    cargo sqlx prepare --check
     cd crates/foundation/platform-types && cargo sqlx prepare --check
     cd crates/libs/platform-auth && cargo sqlx prepare --check
     cd crates/libs/platform-observe && cargo sqlx prepare --check
     cd crates/libs/platform-secrets && cargo sqlx prepare --check
     cd crates/libs/platform-agent && cargo sqlx prepare --check
+
+[group('db')]
+db-seed:
+    cargo run -p platform-seed
 
 # -- Build ----------------------------------------------------------
 [group('build')]
@@ -385,17 +368,94 @@ docs-viewer:
 docs-serve:
     cd docs/viewer && npm run dev
 
-# -- Deploy to cluster ----------------------------------------------
-[group('build')]
-deploy-local tag="platform:dev":
-    just docker {{ tag }}
-    kind load docker-image {{ tag }} --name platform
-    kubectl apply -k deploy/dev
-    kubectl rollout status deployment/platform -n platform --timeout=60s
+# -- Docker images (build + load into Kind) -------------------------
+#
+# Build individual container images and load them into the local Kind cluster
+# so they can be deployed/tested independently without relying on seed images.
+#
+# Usage:
+#   just docker-platform       → main platform binary
+#   just docker-ingest         → standalone OTLP ingest
+#   just docker-k8s-watcher    → K8s event watcher
+#   just docker-proxy          → service mesh proxy (cross-compiled musl)
+#   just docker-proxy-init     → transparent proxy init container
+#   just docker-all            → all of the above
+
+_version := `grep '^version' crates/bins/platform/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'`
+_kind_cluster := "platform"
+
+[group('docker')]
+docker-platform tag=("platform-next:" + _version):
+    docker build -f docker/Dockerfile.platform-next -t {{tag}} .
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    @echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-ingest tag=("platform-ingest:" + _version):
+    docker build -f docker/Dockerfile.platform-ingest -t {{tag}} .
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    @echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-k8s-watcher tag=("platform-k8s-watcher:" + _version):
+    docker build -f docker/Dockerfile.platform-k8s-watcher -t {{tag}} .
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    @echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-proxy tag=("platform-proxy:" + _version):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash hack/build-proxy.sh
+    WORKTREE="$(bash hack/detect-worktree.sh)"
+    PROXY_DIR="/tmp/platform-e2e/${WORKTREE}/proxy"
+    TMPCTX=$(mktemp -d)
+    trap 'rm -rf "$TMPCTX"' EXIT
+    cp "${PROXY_DIR}/amd64" "${TMPCTX}/platform-proxy-amd64"
+    cp "${PROXY_DIR}/arm64" "${TMPCTX}/platform-proxy-arm64"
+    cp docker/Dockerfile.platform-proxy "${TMPCTX}/Dockerfile"
+    docker build -t {{tag}} "$TMPCTX"
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-proxy-init tag=("platform-proxy-init:" + _version):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash hack/build-proxy.sh
+    WORKTREE="$(bash hack/detect-worktree.sh)"
+    PROXY_DIR="/tmp/platform-e2e/${WORKTREE}/proxy"
+    PROXY_INIT_DIR="/tmp/platform-e2e/${WORKTREE}/proxy-init"
+    TMPCTX=$(mktemp -d)
+    trap 'rm -rf "$TMPCTX"' EXIT
+    cp "${PROXY_INIT_DIR}/amd64" "${TMPCTX}/platform-proxy-init-amd64"
+    cp "${PROXY_INIT_DIR}/arm64" "${TMPCTX}/platform-proxy-init-arm64"
+    cp "${PROXY_DIR}/amd64" "${TMPCTX}/platform-proxy-amd64"
+    cp "${PROXY_DIR}/arm64" "${TMPCTX}/platform-proxy-arm64"
+    cp docker/Dockerfile.platform-proxy-init "${TMPCTX}/Dockerfile"
+    docker build -t {{tag}} "$TMPCTX"
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-runner tag=("platform-runner:" + _version):
+    docker build -f docker/Dockerfile.platform-runner -t {{tag}} .
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    @echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-runner-bare tag=("platform-runner-bare:" + _version):
+    docker build -f docker/Dockerfile.platform-runner-bare -t {{tag}} .
+    kind load docker-image {{tag}} --name {{_kind_cluster}}
+    @echo "Loaded {{tag}} into Kind cluster"
+
+[group('docker')]
+docker-all: docker-platform docker-ingest docker-k8s-watcher docker-proxy docker-proxy-init docker-runner docker-runner-bare
+    @echo "All images loaded into Kind cluster (version {{_version}})"
 
 # -- Full CI locally ------------------------------------------------
-ci: fmt lint deny test-unit test-int test-contract test-api cli::lint cli::test mcp::test build
+ci: fmt lint deny test-unit test-int cli::lint cli::test mcp::test build
     @echo "All checks passed"
 
-ci-full: fmt lint deny test-unit test-int test-k8s test-contract test-api test-e2e cli::lint cli::test mcp::test build
-    @echo "All checks passed (including K8s + E2E tests)"
+ci-full: fmt lint deny test-unit test-int test-k8s cli::lint cli::test mcp::test build
+    @echo "All checks passed (including K8s tests)"

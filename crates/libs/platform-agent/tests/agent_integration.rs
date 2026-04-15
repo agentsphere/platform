@@ -824,3 +824,356 @@ async fn fetch_session_not_found_returns_error(pool: PgPool) {
         other => panic!("expected SessionNotFound, got: {other}"),
     }
 }
+
+// ===========================================================================
+// ACL scoped client tests
+// ===========================================================================
+
+/// Create a fred Client using scoped ACL credentials (simulates agent-runner).
+///
+/// Extracts host:port from `VALKEY_URL` env var and combines with the ACL
+/// username/password, because `creds.url` uses `valkey_agent_host` which is
+/// for in-cluster pods and is not resolvable from the test host.
+async fn create_scoped_client(
+    creds: &platform_agent::valkey_acl::SessionValkeyCredentials,
+) -> fred::clients::Client {
+    let valkey_url =
+        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let after_scheme = valkey_url.strip_prefix("redis://").unwrap_or(&valkey_url);
+    let host_port = match after_scheme.find('@') {
+        Some(i) => &after_scheme[i + 1..],
+        None => after_scheme,
+    };
+    let scoped_url = format!(
+        "redis://{}:{}@{}",
+        creds.username, creds.password, host_port
+    );
+    let config = fred::types::config::Config::from_url(&scoped_url).expect("parse url");
+    let client = fred::clients::Client::new(config, None, None, None);
+    fred::interfaces::ClientLike::init(&client)
+        .await
+        .expect("init scoped client");
+    client
+}
+
+/// Scoped client can publish to its session's events channel; admin subscriber receives.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn acl_scoped_publish_subscribe(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let creds = platform_agent::valkey_acl::create_session_acl(&valkey, session_id, "localhost")
+        .await
+        .expect("create ACL");
+
+    assert!(creds.username.contains(&session_id.to_string()));
+    assert_eq!(creds.password.len(), 64);
+
+    // Platform admin subscribes to events channel
+    let events_ch = platform_agent::valkey_acl::events_channel(session_id);
+    let subscriber = valkey.next().clone_new();
+    subscriber.init().await.expect("init subscriber");
+    subscriber.subscribe(&events_ch).await.expect("subscribe");
+    let mut rx = subscriber.message_rx();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Scoped client publishes (agent-runner → platform)
+    let scoped = create_scoped_client(&creds).await;
+    let event = platform_agent::ProgressEvent {
+        kind: platform_agent::ProgressKind::Text,
+        message: "hello from agent".into(),
+        metadata: None,
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    scoped
+        .publish::<(), _, _>(&events_ch, &json)
+        .await
+        .expect("scoped publish");
+
+    // Platform receives the event
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    let payload: String = msg.value.convert().unwrap();
+    let received: platform_agent::ProgressEvent = serde_json::from_str(&payload).unwrap();
+    assert_eq!(received.kind, platform_agent::ProgressKind::Text);
+    assert_eq!(received.message, "hello from agent");
+
+    let _ = subscriber.unsubscribe(&events_ch).await;
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("cleanup");
+}
+
+/// Scoped client subscribes to input channel; platform sends prompt.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn acl_scoped_subscribe_input(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let creds = platform_agent::valkey_acl::create_session_acl(&valkey, session_id, "localhost")
+        .await
+        .expect("create ACL");
+
+    let scoped = create_scoped_client(&creds).await;
+
+    // Scoped client subscribes to input channel (agent-runner listens for prompts)
+    let input_ch = platform_agent::valkey_acl::input_channel(session_id);
+    let scoped_sub = scoped.clone_new();
+    scoped_sub.init().await.expect("init scoped subscriber");
+    scoped_sub.subscribe(&input_ch).await.expect("subscribe");
+    let mut rx = scoped_sub.message_rx();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Platform publishes prompt via admin connection
+    platform_agent::pubsub_bridge::publish_prompt(&valkey, session_id, "fix the bug")
+        .await
+        .expect("publish prompt");
+
+    // Scoped client receives it
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    let payload: String = msg.value.convert().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(parsed["type"], "prompt");
+    assert_eq!(parsed["content"], "fix the bug");
+
+    let _ = scoped_sub.unsubscribe(&input_ch).await;
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("cleanup");
+}
+
+/// Scoped client for session A cannot publish to session B's channels.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn acl_isolation_blocks_cross_session(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_a = Uuid::new_v4();
+    let session_b = Uuid::new_v4();
+
+    let creds_a = platform_agent::valkey_acl::create_session_acl(&valkey, session_a, "localhost")
+        .await
+        .expect("create ACL A");
+
+    let scoped_a = create_scoped_client(&creds_a).await;
+
+    // Publish to own session's channel → should succeed
+    let own_ch = platform_agent::valkey_acl::events_channel(session_a);
+    scoped_a
+        .publish::<(), _, _>(&own_ch, "allowed")
+        .await
+        .expect("publish to own channel should succeed");
+
+    // Attempt to publish to session B's events channel → should fail
+    let other_ch = platform_agent::valkey_acl::events_channel(session_b);
+    let result = scoped_a.publish::<(), _, _>(&other_ch, "intruder").await;
+    assert!(
+        result.is_err(),
+        "scoped client should not publish to another session's channel"
+    );
+
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_a)
+        .await
+        .expect("cleanup");
+}
+
+/// Delete ACL → new connection with same credentials fails.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn acl_cleanup_revokes_access(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let creds = platform_agent::valkey_acl::create_session_acl(&valkey, session_id, "localhost")
+        .await
+        .expect("create ACL");
+
+    // Verify scoped client works before deletion
+    let scoped = create_scoped_client(&creds).await;
+    let events_ch = platform_agent::valkey_acl::events_channel(session_id);
+    scoped
+        .publish::<(), _, _>(&events_ch, "works")
+        .await
+        .expect("should work before deletion");
+
+    // Delete ACL
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("delete ACL");
+
+    // New connection with the same credentials should fail
+    let valkey_url =
+        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let after_scheme = valkey_url.strip_prefix("redis://").unwrap_or(&valkey_url);
+    let host_port = match after_scheme.find('@') {
+        Some(i) => &after_scheme[i + 1..],
+        None => after_scheme,
+    };
+    let scoped_url = format!(
+        "redis://{}:{}@{}",
+        creds.username, creds.password, host_port
+    );
+    let config = fred::types::config::Config::from_url(&scoped_url).expect("parse url");
+    let new_client = fred::clients::Client::new(config, None, None, None);
+    let result = fred::interfaces::ClientLike::init(&new_client).await;
+    assert!(result.is_err(), "connection should fail after ACL deletion");
+}
+
+/// Deleting a non-existent ACL succeeds; double-delete succeeds.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn acl_delete_idempotent(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    // Delete non-existent — should succeed
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("delete non-existent");
+
+    // Create then delete twice
+    platform_agent::valkey_acl::create_session_acl(&valkey, session_id, "localhost")
+        .await
+        .expect("create ACL");
+
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("delete once");
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("delete twice");
+}
+
+/// `subscribe_session_events` receives events and closes on terminal event.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn subscribe_session_events_receives_events(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let mut rx = platform_agent::pubsub_bridge::subscribe_session_events(&valkey, session_id)
+        .await
+        .expect("subscribe");
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let events = vec![
+        platform_agent::ProgressEvent {
+            kind: platform_agent::ProgressKind::Thinking,
+            message: "hmm".into(),
+            metadata: None,
+        },
+        platform_agent::ProgressEvent {
+            kind: platform_agent::ProgressKind::ToolCall,
+            message: "Read".into(),
+            metadata: None,
+        },
+        platform_agent::ProgressEvent {
+            kind: platform_agent::ProgressKind::Text,
+            message: "result".into(),
+            metadata: None,
+        },
+        platform_agent::ProgressEvent {
+            kind: platform_agent::ProgressKind::Completed,
+            message: "done".into(),
+            metadata: None,
+        },
+    ];
+
+    for event in &events {
+        platform_agent::pubsub_bridge::publish_event(&valkey, session_id, event)
+            .await
+            .expect("publish");
+    }
+
+    // Receive all 4 events
+    for expected in &events {
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("channel closed");
+        assert_eq!(received.kind, expected.kind);
+        assert_eq!(received.message, expected.message);
+    }
+
+    // After Completed, the background task exits and channel closes
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+    assert!(
+        next.is_err() || next.unwrap().is_none(),
+        "channel should close after terminal event"
+    );
+}
+
+/// `subscribe_session_events` exits on Error event too.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn subscribe_session_events_exits_on_error(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let mut rx = platform_agent::pubsub_bridge::subscribe_session_events(&valkey, session_id)
+        .await
+        .expect("subscribe");
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let event = platform_agent::ProgressEvent {
+        kind: platform_agent::ProgressKind::Error,
+        message: "fatal error".into(),
+        metadata: None,
+    };
+    platform_agent::pubsub_bridge::publish_event(&valkey, session_id, &event)
+        .await
+        .expect("publish");
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+    assert_eq!(received.kind, platform_agent::ProgressKind::Error);
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+    assert!(
+        next.is_err() || next.unwrap().is_none(),
+        "channel should close after Error event"
+    );
+}
+
+/// `publish_control` reaches scoped subscriber on input channel.
+#[sqlx::test(migrations = "../../../migrations")]
+async fn publish_control_reaches_input_channel(_pool: PgPool) {
+    let valkey = valkey_pool().await;
+    let session_id = Uuid::new_v4();
+
+    let creds = platform_agent::valkey_acl::create_session_acl(&valkey, session_id, "localhost")
+        .await
+        .expect("create ACL");
+
+    let scoped = create_scoped_client(&creds).await;
+    let input_ch = platform_agent::valkey_acl::input_channel(session_id);
+    let scoped_sub = scoped.clone_new();
+    scoped_sub.init().await.expect("init scoped subscriber");
+    scoped_sub.subscribe(&input_ch).await.expect("subscribe");
+    let mut rx = scoped_sub.message_rx();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    platform_agent::pubsub_bridge::publish_control(&valkey, session_id, "interrupt")
+        .await
+        .expect("publish control");
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    let payload: String = msg.value.convert().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(parsed["type"], "control");
+    assert_eq!(parsed["control"]["type"], "interrupt");
+
+    let _ = scoped_sub.unsubscribe(&input_ch).await;
+    platform_agent::valkey_acl::delete_session_acl(&valkey, session_id)
+        .await
+        .expect("cleanup");
+}

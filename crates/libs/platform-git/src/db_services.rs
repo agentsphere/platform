@@ -265,76 +265,38 @@ impl<P: PermissionChecker + 'static> GitAccessControl for PgGitAccessControl<P> 
 // 5. PgPostReceiveHandler
 // ---------------------------------------------------------------------------
 
-/// Trait for side effects triggered by post-receive events.
+/// Post-receive handler backed by Postgres that publishes platform events.
 ///
-/// Allows different implementations (pipeline triggers, webhook dispatch,
-/// MR status updates) to be composed without the handler knowing the details.
-pub trait PostReceiveSideEffects: Send + Sync {
-    /// Trigger a pipeline for the push event.
-    fn trigger_pipeline(
-        &self,
-        project_id: Uuid,
-        branch: &str,
-        commit_sha: Option<&str>,
-        repo_path: &std::path::Path,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
-
-    /// Fire webhooks for a project event.
-    fn fire_webhooks(
-        &self,
-        project_id: Uuid,
-        event: &str,
-        payload: &serde_json::Value,
-    ) -> impl std::future::Future<Output = ()> + Send;
-}
-
-/// Post-receive handler backed by Postgres with pluggable side effects.
-pub struct PgPostReceiveHandler<S: PostReceiveSideEffects> {
+/// DB-local side effects (MR updates) are performed directly. Cross-module
+/// side effects (pipeline triggers, webhooks) are handled by publishing
+/// `PlatformEvent` variants, which the eventbus dispatches.
+pub struct PgPostReceiveHandler {
     pool: PgPool,
-    side_effects: S,
+    valkey: fred::clients::Pool,
 }
 
-impl<S: PostReceiveSideEffects> PgPostReceiveHandler<S> {
-    pub fn new(pool: PgPool, side_effects: S) -> Self {
-        Self { pool, side_effects }
+impl PgPostReceiveHandler {
+    pub fn new(pool: PgPool, valkey: fred::clients::Pool) -> Self {
+        Self { pool, valkey }
     }
 }
 
-impl<S: PostReceiveSideEffects + 'static> PostReceiveHandler for PgPostReceiveHandler<S> {
+impl PostReceiveHandler for PgPostReceiveHandler {
     async fn on_push(&self, params: &PushEvent) -> Result<(), anyhow::Error> {
-        // Fire push webhook
-        self.side_effects
-            .fire_webhooks(
-                params.project_id,
-                "push",
-                &serde_json::json!({
-                    "ref": format!("refs/heads/{}", params.branch),
-                    "after": params.commit_sha,
-                    "pusher": params.user_name,
-                }),
-            )
-            .await;
-
-        // Trigger pipeline if applicable
-        if let Err(e) = self
-            .side_effects
-            .trigger_pipeline(
-                params.project_id,
-                &params.branch,
-                params.commit_sha.as_deref(),
-                &params.repo_path,
-            )
-            .await
-        {
-            tracing::debug!(
-                error = %e,
-                project_id = %params.project_id,
-                branch = %params.branch,
-                "pipeline trigger skipped"
-            );
+        // Publish CodePushed event (eventbus handles pipeline trigger + webhooks)
+        let event = platform_types::events::PlatformEvent::CodePushed {
+            project_id: params.project_id,
+            user_id: params.user_id,
+            user_name: params.user_name.clone(),
+            repo_path: params.repo_path.clone(),
+            branch: params.branch.clone(),
+            commit_sha: params.commit_sha.clone(),
+        };
+        if let Err(e) = platform_types::events::publish(&self.valkey, &event).await {
+            tracing::warn!(error = %e, "failed to publish CodePushed event");
         }
 
-        // Update any open MRs that match the pushed branch
+        // Update any open MRs that match the pushed branch (local DB side effect)
         let _ = sqlx::query!(
             "UPDATE merge_requests SET updated_at = now()
              WHERE project_id = $1 AND source_branch = $2 AND status = 'open'",
@@ -348,23 +310,24 @@ impl<S: PostReceiveSideEffects + 'static> PostReceiveHandler for PgPostReceiveHa
     }
 
     async fn on_tag(&self, params: &TagEvent) -> Result<(), anyhow::Error> {
-        self.side_effects
-            .fire_webhooks(
-                params.project_id,
-                "tag",
-                &serde_json::json!({
-                    "ref": format!("refs/tags/{}", params.tag_name),
-                    "after": params.commit_sha,
-                    "pusher": params.user_name,
-                }),
-            )
-            .await;
+        // Publish TagPushed event (eventbus handles webhooks)
+        let event = platform_types::events::PlatformEvent::TagPushed {
+            project_id: params.project_id,
+            user_id: params.user_id,
+            user_name: params.user_name.clone(),
+            repo_path: params.repo_path.clone(),
+            tag_name: params.tag_name.clone(),
+            commit_sha: params.commit_sha.clone(),
+        };
+        if let Err(e) = platform_types::events::publish(&self.valkey, &event).await {
+            tracing::warn!(error = %e, "failed to publish TagPushed event");
+        }
 
         Ok(())
     }
 
     async fn on_mr_sync(&self, params: &MrSyncEvent) -> Result<(), anyhow::Error> {
-        // Update MR head SHA
+        // Update MR head SHA (local DB side effect)
         let _ = sqlx::query!(
             "UPDATE merge_requests SET head_sha = $1, updated_at = now()
              WHERE project_id = $2 AND source_branch = $3 AND status = 'open'",
@@ -375,18 +338,17 @@ impl<S: PostReceiveSideEffects + 'static> PostReceiveHandler for PgPostReceiveHa
         .execute(&self.pool)
         .await;
 
-        // Fire MR sync webhook
-        self.side_effects
-            .fire_webhooks(
-                params.project_id,
-                "mr",
-                &serde_json::json!({
-                    "action": "synchronize",
-                    "branch": params.branch,
-                    "head_sha": params.commit_sha,
-                }),
-            )
-            .await;
+        // Publish MrBranchSynced event (eventbus handles webhooks)
+        let event = platform_types::events::PlatformEvent::MrBranchSynced {
+            project_id: params.project_id,
+            user_id: params.user_id,
+            repo_path: params.repo_path.clone(),
+            branch: params.branch.clone(),
+            commit_sha: params.commit_sha.clone(),
+        };
+        if let Err(e) = platform_types::events::publish(&self.valkey, &event).await {
+            tracing::warn!(error = %e, "failed to publish MrBranchSynced event");
+        }
 
         Ok(())
     }
@@ -446,27 +408,11 @@ mod tests {
     }
 
     #[test]
-    fn post_receive_handler_compiles_with_mock() {
-        struct MockSideEffects;
-        impl PostReceiveSideEffects for MockSideEffects {
-            async fn trigger_pipeline(
-                &self,
-                _project_id: Uuid,
-                _branch: &str,
-                _commit_sha: Option<&str>,
-                _repo_path: &std::path::Path,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn fire_webhooks(
-                &self,
-                _project_id: Uuid,
-                _event: &str,
-                _payload: &serde_json::Value,
-            ) {
-            }
+    fn post_receive_handler_is_constructible() {
+        // Verify PgPostReceiveHandler compiles (needs PgPool + fred::Pool at runtime)
+        fn make(pool: PgPool, valkey: fred::clients::Pool) -> PgPostReceiveHandler {
+            PgPostReceiveHandler::new(pool, valkey)
         }
-        // Verify the generic compiles (needs a PgPool at runtime)
-        let _ctor = |pool: PgPool| PgPostReceiveHandler::new(pool, MockSideEffects);
+        let _ = make as fn(PgPool, fred::clients::Pool) -> PgPostReceiveHandler;
     }
 }

@@ -22,9 +22,6 @@ use crate::config::PipelineConfig;
 /// `src/` provides a concrete implementation that delegates to the real
 /// deployer, API, and reconciler modules.
 pub trait PipelineServices: Send + Sync + Clone + 'static {
-    /// Attempt to auto-merge any open MRs for the given project.
-    fn try_auto_merge(&self, project_id: Uuid) -> impl Future<Output = ()> + Send;
-
     /// Fire webhooks for a project event.
     fn fire_webhooks(
         &self,
@@ -137,15 +134,10 @@ impl TaskHeartbeat for NoopHeartbeat {
 /// `Arc<Mutex<_>>` so clones share state (required by the `Clone` bound).
 #[derive(Clone, Default)]
 pub struct MockPipelineServices {
-    pub auto_merge_calls: Arc<std::sync::Mutex<Vec<Uuid>>>,
     pub webhook_calls: Arc<std::sync::Mutex<Vec<(Uuid, String, serde_json::Value)>>>,
 }
 
 impl PipelineServices for MockPipelineServices {
-    async fn try_auto_merge(&self, project_id: Uuid) {
-        self.auto_merge_calls.lock().unwrap().push(project_id);
-    }
-
     async fn fire_webhooks(&self, project_id: Uuid, event_name: &str, payload: &serde_json::Value) {
         self.webhook_calls.lock().unwrap().push((
             project_id,

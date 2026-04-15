@@ -773,7 +773,12 @@ async fn reap_idle_sessions(state: &AgentState) -> Result<(), AgentError> {
         .await;
 
         if let Some(pid) = s.project_id {
-            fire_agent_webhook(state.webhook_dispatcher.as_ref(), pid, s.id, "completed").await;
+            let event = platform_types::events::PlatformEvent::AgentSessionEnded {
+                project_id: pid,
+                session_id: s.id,
+                status: "completed".into(),
+            };
+            let _ = platform_types::events::publish(&state.valkey, &event).await;
         }
 
         tracing::info!(session_id = %s.id, "idle agent session reaped");
@@ -816,7 +821,12 @@ async fn finalize_reaped_session(
     }
 
     if let Some(pid) = project_id {
-        fire_agent_webhook(state.webhook_dispatcher.as_ref(), pid, session_id, status).await;
+        let event = platform_types::events::PlatformEvent::AgentSessionEnded {
+            project_id: pid,
+            session_id,
+            status: status.to_string(),
+        };
+        let _ = platform_types::events::publish(&state.valkey, &event).await;
     }
 
     notify_parent_of_completion(state, session_id, status).await;
@@ -1243,22 +1253,6 @@ async fn capture_session_logs(
             tracing::warn!(error = %e, pod = pod_name, "failed to read agent pod logs");
         }
     }
-}
-
-async fn fire_agent_webhook(
-    webhook_dispatcher: &dyn crate::state::DynWebhookDispatcher,
-    project_id: Uuid,
-    session_id: Uuid,
-    status: &str,
-) {
-    let payload = serde_json::json!({
-        "action": status,
-        "session_id": session_id,
-        "project_id": project_id,
-    });
-    webhook_dispatcher
-        .fire_webhooks(project_id, "agent", &payload)
-        .await;
 }
 
 /// Notify the parent session (Manager Agent) when a child session completes or fails.

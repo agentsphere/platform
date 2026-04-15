@@ -1,24 +1,20 @@
 # Full agent runtime image: agent-runner + Claude Code CLI + MCP servers
 #
-# Multi-stage build:
-#   1. Build agent-runner from source
-#   2. Assemble runtime image with all tools pre-installed
+# Multi-stage build: compiles agent-runner from source, then assembles the
+# runtime image with Node.js, Kaniko, kubectl, MCP servers, and Playwright.
+#
+# Usage: docker build -f docker/Dockerfile.platform-runner -t platform-runner .
 
-# ── Stage 1: Build agent-runner ───────────────────────────────────────────
+# Stage 1: Build agent-runner from source
 FROM rust:1.93-slim-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+ENV SQLX_OFFLINE=true
+RUN cargo build --release -p platform-agent-runner \
+  && cp target/release/agent-runner /agent-runner
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev \
-  && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release -p platform-agent-runner \
-    && cp target/release/agent-runner /usr/local/bin/agent-runner
-
-# ── Stage 2: Runtime image ────────────────────────────────────────────────
+# Stage 2: Runtime
 FROM gcr.io/kaniko-project/executor:v1.23.2 AS kaniko
 
 FROM node:22-slim
@@ -45,7 +41,7 @@ RUN mkdir -p /kaniko/ssl/certs \
   && chown -R 1000:1000 /kaniko
 
 # Agent-runner from build stage
-COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
+COPY --from=builder /agent-runner /usr/local/bin/agent-runner
 
 # Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code@1.0.16

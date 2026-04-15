@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn truncate_does_not_panic_on_empty() {
-        let result = read_progress(Path::new("/nonexistent/file.md"));
+        let _result = read_progress(Path::new("/nonexistent/file.md"));
         // This is async, but we test the sync logic via path resolution
         assert!(Path::new("/nonexistent/file.md").parent().is_some());
     }

@@ -670,6 +670,7 @@ mod tests {
     fn subsystem_status_copy_clone() {
         let s = SubsystemStatus::Healthy;
         let s2 = s;
+        #[allow(clippy::clone_on_copy)]
         let s3 = s.clone();
         assert_eq!(s, s2);
         assert_eq!(s, s3);

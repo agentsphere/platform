@@ -126,6 +126,18 @@ pub enum PlatformEvent {
         branch: String,
         commit_sha: Option<String>,
     },
+    /// An agent session ended (completed, failed, timed out).
+    AgentSessionEnded {
+        project_id: Uuid,
+        session_id: Uuid,
+        status: String,
+    },
+    /// A pipeline finished execution (success or failure).
+    PipelineCompleted {
+        pipeline_id: Uuid,
+        project_id: Uuid,
+        status: String,
+    },
 }
 
 /// Publish a [`PlatformEvent`] to the Valkey event bus.
@@ -348,6 +360,16 @@ mod tests {
                 branch: "feature/login".into(),
                 commit_sha: Some("abc123".into()),
             },
+            PlatformEvent::AgentSessionEnded {
+                project_id: Uuid::nil(),
+                session_id: Uuid::nil(),
+                status: "completed".into(),
+            },
+            PlatformEvent::PipelineCompleted {
+                pipeline_id: Uuid::nil(),
+                project_id: Uuid::nil(),
+                status: "success".into(),
+            },
         ];
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
@@ -469,6 +491,42 @@ mod tests {
             } => {
                 assert_eq!(branch, "feature/login");
                 assert_eq!(commit_sha.as_deref(), Some("abc123def456"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn platform_event_serde_roundtrip_agent_session_ended() {
+        let event = PlatformEvent::AgentSessionEnded {
+            project_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            status: "completed".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"AgentSessionEnded""#));
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::AgentSessionEnded { status, .. } => {
+                assert_eq!(status, "completed");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn platform_event_serde_roundtrip_pipeline_completed() {
+        let event = PlatformEvent::PipelineCompleted {
+            pipeline_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            status: "success".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"PipelineCompleted""#));
+        let parsed: PlatformEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PlatformEvent::PipelineCompleted { status, .. } => {
+                assert_eq!(status, "success");
             }
             _ => panic!("wrong variant"),
         }

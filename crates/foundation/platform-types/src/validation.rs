@@ -34,6 +34,18 @@ pub fn check_name(value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validates an email address: 3-254 chars, exactly one `@` with non-empty parts.
+pub fn check_email(value: &str) -> Result<(), ApiError> {
+    check_length("email", value, 3, 254)?;
+    let parts: Vec<&str> = value.splitn(3, '@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(ApiError::BadRequest(
+            "email: must have exactly one @ with non-empty local and domain parts".into(),
+        ));
+    }
+    Ok(())
+}
+
 const GIT_UNSAFE: &[char] = &['~', '^', ':', '*', '[', '?', '\\'];
 
 /// Validates a git branch name.

@@ -38,7 +38,10 @@ pub use validation::slugify_branch;
 
 /// Generic paginated list response.
 #[derive(Debug, serde::Serialize)]
-pub struct ListResponse<T: serde::Serialize> {
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export))]
+pub struct ListResponse<T> {
     pub items: Vec<T>,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub total: i64,
 }

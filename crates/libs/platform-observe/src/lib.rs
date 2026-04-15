@@ -43,12 +43,15 @@ pub fn spawn_background_tasks(
 
     tracker.spawn(ingest::flush_spans(
         state.pool.clone(),
+        state.valkey.clone(),
+        state.alert_router.clone(),
         spans_rx,
         cancel.clone(),
     ));
     tracker.spawn(ingest::flush_logs(
         state.pool.clone(),
         state.valkey.clone(),
+        state.alert_router.clone(),
         logs_rx,
         cancel.clone(),
     ));
@@ -73,6 +76,7 @@ pub fn spawn_background_tasks(
         state.valkey.clone(),
         state.alert_router.clone(),
         cancel.clone(),
+        None,
     ));
 
     // Stream alert evaluator — replaces the poll-based evaluate_alerts_loop.

@@ -6,6 +6,7 @@
 pub mod auth_user;
 pub mod extract;
 pub mod lookup;
+pub mod passkey;
 pub mod password;
 pub mod rate_limit;
 pub mod resolver;
@@ -18,6 +19,6 @@ pub use extract::{cidr_matches, extract_bearer_token, extract_ip, extract_sessio
 pub use lookup::{SessionAuthLookup, TokenAuthLookup, lookup_api_token, lookup_session};
 pub use password::{dummy_hash, hash_password, verify_password};
 pub use rate_limit::check_rate;
-pub use resolver::PgPermissionChecker;
+pub use resolver::{PgPermissionChecker, set_cache_ttl};
 pub use token::{generate_api_token, generate_session_token, hash_token};
 pub use workspace::PgWorkspaceMembershipChecker;

@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use platform_auth::{password, token};
 use platform_auth::resolver;
+use platform_auth::{password, token};
 use platform_types::validation;
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, Permission, UserType, send_audit};
+use platform_types::{
+    ApiError, AuditEntry, AuthUser, ListResponse, Permission, UserType, send_audit,
+};
 
 use crate::api::helpers::require_admin;
 use crate::state::PlatformState;
@@ -53,7 +55,8 @@ pub struct ListParams {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, rename = "User")]
 pub struct UserResponse {
     pub id: Uuid,
     pub name: String,
@@ -65,7 +68,8 @@ pub struct UserResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LoginResponse {
     pub token: String,
     pub expires_at: DateTime<Utc>,
@@ -80,7 +84,8 @@ pub struct CreateTokenRequest {
     pub expires_in_days: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, rename = "ApiToken")]
 pub struct TokenResponse {
     pub id: Uuid,
     pub name: String,
@@ -91,7 +96,8 @@ pub struct TokenResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CreateTokenResponse {
     pub token: String,
     #[serde(flatten)]
@@ -202,7 +208,7 @@ async fn login(
     };
 
     // Set session cookie + return JSON
-    let secure_flag = if state.config.secure_cookies {
+    let secure_flag = if state.config.auth.secure_cookies {
         "; Secure"
     } else {
         ""
@@ -304,7 +310,10 @@ async fn logout(
     ))
 }
 
-async fn me(State(state): State<PlatformState>, auth: AuthUser) -> Result<Json<UserResponse>, ApiError> {
+async fn me(
+    State(state): State<PlatformState>,
+    auth: AuthUser,
+) -> Result<Json<UserResponse>, ApiError> {
     let user = sqlx::query!(
         r#"
         SELECT id, name, display_name, email, user_type, is_active, created_at, updated_at
@@ -673,7 +682,7 @@ async fn create_api_token(
     const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
 
     // S71: Max expiry configurable via PLATFORM_TOKEN_MAX_EXPIRY_DAYS (default 365)
-    let max_days = i64::from(state.config.token_max_expiry_days);
+    let max_days = i64::from(state.config.auth.token_max_expiry_days);
     let days = body.expires_in_days.unwrap_or(DEFAULT_TOKEN_EXPIRY_DAYS);
     if !(1..=max_days).contains(&days) {
         return Err(ApiError::BadRequest(format!(
@@ -737,14 +746,10 @@ async fn validate_token_scopes(
     scopes: &[String],
     project_id: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    let user_perms = resolver::effective_permissions(
-        &state.pool,
-        &state.valkey,
-        auth.user_id,
-        project_id,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
+    let user_perms =
+        resolver::effective_permissions(&state.pool, &state.valkey, auth.user_id, project_id)
+            .await
+            .map_err(ApiError::Internal)?;
 
     let user_perm_strings: std::collections::HashSet<&str> =
         user_perms.iter().map(|p| p.as_str()).collect();

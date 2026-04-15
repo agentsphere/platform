@@ -1,0 +1,32 @@
+# Standalone OTLP ingest binary.
+# Receives traces, logs, metrics over HTTP protobuf; flushes to Postgres;
+# publishes live-tail events to Valkey.
+
+# Stage 1: Dependency recipe
+FROM rust:1.93-slim-bookworm AS planner
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 2: Build deps + binary
+FROM rust:1.93-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+ENV SQLX_OFFLINE=true
+RUN cargo build --release -p platform-ingest
+
+# Stage 3: Minimal runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r -g 1000 platform \
+    && useradd -r -s /sbin/nologin -u 1000 -g 1000 platform
+COPY --from=builder /app/target/release/platform-ingest /platform-ingest
+EXPOSE 4318
+USER 1000
+ENTRYPOINT ["/platform-ingest"]

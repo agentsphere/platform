@@ -1,0 +1,10 @@
+# Keep context small — only whitelist what the build needs
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates/
+!migrations/
+
+**/target/
+**/node_modules/

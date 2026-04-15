@@ -1,0 +1,12 @@
+# Keep context small — only whitelist what the build needs
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates/
+!mcp/
+!docker/entrypoint.sh
+!docker/platform-build-status.sh
+
+**/target/
+**/node_modules/

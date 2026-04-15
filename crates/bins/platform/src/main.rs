@@ -12,6 +12,7 @@ mod config;
 mod eventbus;
 mod middleware;
 mod state;
+mod ui;
 
 use std::sync::Arc;
 
@@ -40,6 +41,8 @@ async fn main() -> anyhow::Result<()> {
     // ── HTTP server ──────────────────────────────────────────────────────
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .merge(api::router())
+        .fallback(ui::static_handler)
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&state.config.core.listen).await?;

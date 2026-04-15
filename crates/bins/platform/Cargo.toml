@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace crates
-platform-types = { path = "../../foundation/platform-types", features = ["kube", "opendal"] }
+platform-types = { path = "../../foundation/platform-types", features = ["kube", "opendal", "ts"] }
 platform-auth = { path = "../../libs/platform-auth" }
 platform-pipeline = { path = "../../libs/platform-pipeline" }
 platform-deployer = { path = "../../libs/platform-deployer" }
@@ -104,6 +104,9 @@ ipnetwork = "0.20"
 
 # Embedded UI
 rust-embed = { version = "8", features = ["compression"] }
+
+# TypeScript type generation
+ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-compat", "serde-json-impl"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -18,26 +18,173 @@ use platform_types::ApiError;
 // Alert query DSL
 // ---------------------------------------------------------------------------
 
-/// Parsed alert query. Format: `metric:<name> [labels:{json}] [agg:<func>] [window:<secs>]`
+/// Signal type for alert routing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AlertSignal {
+    /// Named metric (existing): `metric:<name>`
+    Metric { name: String },
+    /// Log count: `log:count`
+    LogCount,
+    /// Log rate (matching / all): `log:rate`
+    LogRate,
+    /// Span count: `span:count`
+    SpanCount,
+    /// Span error rate: `span:rate`
+    SpanRate,
+    /// Span duration: `span:duration`
+    SpanDuration,
+    /// Trace (root span) count: `trace:count`
+    TraceCount,
+    /// Trace error rate: `trace:rate`
+    TraceRate,
+    /// Trace duration: `trace:duration`
+    TraceDuration,
+}
+
+impl AlertSignal {
+    /// Return the metric name if this is a `Metric` signal.
+    pub fn metric_name(&self) -> Option<&str> {
+        match self {
+            Self::Metric { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a log-type signal.
+    pub fn is_log(&self) -> bool {
+        matches!(self, Self::LogCount | Self::LogRate)
+    }
+
+    /// Whether this is a span or trace signal.
+    pub fn is_span_or_trace(&self) -> bool {
+        matches!(
+            self,
+            Self::SpanCount
+                | Self::SpanRate
+                | Self::SpanDuration
+                | Self::TraceCount
+                | Self::TraceRate
+                | Self::TraceDuration
+        )
+    }
+
+    /// Whether this is a rate signal (needs all records in scope, not just matches).
+    pub fn is_rate(&self) -> bool {
+        matches!(self, Self::LogRate | Self::SpanRate | Self::TraceRate)
+    }
+
+    /// Whether this is a trace (root-span-only) signal.
+    pub fn is_trace_only(&self) -> bool {
+        matches!(
+            self,
+            Self::TraceCount | Self::TraceRate | Self::TraceDuration
+        )
+    }
+
+    /// Whether this is a duration signal.
+    pub fn is_duration(&self) -> bool {
+        matches!(self, Self::SpanDuration | Self::TraceDuration)
+    }
+}
+
+/// Parsed alert query.
+///
+/// Format: `<signal> [labels:{json}] [agg:<func>] [window:<secs>] [level:<levels>]
+///           [regex:<pattern>] [status:<status>] [service:<name>] [name:<name>]`
 pub struct AlertQuery {
-    pub metric_name: String,
+    pub signal: AlertSignal,
     pub labels: Option<serde_json::Value>,
     pub aggregation: String,
     pub window_secs: i32,
+    /// Log level filter (e.g. `["error"]` or `["error", "critical"]`).
+    pub level_filter: Option<Vec<String>>,
+    /// Regex filter for log messages (validated at parse time).
+    pub regex_filter: Option<String>,
+    /// Status filter for spans/traces (`"error"` or `"ok"`).
+    pub status_filter: Option<String>,
+    /// Service name filter.
+    pub service_filter: Option<String>,
+    /// Span/trace name filter.
+    pub name_filter: Option<String>,
 }
 
+const VALID_LOG_LEVELS: &[&str] = &["debug", "info", "warning", "error", "critical"];
+
+/// Extract `regex:"<pattern>"` from the query string, handling quoted patterns
+/// that may contain spaces. Returns the query with the regex token removed.
+fn extract_regex_filter(query: &str, out: &mut Option<String>) -> Result<String, ApiError> {
+    let Some(start) = query.find("regex:\"") else {
+        // Also handle unquoted regex (no spaces)
+        if let Some(pos) = query.find("regex:") {
+            let rest = &query[pos + 6..];
+            let end = rest.find(' ').unwrap_or(rest.len());
+            let pattern = &rest[..end];
+            regex::Regex::new(pattern)
+                .map_err(|e| ApiError::BadRequest(format!("invalid regex pattern: {e}")))?;
+            *out = Some(pattern.to_string());
+            let mut cleaned = query[..pos].to_string();
+            cleaned.push_str(&query[pos + 6 + end..]);
+            return Ok(cleaned);
+        }
+        return Ok(query.to_string());
+    };
+
+    let after_quote = start + 7; // skip `regex:"`
+    let Some(end_quote) = query[after_quote..].find('"') else {
+        return Err(ApiError::BadRequest(
+            "unterminated regex pattern — missing closing quote".into(),
+        ));
+    };
+    let pattern = &query[after_quote..after_quote + end_quote];
+    regex::Regex::new(pattern)
+        .map_err(|e| ApiError::BadRequest(format!("invalid regex pattern: {e}")))?;
+    *out = Some(pattern.to_string());
+
+    // Remove the regex:"..." token from the query for further parsing
+    let mut cleaned = query[..start].to_string();
+    cleaned.push_str(&query[after_quote + end_quote + 1..]);
+    Ok(cleaned)
+}
+
+#[allow(clippy::too_many_lines)]
 pub fn parse_alert_query(query: &str) -> Result<AlertQuery, ApiError> {
     platform_types::validation::check_length("query", query, 1, 1000)?;
 
-    let mut metric_name = None;
+    let mut signal: Option<AlertSignal> = None;
     let mut labels = None;
     let mut aggregation = "avg".to_string();
     let mut window_secs: i32 = 300;
+    let mut level_filter = None;
+    let mut regex_filter = None;
+    let mut status_filter = None;
+    let mut service_filter = None;
+    let mut name_filter = None;
 
-    for part in query.split_whitespace() {
+    // Pre-extract regex:"..." (may contain spaces) before whitespace splitting
+    let query_for_split = extract_regex_filter(query, &mut regex_filter)?;
+
+    for part in query_for_split.split_whitespace() {
         if let Some(name) = part.strip_prefix("metric:") {
             platform_types::validation::check_length("metric_name", name, 1, 255)?;
-            metric_name = Some(name.to_string());
+            signal = Some(AlertSignal::Metric {
+                name: name.to_string(),
+            });
+        } else if part == "log:count" {
+            signal = Some(AlertSignal::LogCount);
+        } else if part == "log:rate" {
+            signal = Some(AlertSignal::LogRate);
+        } else if part == "span:count" {
+            signal = Some(AlertSignal::SpanCount);
+        } else if part == "span:rate" {
+            signal = Some(AlertSignal::SpanRate);
+        } else if part == "span:duration" {
+            signal = Some(AlertSignal::SpanDuration);
+        } else if part == "trace:count" {
+            signal = Some(AlertSignal::TraceCount);
+        } else if part == "trace:rate" {
+            signal = Some(AlertSignal::TraceRate);
+        } else if part == "trace:duration" {
+            signal = Some(AlertSignal::TraceDuration);
         } else if let Some(json) = part.strip_prefix("labels:") {
             labels = Some(
                 serde_json::from_str(json)
@@ -57,17 +204,78 @@ pub fn parse_alert_query(query: &str) -> Result<AlertQuery, ApiError> {
                     "window must be between 10 and 86400 seconds".into(),
                 ));
             }
+        } else if let Some(levels) = part.strip_prefix("level:") {
+            let parsed: Vec<String> = levels.split(',').map(|l| l.trim().to_lowercase()).collect();
+            for l in &parsed {
+                if !VALID_LOG_LEVELS.contains(&l.as_str()) {
+                    return Err(ApiError::BadRequest(format!("unknown log level: {l}")));
+                }
+            }
+            level_filter = Some(parsed);
+        } else if let Some(status) = part.strip_prefix("status:") {
+            if !["error", "ok"].contains(&status) {
+                return Err(ApiError::BadRequest(format!(
+                    "status must be 'error' or 'ok', got: {status}"
+                )));
+            }
+            status_filter = Some(status.to_string());
+        } else if let Some(svc) = part.strip_prefix("service:") {
+            platform_types::validation::check_length("service", svc, 1, 255)?;
+            service_filter = Some(svc.to_string());
+        } else if let Some(n) = part.strip_prefix("name:") {
+            platform_types::validation::check_length("name", n, 1, 255)?;
+            name_filter = Some(n.to_string());
         }
     }
 
-    let metric_name = metric_name
-        .ok_or_else(|| ApiError::BadRequest("query must include metric:<name>".into()))?;
+    let signal = signal
+        .ok_or_else(|| ApiError::BadRequest("query must include a signal (metric:<name>, log:count, log:rate, span:count, span:rate, span:duration, trace:count, trace:rate, trace:duration)".into()))?;
+
+    // Validation: log rate requires level_filter
+    if signal == AlertSignal::LogRate && level_filter.is_none() {
+        return Err(ApiError::BadRequest(
+            "log:rate requires level:<levels> to define the matching criteria".into(),
+        ));
+    }
+
+    // Validation: level filter only valid on log signals
+    if level_filter.is_some() && !signal.is_log() {
+        return Err(ApiError::BadRequest(
+            "level: filter is only valid for log:count and log:rate signals".into(),
+        ));
+    }
+
+    // Validation: regex only valid on log signals
+    if regex_filter.is_some() && !signal.is_log() {
+        return Err(ApiError::BadRequest(
+            "regex: filter is only valid for log signals".into(),
+        ));
+    }
+
+    // Validation: status only valid on span/trace signals
+    if status_filter.is_some() && !signal.is_span_or_trace() {
+        return Err(ApiError::BadRequest(
+            "status: filter is only valid for span/trace signals".into(),
+        ));
+    }
+
+    // Validation: name only valid on span/trace signals
+    if name_filter.is_some() && !signal.is_span_or_trace() {
+        return Err(ApiError::BadRequest(
+            "name: filter is only valid for span/trace signals".into(),
+        ));
+    }
 
     Ok(AlertQuery {
-        metric_name,
+        signal,
         labels,
         aggregation,
         window_secs,
+        level_filter,
+        regex_filter,
+        status_filter,
+        service_filter,
+        name_filter,
     })
 }
 
@@ -85,17 +293,52 @@ pub fn validate_condition(condition: &str) -> Result<(), ApiError> {
 }
 
 // ---------------------------------------------------------------------------
-// AlertRouter — maps (metric_name, project_id) to matching rule IDs
+// AlertRouter — multi-signal routing
 // ---------------------------------------------------------------------------
 
-/// Key for the routing table: (`metric_name`, `project_id`).
-/// `None` `project_id` = platform-level metrics only.
-type RouteKey = (String, Option<Uuid>);
+/// Route entry for metric rules.
+pub(crate) struct MetricRouteEntry {
+    pub rule_id: Uuid,
+    pub labels: Option<serde_json::Value>,
+}
 
-/// Read-only index mapping `(metric_name, project_id)` to rule IDs + label filters.
+/// Route entry for log rules.
+pub(crate) struct LogRouteEntry {
+    pub rule_id: Uuid,
+    pub signal: AlertSignal,
+    pub level_filter: Option<Vec<String>>,
+    pub regex_filter: Option<regex::Regex>,
+    pub service_filter: Option<String>,
+}
+
+/// Route entry for span/trace rules.
+pub(crate) struct SpanRouteEntry {
+    pub rule_id: Uuid,
+    pub signal: AlertSignal,
+    pub status_filter: Option<String>,
+    pub service_filter: Option<String>,
+    pub name_filter: Option<String>,
+}
+
+/// Input data for span alert matching.
+pub(crate) struct SpanAlertInput<'a> {
+    pub name: &'a str,
+    pub service: &'a str,
+    pub status: &'a str,
+    pub duration_ms: Option<f64>,
+    pub is_root: bool,
+}
+
+/// Read-only index for routing ingest records to alert rules.
 /// Built from DB, rebuilt on rule-change notification.
+#[allow(clippy::struct_field_names)]
 pub struct AlertRouter {
-    routes: HashMap<RouteKey, Vec<(Uuid, Option<serde_json::Value>)>>,
+    /// Metric rules: `(metric_name, project_id)` → entries.
+    metric_routes: HashMap<(String, Option<Uuid>), Vec<MetricRouteEntry>>,
+    /// Log rules: `project_id` → entries.
+    log_routes: HashMap<Option<Uuid>, Vec<LogRouteEntry>>,
+    /// Span/trace rules: `project_id` → entries.
+    span_routes: HashMap<Option<Uuid>, Vec<SpanRouteEntry>>,
 }
 
 impl AlertRouter {
@@ -109,25 +352,75 @@ impl AlertRouter {
         .fetch_all(pool)
         .await?;
 
-        let mut routes: HashMap<RouteKey, Vec<(Uuid, Option<serde_json::Value>)>> = HashMap::new();
+        let mut metric_routes: HashMap<(String, Option<Uuid>), Vec<MetricRouteEntry>> =
+            HashMap::new();
+        let mut log_routes: HashMap<Option<Uuid>, Vec<LogRouteEntry>> = HashMap::new();
+        let mut span_routes: HashMap<Option<Uuid>, Vec<SpanRouteEntry>> = HashMap::new();
+
         for row in &rows {
             let id: Uuid = row.get("id");
             let query_str: String = row.get("query");
             let project_id: Option<Uuid> = row.get("project_id");
 
-            if let Ok(aq) = parse_alert_query(&query_str) {
-                let key = (aq.metric_name, project_id);
-                routes.entry(key).or_default().push((id, aq.labels));
+            let Ok(aq) = parse_alert_query(&query_str) else {
+                continue;
+            };
+
+            match &aq.signal {
+                AlertSignal::Metric { name } => {
+                    let key = (name.clone(), project_id);
+                    metric_routes
+                        .entry(key)
+                        .or_default()
+                        .push(MetricRouteEntry {
+                            rule_id: id,
+                            labels: aq.labels,
+                        });
+                }
+                s if s.is_log() => {
+                    let compiled_regex = aq
+                        .regex_filter
+                        .as_ref()
+                        .and_then(|p| regex::Regex::new(p).ok());
+                    log_routes
+                        .entry(project_id)
+                        .or_default()
+                        .push(LogRouteEntry {
+                            rule_id: id,
+                            signal: aq.signal,
+                            level_filter: aq.level_filter,
+                            regex_filter: compiled_regex,
+                            service_filter: aq.service_filter,
+                        });
+                }
+                _ => {
+                    span_routes
+                        .entry(project_id)
+                        .or_default()
+                        .push(SpanRouteEntry {
+                            rule_id: id,
+                            signal: aq.signal,
+                            status_filter: aq.status_filter,
+                            service_filter: aq.service_filter,
+                            name_filter: aq.name_filter,
+                        });
+                }
             }
         }
 
-        Ok(Self { routes })
+        Ok(Self {
+            metric_routes,
+            log_routes,
+            span_routes,
+        })
     }
 
     /// Build an empty router (no rules loaded).
     pub fn empty() -> Self {
         Self {
-            routes: HashMap::new(),
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: HashMap::new(),
         }
     }
 
@@ -140,23 +433,135 @@ impl AlertRouter {
         project_id: Option<Uuid>,
     ) -> Vec<Uuid> {
         let key = (name.to_string(), project_id);
-        let Some(candidates) = self.routes.get(&key) else {
+        let Some(candidates) = self.metric_routes.get(&key) else {
             return Vec::new();
         };
 
         candidates
             .iter()
-            .filter(|(_, filter)| match filter {
+            .filter(|e| match &e.labels {
                 None => true,
                 Some(f) => labels_subset(f, labels),
             })
-            .map(|(id, _)| *id)
+            .map(|e| e.rule_id)
             .collect()
     }
 
-    /// Whether the router has zero rules.
+    /// Match log rules. Returns `(rule_id, value)` pairs.
+    ///
+    /// For count rules: value = 1.0 only if the log matches all filters.
+    /// For rate rules: value = 1.0 if level matches, 0.0 if not (every log in
+    /// scope produces an entry so `agg:avg` gives the rate).
+    pub(crate) fn matching_log_rules(
+        &self,
+        level: &str,
+        message: &str,
+        service: &str,
+        project_id: Option<Uuid>,
+    ) -> Vec<(Uuid, f64)> {
+        let Some(entries) = self.log_routes.get(&project_id) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for e in entries {
+            // Service filter
+            if e.service_filter.as_ref().is_some_and(|sf| sf != service) {
+                continue;
+            }
+
+            let level_matches = e
+                .level_filter
+                .as_ref()
+                .is_none_or(|levels| levels.iter().any(|l| l == level));
+
+            let regex_matches = e
+                .regex_filter
+                .as_ref()
+                .is_none_or(|re| re.is_match(message));
+
+            if e.signal.is_rate() {
+                // Rate rule: emit for every log in scope, value depends on match
+                let value = if level_matches && regex_matches {
+                    1.0
+                } else {
+                    0.0
+                };
+                out.push((e.rule_id, value));
+            } else if level_matches && regex_matches {
+                // Count rule: only emit for matching logs
+                out.push((e.rule_id, 1.0));
+            }
+        }
+        out
+    }
+
+    /// Match span/trace rules. Returns `(rule_id, value)` pairs.
+    ///
+    /// For count rules: value = 1.0 if span matches all filters.
+    /// For rate rules: value = 1.0 if status=error, 0.0 otherwise.
+    /// For duration rules: value = `duration_ms`.
+    pub(crate) fn matching_span_rules(
+        &self,
+        input: &SpanAlertInput<'_>,
+        project_id: Option<Uuid>,
+    ) -> Vec<(Uuid, f64)> {
+        let Some(entries) = self.span_routes.get(&project_id) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for e in entries {
+            // Trace-only signals require root spans
+            if e.signal.is_trace_only() && !input.is_root {
+                continue;
+            }
+
+            // Service filter
+            if e.service_filter
+                .as_ref()
+                .is_some_and(|sf| sf != input.service)
+            {
+                continue;
+            }
+
+            // Name filter
+            if e.name_filter.as_ref().is_some_and(|nf| nf != input.name) {
+                continue;
+            }
+
+            let status_matches = e.status_filter.as_ref().is_none_or(|sf| sf == input.status);
+
+            if e.signal.is_rate() {
+                // Rate: emit for every span in scope, value = 1.0 if error
+                let value = if input.status == "error" { 1.0 } else { 0.0 };
+                out.push((e.rule_id, value));
+            } else if e.signal.is_duration() {
+                // Duration: emit duration_ms if span matches
+                if status_matches && let Some(dur) = input.duration_ms {
+                    out.push((e.rule_id, dur));
+                }
+            } else if status_matches {
+                // Count: emit 1.0 if matches
+                out.push((e.rule_id, 1.0));
+            }
+        }
+        out
+    }
+
+    /// Whether the router has zero rules of any kind.
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.metric_routes.is_empty() && self.log_routes.is_empty() && self.span_routes.is_empty()
+    }
+
+    /// Whether the router has any log-signal rules.
+    pub fn has_log_rules(&self) -> bool {
+        !self.log_routes.is_empty()
+    }
+
+    /// Whether the router has any span/trace-signal rules.
+    pub fn has_span_rules(&self) -> bool {
+        !self.span_routes.is_empty()
     }
 }
 
@@ -719,10 +1124,15 @@ pub async fn alert_rule_subscriber(
     valkey: fred::clients::Pool,
     alert_router: std::sync::Arc<tokio::sync::RwLock<AlertRouter>>,
     cancel: tokio_util::sync::CancellationToken,
+    degraded_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    use fred::interfaces::{EventInterface, PubsubInterface};
+    use fred::interfaces::{ClientLike, EventInterface, PubsubInterface};
 
     let subscriber = valkey.next().clone_new();
+    if let Err(e) = subscriber.init().await {
+        tracing::error!(error = %e, "failed to connect alert rule subscriber");
+        return;
+    }
     if let Err(e) = subscriber.subscribe(ALERT_RULES_CHANGED_CHANNEL).await {
         tracing::error!(error = %e, "failed to subscribe to alert rules channel");
         return;
@@ -745,9 +1155,15 @@ pub async fn alert_rule_subscriber(
                         match AlertRouter::from_db(&pool).await {
                             Ok(new_router) => {
                                 *alert_router.write().await = new_router;
+                                if let Some(flag) = &degraded_flag {
+                                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 tracing::info!("alert router rebuilt after rule change");
                             }
                             Err(e) => {
+                                if let Some(flag) = &degraded_flag {
+                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 tracing::error!(error = %e, "failed to rebuild alert router");
                             }
                         }
@@ -956,8 +1372,8 @@ pub async fn resolve_alert(pool: &sqlx::PgPool, rule_id: Uuid) -> Result<(), sql
 
 /// Handle alert state transition with explicit pool/valkey params.
 ///
-/// Publishes to a dedicated `"alert:fired"` Valkey channel (not `PlatformEvent`).
-/// The main binary's eventbus subscribes to this channel separately.
+/// Publishes `PlatformEvent::AlertFired` to the platform event bus so the
+/// eventbus can dispatch notifications (in-app, email, webhook).
 pub async fn handle_alert_state(
     pool: &sqlx::PgPool,
     valkey: &fred::clients::Pool,
@@ -972,15 +1388,18 @@ pub async fn handle_alert_state(
         if let Err(e) = fire_alert(pool, rule_info.id, value).await {
             tracing::error!(error = %e, rule_id = %rule_info.id, "failed to persist alert firing");
         }
-        // Publish to dedicated "alert:fired" channel
-        let payload = serde_json::json!({
-            "rule_id": rule_info.id,
-            "project_id": rule_info.project_id,
-            "severity": rule_info.severity,
-            "value": value,
-            "alert_name": rule_info.name,
-        });
-        let _ = platform_types::valkey::publish(valkey, "alert:fired", &payload.to_string()).await;
+        // Publish PlatformEvent::AlertFired to the event bus
+        let event = platform_types::events::PlatformEvent::AlertFired {
+            rule_id: rule_info.id,
+            project_id: rule_info.project_id,
+            severity: rule_info.severity.to_string(),
+            value,
+            message: format!("Alert {} fired: {}", rule_info.name, rule_info.severity),
+            alert_name: rule_info.name.to_string(),
+        };
+        if let Err(e) = platform_types::events::publish(valkey, &event).await {
+            tracing::warn!(error = %e, rule_id = %rule_info.id, "failed to publish AlertFired event");
+        }
     }
     if transition.should_resolve
         && let Err(e) = resolve_alert(pool, rule_info.id).await
@@ -1089,9 +1508,15 @@ async fn evaluate_one_rule(
 
     let aq = parse_alert_query(&rule_query)?;
 
+    // The poll-based evaluator only supports metric signals.
+    // Log/span/trace signals are handled by the stream evaluator.
+    let Some(metric_name) = aq.signal.metric_name() else {
+        return Ok(());
+    };
+
     let value = evaluate_metric(
         pool,
-        &aq.metric_name,
+        metric_name,
         aq.labels.as_ref(),
         &aq.aggregation,
         aq.window_secs,
@@ -1138,7 +1563,12 @@ mod tests {
     #[test]
     fn parse_simple_query() {
         let q = parse_alert_query("metric:cpu_usage agg:avg window:300").unwrap();
-        assert_eq!(q.metric_name, "cpu_usage");
+        assert_eq!(
+            q.signal,
+            AlertSignal::Metric {
+                name: "cpu_usage".into()
+            }
+        );
         assert_eq!(q.aggregation, "avg");
         assert_eq!(q.window_secs, 300);
         assert!(q.labels.is_none());
@@ -1147,7 +1577,12 @@ mod tests {
     #[test]
     fn parse_query_with_labels() {
         let q = parse_alert_query(r#"metric:http_errors labels:{"method":"GET"} agg:sum"#).unwrap();
-        assert_eq!(q.metric_name, "http_errors");
+        assert_eq!(
+            q.signal,
+            AlertSignal::Metric {
+                name: "http_errors".into()
+            }
+        );
         assert_eq!(q.aggregation, "sum");
         assert!(q.labels.is_some());
     }
@@ -1160,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_missing_metric() {
+    fn parse_query_missing_signal() {
         assert!(parse_alert_query("agg:sum").is_err());
     }
 
@@ -1388,7 +1823,12 @@ mod tests {
     #[test]
     fn parse_query_multiple_spaces_between_parts() {
         let q = parse_alert_query("metric:cpu_usage   agg:sum   window:600").unwrap();
-        assert_eq!(q.metric_name, "cpu_usage");
+        assert_eq!(
+            q.signal,
+            AlertSignal::Metric {
+                name: "cpu_usage".into()
+            }
+        );
         assert_eq!(q.aggregation, "sum");
         assert_eq!(q.window_secs, 600);
     }
@@ -1396,7 +1836,12 @@ mod tests {
     #[test]
     fn parse_query_metric_only_uses_defaults() {
         let q = parse_alert_query("metric:memory_usage").unwrap();
-        assert_eq!(q.metric_name, "memory_usage");
+        assert_eq!(
+            q.signal,
+            AlertSignal::Metric {
+                name: "memory_usage".into()
+            }
+        );
         assert_eq!(q.aggregation, "avg");
         assert_eq!(q.window_secs, 300);
         assert!(q.labels.is_none());
@@ -1429,7 +1874,7 @@ mod tests {
     #[test]
     fn parse_query_unknown_prefix_ignored() {
         let q = parse_alert_query("metric:cpu foo:bar baz:qux").unwrap();
-        assert_eq!(q.metric_name, "cpu");
+        assert_eq!(q.signal, AlertSignal::Metric { name: "cpu".into() });
         assert_eq!(q.aggregation, "avg");
     }
 
@@ -1490,6 +1935,16 @@ mod tests {
 
     // -- AlertRouter --
 
+    fn make_metric_router(
+        entries: Vec<((String, Option<Uuid>), Vec<MetricRouteEntry>)>,
+    ) -> AlertRouter {
+        AlertRouter {
+            metric_routes: entries.into_iter().collect(),
+            log_routes: HashMap::new(),
+            span_routes: HashMap::new(),
+        }
+    }
+
     #[test]
     fn alert_router_empty() {
         let router = AlertRouter::empty();
@@ -1504,15 +1959,18 @@ mod tests {
     #[test]
     fn alert_router_exact_match() {
         let id1 = Uuid::new_v4();
-        let mut routes = HashMap::new();
-        routes.insert(("cpu".to_string(), None), vec![(id1, None)]);
-        let router = AlertRouter { routes };
+        let router = make_metric_router(vec![(
+            ("cpu".into(), None),
+            vec![MetricRouteEntry {
+                rule_id: id1,
+                labels: None,
+            }],
+        )]);
 
         assert_eq!(
             router.matching_rules("cpu", &serde_json::json!({}), None),
             vec![id1]
         );
-        // Different metric — no match
         assert!(
             router
                 .matching_rules("mem", &serde_json::json!({}), None)
@@ -1524,22 +1982,23 @@ mod tests {
     fn alert_router_project_scoping() {
         let id1 = Uuid::new_v4();
         let pid = Uuid::new_v4();
-        let mut routes = HashMap::new();
-        routes.insert(("cpu".to_string(), Some(pid)), vec![(id1, None)]);
-        let router = AlertRouter { routes };
+        let router = make_metric_router(vec![(
+            ("cpu".into(), Some(pid)),
+            vec![MetricRouteEntry {
+                rule_id: id1,
+                labels: None,
+            }],
+        )]);
 
-        // Match with correct project_id
         assert_eq!(
             router.matching_rules("cpu", &serde_json::json!({}), Some(pid)),
             vec![id1]
         );
-        // No match with None project_id
         assert!(
             router
                 .matching_rules("cpu", &serde_json::json!({}), None)
                 .is_empty()
         );
-        // No match with different project_id
         assert!(
             router
                 .matching_rules("cpu", &serde_json::json!({}), Some(Uuid::new_v4()))
@@ -1551,11 +2010,14 @@ mod tests {
     fn alert_router_label_filter_subset() {
         let id1 = Uuid::new_v4();
         let filter = serde_json::json!({"env": "prod"});
-        let mut routes = HashMap::new();
-        routes.insert(("cpu".to_string(), None), vec![(id1, Some(filter))]);
-        let router = AlertRouter { routes };
+        let router = make_metric_router(vec![(
+            ("cpu".into(), None),
+            vec![MetricRouteEntry {
+                rule_id: id1,
+                labels: Some(filter),
+            }],
+        )]);
 
-        // Labels superset of filter — match
         assert_eq!(
             router.matching_rules(
                 "cpu",
@@ -1564,13 +2026,11 @@ mod tests {
             ),
             vec![id1]
         );
-        // Labels missing filter key — no match
         assert!(
             router
                 .matching_rules("cpu", &serde_json::json!({"host": "web1"}), None)
                 .is_empty()
         );
-        // Labels wrong value — no match
         assert!(
             router
                 .matching_rules("cpu", &serde_json::json!({"env": "dev"}), None)
@@ -1582,18 +2042,23 @@ mod tests {
     fn alert_router_multiple_rules_same_metric() {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        let mut routes = HashMap::new();
-        routes.insert(
-            ("cpu".to_string(), None),
-            vec![(id1, None), (id2, Some(serde_json::json!({"env": "prod"})))],
-        );
-        let router = AlertRouter { routes };
+        let router = make_metric_router(vec![(
+            ("cpu".into(), None),
+            vec![
+                MetricRouteEntry {
+                    rule_id: id1,
+                    labels: None,
+                },
+                MetricRouteEntry {
+                    rule_id: id2,
+                    labels: Some(serde_json::json!({"env": "prod"})),
+                },
+            ],
+        )]);
 
-        // Both match when labels include env=prod
         let matches = router.matching_rules("cpu", &serde_json::json!({"env": "prod"}), None);
         assert_eq!(matches.len(), 2);
 
-        // Only the no-filter rule matches
         let matches = router.matching_rules("cpu", &serde_json::json!({}), None);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], id1);
@@ -1794,5 +2259,536 @@ mod tests {
         assert_eq!(result[0].0, "1234-0");
         assert_eq!(result[0].1.get("r").unwrap(), "abc");
         assert_eq!(result[0].1.get("t").unwrap(), "999");
+    }
+
+    // -- Multi-signal DSL parsing --
+
+    #[test]
+    fn parse_log_count_query() {
+        let q = parse_alert_query("log:count level:error agg:count window:300").unwrap();
+        assert_eq!(q.signal, AlertSignal::LogCount);
+        assert_eq!(q.level_filter, Some(vec!["error".into()]));
+        assert_eq!(q.aggregation, "count");
+        assert_eq!(q.window_secs, 300);
+    }
+
+    #[test]
+    fn parse_log_count_multiple_levels() {
+        let q = parse_alert_query("log:count level:error,critical agg:count").unwrap();
+        assert_eq!(q.signal, AlertSignal::LogCount);
+        assert_eq!(
+            q.level_filter,
+            Some(vec!["error".into(), "critical".into()])
+        );
+    }
+
+    #[test]
+    fn parse_log_rate_with_level() {
+        let q = parse_alert_query("log:rate level:error agg:avg window:300").unwrap();
+        assert_eq!(q.signal, AlertSignal::LogRate);
+        assert_eq!(q.level_filter, Some(vec!["error".into()]));
+        assert_eq!(q.aggregation, "avg");
+    }
+
+    #[test]
+    fn parse_log_rate_without_level_rejected() {
+        assert!(parse_alert_query("log:rate agg:avg window:300").is_err());
+    }
+
+    #[test]
+    fn parse_log_count_with_regex() {
+        let q = parse_alert_query(r#"log:count level:error regex:"OOM killed" agg:count"#).unwrap();
+        assert_eq!(q.signal, AlertSignal::LogCount);
+        assert_eq!(q.regex_filter, Some("OOM killed".into()));
+    }
+
+    #[test]
+    fn parse_log_invalid_regex_rejected() {
+        assert!(parse_alert_query(r#"log:count regex:"[invalid" agg:count"#).is_err());
+    }
+
+    #[test]
+    fn parse_log_unknown_level_rejected() {
+        assert!(parse_alert_query("log:count level:trace agg:count").is_err());
+    }
+
+    #[test]
+    fn parse_span_count_query() {
+        let q = parse_alert_query("span:count status:error agg:count window:300").unwrap();
+        assert_eq!(q.signal, AlertSignal::SpanCount);
+        assert_eq!(q.status_filter, Some("error".into()));
+    }
+
+    #[test]
+    fn parse_span_rate_query() {
+        let q = parse_alert_query("span:rate agg:avg window:300").unwrap();
+        assert_eq!(q.signal, AlertSignal::SpanRate);
+        assert!(q.status_filter.is_none()); // Rate doesn't need explicit status filter
+    }
+
+    #[test]
+    fn parse_span_duration_query() {
+        let q =
+            parse_alert_query("span:duration service:api name:handle_request agg:max window:60")
+                .unwrap();
+        assert_eq!(q.signal, AlertSignal::SpanDuration);
+        assert_eq!(q.service_filter, Some("api".into()));
+        assert_eq!(q.name_filter, Some("handle_request".into()));
+        assert_eq!(q.aggregation, "max");
+    }
+
+    #[test]
+    fn parse_trace_count_query() {
+        let q = parse_alert_query("trace:count status:error agg:count").unwrap();
+        assert_eq!(q.signal, AlertSignal::TraceCount);
+    }
+
+    #[test]
+    fn parse_trace_rate_query() {
+        let q = parse_alert_query("trace:rate agg:avg window:300").unwrap();
+        assert_eq!(q.signal, AlertSignal::TraceRate);
+    }
+
+    #[test]
+    fn parse_trace_duration_query() {
+        let q = parse_alert_query("trace:duration agg:avg").unwrap();
+        assert_eq!(q.signal, AlertSignal::TraceDuration);
+    }
+
+    #[test]
+    fn parse_log_count_with_service() {
+        let q = parse_alert_query("log:count level:error service:api agg:count").unwrap();
+        assert_eq!(q.service_filter, Some("api".into()));
+    }
+
+    #[test]
+    fn parse_level_on_metric_rejected() {
+        assert!(parse_alert_query("metric:cpu level:error").is_err());
+    }
+
+    #[test]
+    fn parse_regex_on_span_rejected() {
+        assert!(parse_alert_query(r#"span:count regex:"foo""#).is_err());
+    }
+
+    #[test]
+    fn parse_status_on_log_rejected() {
+        assert!(parse_alert_query("log:count status:error").is_err());
+    }
+
+    #[test]
+    fn parse_name_on_metric_rejected() {
+        assert!(parse_alert_query("metric:cpu name:foo").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_status_rejected() {
+        assert!(parse_alert_query("span:count status:unknown").is_err());
+    }
+
+    // -- AlertRouter multi-signal matching --
+
+    #[test]
+    fn alert_router_log_count_matches() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: [(
+                None,
+                vec![LogRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::LogCount,
+                    level_filter: Some(vec!["error".into()]),
+                    regex_filter: None,
+                    service_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            span_routes: HashMap::new(),
+        };
+
+        let matches = router.matching_log_rules("error", "something failed", "api", None);
+        assert_eq!(matches, vec![(id1, 1.0)]);
+
+        // Non-matching level
+        let matches = router.matching_log_rules("info", "all good", "api", None);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn alert_router_log_rate_emits_for_all() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: [(
+                None,
+                vec![LogRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::LogRate,
+                    level_filter: Some(vec!["error".into()]),
+                    regex_filter: None,
+                    service_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            span_routes: HashMap::new(),
+        };
+
+        // Error log → 1.0
+        let matches = router.matching_log_rules("error", "fail", "api", None);
+        assert_eq!(matches, vec![(id1, 1.0)]);
+
+        // Info log → 0.0 (still emitted for rate)
+        let matches = router.matching_log_rules("info", "ok", "api", None);
+        assert_eq!(matches, vec![(id1, 0.0)]);
+    }
+
+    #[test]
+    fn alert_router_log_regex_filter() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: [(
+                None,
+                vec![LogRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::LogCount,
+                    level_filter: Some(vec!["error".into()]),
+                    regex_filter: Some(regex::Regex::new("OOM").unwrap()),
+                    service_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            span_routes: HashMap::new(),
+        };
+
+        let matches = router.matching_log_rules("error", "OOM killed process", "api", None);
+        assert_eq!(matches, vec![(id1, 1.0)]);
+
+        // Regex doesn't match
+        let matches = router.matching_log_rules("error", "timeout", "api", None);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn alert_router_log_service_filter() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: [(
+                None,
+                vec![LogRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::LogCount,
+                    level_filter: Some(vec!["error".into()]),
+                    regex_filter: None,
+                    service_filter: Some("api".into()),
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            span_routes: HashMap::new(),
+        };
+
+        let matches = router.matching_log_rules("error", "fail", "api", None);
+        assert_eq!(matches.len(), 1);
+
+        // Different service — no match
+        let matches = router.matching_log_rules("error", "fail", "worker", None);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn alert_router_span_count_matches() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: [(
+                None,
+                vec![SpanRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::SpanCount,
+                    status_filter: Some("error".into()),
+                    service_filter: None,
+                    name_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let input = SpanAlertInput {
+            name: "GET /api",
+            service: "api",
+            status: "error",
+            duration_ms: Some(100.0),
+            is_root: false,
+        };
+        let matches = router.matching_span_rules(&input, None);
+        assert_eq!(matches, vec![(id1, 1.0)]);
+
+        // ok status — no match
+        let input_ok = SpanAlertInput {
+            name: "GET /api",
+            service: "api",
+            status: "ok",
+            duration_ms: Some(50.0),
+            is_root: false,
+        };
+        assert!(router.matching_span_rules(&input_ok, None).is_empty());
+    }
+
+    #[test]
+    fn alert_router_span_rate_emits_for_all() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: [(
+                None,
+                vec![SpanRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::SpanRate,
+                    status_filter: None,
+                    service_filter: None,
+                    name_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let err = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "error",
+            duration_ms: Some(100.0),
+            is_root: false,
+        };
+        assert_eq!(router.matching_span_rules(&err, None), vec![(id1, 1.0)]);
+
+        let ok = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "ok",
+            duration_ms: Some(50.0),
+            is_root: false,
+        };
+        assert_eq!(router.matching_span_rules(&ok, None), vec![(id1, 0.0)]);
+    }
+
+    #[test]
+    fn alert_router_trace_only_root_spans() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: [(
+                None,
+                vec![SpanRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::TraceCount,
+                    status_filter: Some("error".into()),
+                    service_filter: None,
+                    name_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let root = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "error",
+            duration_ms: Some(100.0),
+            is_root: true,
+        };
+        assert_eq!(router.matching_span_rules(&root, None), vec![(id1, 1.0)]);
+
+        let child = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "error",
+            duration_ms: Some(100.0),
+            is_root: false,
+        };
+        assert!(router.matching_span_rules(&child, None).is_empty());
+    }
+
+    #[test]
+    fn alert_router_span_duration_value() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: [(
+                None,
+                vec![SpanRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::SpanDuration,
+                    status_filter: None,
+                    service_filter: None,
+                    name_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let input = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "ok",
+            duration_ms: Some(250.0),
+            is_root: false,
+        };
+        assert_eq!(router.matching_span_rules(&input, None), vec![(id1, 250.0)]);
+
+        // No duration — no match for duration rules
+        let no_dur = SpanAlertInput {
+            name: "op",
+            service: "s",
+            status: "ok",
+            duration_ms: None,
+            is_root: false,
+        };
+        assert!(router.matching_span_rules(&no_dur, None).is_empty());
+    }
+
+    #[test]
+    fn alert_router_span_name_and_service_filter() {
+        let id1 = Uuid::new_v4();
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: HashMap::new(),
+            span_routes: [(
+                None,
+                vec![SpanRouteEntry {
+                    rule_id: id1,
+                    signal: AlertSignal::SpanCount,
+                    status_filter: Some("error".into()),
+                    service_filter: Some("api".into()),
+                    name_filter: Some("checkout".into()),
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let good = SpanAlertInput {
+            name: "checkout",
+            service: "api",
+            status: "error",
+            duration_ms: None,
+            is_root: false,
+        };
+        assert_eq!(router.matching_span_rules(&good, None).len(), 1);
+
+        // Wrong service
+        let wrong_svc = SpanAlertInput {
+            name: "checkout",
+            service: "worker",
+            status: "error",
+            duration_ms: None,
+            is_root: false,
+        };
+        assert!(router.matching_span_rules(&wrong_svc, None).is_empty());
+
+        // Wrong name
+        let wrong_name = SpanAlertInput {
+            name: "login",
+            service: "api",
+            status: "error",
+            duration_ms: None,
+            is_root: false,
+        };
+        assert!(router.matching_span_rules(&wrong_name, None).is_empty());
+    }
+
+    #[test]
+    fn alert_router_has_log_rules() {
+        let router = AlertRouter::empty();
+        assert!(!router.has_log_rules());
+        assert!(!router.has_span_rules());
+
+        let router = AlertRouter {
+            metric_routes: HashMap::new(),
+            log_routes: [(
+                None,
+                vec![LogRouteEntry {
+                    rule_id: Uuid::new_v4(),
+                    signal: AlertSignal::LogCount,
+                    level_filter: None,
+                    regex_filter: None,
+                    service_filter: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            span_routes: HashMap::new(),
+        };
+        assert!(router.has_log_rules());
+        assert!(!router.has_span_rules());
+    }
+
+    // -- Rate aggregation integration --
+
+    #[test]
+    fn rate_rule_avg_gives_ratio() {
+        let now = Utc::now();
+        let mut w = RuleWindow::new(300, "avg");
+        // Simulate: 2 errors out of 5 logs
+        w.push(now, 1.0); // error
+        w.push(now, 1.0); // error
+        w.push(now, 0.0); // info
+        w.push(now, 0.0); // info
+        w.push(now, 0.0); // info
+        let rate = w.aggregate().unwrap();
+        assert!((rate - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn duration_rule_max_aggregation() {
+        let now = Utc::now();
+        let mut w = RuleWindow::new(300, "max");
+        w.push(now, 100.0);
+        w.push(now, 200.0);
+        w.push(now, 150.0);
+        assert!((w.aggregate().unwrap() - 200.0).abs() < f64::EPSILON);
+    }
+
+    // -- AlertSignal helpers --
+
+    #[test]
+    fn alert_signal_helpers() {
+        assert!(AlertSignal::LogCount.is_log());
+        assert!(AlertSignal::LogRate.is_log());
+        assert!(!AlertSignal::SpanCount.is_log());
+
+        assert!(AlertSignal::SpanCount.is_span_or_trace());
+        assert!(AlertSignal::TraceRate.is_span_or_trace());
+        assert!(!AlertSignal::LogCount.is_span_or_trace());
+
+        assert!(AlertSignal::LogRate.is_rate());
+        assert!(AlertSignal::SpanRate.is_rate());
+        assert!(AlertSignal::TraceRate.is_rate());
+        assert!(!AlertSignal::LogCount.is_rate());
+
+        assert!(AlertSignal::TraceCount.is_trace_only());
+        assert!(!AlertSignal::SpanCount.is_trace_only());
+
+        assert!(AlertSignal::SpanDuration.is_duration());
+        assert!(!AlertSignal::SpanCount.is_duration());
+
+        assert_eq!(
+            AlertSignal::Metric { name: "cpu".into() }.metric_name(),
+            Some("cpu")
+        );
+        assert!(AlertSignal::LogCount.metric_name().is_none());
     }
 }

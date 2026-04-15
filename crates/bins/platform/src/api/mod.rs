@@ -41,7 +41,7 @@ pub mod releases;
 // pub mod setup;           // needs crate::store::bootstrap, crate::workspace
 // pub mod ssh_keys;        // needs platform_git::ssh_keys
 // pub mod user_keys;       // needs platform_secrets::user_keys
-// pub mod users;           // needs crate::workspace::service
+pub mod users;
 // pub mod webhooks;        // needs validation::check_ssrf_url
 // pub mod workspaces;      // needs crate::workspace
 
@@ -60,4 +60,5 @@ pub fn router() -> Router<PlatformState> {
         .merge(mesh::router())
         .merge(notifications::router())
         .merge(releases::router())
+        .merge(users::router())
 }

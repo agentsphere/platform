@@ -46,6 +46,9 @@ hex = "0.4"
 # Compression
 flate2 = "1"
 
+# Regex for log alert filters
+regex = "1"
+
 # Object storage (MinIO)
 opendal = { version = "0.55", features = ["services-s3"] }
 
