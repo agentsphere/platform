@@ -49,7 +49,7 @@ pub struct PlatformState {
     pub mesh_ca: Option<Arc<platform_mesh::MeshCa>>,
 
     // -- Health --
-    pub health: Arc<tokio::sync::RwLock<platform_operator::health::HealthSnapshot>>,
+    pub health: Arc<std::sync::RwLock<platform_operator::health::HealthSnapshot>>,
 
     // -- Domain services --
     pub secrets_resolver: Option<AppSecretsResolver>,
@@ -159,6 +159,21 @@ impl PlatformState {
             alert_router: Arc::new(tokio::sync::RwLock::new(
                 platform_observe::alert::AlertRouter::empty(),
             )),
+        }
+    }
+
+    /// Construct an [`OperatorState`] from shared infrastructure.
+    ///
+    /// Cheap to call — all inner fields are `Arc`/`Clone`.
+    pub fn operator_state(&self) -> platform_operator::state::OperatorState {
+        platform_operator::state::OperatorState {
+            pool: self.pool.clone(),
+            valkey: self.valkey.clone(),
+            kube: self.kube.clone(),
+            minio: self.minio.clone(),
+            config: Arc::new(self.config.to_operator_config()),
+            task_registry: self.task_registry.clone(),
+            health: self.health.clone(),
         }
     }
 

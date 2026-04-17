@@ -76,11 +76,29 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Health monitor ─────────────────────────────────────────────────
+    let operator_state = state.operator_state();
+    tokio::spawn(platform_operator::health::run(
+        operator_state,
+        cancel.clone(),
+    ));
+
     // ── Observe subsystem ────────────────────────────────────────────────
     let observe_state = state.observe_state();
+    tokio::spawn(platform_observe::partitions::run(
+        state.pool.clone(),
+        cancel.clone(),
+    ));
     let observe_channels =
         platform_observe::spawn_background_tasks(&observe_state, cancel.clone(), &tracker);
     let observe_router = platform_observe::router(observe_channels).with_state(observe_state);
+
+    // ── Agent preview watcher ────────────────────────────────────────────
+    let agent_state = state.agent_state();
+    tokio::spawn(platform_agent::preview_watcher::run(
+        agent_state,
+        cancel.clone(),
+    ));
 
     // ── HTTP server ──────────────────────────────────────────────────────
     let app = axum::Router::new()
@@ -248,7 +266,7 @@ async fn init_infrastructure(config: PlatformConfig) -> anyhow::Result<PlatformS
         mesh_ca,
         secrets_resolver,
         notification_dispatcher,
-        health: Arc::new(tokio::sync::RwLock::new(
+        health: Arc::new(std::sync::RwLock::new(
             platform_operator::health::HealthSnapshot::default(),
         )),
         secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

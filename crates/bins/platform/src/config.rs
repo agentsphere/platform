@@ -479,6 +479,28 @@ impl PlatformConfig {
         }
     }
 
+    /// Build domain-specific [`platform_operator::state::OperatorConfig`] from env-level sub-configs.
+    pub fn to_operator_config(&self) -> platform_operator::state::OperatorConfig {
+        platform_operator::state::OperatorConfig {
+            health_check_interval_secs: self.operator.health_check_interval_secs,
+            platform_namespace: self.core.platform_namespace.clone(),
+            dev_mode: self.core.dev_mode,
+            master_key: self.secrets.master_key.clone(),
+            git_repos_path: self.git.git_repos_path.clone(),
+            registry_url: self.registry.registry_url.clone(),
+            registry_node_url: self.registry.registry_node_url.clone(),
+            gateway_name: self.gateway.gateway_name.clone(),
+            gateway_namespace: self.gateway.gateway_namespace.clone(),
+            gateway_auto_deploy: self.gateway.gateway_auto_deploy,
+            gateway_http_port: self.gateway.gateway_http_port,
+            gateway_tls_port: self.gateway.gateway_tls_port,
+            gateway_http_node_port: self.gateway.gateway_http_node_port,
+            gateway_tls_node_port: self.gateway.gateway_tls_node_port,
+            gateway_watch_namespaces: self.gateway.gateway_watch_namespaces.clone(),
+            platform_api_url: self.pipeline.platform_api_url.clone(),
+        }
+    }
+
     /// Build domain-specific [`platform_deployer::state::DeployerConfig`] from env-level sub-configs.
     pub fn to_deployer_config(&self) -> platform_deployer::state::DeployerConfig {
         platform_deployer::state::DeployerConfig {

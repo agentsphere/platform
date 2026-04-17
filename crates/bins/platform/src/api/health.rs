@@ -53,7 +53,11 @@ async fn health_summary(
 ) -> Result<Json<HealthSummary>, ApiError> {
     require_admin(&state, &auth).await?;
 
-    let snap = state.health.read().await.clone();
+    let snap = state
+        .health
+        .read()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("health lock poisoned")))?
+        .clone();
 
     Ok(Json(HealthSummary {
         overall: snap.overall,
@@ -70,7 +74,11 @@ async fn health_details(
 ) -> Result<Json<HealthSnapshot>, ApiError> {
     require_admin(&state, &auth).await?;
 
-    let snap = state.health.read().await.clone();
+    let snap = state
+        .health
+        .read()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("health lock poisoned")))?
+        .clone();
 
     Ok(Json(snap))
 }
