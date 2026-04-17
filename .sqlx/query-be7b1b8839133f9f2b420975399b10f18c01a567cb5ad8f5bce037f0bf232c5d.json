@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.name as \"name!\"\n        FROM permissions p\n        JOIN role_permissions rp ON rp.permission_id = p.id\n        WHERE rp.role_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "be7b1b8839133f9f2b420975399b10f18c01a567cb5ad8f5bce037f0bf232c5d"
+}

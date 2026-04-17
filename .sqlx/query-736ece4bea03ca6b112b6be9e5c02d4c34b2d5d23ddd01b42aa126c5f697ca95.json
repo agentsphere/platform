@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE alert_events SET status = 'resolved', resolved_at = now()\n        WHERE rule_id = $1 AND status = 'firing' AND resolved_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "736ece4bea03ca6b112b6be9e5c02d4c34b2d5d23ddd01b42aa126c5f697ca95"
+}

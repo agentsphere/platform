@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE llm_provider_configs\n        SET encrypted_config = $3, model = $4, label = $5,\n            validation_status = 'untested', last_validated_at = NULL, updated_at = now()\n        WHERE id = $1 AND user_id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "057941de2a728e8eaa8b32e70fdea0db917ea87fffd57d39048ea7508aa9f5ed"
+}

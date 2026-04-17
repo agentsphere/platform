@@ -11,9 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, send_audit, validation};
-use platform_git::gpg_keys;
 use crate::state::PlatformState;
+use platform_git::gpg_keys;
+use platform_types::{ApiError, AuditEntry, AuthUser, ListResponse, send_audit, validation};
 
 use super::helpers::require_admin;
 
@@ -98,7 +98,8 @@ async fn add_gpg_key(
     let armor = body.public_key.clone();
     let parsed = tokio::task::spawn_blocking(move || gpg_keys::parse_gpg_public_key(&armor))
         .await
-        .map_err(|e| ApiError::Internal(e.into()))??;
+        .map_err(|e| ApiError::Internal(e.into()))?
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Get user email for verification
     let user_email: String =

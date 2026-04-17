@@ -20,9 +20,9 @@ use axum::routing::any;
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
-use platform_types::{ApiError, AuthUser, Permission};
-use platform_auth::resolver;
 use crate::state::PlatformState;
+use platform_auth::resolver;
+use platform_types::{ApiError, AuthUser, Permission};
 
 /// Shared reqwest client for preview proxying (reuses connections).
 static PREVIEW_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -231,12 +231,12 @@ async fn preview_proxy(
         &namespace,
         path,
         query.as_deref(),
-        state.config.preview_proxy_url.as_deref(),
+        state.config.deployer.preview_proxy_url.as_deref(),
         None,
     );
     tracing::info!(
         %target_url,
-        proxy_configured = state.config.preview_proxy_url.is_some(),
+        proxy_configured = state.config.deployer.preview_proxy_url.is_some(),
         "preview proxy request"
     );
 
@@ -481,7 +481,9 @@ async fn deploy_preview_proxy(
     super::helpers::require_project_read(&state, &auth, project_id).await?;
 
     // Compute deploy namespace
-    let namespace = platform_deployer::reconciler::target_namespace(&state.config, slug, &params.env);
+    let deployer_config = state.config.to_deployer_config();
+    let namespace =
+        platform_deployer::reconciler::target_namespace(&deployer_config, slug, &params.env);
     if !validate_namespace_format(&namespace) {
         return Err(ApiError::BadRequest("invalid namespace format".into()));
     }
@@ -521,7 +523,7 @@ async fn deploy_preview_proxy(
         &namespace,
         path,
         req_query.as_deref(),
-        state.config.preview_proxy_url.as_deref(),
+        state.config.deployer.preview_proxy_url.as_deref(),
         Some(port),
     );
     tracing::debug!(%target_url, "deploy preview proxy request");
@@ -550,6 +552,7 @@ async fn deploy_preview_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
 
     // -- build_target_url --
 
@@ -832,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_axum_to_tungstenite_binary() {
-        let data: bytes::Bytes = vec![1u8, 2, 3].into();
+        let data: Bytes = vec![1u8, 2, 3].into();
         let msg = Message::Binary(data.clone());
         let ts = axum_to_tungstenite(msg);
         assert!(ts.is_binary());
@@ -840,7 +843,7 @@ mod tests {
 
     #[test]
     fn test_axum_to_tungstenite_ping() {
-        let data: bytes::Bytes = vec![42u8].into();
+        let data: Bytes = vec![42u8].into();
         let msg = Message::Ping(data);
         let ts = axum_to_tungstenite(msg);
         assert!(ts.is_ping());
@@ -848,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_axum_to_tungstenite_pong() {
-        let data: bytes::Bytes = vec![0u8].into();
+        let data: Bytes = vec![0u8].into();
         let msg = Message::Pong(data);
         let ts = axum_to_tungstenite(msg);
         assert!(ts.is_pong());

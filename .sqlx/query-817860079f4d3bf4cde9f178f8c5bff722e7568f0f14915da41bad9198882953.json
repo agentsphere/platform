@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!: i64\"\n        FROM issues\n        WHERE project_id = $1\n          AND ($2::text IS NULL OR status = $2)\n          AND ($3::uuid IS NULL OR assignee_id = $3)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "817860079f4d3bf4cde9f178f8c5bff722e7568f0f14915da41bad9198882953"
+}

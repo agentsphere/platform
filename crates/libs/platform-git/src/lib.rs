@@ -75,7 +75,10 @@ pub use pkt_line::{find_flush_pkt, pkt_line_header};
 pub use plumbing::CliGitRepoManager;
 pub use protection::BranchProtection;
 pub use server_config::GitServerConfig;
-pub use server_services::{BrowserUser, GitServerServices, GitServerState, GpgKeyInfo};
+pub use server_services::{
+    BrowserUser, GitPushAudit, GitRepoPathResolver, GitServerServices, GitServerState,
+    GitSignatureVerifier, GpgKeyInfo, LfsObjectStore,
+};
 pub use signature::{SignatureInfo, SignatureStatus};
 pub use ssh_command::ParsedCommand;
 pub use ssh_keys::ParsedSshKey;

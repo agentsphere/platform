@@ -18,9 +18,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, send_audit, validation};
-use platform_secrets::{engine, llm_providers};
 use crate::state::PlatformState;
+use platform_secrets::{engine, llm_providers};
+use platform_types::{ApiError, AuditEntry, AuthUser, ListResponse, send_audit, validation};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,6 +68,7 @@ pub struct ActiveProviderResponse {
 fn get_master_key(state: &PlatformState) -> Result<[u8; 32], ApiError> {
     let hex_str = state
         .config
+        .secrets
         .master_key
         .as_deref()
         .ok_or_else(|| ApiError::ServiceUnavailable("secrets engine not configured".into()))?;

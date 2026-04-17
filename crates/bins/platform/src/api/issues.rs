@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, send_audit};
 use platform_types::{ApiError, AuthUser, Permission};
+use platform_types::{AuditEntry, send_audit};
 
 use crate::state::PlatformState;
 

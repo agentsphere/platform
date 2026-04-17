@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE merge_requests SET head_sha = $1, updated_at = now()\n             WHERE project_id = $2 AND source_branch = $3 AND status = 'open'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2f9b5c127e5d73960572ec6d4e51ab8fe365f08cef6947b83e0e506dd257dafd"
+}

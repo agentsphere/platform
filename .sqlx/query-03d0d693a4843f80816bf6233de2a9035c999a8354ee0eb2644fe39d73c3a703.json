@@ -1,0 +1,99 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE projects SET\n            display_name = COALESCE($2, display_name),\n            description = COALESCE($3, description),\n            visibility = COALESCE($4, visibility),\n            default_branch = COALESCE($5, default_branch),\n            agent_image = COALESCE($6, agent_image),\n            updated_at = now()\n        WHERE id = $1 AND is_active = true\n        RETURNING id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,\n                  namespace_slug, agent_image, is_active, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "visibility",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "default_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "namespace_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "03d0d693a4843f80816bf6233de2a9035c999a8354ee0eb2644fe39d73c3a703"
+}

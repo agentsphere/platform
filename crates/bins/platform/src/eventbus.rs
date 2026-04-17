@@ -16,8 +16,10 @@
 
 use fred::interfaces::PubsubInterface;
 use fred::prelude::*;
-use platform_types::WebhookDispatcher;
 use platform_types::events::{EVENTS_CHANNEL, PlatformEvent};
+use platform_types::{
+    MergeRequestHandler, NotificationDispatcher, NotifyParams, WebhookDispatcher,
+};
 use tracing::Instrument;
 
 use crate::state::PlatformState;
@@ -105,13 +107,9 @@ async fn handle_event(state: &PlatformState, payload: &str) -> anyhow::Result<()
         | PlatformEvent::RollbackRequested { .. } => {
             state.deploy_notify.notify_one();
         }
-
-        // Pipeline events wake the executor
         PlatformEvent::PipelineQueued { .. } => {
             state.pipeline_notify.notify_one();
         }
-
-        // Code push: trigger pipeline + fire webhooks
         PlatformEvent::CodePushed {
             project_id,
             user_id,
@@ -131,8 +129,6 @@ async fn handle_event(state: &PlatformState, payload: &str) -> anyhow::Result<()
             )
             .await;
         }
-
-        // Tag push: fire webhooks
         PlatformEvent::TagPushed {
             project_id,
             user_name,
@@ -140,76 +136,46 @@ async fn handle_event(state: &PlatformState, payload: &str) -> anyhow::Result<()
             commit_sha,
             ..
         } => {
-            let webhook = platform_webhook::WebhookDispatch::new(state.pool.clone());
-            webhook
-                .fire_webhooks(
-                    project_id,
-                    "tag",
-                    &serde_json::json!({
-                        "ref": format!("refs/tags/{tag_name}"),
-                        "after": commit_sha,
-                        "pusher": user_name,
-                    }),
-                )
-                .await;
+            fire_webhook(state, project_id, "tag", &serde_json::json!({
+                "ref": format!("refs/tags/{tag_name}"), "after": commit_sha, "pusher": user_name,
+            })).await;
         }
-
-        // MR branch synced: fire webhooks
         PlatformEvent::MrBranchSynced {
             project_id,
             branch,
             commit_sha,
             ..
         } => {
-            let webhook = platform_webhook::WebhookDispatch::new(state.pool.clone());
-            webhook
-                .fire_webhooks(
-                    project_id,
-                    "mr",
-                    &serde_json::json!({
-                        "action": "synchronize",
-                        "branch": branch,
-                        "head_sha": commit_sha,
-                    }),
-                )
-                .await;
+            fire_webhook(
+                state,
+                project_id,
+                "mr",
+                &serde_json::json!({
+                    "action": "synchronize", "branch": branch, "head_sha": commit_sha,
+                }),
+            )
+            .await;
         }
-
-        // Agent session ended: fire webhook
         PlatformEvent::AgentSessionEnded {
             project_id,
             session_id,
             status,
         } => {
-            let webhook = platform_webhook::WebhookDispatch::new(state.pool.clone());
-            webhook
-                .fire_webhooks(
-                    project_id,
-                    "agent",
-                    &serde_json::json!({
-                        "action": status,
-                        "session_id": session_id,
-                        "project_id": project_id,
-                    }),
-                )
-                .await;
+            fire_webhook(
+                state,
+                project_id,
+                "agent",
+                &serde_json::json!({
+                    "action": status, "session_id": session_id, "project_id": project_id,
+                }),
+            )
+            .await;
         }
-
-        // Pipeline completed: auto-merge on success
         PlatformEvent::PipelineCompleted {
             project_id, status, ..
         } => {
-            if status == "success" {
-                let merger = platform_git::CliGitMerger::new();
-                let repos_path = state.config.git.git_repos_path.clone();
-                let handler =
-                    platform_git::AutoMergeHandler::new(state.pool.clone(), merger, repos_path);
-                use platform_types::MergeRequestHandler;
-                handler.try_auto_merge(project_id).await;
-            }
+            handle_pipeline_completed(state, project_id, &status).await;
         }
-
-        // Alert fired: dispatch notification
         PlatformEvent::AlertFired {
             rule_id,
             project_id,
@@ -220,12 +186,31 @@ async fn handle_event(state: &PlatformState, payload: &str) -> anyhow::Result<()
         } => {
             handle_alert_fired(state, rule_id, project_id, &severity, &message, &alert_name).await;
         }
-
-        // Remaining events — no-op
         _ => {}
     }
 
     Ok(())
+}
+
+/// Fire webhooks for a project event.
+async fn fire_webhook(
+    state: &PlatformState,
+    project_id: uuid::Uuid,
+    event: &str,
+    payload: &serde_json::Value,
+) {
+    let webhook = platform_webhook::WebhookDispatch::new(state.pool.clone());
+    webhook.fire_webhooks(project_id, event, payload).await;
+}
+
+/// Auto-merge open MRs after a successful pipeline.
+async fn handle_pipeline_completed(state: &PlatformState, project_id: uuid::Uuid, status: &str) {
+    if status == "success" {
+        let merger = platform_git::CliGitMerger;
+        let repos_path = state.config.git.git_repos_path.clone();
+        let handler = platform_git::AutoMergeHandler::new(state.pool.clone(), merger, repos_path);
+        handler.try_auto_merge(project_id).await;
+    }
 }
 
 /// Handle a code push: trigger pipeline and fire push webhooks.
@@ -282,7 +267,7 @@ async fn handle_code_pushed(
     }
 }
 
-/// Handle an alert firing: dispatch in-app notification to the project owner.
+/// Handle an alert firing: dispatch notification via `NotificationDispatcher`.
 async fn handle_alert_fired(
     state: &PlatformState,
     rule_id: uuid::Uuid,
@@ -315,19 +300,21 @@ async fn handle_alert_fired(
         }
     };
 
-    // Insert in-app notification
+    // Dispatch via NotificationDispatcher (handles rate limiting, routing, status tracking)
     let subject = format!("[{severity}] {alert_name}");
-    if let Err(e) = sqlx::query!(
-        r#"INSERT INTO notifications (id, user_id, notification_type, subject, body, channel, ref_type, ref_id)
-           VALUES (gen_random_uuid(), $1, 'alert', $2, $3, 'in_app', 'alert_rule', $4)"#,
-        owner_id,
-        subject,
-        message,
-        rule_id,
-    )
-    .execute(&state.pool)
-    .await
+    if let Err(e) = state
+        .notification_dispatcher
+        .notify(NotifyParams {
+            user_id: owner_id,
+            notification_type: "alert",
+            subject: &subject,
+            body: Some(message),
+            channel: "in_app",
+            ref_type: Some("alert_rule"),
+            ref_id: Some(rule_id),
+        })
+        .await
     {
-        tracing::error!(error = %e, %rule_id, "failed to insert alert notification");
+        tracing::error!(error = %e, %rule_id, "failed to dispatch alert notification");
     }
 }

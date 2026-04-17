@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status, branch, pod_name,\n               provider, cost_tokens, created_at, finished_at, spawn_depth, execution_mode\n        FROM agent_sessions\n        WHERE parent_session_id = $1\n        ORDER BY created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "agent_user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "prompt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "pod_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "cost_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "spawn_depth",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "execution_mode",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "97f9b938c8445cee8d043b69f2efbc0774ea4d9f73990449d5c3aa42b667b379"
+}

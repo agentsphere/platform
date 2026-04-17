@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, send_audit};
-use platform_types::AuthUser;
-use platform_types::ApiError;
-use platform_types::Permission;
-use platform_auth::resolver;
-use platform_types::validation;
 use crate::state::PlatformState;
+use platform_auth::resolver;
+use platform_types::ApiError;
+use platform_types::AuthUser;
+use platform_types::Permission;
+use platform_types::validation;
+use platform_types::{AuditEntry, send_audit};
 
 use super::helpers::{require_admin, require_project_read};
 
@@ -121,11 +121,7 @@ pub struct ListParams {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ListResponse<T: Serialize> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
+use super::helpers::ListResponse;
 
 // Ops repo types (unchanged)
 #[derive(Debug, Deserialize)]
@@ -550,10 +546,9 @@ async fn create_release(
     state.deploy_notify.notify_one();
 
     // Publish event
-    // TODO: wire from platform eventbus crate
-    let _ = crate::store::eventbus::publish(
+    let _ = platform_types::events::publish(
         &state.valkey,
-        &crate::store::eventbus::PlatformEvent::ReleaseCreated {
+        &platform_types::events::PlatformEvent::ReleaseCreated {
             target_id,
             release_id,
             project_id: id,
@@ -893,12 +888,10 @@ async fn staging_status(
     let ops_path = std::path::PathBuf::from(&ops_repo.repo_path);
 
     // staging branch may not exist yet (no deployment to staging has occurred)
-    // TODO: wire from platform deployer crate
     let Ok((diverged, staging_sha, prod_sha)) =
-        crate::deployer::ops_repo::compare_branches(&ops_path, "staging", &ops_repo.branch).await
+        platform_ops_repo::compare_branches(&ops_path, "staging", &ops_repo.branch).await
     else {
-        // TODO: wire from platform deployer crate
-        let prod_sha = crate::deployer::ops_repo::get_head_sha(&ops_path)
+        let prod_sha = platform_ops_repo::get_head_sha(&ops_path)
             .await
             .unwrap_or_default();
         return Ok(Json(StagingStatusResponse {
@@ -910,18 +903,15 @@ async fn staging_status(
         }));
     };
 
-    // TODO: wire from platform deployer crate
-    let staging_image = crate::deployer::ops_repo::read_values(&ops_path, "staging", "staging")
+    let staging_image = platform_ops_repo::read_values(&ops_path, "staging", "staging")
         .await
         .ok()
         .and_then(|v| v["image_ref"].as_str().map(String::from));
 
-    // TODO: wire from platform deployer crate
-    let prod_image =
-        crate::deployer::ops_repo::read_values(&ops_path, &ops_repo.branch, "production")
-            .await
-            .ok()
-            .and_then(|v| v["image_ref"].as_str().map(String::from));
+    let prod_image = platform_ops_repo::read_values(&ops_path, &ops_repo.branch, "production")
+        .await
+        .ok()
+        .and_then(|v| v["image_ref"].as_str().map(String::from));
 
     Ok(Json(StagingStatusResponse {
         diverged,
@@ -942,8 +932,7 @@ async fn promote_staging(
     let ops_repo = fetch_ops_repo_for_project(&state, id).await?;
     let ops_path = std::path::PathBuf::from(&ops_repo.repo_path);
 
-    // TODO: wire from platform deployer crate
-    let staging_values = crate::deployer::ops_repo::read_values(&ops_path, "staging", "staging")
+    let staging_values = platform_ops_repo::read_values(&ops_path, "staging", "staging")
         .await
         .map_err(|e| ApiError::BadRequest(format!("no staging deployment to promote: {e}")))?;
 
@@ -952,15 +941,13 @@ async fn promote_staging(
         .ok_or_else(|| ApiError::BadRequest("staging values missing image_ref".into()))?
         .to_string();
 
-    // TODO: wire from platform deployer crate
-    let new_sha = crate::deployer::ops_repo::merge_branch(&ops_path, "staging", &ops_repo.branch)
+    let new_sha = platform_ops_repo::merge_branch(&ops_path, "staging", &ops_repo.branch)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-    // TODO: wire from platform eventbus crate
-    let _ = crate::store::eventbus::publish(
+    let _ = platform_types::events::publish(
         &state.valkey,
-        &crate::store::eventbus::PlatformEvent::OpsRepoUpdated {
+        &platform_types::events::PlatformEvent::OpsRepoUpdated {
             project_id: id,
             ops_repo_id: ops_repo.id,
             environment: "production".into(),
@@ -1065,10 +1052,13 @@ async fn list_deploy_iframes(
         return Ok(Json(vec![]));
     }
 
-    // TODO: wire from platform deployer crate
-    let namespace = crate::deployer::reconciler::target_namespace(&state.config, slug, &query.env);
+    let namespace = platform_deployer::reconciler::target_namespace(
+        &state.config.to_deployer_config(),
+        slug,
+        &query.env,
+    );
 
-    if !crate::api::preview::validate_namespace_format(&namespace) {
+    if !super::preview::validate_namespace_format(&namespace) {
         return Ok(Json(vec![]));
     }
 
@@ -1137,9 +1127,8 @@ async fn create_ops_repo(
     let branch = body.branch.as_deref().unwrap_or("main");
     let path = body.path.as_deref().unwrap_or("/");
 
-    // TODO: wire from platform deployer crate
     let repo_path =
-        crate::deployer::ops_repo::init_ops_repo(&state.config.ops_repos_path, &body.name, branch)
+        platform_ops_repo::init_ops_repo(&state.config.deployer.ops_repos_path, &body.name, branch)
             .await
             .map_err(|e| ApiError::Internal(e.into()))?;
 

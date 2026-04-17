@@ -42,6 +42,9 @@ fred = { version = "10", features = ["subscriber-client"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# URL parsing (for SSRF validation)
+url = "2"
+
 # Tracing
 tracing = "0.1"
 

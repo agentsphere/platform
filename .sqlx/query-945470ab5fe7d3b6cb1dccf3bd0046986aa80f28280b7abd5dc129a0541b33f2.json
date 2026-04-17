@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as \"count!: i64\"\n               FROM workspaces w\n               JOIN workspace_members wm ON wm.workspace_id = w.id\n               WHERE wm.user_id = $1 AND w.is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "945470ab5fe7d3b6cb1dccf3bd0046986aa80f28280b7abd5dc129a0541b33f2"
+}

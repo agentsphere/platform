@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT wm.role as \"role!\"\n        FROM workspace_members wm\n        JOIN projects p ON p.workspace_id = wm.workspace_id\n        JOIN workspaces w ON w.id = wm.workspace_id\n        WHERE p.id = $1 AND p.is_active = true AND w.is_active = true AND wm.user_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a00c7914f8ace4af1c77544bcc73a400a6b22f808a8cbec8fa0be39246684b2e"
+}

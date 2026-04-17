@@ -24,6 +24,7 @@ platform-registry = { path = "../../libs/platform-registry" }
 platform-secrets = { path = "../../libs/platform-secrets" }
 platform-mesh = { path = "../../libs/platform-mesh" }
 platform-k8s = { path = "../../libs/platform-k8s" }
+platform-ops-repo = { path = "../../libs/platform-ops-repo" }
 platform-operator = { path = "../../libs/platform-operator" }
 
 # HTTP framework

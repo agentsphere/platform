@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO delegations (delegator_id, delegate_id, permission_id, project_id, expires_at, reason)\n        VALUES ($1, $2, $3, $4, $5, $6)\n        RETURNING id, delegator_id, delegate_id, permission_id,\n                  (SELECT name FROM permissions WHERE id = permission_id) as \"permission_name!\",\n                  project_id, expires_at, reason, created_at, revoked_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "delegator_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "delegate_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "permission_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "permission_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "revoked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "0db7c808ea922ea016dce03b278855fa4964d28e935a2a6816fdc2cc78bf3bf0"
+}

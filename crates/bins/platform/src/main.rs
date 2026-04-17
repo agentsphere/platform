@@ -8,9 +8,15 @@
 //! health monitoring, and event processing.
 
 mod api;
+mod bootstrap;
 mod config;
 mod eventbus;
+mod git;
+mod git_services;
 mod middleware;
+mod passkey;
+mod secrets_request;
+mod services;
 mod state;
 mod ui;
 
@@ -36,14 +42,54 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Background tasks ─────────────────────────────────────────────────
     let cancel = tokio_util::sync::CancellationToken::new();
+    let tracker = tokio_util::task::TaskTracker::new();
     tokio::spawn(eventbus::run(state.clone(), cancel.clone()));
+
+    // ── Pipeline executor ────────────────────────────────────────────────
+    let pipeline_state = state.pipeline_state();
+    tokio::spawn(platform_pipeline::executor::run(
+        pipeline_state,
+        cancel.clone(),
+    ));
+
+    // ── Deployer reconciler + analysis ──────────────────────────────────
+    let deployer_state = state.deployer_state();
+    tokio::spawn(platform_deployer::reconciler::run(
+        deployer_state.clone(),
+        cancel.clone(),
+    ));
+    tokio::spawn(platform_deployer::analysis::run(
+        deployer_state,
+        cancel.clone(),
+    ));
+
+    // ── SSH server (optional) ──────────────────────────────────────────
+    if state.config.git.ssh_listen.is_some() {
+        let git_state = state.git_state();
+        let ssh_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                platform_git::ssh_server::run(git_state.svc, git_state.config, ssh_cancel).await
+            {
+                tracing::error!(error = %e, "SSH server error");
+            }
+        });
+    }
+
+    // ── Observe subsystem ────────────────────────────────────────────────
+    let observe_state = state.observe_state();
+    let observe_channels =
+        platform_observe::spawn_background_tasks(&observe_state, cancel.clone(), &tracker);
+    let observe_router = platform_observe::router(observe_channels).with_state(observe_state);
 
     // ── HTTP server ──────────────────────────────────────────────────────
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
         .fallback(ui::static_handler)
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .merge(git::router(&state))
+        .merge(observe_router);
 
     let listener = tokio::net::TcpListener::bind(&state.config.core.listen).await?;
     tracing::info!(listen = %state.config.core.listen, "platform-next listening");
@@ -79,6 +125,7 @@ fn load_config() -> anyhow::Result<PlatformConfig> {
     Ok(config)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn init_infrastructure(config: PlatformConfig) -> anyhow::Result<PlatformState> {
     // ── Database ─────────────────────────────────────────────────────────
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -155,6 +202,37 @@ async fn init_infrastructure(config: PlatformConfig) -> anyhow::Result<PlatformS
         None
     };
 
+    // ── Secrets resolver (optional — requires master key) ─────────────
+    let secrets_resolver = config
+        .secrets
+        .master_key
+        .as_deref()
+        .map(|hex| -> anyhow::Result<_> {
+            let key = platform_secrets::parse_master_key(hex)?;
+            Ok(services::AppSecretsResolver::new(pool.clone(), key))
+        })
+        .transpose()?;
+    if secrets_resolver.is_some() {
+        tracing::info!("secrets resolver ready");
+    } else {
+        tracing::warn!("PLATFORM_MASTER_KEY not set — secrets resolver disabled");
+    }
+
+    // ── Notification dispatcher ────────────────────────────────────────
+    let smtp_config = services::to_notify_smtp_config(&config.smtp);
+    let webhook_dispatch = platform_webhook::WebhookDispatch::new(pool.clone());
+    let notification_dispatcher = services::AppNotificationDispatcher::new(
+        pool.clone(),
+        valkey_pool.clone(),
+        smtp_config,
+        webhook_dispatch,
+    );
+    tracing::info!("notification dispatcher ready");
+
+    let cli_session_manager = platform_agent::claude_cli::session::CliSessionManager::new(
+        config.agent.max_cli_subprocesses,
+    );
+
     Ok(PlatformState {
         pool: pool.clone(),
         valkey: valkey_pool,
@@ -168,10 +246,12 @@ async fn init_infrastructure(config: PlatformConfig) -> anyhow::Result<PlatformS
         audit_tx: platform_types::AuditLog::new(pool),
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
         mesh_ca,
+        secrets_resolver,
+        notification_dispatcher,
         health: Arc::new(tokio::sync::RwLock::new(
             platform_operator::health::HealthSnapshot::default(),
         )),
-        secret_requests: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        cli_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        secret_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cli_session_manager,
     })
 }

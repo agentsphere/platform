@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(ms.value) FROM metric_samples ms\n                   JOIN metric_series ser ON ser.id = ms.series_id\n                   WHERE ser.name = $1 AND ($2::jsonb IS NULL OR ser.labels @> $2)\n                   AND ms.timestamp > now() - $3 * interval '1 second'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5533ae8a03eb65bca80b35044f4269caefc3257831d243751bde4fe81c048fc0"
+}

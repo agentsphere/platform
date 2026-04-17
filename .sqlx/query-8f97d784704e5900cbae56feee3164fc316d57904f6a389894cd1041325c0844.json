@@ -1,0 +1,73 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO secrets (project_id, workspace_id, environment, name, encrypted_value, scope, created_by)\n        VALUES (NULL, NULL, NULL, $1, $2, $3, $4)\n        ON CONFLICT (name) WHERE project_id IS NULL AND workspace_id IS NULL AND environment IS NULL\n        DO UPDATE SET\n            encrypted_value = EXCLUDED.encrypted_value,\n            scope = EXCLUDED.scope,\n            version = secrets.version + 1,\n            updated_at = now()\n        RETURNING id, project_id, workspace_id, environment, name, scope, version,\n                  created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "environment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8f97d784704e5900cbae56feee3164fc316d57904f6a389894cd1041325c0844"
+}

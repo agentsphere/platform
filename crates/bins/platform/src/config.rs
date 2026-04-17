@@ -17,7 +17,7 @@ use platform_types::config::{
 ///
 /// Composes all domain sub-configs. Loaded from environment variables.
 #[derive(Clone)]
-#[allow(clippy::struct_excessive_bools, dead_code)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlatformConfig {
     pub core: CoreConfig,
     pub db: DbConfig,
@@ -418,5 +418,84 @@ impl PlatformConfig {
         }
 
         (warnings, errors)
+    }
+
+    /// Build domain-specific [`platform_agent::config::AgentConfig`] from env-level sub-configs.
+    pub fn to_agent_config(&self) -> platform_agent::config::AgentConfig {
+        platform_agent::config::AgentConfig {
+            platform_api_url: self.pipeline.platform_api_url.clone(),
+            registry_url: self.registry.registry_url.clone(),
+            registry_node_url: self.registry.registry_node_url.clone(),
+            valkey_agent_host: self.valkey.valkey_agent_host.clone(),
+            claude_cli_version: self.agent.claude_cli_version.clone(),
+            runner_image: self.pipeline.runner_image.clone(),
+            git_clone_image: self.pipeline.git_clone_image.clone(),
+            agent_namespace: self.agent.agent_namespace.clone(),
+            platform_namespace: self.core.platform_namespace.clone(),
+            gateway_namespace: self.gateway.gateway_namespace.clone(),
+            ns_prefix: self.core.ns_prefix.clone(),
+            dev_mode: self.core.dev_mode,
+            session_idle_timeout_secs: self.agent.session_idle_timeout_secs,
+            proxy_binary_path: self.mesh.proxy_binary_path.clone(),
+            master_key: self.secrets.master_key.clone(),
+            listen: self.core.listen.clone(),
+            mcp_servers_path: self.agent.mcp_servers_path.clone(),
+            manager_session_max_per_user: self.agent.manager_session_max_per_user,
+            cli_spawn_enabled: self.agent.cli_spawn_enabled,
+        }
+    }
+
+    /// Build domain-specific [`platform_git::GitServerConfig`] from env-level sub-configs.
+    pub fn to_git_server_config(&self) -> platform_git::GitServerConfig {
+        platform_git::GitServerConfig {
+            repos_path: self.git.git_repos_path.clone(),
+            ssh_host_key_path: Some(std::path::PathBuf::from(&self.git.ssh_host_key_path)),
+            ssh_listen_addr: self.git.ssh_listen.clone(),
+            git_http_timeout_secs: self.git.git_http_timeout_secs,
+            max_lfs_object_bytes: self.git.max_lfs_object_bytes,
+        }
+    }
+
+    /// Build domain-specific [`platform_pipeline::config::PipelineConfig`] from env-level sub-configs.
+    pub fn to_pipeline_config(&self) -> platform_pipeline::config::PipelineConfig {
+        platform_pipeline::config::PipelineConfig {
+            kaniko_image: self.pipeline.kaniko_image.clone(),
+            git_clone_image: self.pipeline.git_clone_image.clone(),
+            platform_api_url: self.pipeline.platform_api_url.clone(),
+            platform_namespace: self.core.platform_namespace.clone(),
+            ns_prefix: self.core.ns_prefix.clone(),
+            gateway_namespace: self.gateway.gateway_namespace.clone(),
+            registry_url: self.registry.registry_url.clone(),
+            node_registry_url: self.registry.registry_node_url.clone(),
+            pipeline_timeout_secs: self.pipeline.pipeline_timeout_secs,
+            pipeline_max_parallel: self.pipeline.pipeline_max_parallel,
+            dev_mode: self.core.dev_mode,
+            master_key: self.secrets.master_key.clone(),
+            ops_repos_path: self.deployer.ops_repos_path.to_string_lossy().into_owned(),
+            proxy_binary_path: self.mesh.proxy_binary_path.clone(),
+            pipeline_namespace: self.pipeline.pipeline_namespace.clone(),
+            max_artifact_file_bytes: self.pipeline.max_artifact_file_bytes,
+            max_artifact_total_bytes: self.pipeline.max_artifact_total_bytes,
+        }
+    }
+
+    /// Build domain-specific [`platform_deployer::state::DeployerConfig`] from env-level sub-configs.
+    pub fn to_deployer_config(&self) -> platform_deployer::state::DeployerConfig {
+        platform_deployer::state::DeployerConfig {
+            ops_repos_path: self.deployer.ops_repos_path.to_string_lossy().into_owned(),
+            platform_namespace: self.core.platform_namespace.clone(),
+            ns_prefix: self.core.ns_prefix.clone(),
+            dev_mode: self.core.dev_mode,
+            gateway_namespace: self.gateway.gateway_namespace.clone(),
+            preview_proxy_url: self.deployer.preview_proxy_url.clone(),
+            registry_node_url: self.registry.registry_node_url.clone(),
+            registry_url: self.registry.registry_url.clone(),
+            proxy_binary_path: self.mesh.proxy_binary_path.clone(),
+            mesh_enabled: self.mesh.mesh_enabled,
+            mesh_strict_mtls: self.mesh.mesh_strict_mtls,
+            platform_api_url: self.pipeline.platform_api_url.clone(),
+            gateway_name: self.gateway.gateway_name.clone(),
+            master_key: self.secrets.master_key.clone(),
+        }
     }
 }

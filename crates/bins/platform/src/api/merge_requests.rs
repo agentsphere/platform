@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, send_audit};
 use platform_types::{ApiError, AuthUser, Permission, UserType};
+use platform_types::{AuditEntry, send_audit};
 
 use crate::state::PlatformState;
 
@@ -571,9 +571,14 @@ async fn enforce_merge_gates(
     target_branch: &str,
     merge_method: &str,
 ) -> Result<(), ApiError> {
-    let rule = crate::git::protection::get_protection(&state.pool, project_id, target_branch)
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("protection check: {e}")))?;
+    let protection_provider = platform_git::PgBranchProtectionProvider::new(&state.pool);
+    let rule = platform_git::BranchProtectionProvider::get_protection(
+        &protection_provider,
+        project_id,
+        target_branch,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("protection check: {e}")))?;
 
     let Some(ref rule) = rule else {
         return Ok(());
@@ -1785,7 +1790,8 @@ async fn run_post_merge_side_effects(
     )
     .await;
 
-    crate::deployer::preview::stop_preview_for_branch(&state.pool, project_id, source_branch).await;
+    platform_deployer::preview::stop_preview_for_branch(&state.pool, project_id, source_branch)
+        .await;
 
     // Trigger push pipeline on the target branch (background, best-effort).
     // do_merge() writes directly to the bare repo via worktree, bypassing the
@@ -1798,22 +1804,27 @@ async fn run_post_merge_side_effects(
         let trigger_user = auth.user_id;
         tokio::spawn(async move {
             let merge_sha = get_branch_head_sha(&trigger_repo, &trigger_branch).await;
-            let params = crate::pipeline::trigger::PushTriggerParams {
+            let params = platform_pipeline::trigger::PushTriggerParams {
                 project_id,
                 user_id: trigger_user,
                 repo_path: trigger_repo,
                 branch: trigger_branch,
                 commit_sha: merge_sha,
             };
-            match crate::pipeline::trigger::on_push(
+            match platform_pipeline::trigger::on_push(
                 &trigger_state.pool,
                 &params,
-                &trigger_state.config.kaniko_image,
+                &trigger_state.config.pipeline.kaniko_image,
             )
             .await
             {
                 Ok(Some(pipeline_id)) => {
-                    crate::pipeline::trigger::notify_executor(&trigger_state, pipeline_id).await;
+                    platform_pipeline::trigger::notify_executor(
+                        &trigger_state.pipeline_notify,
+                        &trigger_state.valkey,
+                        pipeline_id,
+                    )
+                    .await;
                     tracing::info!(%project_id, %pipeline_id, "post-merge push pipeline triggered");
                 }
                 Ok(None) => {
@@ -1846,7 +1857,7 @@ fn spawn_mr_pipeline_trigger(
     let action = action.to_string();
     tokio::spawn(async move {
         let sha = get_branch_head_sha(&repo, &branch).await;
-        let mr_params = crate::pipeline::trigger::MrTriggerParams {
+        let mr_params = platform_pipeline::trigger::MrTriggerParams {
             project_id,
             user_id,
             repo_path: repo,
@@ -1854,11 +1865,20 @@ fn spawn_mr_pipeline_trigger(
             commit_sha: sha,
             action,
         };
-        match crate::pipeline::trigger::on_mr(&pool, &mr_params, &trigger_state.config.kaniko_image)
-            .await
+        match platform_pipeline::trigger::on_mr(
+            &pool,
+            &mr_params,
+            &trigger_state.config.pipeline.kaniko_image,
+        )
+        .await
         {
             Ok(Some(pipeline_id)) => {
-                crate::pipeline::trigger::notify_executor(&trigger_state, pipeline_id).await;
+                platform_pipeline::trigger::notify_executor(
+                    &trigger_state.pipeline_notify,
+                    &trigger_state.valkey,
+                    pipeline_id,
+                )
+                .await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -1903,22 +1923,23 @@ async fn post_merge_deploy(
     // Must match the format used by gitops_sync step in the pipeline executor.
     let registry = state
         .config
+        .registry
         .registry_node_url
         .as_deref()
-        .or(state.config.registry_url.as_deref())
+        .or(state.config.registry.registry_url.as_deref())
         .unwrap_or("localhost:5000");
     let image_ref = format!("{registry}/{project_name}/app:{source_head_sha}");
 
     // Read VERSION file from target branch (post-merge)
     let version_info =
-        crate::pipeline::trigger::read_version_at_ref(repo_path, target_branch).await;
+        platform_pipeline::trigger::read_version_at_ref(repo_path, target_branch).await;
 
     // Optional: add version alias tag in registry (use the "app" image version)
     if let Some(ref vi) = version_info
         && let Some(ver) = vi.images.get("app")
-        && state.config.registry_url.is_some()
+        && state.config.registry.registry_url.is_some()
     {
-        match crate::registry::copy_tag(&state.pool, &project_name, &image_tag, ver).await {
+        match platform_registry::copy_tag(&state.pool, &project_name, &image_tag, ver).await {
             Ok(()) => tracing::info!(version = %ver, "added version tag alias"),
             Err(e) => tracing::warn!(
                 error = %e,
@@ -1981,13 +2002,9 @@ async fn post_merge_deploy(
         let merge_sha = get_branch_head_sha(repo_path, target_branch).await;
         if let Some(sha) = merge_sha {
             let ops_path = std::path::PathBuf::from(&ops.repo_path);
-            if let Err(e) = crate::deployer::ops_repo::sync_from_project_repo(
-                repo_path,
-                &ops_path,
-                &ops.branch,
-                &sha,
-            )
-            .await
+            if let Err(e) =
+                platform_ops_repo::sync_from_project_repo(repo_path, &ops_path, &ops.branch, &sha)
+                    .await
             {
                 tracing::warn!(error = %e, "post-merge deploy/ sync failed");
             }
@@ -1996,13 +2013,9 @@ async fn post_merge_deploy(
                 "image_ref": image_ref,
                 "version": version_info.as_ref().and_then(|vi| vi.images.get("app").map(String::as_str)).unwrap_or(short_sha),
             });
-            if let Err(e) = crate::deployer::ops_repo::commit_values(
-                &ops_path,
-                &ops.branch,
-                "production",
-                &values,
-            )
-            .await
+            if let Err(e) =
+                platform_ops_repo::commit_values(&ops_path, &ops.branch, "production", &values)
+                    .await
             {
                 tracing::warn!(error = %e, "post-merge values commit failed");
             }

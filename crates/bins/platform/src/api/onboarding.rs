@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, ApiError, AuthUser, Permission, send_audit};
+use platform_types::{ApiError, AuditEntry, AuthUser, Permission, send_audit};
 
 use crate::api::helpers::require_admin;
 use crate::state::PlatformState;
@@ -297,15 +297,15 @@ async fn create_demo_project(
 /// Fallback for checking wizard completion directly from DB.
 async fn is_wizard_completed_fallback(state: &PlatformState) -> Result<bool, anyhow::Error> {
     let val: Option<serde_json::Value> = sqlx::query_scalar(
-        "SELECT value FROM platform_settings WHERE key = 'onboarding_completed'"
+        "SELECT value FROM platform_settings WHERE key = 'onboarding_completed'",
     )
     .fetch_optional(&state.pool)
     .await?;
 
-    Ok(val.map(|v| v.as_bool().unwrap_or(false)).unwrap_or(false))
+    Ok(val.is_some_and(|v| v.as_bool().unwrap_or(false)))
 }
 
-/// Fallback for reading a platform_settings key directly from DB.
+/// Fallback for reading a `platform_settings` key directly from DB.
 async fn get_setting_fallback(state: &PlatformState, key: &str) -> Option<serde_json::Value> {
     sqlx::query_scalar("SELECT value FROM platform_settings WHERE key = $1")
         .bind(key)
@@ -316,9 +316,14 @@ async fn get_setting_fallback(state: &PlatformState, key: &str) -> Option<serde_
 }
 
 /// Save an Anthropic API key for the user (reuses existing provider key logic).
-async fn save_provider_key(state: &PlatformState, user_id: Uuid, api_key: &str) -> Result<(), ApiError> {
+async fn save_provider_key(
+    state: &PlatformState,
+    user_id: Uuid,
+    api_key: &str,
+) -> Result<(), ApiError> {
     let hex_str = state
         .config
+        .secrets
         .master_key
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("master key not configured".into()))?;
@@ -358,6 +363,7 @@ async fn save_cli_token(
 ) -> Result<(), ApiError> {
     let hex_str = state
         .config
+        .secrets
         .master_key
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("master key not configured".into()))?;
@@ -387,6 +393,7 @@ async fn save_custom_provider(
 ) -> Result<(), ApiError> {
     let hex_str = state
         .config
+        .secrets
         .master_key
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("master key not configured".into()))?;
@@ -462,7 +469,7 @@ async fn start_claude_auth(
     require_admin(&state, &auth).await?;
 
     // Rate limit: 50/hour in dev mode, 5/hour in production
-    let max_attempts = if state.config.dev_mode { 50 } else { 5 };
+    let max_attempts = if state.config.core.dev_mode { 50 } else { 5 };
     platform_auth::rate_limit::check_rate(
         &state.valkey,
         "claude-auth",
@@ -550,7 +557,7 @@ async fn verify_oauth_token(
 
     validation::check_length("token", &body.token, 10, 500)?;
 
-    let max_attempts = if state.config.dev_mode { 50 } else { 10 };
+    let max_attempts = if state.config.core.dev_mode { 50 } else { 10 };
     platform_auth::rate_limit::check_rate(
         &state.valkey,
         "verify-oauth",

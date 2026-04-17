@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as \"count!: i64\" FROM mr_reviews\n            WHERE mr_id = $1 AND verdict = 'approve' AND is_stale = false",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5608798f4b1e04a6d820aab45f1c00889e41965c1ce09a42c51e8d591a9e4df9"
+}

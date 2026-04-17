@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT encrypted_value, scope,\n               project_id, workspace_id, environment\n        FROM secrets\n        WHERE name = $1\n          AND (\n              -- Level 1: project + environment\n              (project_id = $2 AND environment = $3)\n              -- Level 2: project (no env)\n              OR (project_id = $2 AND environment IS NULL)\n              -- Level 3: workspace (no project)\n              OR (workspace_id = $4 AND project_id IS NULL AND environment IS NULL)\n              -- Level 4: global\n              OR (project_id IS NULL AND workspace_id IS NULL AND environment IS NULL)\n          )\n        ORDER BY\n            CASE\n                WHEN project_id = $2 AND environment = $3 THEN 0\n                WHEN project_id = $2 AND environment IS NULL THEN 1\n                WHEN workspace_id = $4 AND project_id IS NULL THEN 2\n                ELSE 3\n            END\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "encrypted_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "environment",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c2fafba5805e10e457a1c7bc9b2b39c80cea834eaedb1a81f90c180ffd46c9ff"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO alert_events (rule_id, status, value, message)\n        VALUES ($1, 'firing', $2, 'Alert condition met')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b413fea329cee79a4879de345e99516b04f62e74c2fcd2040701921cab2bca58"
+}

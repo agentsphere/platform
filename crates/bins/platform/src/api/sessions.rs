@@ -14,15 +14,15 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+use crate::state::PlatformState;
 use platform_agent::AgentRoleName;
 use platform_agent::service;
-use platform_types::{AuditEntry, send_audit};
-use platform_types::AuthUser;
-use platform_types::ApiError;
-use platform_types::Permission;
 use platform_auth::resolver;
+use platform_types::ApiError;
+use platform_types::AuthUser;
+use platform_types::Permission;
 use platform_types::validation;
-use crate::state::PlatformState;
+use platform_types::{AuditEntry, send_audit};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -303,10 +303,17 @@ fn validate_provider_config(config: &serde_json::Value) -> Result<(), ApiError> 
         return Ok(());
     };
     if let Some(ref image) = parsed.image {
-        validation::check_container_image(image)?;
+        validation::check_pipeline_image(image)?;
     }
     if let Some(ref commands) = parsed.setup_commands {
-        validation::check_setup_commands(commands)?;
+        if commands.len() > 20 {
+            return Err(ApiError::BadRequest(
+                "setup_commands: max 20 commands".into(),
+            ));
+        }
+        for cmd in commands {
+            validation::check_length("setup_command", cmd, 1, 10_000)?;
+        }
     }
     if let Some(ref role) = parsed.role
         && platform_agent::provider::resolve_role(role).is_none()
@@ -316,7 +323,14 @@ fn validate_provider_config(config: &serde_json::Value) -> Result<(), ApiError> 
         )));
     }
     if let Some(ref browser) = parsed.browser {
-        validation::check_browser_config(browser)?;
+        if browser.allowed_origins.len() > 20 {
+            return Err(ApiError::BadRequest(
+                "browser.allowed_origins: max 20 entries".into(),
+            ));
+        }
+        for origin in &browser.allowed_origins {
+            validation::check_url(origin)?;
+        }
         let role = parsed.role.as_deref().unwrap_or("dev");
         if !matches!(role, "ui" | "test") {
             return Err(ApiError::BadRequest(
@@ -385,8 +399,9 @@ async fn create_session(
     .ok_or_else(|| ApiError::NotFound("project".into()))?;
 
     // Create session (identity + pod)
+    let agent = state.agent_state();
     let session = service::create_session(
-        &state,
+        &agent,
         auth.user_id,
         id,
         prompt,
@@ -560,7 +575,8 @@ async fn send_message(
 
     require_session_write(&state, &auth, id, session.user_id).await?;
 
-    service::send_message(&state, session_id, &body.content)
+    let agent = state.agent_state();
+    service::send_message(&agent, session_id, &body.content)
         .await
         .map_err(ApiError::from)?;
 
@@ -597,7 +613,8 @@ async fn stop_session(
 
     require_session_write(&state, &auth, id, session.user_id).await?;
 
-    service::stop_session(&state, session_id)
+    let agent = state.agent_state();
+    service::stop_session(&agent, session_id)
         .await
         .map_err(ApiError::from)?;
 
@@ -1092,7 +1109,8 @@ async fn send_message_global(
 
     validation::check_length("content", &body.content, 1, 100_000)?;
 
-    service::send_message(&state, session_id, &body.content)
+    let agent = state.agent_state();
+    service::send_message(&agent, session_id, &body.content)
         .await
         .map_err(ApiError::from)?;
 
@@ -1194,7 +1212,8 @@ async fn create_manager_session_handler(
         validation::check_length("prompt", prompt, 1, 100_000)?;
     }
 
-    let session_id = service::create_manager_session(&state, auth.user_id, body.prompt)
+    let agent = state.agent_state();
+    let session_id = service::create_manager_session(&agent, auth.user_id, body.prompt)
         .await
         .map_err(ApiError::from)?;
 
@@ -1298,7 +1317,8 @@ async fn send_manager_message(
         return Err(ApiError::NotFound("session".into()));
     }
 
-    service::send_manager_message(&state, id, &body.content)
+    let agent = state.agent_state();
+    service::send_manager_message(&agent, id, &body.content)
         .await
         .map_err(ApiError::from)?;
 
@@ -1374,7 +1394,8 @@ async fn stop_manager_session(
         return Err(ApiError::NotFound("session".into()));
     }
 
-    service::stop_session(&state, id)
+    let agent = state.agent_state();
+    service::stop_session(&agent, id)
         .await
         .map_err(ApiError::from)?;
 

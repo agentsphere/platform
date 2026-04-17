@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MIN(ms.value) FROM metric_samples ms\n                   JOIN metric_series ser ON ser.id = ms.series_id\n                   WHERE ser.name = $1 AND ($2::jsonb IS NULL OR ser.labels @> $2)\n                   AND ms.timestamp > now() - $3 * interval '1 second'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "57429a6ca1ca3fd39dd2e6607aa4b018bc2ea670120d45b936483b7ff6790acf"
+}

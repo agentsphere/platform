@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO traces (id, trace_id, root_span, service, status, started_at, project_id, session_id, user_id)\n            VALUES ($1, $2, $3, $4, 'unset', $5, $6, $7, $8)\n            ON CONFLICT (trace_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2cad21acdae696c40d805b1c8027a496cf20015a540e0a95bed90175a99d650f"
+}

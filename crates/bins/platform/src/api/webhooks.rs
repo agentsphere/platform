@@ -18,12 +18,13 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, ApiError, AuthUser, send_audit, validation};
+use platform_types::{ApiError, AuditEntry, AuthUser, send_audit, validation};
 
 use super::helpers::require_project_write;
 use crate::state::PlatformState;
 
 /// Shared HTTP client for webhook dispatch (with timeouts).
+#[allow(dead_code)]
 pub(crate) static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -34,6 +35,7 @@ pub(crate) static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 /// Concurrency limiter for webhook dispatch (max 50 concurrent deliveries).
+#[allow(dead_code)]
 pub(crate) static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(50));
 
 // ---------------------------------------------------------------------------
@@ -42,6 +44,7 @@ pub(crate) static WEBHOOK_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Sema
 
 /// Validate a webhook URL to block SSRF attacks.
 /// Rejects private/loopback IPs, link-local, metadata endpoints, and non-HTTP schemes.
+#[allow(dead_code)]
 pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), ApiError> {
     let parsed =
         url::Url::parse(url_str).map_err(|_| ApiError::BadRequest("invalid URL".into()))?;

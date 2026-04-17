@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT p.name as \"name!\"\n        FROM permissions p\n        WHERE p.id IN (\n            SELECT rp.permission_id\n            FROM user_roles ur\n            JOIN role_permissions rp ON rp.role_id = ur.role_id\n            WHERE ur.user_id = $1\n              AND ur.project_id IS NULL\n\n            UNION\n\n            SELECT rp.permission_id\n            FROM user_roles ur\n            JOIN role_permissions rp ON rp.role_id = ur.role_id\n            WHERE ur.user_id = $1\n              AND ur.project_id = $2\n\n            UNION\n\n            SELECT d.permission_id\n            FROM delegations d\n            WHERE d.delegate_id = $1\n              AND d.project_id IS NULL\n              AND d.revoked_at IS NULL\n              AND (d.expires_at IS NULL OR d.expires_at > now())\n\n            UNION\n\n            SELECT d.permission_id\n            FROM delegations d\n            WHERE d.delegate_id = $1\n              AND d.project_id = $2\n              AND d.revoked_at IS NULL\n              AND (d.expires_at IS NULL OR d.expires_at > now())\n        )",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "28077fd3aaa975f9cd47c22df9dc43f87172f2871fe84e17a31b4ce93b6c4ddc"
+}

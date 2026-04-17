@@ -11,10 +11,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use platform_agent::commands::{validate_command_name, validate_template};
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, Permission, send_audit, validation};
-use platform_auth::resolver;
 use crate::state::PlatformState;
+use platform_agent::commands::{validate_command_name, validate_template};
+use platform_auth::resolver;
+use platform_types::{
+    ApiError, AuditEntry, AuthUser, ListResponse, Permission, send_audit, validation,
+};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -642,9 +644,12 @@ async fn list_resolved_commands(
     super::helpers::require_project_read(&state, &auth, params.project_id).await?;
     let workspace_id = project_workspace_id(&state.pool, params.project_id).await?;
 
-    let resolved =
-        platform_agent::commands::resolve_all_commands(&state.pool, params.project_id, workspace_id)
-            .await?;
+    let resolved = platform_agent::commands::resolve_all_commands(
+        &state.pool,
+        params.project_id,
+        workspace_id,
+    )
+    .await?;
 
     Ok(Json(resolved))
 }

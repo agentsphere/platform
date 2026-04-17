@@ -16,10 +16,8 @@ use sqlx::Row;
 
 use platform_auth::token;
 use platform_types::validation;
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, UserType, send_audit};
+use platform_types::{ApiError, AuditEntry, AuthUser, ListResponse, UserType, send_audit};
 
-// TODO: wire passkey from platform crate — passkey module not yet in platform_auth
-// use platform_auth::passkey;
 use crate::state::PlatformState;
 
 // ---------------------------------------------------------------------------
@@ -140,7 +138,6 @@ async fn begin_register(
     .fetch_one(&state.pool)
     .await?;
 
-    // TODO: wire passkey from platform crate — passkey module not yet in platform_auth
     let ccr = crate::passkey::begin_registration(
         &state.webauthn,
         &state.valkey,
@@ -161,10 +158,10 @@ async fn complete_register(
     auth: AuthUser,
     Json(body): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // TODO: wire passkey from platform crate — passkey module not yet in platform_auth
-    let pk = crate::passkey::finish_registration(&state.webauthn, &state.valkey, auth.user_id, &body)
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("registration failed: {e}")))?;
+    let pk =
+        crate::passkey::finish_registration(&state.webauthn, &state.valkey, auth.user_id, &body)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("registration failed: {e}")))?;
 
     // Store credential in DB
     let cred_id_bytes: Vec<u8> = pk.cred_id().to_vec();
@@ -359,11 +356,12 @@ async fn delete_passkey(
 // Authentication handlers (unauthenticated)
 // ---------------------------------------------------------------------------
 
-async fn begin_login(State(state): State<PlatformState>) -> Result<Json<BeginLoginResponse>, ApiError> {
+async fn begin_login(
+    State(state): State<PlatformState>,
+) -> Result<Json<BeginLoginResponse>, ApiError> {
     // S39: Rate limit — each call creates a Valkey challenge object (120s TTL)
     platform_auth::rate_limit::check_rate(&state.valkey, "passkey_begin", "global", 60, 60).await?;
 
-    // TODO: wire passkey from platform crate — passkey module not yet in platform_auth
     let (rcr, challenge_id) =
         crate::passkey::begin_discoverable_authentication(&state.webauthn, &state.valkey)
             .await
@@ -387,7 +385,8 @@ async fn complete_login(
 
     // Rate-limit passkey login attempts (global key — challenge_id is per-ceremony
     // and would allow unlimited attempts across ceremonies)
-    platform_auth::rate_limit::check_rate(&state.valkey, "passkey_login", "global", 50, 300).await?;
+    platform_auth::rate_limit::check_rate(&state.valkey, "passkey_login", "global", 50, 300)
+        .await?;
 
     // Extract the credential ID from the request to pre-filter the DB query,
     // rather than loading ALL credentials for ALL active users.
@@ -421,8 +420,7 @@ async fn complete_login(
         return Err(ApiError::Unauthorized);
     }
 
-    // TODO: wire passkey from platform crate — passkey module not yet in platform_auth
-    let (_auth_state, auth_result) = crate::passkey::finish_discoverable_authentication(
+    let auth_result = crate::passkey::finish_discoverable_authentication(
         &state.webauthn,
         &state.valkey,
         &body.challenge_id,
@@ -550,7 +548,7 @@ async fn build_passkey_session(
         },
     };
 
-    let secure_flag = if state.config.secure_cookies {
+    let secure_flag = if state.config.auth.secure_cookies {
         "; Secure"
     } else {
         ""

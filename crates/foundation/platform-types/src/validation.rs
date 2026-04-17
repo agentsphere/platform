@@ -46,6 +46,125 @@ pub fn check_email(value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validates a list of labels: max 50, each 1-100 chars.
+pub fn check_labels(labels: &[String]) -> Result<(), ApiError> {
+    if labels.len() > 50 {
+        return Err(ApiError::BadRequest("max 50 labels".into()));
+    }
+    for label in labels {
+        check_length("label", label, 1, 100)?;
+    }
+    Ok(())
+}
+
+/// Validates a URL: 1-2048 chars, http(s) only.
+pub fn check_url(value: &str) -> Result<(), ApiError> {
+    check_length("url", value, 1, 2048)?;
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "url must use http or https scheme".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates an LFS object ID: exactly 64 hex chars.
+pub fn check_lfs_oid(oid: &str) -> Result<(), ApiError> {
+    if oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "LFS OID must be exactly 64 hex characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check whether an IP address is private/reserved (SSRF protection).
+pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_private_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_private_ipv4(mapped_v4);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || is_ipv6_unique_local(&v6)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_unspecified()
+}
+
+fn is_ipv6_unique_local(v6: &std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Validate a URL against SSRF attacks.
+///
+/// Blocks private/loopback IPs, link-local, metadata endpoints,
+/// non-allowed schemes, and DNS names resolving to private IPs.
+pub fn check_ssrf_url(url_str: &str, allowed_schemes: &[&str]) -> Result<(), ApiError> {
+    use std::net::ToSocketAddrs;
+
+    let parsed =
+        url::Url::parse(url_str).map_err(|_| ApiError::BadRequest("invalid URL".into()))?;
+
+    if !allowed_schemes.contains(&parsed.scheme()) {
+        return Err(ApiError::BadRequest(format!(
+            "URL must use one of these schemes: {allowed_schemes:?}"
+        )));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("URL must have a host".into()))?;
+
+    let blocked_hosts = [
+        "localhost",
+        "169.254.169.254",
+        "metadata.google.internal",
+        "[::1]",
+    ];
+    let host_lower = host.to_lowercase();
+    if blocked_hosts.iter().any(|b| host_lower == *b) {
+        return Err(ApiError::BadRequest(
+            "URL must not target internal/metadata endpoints".into(),
+        ));
+    }
+
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err(ApiError::BadRequest(
+            "URL must not target private/reserved IP addresses".into(),
+        ));
+    }
+
+    // DNS rebinding mitigation — resolve hostname and check IPs
+    if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+        for addr in addrs {
+            if is_private_ip(addr.ip()) {
+                return Err(ApiError::BadRequest(
+                    "URL hostname resolves to a private/reserved IP address".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 const GIT_UNSAFE: &[char] = &['~', '^', ':', '*', '[', '?', '\\'];
 
 /// Validates a git branch name.
@@ -207,6 +326,122 @@ mod tests {
     #[test]
     fn check_length_exact_boundary() {
         assert!(check_length("name", "12345", 5, 5).is_ok());
+    }
+
+    // --- check_labels ---
+
+    #[test]
+    fn check_labels_valid() {
+        assert!(check_labels(&["bug".into(), "feature".into()]).is_ok());
+    }
+
+    #[test]
+    fn check_labels_empty() {
+        assert!(check_labels(&[]).is_ok());
+    }
+
+    #[test]
+    fn check_labels_too_many() {
+        let labels: Vec<String> = (0..51).map(|i| format!("label{i}")).collect();
+        assert!(check_labels(&labels).is_err());
+    }
+
+    #[test]
+    fn check_labels_one_too_long() {
+        assert!(check_labels(&["a".repeat(101)]).is_err());
+    }
+
+    #[test]
+    fn check_labels_one_empty() {
+        assert!(check_labels(&[String::new()]).is_err());
+    }
+
+    // --- check_url ---
+
+    #[test]
+    fn check_url_valid_https() {
+        assert!(check_url("https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn check_url_valid_http() {
+        assert!(check_url("http://example.com").is_ok());
+    }
+
+    #[test]
+    fn check_url_rejects_ftp() {
+        assert!(check_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn check_url_rejects_empty() {
+        assert!(check_url("").is_err());
+    }
+
+    #[test]
+    fn check_url_rejects_too_long() {
+        let long = format!("https://example.com/{}", "a".repeat(2048));
+        assert!(check_url(&long).is_err());
+    }
+
+    // --- check_lfs_oid ---
+
+    #[test]
+    fn check_lfs_oid_valid() {
+        assert!(check_lfs_oid(&"a".repeat(64)).is_ok());
+        assert!(check_lfs_oid(&"0123456789abcdef".repeat(4)).is_ok());
+    }
+
+    #[test]
+    fn check_lfs_oid_too_short() {
+        assert!(check_lfs_oid(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn check_lfs_oid_too_long() {
+        assert!(check_lfs_oid(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn check_lfs_oid_non_hex() {
+        assert!(check_lfs_oid(&"g".repeat(64)).is_err());
+    }
+
+    // --- is_private_ip ---
+
+    #[test]
+    fn private_ip_loopback_v4() {
+        assert!(is_private_ip("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_rfc1918_10() {
+        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_rfc1918_172() {
+        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_rfc1918_192() {
+        assert!(is_private_ip("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_link_local() {
+        assert!(is_private_ip("169.254.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_public() {
+        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ip_loopback_v6() {
+        assert!(is_private_ip("::1".parse().unwrap()));
     }
 
     // --- check_pipeline_image ---

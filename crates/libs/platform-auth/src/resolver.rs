@@ -4,11 +4,12 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use platform_types::valkey;
-use platform_types::{Permission, PermissionChecker, PermissionResolver};
+use platform_types::{ApiError, Permission, PermissionChecker, PermissionResolver};
 
 static CACHE_TTL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -271,6 +272,179 @@ impl PermissionResolver for PgPermissionChecker<'_> {
     ) -> anyhow::Result<()> {
         invalidate_permissions(self.valkey, user_id, project_id).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Delegation types and functions
+// ---------------------------------------------------------------------------
+
+/// Parameters for creating a permission delegation.
+#[derive(Debug)]
+pub struct CreateDelegationParams {
+    pub delegator_id: Uuid,
+    pub delegate_id: Uuid,
+    pub permission: Permission,
+    pub project_id: Option<Uuid>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub reason: Option<String>,
+}
+
+/// A delegation record from the database.
+#[derive(Debug, serde::Serialize)]
+pub struct Delegation {
+    pub id: Uuid,
+    pub delegator_id: Uuid,
+    pub delegate_id: Uuid,
+    pub permission_id: Uuid,
+    pub permission_name: String,
+    pub project_id: Option<Uuid>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Create a permission delegation from one user to another.
+///
+/// Security: prevents self-delegation and re-delegation of delegated-only permissions (A6).
+#[tracing::instrument(skip(pool, valkey), fields(delegator = %req.delegator_id, delegate = %req.delegate_id), err)]
+pub async fn create_delegation(
+    pool: &PgPool,
+    valkey: &fred::clients::Pool,
+    req: &CreateDelegationParams,
+) -> Result<Delegation, ApiError> {
+    if req.delegator_id == req.delegate_id {
+        return Err(ApiError::BadRequest(
+            "cannot delegate permissions to yourself".into(),
+        ));
+    }
+
+    // Validate delegator holds this permission
+    let delegator_has = has_permission(
+        pool,
+        valkey,
+        req.delegator_id,
+        req.project_id,
+        req.permission,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    if !delegator_has {
+        return Err(ApiError::Forbidden);
+    }
+
+    // A6: Prevent re-delegation — delegator must hold via direct role assignment
+    let has_via_role: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM user_roles ur \
+         JOIN role_permissions rp ON rp.role_id = ur.role_id \
+         JOIN permissions p ON p.id = rp.permission_id \
+         WHERE ur.user_id = $1 AND p.name = $2 \
+         AND (ur.project_id = $3 OR ur.project_id IS NULL OR $3::uuid IS NULL))",
+    )
+    .bind(req.delegator_id)
+    .bind(req.permission.as_str())
+    .bind(req.project_id)
+    .fetch_one(pool)
+    .await?;
+
+    if !has_via_role {
+        return Err(ApiError::BadRequest(
+            "cannot delegate a permission obtained only via delegation".into(),
+        ));
+    }
+
+    // Look up permission ID
+    let permission_id: Uuid = sqlx::query_scalar("SELECT id FROM permissions WHERE name = $1")
+        .bind(req.permission.as_str())
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("unknown permission".into()))?;
+
+    let row = sqlx::query_as!(
+        Delegation,
+        r#"
+        INSERT INTO delegations (delegator_id, delegate_id, permission_id, project_id, expires_at, reason)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, delegator_id, delegate_id, permission_id,
+                  (SELECT name FROM permissions WHERE id = permission_id) as "permission_name!",
+                  project_id, expires_at, reason, created_at, revoked_at
+        "#,
+        req.delegator_id,
+        req.delegate_id,
+        permission_id,
+        req.project_id,
+        req.expires_at,
+        req.reason,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    // Invalidate delegate's cached permissions
+    let _ = invalidate_permissions(valkey, req.delegate_id, req.project_id).await;
+
+    Ok(row)
+}
+
+/// Revoke a delegation by setting its `revoked_at` timestamp.
+#[tracing::instrument(skip(pool, valkey), fields(%delegation_id), err)]
+pub async fn revoke_delegation(
+    pool: &PgPool,
+    valkey: &fred::clients::Pool,
+    delegation_id: Uuid,
+) -> Result<(), ApiError> {
+    let row = sqlx::query!(
+        r#"
+        UPDATE delegations SET revoked_at = now()
+        WHERE id = $1 AND revoked_at IS NULL
+        RETURNING delegate_id, project_id
+        "#,
+        delegation_id,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("delegation".into()))?;
+
+    let _ = invalidate_permissions(valkey, row.delegate_id, row.project_id).await;
+
+    Ok(())
+}
+
+/// List delegations granted by or received by a user.
+#[tracing::instrument(skip(pool), fields(%user_id), err)]
+pub async fn list_delegations(
+    pool: &PgPool,
+    user_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Delegation>, ApiError> {
+    let rows = sqlx::query_as!(
+        Delegation,
+        r#"
+        SELECT
+            d.id,
+            d.delegator_id,
+            d.delegate_id,
+            d.permission_id,
+            p.name as "permission_name!",
+            d.project_id,
+            d.expires_at,
+            d.reason,
+            d.created_at,
+            d.revoked_at
+        FROM delegations d
+        JOIN permissions p ON p.id = d.permission_id
+        WHERE d.delegator_id = $1 OR d.delegate_id = $1
+        ORDER BY d.created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+        user_id,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 #[cfg(test)]

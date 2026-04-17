@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT u.id as \"user_id!\", u.name as \"user_name!\"\n               FROM users u\n               JOIN user_ssh_keys sk ON u.id = sk.user_id\n               WHERE sk.fingerprint = $1 AND u.is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d2d8ef1767ffc77b1e88b6d5bd63204ea265c4bfc3405840a8350b937229d291"
+}

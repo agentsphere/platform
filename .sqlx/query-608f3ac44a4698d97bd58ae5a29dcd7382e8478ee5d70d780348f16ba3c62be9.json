@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, pattern, require_pr, block_force_push, required_approvals,\n                      dismiss_stale_reviews, required_checks, require_up_to_date,\n                      allow_admin_bypass, merge_methods\n               FROM branch_protection_rules\n               WHERE project_id = $1 AND pattern = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pattern",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "require_pr",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "block_force_push",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "required_approvals",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "dismiss_stale_reviews",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "required_checks",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "require_up_to_date",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "allow_admin_bypass",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "merge_methods",
+        "type_info": "TextArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "608f3ac44a4698d97bd58ae5a29dcd7382e8478ee5d70d780348f16ba3c62be9"
+}

@@ -14,14 +14,58 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, send_audit};
 use platform_types::{ApiError, AuthUser};
-// TODO: wire from platform crate — workspace module
-// use crate::workspace::{self, service};
+use platform_types::{AuditEntry, send_audit};
 
 use platform_types::ListResponse;
 
 use crate::state::PlatformState;
+
+// ---------------------------------------------------------------------------
+// Domain types (from archive/src/workspace/types.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct Workspace {
+    id: Uuid,
+    name: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    owner_id: Uuid,
+    is_active: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceMember {
+    id: Uuid,
+    #[allow(dead_code)]
+    workspace_id: Uuid,
+    user_id: Uuid,
+    user_name: String,
+    role: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWorkspaceRequest {
+    name: String,
+    display_name: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateWorkspaceRequest {
+    display_name: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddMemberRequest {
+    user_id: Uuid,
+    role: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -39,9 +83,8 @@ pub struct WorkspaceResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-// TODO: wire from platform crate — workspace::Workspace
-impl From<crate::workspace::Workspace> for WorkspaceResponse {
-    fn from(w: crate::workspace::Workspace) -> Self {
+impl From<Workspace> for WorkspaceResponse {
+    fn from(w: Workspace) -> Self {
         Self {
             id: w.id,
             name: w.name,
@@ -64,9 +107,8 @@ pub struct MemberResponse {
     pub created_at: DateTime<Utc>,
 }
 
-// TODO: wire from platform crate — workspace::WorkspaceMember
-impl From<crate::workspace::WorkspaceMember> for MemberResponse {
-    fn from(m: crate::workspace::WorkspaceMember) -> Self {
+impl From<WorkspaceMember> for MemberResponse {
+    fn from(m: WorkspaceMember) -> Self {
         Self {
             id: m.id,
             user_id: m.user_id,
@@ -117,8 +159,268 @@ pub fn router() -> Router<PlatformState> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// TODO: wire from platform crate — workspace::service
-use crate::workspace::service;
+mod service {
+    use platform_types::ApiError;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::{Workspace, WorkspaceMember};
+
+    pub async fn is_member(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2
+            ) as "exists!: bool""#,
+            workspace_id,
+            user_id,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn is_admin(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM workspace_members
+                WHERE workspace_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')
+            ) as "exists!: bool""#,
+            workspace_id,
+            user_id,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn is_owner(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM workspaces WHERE id = $1 AND owner_id = $2 AND is_active = true
+            ) as "exists!: bool""#,
+            workspace_id,
+            user_id,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn get_workspace(pool: &PgPool, id: Uuid) -> Result<Option<Workspace>, ApiError> {
+        let row = sqlx::query_as!(
+            Workspace,
+            r#"SELECT id, name, display_name, description, owner_id, is_active,
+                      created_at, updated_at
+               FROM workspaces WHERE id = $1 AND is_active = true"#,
+            id,
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn list_user_workspaces(
+        pool: &PgPool,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Workspace>, i64), ApiError> {
+        let total = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!: i64"
+               FROM workspaces w
+               JOIN workspace_members wm ON wm.workspace_id = w.id
+               WHERE wm.user_id = $1 AND w.is_active = true"#,
+            user_id,
+        )
+        .fetch_one(pool)
+        .await?;
+
+        let rows = sqlx::query_as!(
+            Workspace,
+            r#"SELECT w.id, w.name, w.display_name, w.description, w.owner_id,
+                      w.is_active, w.created_at, w.updated_at
+               FROM workspaces w
+               JOIN workspace_members wm ON wm.workspace_id = w.id
+               WHERE wm.user_id = $1 AND w.is_active = true
+               ORDER BY w.updated_at DESC
+               LIMIT $2 OFFSET $3"#,
+            user_id,
+            limit,
+            offset,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok((rows, total))
+    }
+
+    pub async fn create_workspace(
+        pool: &PgPool,
+        owner_id: Uuid,
+        name: &str,
+        display_name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<Workspace, ApiError> {
+        let id = Uuid::new_v4();
+        let mut tx = pool.begin().await?;
+
+        sqlx::query!(
+            r#"INSERT INTO workspaces (id, name, display_name, description, owner_id)
+               VALUES ($1, $2, $3, $4, $5)"#,
+            id,
+            name,
+            display_name,
+            description,
+            owner_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.constraint() == Some("workspaces_name_key")
+            {
+                return ApiError::Conflict("workspace name already taken".into());
+            }
+            ApiError::from(e)
+        })?;
+
+        sqlx::query!(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            id,
+            owner_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        get_workspace(pool, id)
+            .await?
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("workspace vanished after creation")))
+    }
+
+    pub async fn update_workspace(
+        pool: &PgPool,
+        id: Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<Workspace, ApiError> {
+        let result = sqlx::query!(
+            r#"UPDATE workspaces SET
+                display_name = COALESCE($2, display_name),
+                description = COALESCE($3, description),
+                updated_at = now()
+               WHERE id = $1 AND is_active = true"#,
+            id,
+            display_name,
+            description,
+        )
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound("workspace".into()));
+        }
+
+        get_workspace(pool, id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("workspace".into()))
+    }
+
+    pub async fn delete_workspace(pool: &PgPool, id: Uuid) -> Result<bool, ApiError> {
+        let result = sqlx::query!(
+            "UPDATE workspaces SET is_active = false, updated_at = now() WHERE id = $1 AND is_active = true",
+            id,
+        )
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE projects SET is_active = false, updated_at = now() WHERE workspace_id = $1 AND is_active = true",
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_members(
+        pool: &PgPool,
+        workspace_id: Uuid,
+    ) -> Result<Vec<WorkspaceMember>, ApiError> {
+        let rows = sqlx::query!(
+            r#"SELECT wm.id, wm.workspace_id, wm.user_id, u.name as user_name,
+                      wm.role, wm.created_at
+               FROM workspace_members wm
+               JOIN users u ON u.id = wm.user_id
+               WHERE wm.workspace_id = $1
+               ORDER BY wm.created_at"#,
+            workspace_id,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| WorkspaceMember {
+                id: r.id,
+                workspace_id: r.workspace_id,
+                user_id: r.user_id,
+                user_name: r.user_name,
+                role: r.role,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    pub async fn add_member(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        role: &str,
+    ) -> Result<(), ApiError> {
+        sqlx::query!(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+            workspace_id,
+            user_id,
+            role,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_member(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let result = sqlx::query!(
+            "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+            workspace_id,
+            user_id,
+        )
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
 
 async fn require_workspace_member(
     state: &PlatformState,
@@ -150,8 +452,7 @@ async fn require_workspace_admin(
 async fn create_workspace(
     State(state): State<PlatformState>,
     auth: AuthUser,
-    // TODO: wire from platform crate — workspace::CreateWorkspaceRequest
-    Json(body): Json<crate::workspace::CreateWorkspaceRequest>,
+    Json(body): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
     validation::check_name(&body.name)?;
     if let Some(ref dn) = body.display_name {
@@ -226,8 +527,7 @@ async fn update_workspace(
     State(state): State<PlatformState>,
     auth: AuthUser,
     Path(id): Path<Uuid>,
-    // TODO: wire from platform crate — workspace::UpdateWorkspaceRequest
-    Json(body): Json<crate::workspace::UpdateWorkspaceRequest>,
+    Json(body): Json<UpdateWorkspaceRequest>,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     auth.check_workspace_scope(id)?;
     require_workspace_admin(&state, &auth, id).await?;
@@ -364,8 +664,7 @@ async fn add_member(
     State(state): State<PlatformState>,
     auth: AuthUser,
     Path(id): Path<Uuid>,
-    // TODO: wire from platform crate — workspace::AddMemberRequest
-    Json(body): Json<crate::workspace::AddMemberRequest>,
+    Json(body): Json<AddMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     auth.check_workspace_scope(id)?;
     require_workspace_admin(&state, &auth, id).await?;

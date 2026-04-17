@@ -12,11 +12,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, send_audit};
-use platform_types::AuthUser;
-use platform_types::ApiError;
-use platform_types::validation;
 use crate::state::PlatformState;
+use platform_types::ApiError;
+use platform_types::AuthUser;
+use platform_types::validation;
+use platform_types::{AuditEntry, send_audit};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -207,21 +207,20 @@ async fn trigger_pipeline(
             .repo_path
             .ok_or_else(|| ApiError::BadRequest("project has no repo path".into()))?,
     );
-    // TODO: wire from platform-pipeline crate
-    let pipeline_id = crate::pipeline::trigger::on_api(
+    let pipeline_id = platform_pipeline::trigger::on_api(
         &state.pool,
         &repo_path,
         id,
         &body.git_ref,
         auth.user_id,
-        &state.config.kaniko_image,
+        &state.config.pipeline.kaniko_image,
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(|e| ApiError::Internal(e.into()))?;
 
     // Notify executor
-    // TODO: wire from platform-pipeline crate
-    crate::pipeline::trigger::notify_executor(&state, pipeline_id).await;
+    platform_pipeline::trigger::notify_executor(&state.pipeline_notify, &state.valkey, pipeline_id)
+        .await;
 
     send_audit(
         &state.audit_tx,
@@ -378,10 +377,76 @@ async fn cancel_pipeline(
         return Err(ApiError::NotFound("pipeline".into()));
     }
 
-    // TODO: wire from platform-pipeline crate
-    crate::pipeline::executor::cancel_pipeline(&state, pipeline_id)
-        .await
-        .map_err(ApiError::from)?;
+    // Inline cancel logic (avoids needing PipelineServices trait impl)
+    let current_status_str =
+        sqlx::query_scalar::<_, String>("SELECT status FROM pipelines WHERE id = $1")
+            .bind(pipeline_id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    let to = platform_pipeline::PipelineStatus::Cancelled;
+    if let Some(current) = platform_pipeline::PipelineStatus::parse(&current_status_str) {
+        if !current.can_transition_to(to) {
+            return Err(ApiError::BadRequest(format!(
+                "cannot cancel pipeline in status '{current_status_str}'"
+            )));
+        }
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "unknown pipeline status '{current_status_str}'"
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE pipelines SET status = $2, finished_at = now() WHERE id = $1 AND status = $3",
+    )
+    .bind(pipeline_id)
+    .bind(to.as_str())
+    .bind(&current_status_str)
+    .execute(&state.pool)
+    .await?;
+
+    // Skip remaining pending steps
+    sqlx::query(
+        "UPDATE pipeline_steps SET status = 'skipped', finished_at = now() WHERE pipeline_id = $1 AND status = 'pending'",
+    )
+    .bind(pipeline_id)
+    .execute(&state.pool)
+    .await?;
+
+    // Delete running pods (best-effort)
+    let short_id = &pipeline_id.to_string()[..8];
+    let ns_slug = sqlx::query_scalar::<_, String>(
+        "SELECT p.namespace_slug FROM pipelines pl JOIN projects p ON p.id = pl.project_id WHERE pl.id = $1",
+    )
+    .bind(pipeline_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let namespace = ns_slug.map_or_else(
+        || state.config.pipeline.pipeline_namespace.clone(),
+        |slug| {
+            platform_k8s::pipeline_namespace_name(
+                state.config.core.ns_prefix.as_deref(),
+                &slug,
+                short_id,
+            )
+        },
+    );
+
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(state.kube.clone(), &namespace);
+    let label = format!("platform.io/pipeline={pipeline_id}");
+    let lp = kube::api::ListParams::default().labels(&label);
+    if let Ok(pod_list) = pods.list(&lp).await {
+        for pod in pod_list {
+            if let Some(name) = pod.metadata.name {
+                let _ = pods
+                    .delete(&name, &kube::api::DeleteParams::default())
+                    .await;
+            }
+        }
+    }
 
     send_audit(
         &state.audit_tx,
@@ -466,7 +531,7 @@ async fn stream_live_logs(
     pipeline_id: Uuid,
     step_name: &str,
 ) -> Result<Response, ApiError> {
-    let namespace = &state.config.pipeline_namespace;
+    let namespace = &state.config.pipeline.pipeline_namespace;
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(state.kube.clone(), namespace);
 
@@ -778,7 +843,10 @@ async fn fetch_child_files(
         .collect())
 }
 
-async fn fetch_pipeline(state: &PlatformState, pipeline_id: Uuid) -> Result<PipelineResponse, ApiError> {
+async fn fetch_pipeline(
+    state: &PlatformState,
+    pipeline_id: Uuid,
+) -> Result<PipelineResponse, ApiError> {
     let row = sqlx::query!(
         r#"
         SELECT id, project_id, trigger, git_ref, commit_sha, status,
@@ -805,8 +873,7 @@ async fn fetch_pipeline(state: &PlatformState, pipeline_id: Uuid) -> Result<Pipe
     })
 }
 
-// TODO: wire from platform-pipeline crate
-use crate::pipeline::slug;
+use platform_pipeline::slug;
 
 /// Sanitize a filename for use in Content-Disposition headers.
 /// Only allows alphanumeric characters, hyphens, underscores, and dots.

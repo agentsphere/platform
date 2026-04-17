@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, send_audit};
 use platform_types::{ApiError, AuthUser, Permission};
+use platform_types::{AuditEntry, send_audit};
 // TODO: wire from platform crate — slugify_namespace
 use platform_k8s::slugify_namespace;
 
@@ -206,21 +206,22 @@ pub async fn setup_project_infrastructure(
     namespace_slug: &str,
 ) -> Result<(), ApiError> {
     let project_id_str = project_id.to_string();
-    let prod_ns = state.config.project_namespace(namespace_slug, "prod");
+    let prod_ns = state.config.core.project_namespace(namespace_slug, "prod");
 
     // 1. Create prod namespace
     let svc_ns = state
         .config
+        .core
         .ns_prefix
         .as_deref()
-        .unwrap_or(&state.config.platform_namespace);
-    if let Err(e) = crate::deployer::namespace::ensure_namespace_with_services_ns(
+        .unwrap_or(&state.config.core.platform_namespace);
+    if let Err(e) = platform_k8s::ensure_namespace_with_services_ns(
         &state.kube,
         &prod_ns,
         "prod",
         &project_id_str,
-        &state.config.platform_namespace,
-        &state.config.gateway_namespace,
+        &state.config.core.platform_namespace,
+        &state.config.gateway.gateway_namespace,
         svc_ns,
         false,
     )
@@ -230,8 +231,8 @@ pub async fn setup_project_infrastructure(
     }
 
     // 4. Auto-create ops repo (best-effort -- don't block project creation)
-    match crate::deployer::ops_repo::init_ops_repo(
-        &state.config.ops_repos_path,
+    match platform_ops_repo::init_ops_repo(
+        &state.config.deployer.ops_repos_path,
         namespace_slug,
         "main",
     )
@@ -308,19 +309,64 @@ async fn resolve_workspace(
     workspace_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
     if let Some(ws_id) = workspace_id {
-        // TODO: wire from platform crate — workspace::service::is_member
-        if !crate::workspace::service::is_member(pool, ws_id, user_id).await? {
+        let checker = platform_auth::PgWorkspaceMembershipChecker::new(pool);
+        let is_member =
+            platform_types::WorkspaceMembershipChecker::is_member(&checker, ws_id, user_id)
+                .await
+                .map_err(ApiError::Internal)?;
+        if !is_member {
             return Err(ApiError::BadRequest(
                 "you are not a member of this workspace".into(),
             ));
         }
         Ok(ws_id)
     } else {
-        // TODO: wire from platform crate — workspace::service::get_or_create_default_workspace
-        crate::workspace::service::get_or_create_default_workspace(
-            pool, user_id, owner_name, owner_name,
+        // Get or create default workspace for user
+        let existing = sqlx::query_scalar!(
+            r#"SELECT id FROM workspaces WHERE owner_id = $1 AND is_active = true ORDER BY created_at LIMIT 1"#,
+            user_id,
         )
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        let ws_id = Uuid::new_v4();
+        let ws_name = format!("{owner_name}-personal");
+        let ws_display = format!("{owner_name}'s workspace");
+
+        let mut tx = pool.begin().await?;
+        sqlx::query!(
+            r#"INSERT INTO workspaces (id, name, display_name, description, owner_id)
+               VALUES ($1, $2, $3, 'Personal workspace', $4)"#,
+            ws_id,
+            ws_name,
+            ws_display,
+            user_id,
+        )
+        .execute(&mut *tx)
         .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.constraint() == Some("workspaces_name_key")
+            {
+                return ApiError::Conflict("workspace name already taken".into());
+            }
+            ApiError::from(e)
+        })?;
+
+        sqlx::query!(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            ws_id,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(ws_id)
     }
 }
 
@@ -357,14 +403,16 @@ async fn init_project_repo_and_workspace(
         .fetch_one(&state.pool)
         .await?;
 
-    let repo_path = crate::git::repo::init_bare_repo(
-        &state.config.git_repos_path,
+    let git_mgr = platform_git::CliGitRepoManager;
+    let repo_path = platform_git::traits::GitRepoManager::init_bare(
+        &git_mgr,
+        &state.config.git.git_repos_path,
         &owner_name,
         &body.name,
         default_branch,
     )
     .await
-    .map_err(ApiError::Internal)?;
+    .map_err(|e| ApiError::Internal(e.into()))?;
 
     let repo_path_str = repo_path.to_string_lossy().to_string();
 
@@ -672,7 +720,7 @@ async fn update_project(
         ));
     }
     if let Some(ref image) = body.agent_image {
-        validation::check_container_image(image)?;
+        validation::check_pipeline_image(image)?;
     }
 
     let project = sqlx::query_as!(

@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!: i64\"\n        FROM projects\n        WHERE is_active = true\n          AND ($1::uuid IS NULL OR owner_id = $1)\n          AND ($2::text IS NULL OR visibility = $2)\n          AND ($3::text IS NULL OR name ILIKE $3)\n          AND ($5::uuid IS NULL OR id = $5)\n          AND ($6::uuid IS NULL OR workspace_id = $6)\n          AND (\n              visibility = 'public'\n              OR visibility = 'internal'\n              OR owner_id = $4\n              OR EXISTS(\n                  SELECT 1 FROM user_roles ur\n                  JOIN role_permissions rp ON rp.role_id = ur.role_id\n                  JOIN permissions p ON p.id = rp.permission_id\n                  WHERE ur.user_id = $4 AND p.name = 'project:read'\n                  AND (ur.project_id = projects.id OR ur.project_id IS NULL)\n              )\n              OR EXISTS(\n                  SELECT 1 FROM workspace_members wm\n                  WHERE wm.workspace_id = projects.workspace_id\n                  AND wm.user_id = $4\n              )\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "180aee66582d17be7befca95ad6fa012f7886197e484c85f3dbb086ca15825d7"
+}

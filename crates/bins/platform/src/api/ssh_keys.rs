@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, send_audit, validation};
-use platform_git::ssh_keys;
 use crate::state::PlatformState;
+use platform_git::ssh_keys;
+use platform_types::{ApiError, AuditEntry, AuthUser, ListResponse, send_audit, validation};
 
 use super::helpers::require_admin;
 
@@ -82,7 +82,8 @@ async fn add_ssh_key(
     )
     .await?;
 
-    let parsed = ssh_keys::parse_ssh_public_key(&body.public_key)?;
+    let parsed = ssh_keys::parse_ssh_public_key(&body.public_key)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Enforce max 50 keys per user
     let count: i64 = sqlx::query_scalar!(

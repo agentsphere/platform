@@ -4173,6 +4173,7 @@ dependencies = [
  "platform-notify",
  "platform-observe",
  "platform-operator",
+ "platform-ops-repo",
  "platform-pipeline",
  "platform-registry",
  "platform-secrets",
@@ -4447,6 +4448,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ts-rs",
+ "url",
  "uuid",
 ]
 

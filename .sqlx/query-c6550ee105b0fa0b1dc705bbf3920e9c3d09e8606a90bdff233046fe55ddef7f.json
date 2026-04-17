@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_gpg_keys (id, user_id, key_id, fingerprint, public_key_armor, public_key_bytes, emails, expires_at, can_sign, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bytea",
+        "TextArray",
+        "Timestamptz",
+        "Bool",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c6550ee105b0fa0b1dc705bbf3920e9c3d09e8606a90bdff233046fe55ddef7f"
+}

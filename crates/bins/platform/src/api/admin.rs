@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use platform_auth::resolver;
 use platform_types::validation;
-use platform_types::{AuditEntry, ApiError, AuthUser, ListResponse, Permission, UserType, send_audit};
+use platform_types::{
+    ApiError, AuditEntry, AuthUser, ListResponse, Permission, UserType, send_audit,
+};
 
 use crate::api::helpers::require_admin;
 use crate::api::users::{CreateTokenResponse, ListParams, TokenResponse, UserResponse};

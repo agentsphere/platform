@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT u.name as \"owner_name!\", p.name as \"project_name!\"\n               FROM projects p\n               JOIN users u ON p.owner_id = u.id\n               WHERE p.id = $1 AND p.is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6da57c23e979a33b014ef45e684a56e261879d8d25848d7495dc2826e0cfcd87"
+}

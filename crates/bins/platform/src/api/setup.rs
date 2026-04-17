@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use platform_auth::password;
 use platform_types::validation;
-use platform_types::{AuditEntry, ApiError, send_audit};
+use platform_types::{ApiError, AuditEntry, send_audit};
 
 use crate::state::PlatformState;
 

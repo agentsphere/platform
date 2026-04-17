@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::helpers::require_project_read;
-use platform_types::{AuditEntry, ApiError, AuthUser, Permission, send_audit, validation};
-use platform_auth::resolver;
 use crate::state::PlatformState;
+use platform_auth::resolver;
+use platform_types::{ApiError, AuditEntry, AuthUser, Permission, send_audit, validation};
 
 // ---------------------------------------------------------------------------
 // Router

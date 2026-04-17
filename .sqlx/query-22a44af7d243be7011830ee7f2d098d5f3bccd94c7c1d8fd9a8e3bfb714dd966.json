@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.name as \"name!: String\",\n                  u.name as \"owner_name!: String\",\n                  p.agent_image\n           FROM projects p\n           JOIN users u ON u.id = p.owner_id\n           WHERE p.id = $1 AND p.is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_name!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_image",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "22a44af7d243be7011830ee7f2d098d5f3bccd94c7c1d8fd9a8e3bfb714dd966"
+}

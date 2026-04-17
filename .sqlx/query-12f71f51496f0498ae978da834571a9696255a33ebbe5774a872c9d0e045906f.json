@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO user_provider_keys (user_id, provider, encrypted_key, key_suffix)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (user_id, provider)\n        DO UPDATE SET\n            encrypted_key = EXCLUDED.encrypted_key,\n            key_suffix    = EXCLUDED.key_suffix,\n            updated_at    = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "12f71f51496f0498ae978da834571a9696255a33ebbe5774a872c9d0e045906f"
+}

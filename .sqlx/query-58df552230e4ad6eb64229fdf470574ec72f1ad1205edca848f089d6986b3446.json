@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, user_id, key_id, fingerprint, public_key_armor, emails, expires_at, can_sign, created_at\n           FROM user_gpg_keys\n           WHERE id = $1 AND user_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "key_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "fingerprint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "public_key_armor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "emails",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 6,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "can_sign",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "58df552230e4ad6eb64229fdf470574ec72f1ad1205edca848f089d6986b3446"
+}

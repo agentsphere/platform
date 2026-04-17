@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_ssh_keys SET last_used_at = now() WHERE fingerprint = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0cb1d4db11ea6d4731a452000517565ffd4ac89df5ca5ed5315656475910c81d"
+}

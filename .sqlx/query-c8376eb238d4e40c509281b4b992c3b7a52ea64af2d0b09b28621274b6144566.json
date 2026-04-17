@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.name as \"name!\", u.name as \"owner!\",\n                      p.default_branch as \"default_branch!\"\n               FROM projects p\n               JOIN users u ON p.owner_id = u.id\n               WHERE p.id = $1 AND p.is_active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "default_branch!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c8376eb238d4e40c509281b4b992c3b7a52ea64af2d0b09b28621274b6144566"
+}

@@ -12,38 +12,38 @@
 pub mod helpers;
 
 // -- Modules that compile against workspace crate APIs --
+pub mod admin;
+pub mod alerts;
 pub mod branch_protection;
 pub mod cli_auth;
+pub mod commands;
 pub mod dashboard;
 pub mod downloads;
+pub mod flags;
+pub mod gpg_keys;
 pub mod health;
+pub mod issues;
+pub mod llm_providers;
 pub mod mesh;
 pub mod notifications;
 pub mod releases;
-
-// -- Modules with remaining internal deps (files exist, not yet wired) --
-// TODO: uncomment as crate APIs are wired up
-// pub mod admin;           // needs platform_auth::resolver delegation functions
-// pub mod commands;        // needs crate::workspace, crate::agent::commands
-// pub mod deployments;     // needs crate::deployer, crate::store::eventbus
-// pub mod flags;           // needs validation::check_ssrf_url, check_email
-// pub mod gpg_keys;        // needs platform_git::gpg_keys
-// pub mod issues;          // needs validation::check_labels
-// pub mod llm_providers;   // needs platform_secrets::llm_providers, platform_agent::llm_validate
-// pub mod merge_requests;  // needs crate::git, crate::pipeline, crate::deployer
-// pub mod onboarding;      // needs crate::workspace, crate::onboarding
-// pub mod passkeys;        // needs crate::auth::passkey
-// pub mod pipelines;       // needs crate::pipeline::trigger, crate::pipeline::executor
-// pub mod preview;         // needs crate::deployer
-// pub mod projects;        // needs crate::workspace, crate::git, crate::deployer
-// pub mod secrets;         // needs crate::secrets::request, crate::workspace
-// pub mod sessions;        // needs platform_agent::service, platform_agent::pubsub_bridge
-// pub mod setup;           // needs crate::store::bootstrap, crate::workspace
-// pub mod ssh_keys;        // needs platform_git::ssh_keys
-// pub mod user_keys;       // needs platform_secrets::user_keys
+pub mod setup;
+pub mod ssh_keys;
+pub mod user_keys;
 pub mod users;
-// pub mod webhooks;        // needs validation::check_ssrf_url
-// pub mod workspaces;      // needs crate::workspace
+pub mod webhooks;
+
+pub mod deployments;
+pub mod merge_requests;
+#[allow(dead_code)]
+pub mod onboarding;
+pub mod passkeys;
+pub mod pipelines;
+pub mod preview;
+pub mod projects;
+pub mod secrets;
+pub mod sessions;
+pub mod workspaces;
 
 use axum::Router;
 
@@ -52,13 +52,34 @@ use crate::state::PlatformState;
 #[allow(dead_code)]
 pub fn router() -> Router<PlatformState> {
     Router::new()
+        .merge(admin::router())
+        .merge(alerts::router())
         .merge(branch_protection::router())
         .merge(cli_auth::router())
+        .merge(commands::router())
         .merge(dashboard::router())
         .merge(downloads::router())
+        .merge(flags::router())
+        .merge(gpg_keys::router())
         .merge(health::router())
+        .merge(issues::router())
+        .merge(llm_providers::router())
         .merge(mesh::router())
         .merge(notifications::router())
+        .merge(passkeys::router())
         .merge(releases::router())
+        .merge(setup::router())
+        .merge(ssh_keys::router())
+        .merge(user_keys::router())
         .merge(users::router())
+        .merge(preview::router())
+        .merge(sessions::router())
+        .merge(deployments::router())
+        .merge(merge_requests::router())
+        .merge(onboarding::router())
+        .merge(pipelines::router())
+        .merge(projects::router())
+        .merge(secrets::router())
+        .merge(webhooks::router())
+        .merge(workspaces::router())
 }

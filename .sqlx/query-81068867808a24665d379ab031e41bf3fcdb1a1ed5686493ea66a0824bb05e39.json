@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT number, auto_merge_by, auto_merge_method\n        FROM merge_requests\n        WHERE project_id = $1 AND status = 'open' AND auto_merge = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "number",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "auto_merge_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "auto_merge_method",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "81068867808a24665d379ab031e41bf3fcdb1a1ed5686493ea66a0824bb05e39"
+}

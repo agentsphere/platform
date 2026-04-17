@@ -1,0 +1,130 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, project_id, user_id, agent_user_id, prompt, status,\n               branch, pod_name, provider, provider_config,\n               cost_tokens, created_at, finished_at,\n               parent_session_id, spawn_depth, allowed_child_roles,\n               execution_mode, uses_pubsub, session_namespace\n        FROM agent_sessions WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "agent_user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "prompt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "pod_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "provider_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 10,
+        "name": "cost_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "parent_session_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "spawn_depth",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 15,
+        "name": "allowed_child_roles",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 16,
+        "name": "execution_mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "uses_pubsub",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
+        "name": "session_namespace",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "fd9b3c015d3035311e67b606f8e5688b69e7bdc549dd57fa591d5a5125f177c0"
+}

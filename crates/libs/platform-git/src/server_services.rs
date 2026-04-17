@@ -37,29 +37,11 @@ pub struct GpgKeyInfo {
 }
 
 // ---------------------------------------------------------------------------
-// GitServerServices — combined supertrait
+// GitRepoPathResolver — path lookup + scoped read checks
 // ---------------------------------------------------------------------------
 
-/// Combined services trait for git server operations.
-///
-/// The main binary provides an implementation backed by `AppState`.
-/// All DB access, auth, caching, and object storage are behind these methods.
-pub trait GitServerServices:
-    GitAuthenticator
-    + GitAccessControl
-    + ProjectResolver
-    + BranchProtectionProvider
-    + PostReceiveHandler
-    + Send
-    + Sync
-    + 'static
-{
-    /// Rate-limit git authentication attempts.
-    fn check_git_rate(&self, username: &str) -> impl Future<Output = Result<(), GitError>> + Send;
-
-    /// Update SSH key last-used timestamp (fire-and-forget).
-    fn update_ssh_key_last_used(&self, fingerprint: &str);
-
+/// Resolves repo paths and checks scoped read permissions for browser/UI access.
+pub trait GitRepoPathResolver: Send + Sync + 'static {
     /// Look up a project repo path by project ID (for browser API).
     fn get_project_repo_path(
         &self,
@@ -80,23 +62,44 @@ pub trait GitServerServices:
         token_scopes: Option<&[String]>,
     ) -> impl Future<Output = Result<(), GitError>> + Send;
 
-    /// Check whether a user is admin or project owner (for branch protection bypass).
-    fn check_admin_or_owner(
+    /// Check workspace boundary for a project (API token workspace scope).
+    fn check_workspace_boundary(
         &self,
-        user_id: Uuid,
-        project: &ResolvedProject,
-        allow_admin_bypass: bool,
-    ) -> impl Future<Output = Result<bool, anyhow::Error>> + Send;
-
-    /// Audit log a git push event.
-    fn audit_git_push(
-        &self,
-        user_id: Uuid,
-        user_name: &str,
         project_id: Uuid,
-        ip_addr: Option<&str>,
-    );
+        workspace_id: Uuid,
+    ) -> impl Future<Output = Result<bool, GitError>> + Send;
+}
 
+// ---------------------------------------------------------------------------
+// LfsObjectStore — presigned URLs + size limits for LFS
+// ---------------------------------------------------------------------------
+
+/// Object storage operations for Git LFS (presigned URLs, size limits).
+pub trait LfsObjectStore: Send + Sync + 'static {
+    /// Generate a presigned read URL for a LFS object.
+    fn presign_lfs_read(
+        &self,
+        path: &str,
+        duration: Duration,
+    ) -> impl Future<Output = Result<String, anyhow::Error>> + Send;
+
+    /// Generate a presigned write URL for a LFS object.
+    fn presign_lfs_write(
+        &self,
+        path: &str,
+        duration: Duration,
+    ) -> impl Future<Output = Result<String, anyhow::Error>> + Send;
+
+    /// Maximum allowed LFS object size in bytes.
+    fn max_lfs_object_bytes(&self) -> u64;
+}
+
+// ---------------------------------------------------------------------------
+// GitSignatureVerifier — GPG key lookup + signature cache
+// ---------------------------------------------------------------------------
+
+/// GPG key lookup and signature verification caching.
+pub trait GitSignatureVerifier: Send + Sync + 'static {
     /// Look up a GPG key by key ID for signature verification.
     fn lookup_gpg_key(
         &self,
@@ -116,30 +119,78 @@ pub trait GitServerServices:
         value: &str,
         ttl_secs: u64,
     ) -> impl Future<Output = Result<(), anyhow::Error>> + Send;
+}
 
-    /// Generate a presigned read URL for a LFS object.
-    fn presign_lfs_read(
+// ---------------------------------------------------------------------------
+// GitPushAudit — rate limiting, SSH key tracking, admin checks, audit logging
+// ---------------------------------------------------------------------------
+
+/// Rate limiting, SSH key tracking, admin/owner checks, and audit logging
+/// for git push operations.
+pub trait GitPushAudit: Send + Sync + 'static {
+    /// Rate-limit git authentication attempts.
+    fn check_git_rate(&self, username: &str) -> impl Future<Output = Result<(), GitError>> + Send;
+
+    /// Update SSH key last-used timestamp (fire-and-forget).
+    fn update_ssh_key_last_used(&self, fingerprint: &str);
+
+    /// Check whether a user is admin or project owner (for branch protection bypass).
+    fn check_admin_or_owner(
         &self,
-        path: &str,
-        duration: Duration,
-    ) -> impl Future<Output = Result<String, anyhow::Error>> + Send;
+        user_id: Uuid,
+        project: &ResolvedProject,
+        allow_admin_bypass: bool,
+    ) -> impl Future<Output = Result<bool, anyhow::Error>> + Send;
 
-    /// Generate a presigned write URL for a LFS object.
-    fn presign_lfs_write(
+    /// Audit log a git push event.
+    fn audit_git_push(
         &self,
-        path: &str,
-        duration: Duration,
-    ) -> impl Future<Output = Result<String, anyhow::Error>> + Send;
-
-    /// Maximum allowed LFS object size in bytes.
-    fn max_lfs_object_bytes(&self) -> u64;
-
-    /// Check workspace boundary for a project (API token workspace scope).
-    fn check_workspace_boundary(
-        &self,
+        user_id: Uuid,
+        user_name: &str,
         project_id: Uuid,
-        workspace_id: Uuid,
-    ) -> impl Future<Output = Result<bool, GitError>> + Send;
+        ip_addr: Option<&str>,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GitServerServices — marker supertrait + blanket impl
+// ---------------------------------------------------------------------------
+
+/// Combined services trait for git server operations.
+///
+/// This is a marker trait — all methods live in focused sub-traits.
+/// The blanket impl auto-derives `GitServerServices` for any type that
+/// implements all 9 sub-traits.
+pub trait GitServerServices:
+    GitAuthenticator
+    + GitAccessControl
+    + ProjectResolver
+    + BranchProtectionProvider
+    + PostReceiveHandler
+    + GitRepoPathResolver
+    + LfsObjectStore
+    + GitSignatureVerifier
+    + GitPushAudit
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<T> GitServerServices for T where
+    T: GitAuthenticator
+        + GitAccessControl
+        + ProjectResolver
+        + BranchProtectionProvider
+        + PostReceiveHandler
+        + GitRepoPathResolver
+        + LfsObjectStore
+        + GitSignatureVerifier
+        + GitPushAudit
+        + Send
+        + Sync
+        + 'static
+{
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +270,13 @@ mod tests {
         };
         let debug = format!("{user:?}");
         assert!(debug.contains("BrowserUser"));
+    }
+
+    #[test]
+    fn blanket_impl_links_sub_traits() {
+        // Compile-time verification that the blanket impl connects
+        // all 9 sub-traits to the GitServerServices marker.
+        fn _takes<T: GitServerServices>(_: &T) {}
     }
 
     #[test]

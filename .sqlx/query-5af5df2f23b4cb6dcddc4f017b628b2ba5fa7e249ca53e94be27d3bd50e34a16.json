@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE merge_requests\n        SET auto_merge = true, auto_merge_by = $3, auto_merge_method = $4, updated_at = now()\n        WHERE project_id = $1 AND number = $2 AND status = 'open'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5af5df2f23b4cb6dcddc4f017b628b2ba5fa7e249ca53e94be27d3bd50e34a16"
+}

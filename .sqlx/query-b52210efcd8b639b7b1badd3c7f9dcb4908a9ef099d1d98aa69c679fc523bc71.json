@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM secrets WHERE workspace_id = $1 AND project_id IS NULL AND name = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b52210efcd8b639b7b1badd3c7f9dcb4908a9ef099d1d98aa69c679fc523bc71"
+}

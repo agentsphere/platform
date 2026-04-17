@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE workspaces SET\n                display_name = COALESCE($2, display_name),\n                description = COALESCE($3, description),\n                updated_at = now()\n               WHERE id = $1 AND is_active = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6ee3d326d8dc99ee36708e7fc0d583c5d880b349efd4ebe089a77b1da46c027"
+}

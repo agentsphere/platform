@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sessions SET status = 'running', pod_name = $2, uses_pubsub = true, session_namespace = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d24c6ed3b9bddaefe4c53fcb5db5c0ac19151bb3b5342628b8322bccb21cab61"
+}

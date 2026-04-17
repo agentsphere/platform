@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET active_llm_provider = 'auto' WHERE id = $1 AND active_llm_provider = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fada9641d73078a1fc9edc6167a9f354b06885141ad81787fa7a9454046fcdf9"
+}

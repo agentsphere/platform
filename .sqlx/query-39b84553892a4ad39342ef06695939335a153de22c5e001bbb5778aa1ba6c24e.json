@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT SUM(ms.value) FROM metric_samples ms\n                   JOIN metric_series ser ON ser.id = ms.series_id\n                   WHERE ser.name = $1 AND ($2::jsonb IS NULL OR ser.labels @> $2)\n                   AND ms.timestamp > now() - $3 * interval '1 second'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "39b84553892a4ad39342ef06695939335a153de22c5e001bbb5778aa1ba6c24e"
+}

@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, project_id, workspace_id, name, description,\n               persistent_session, created_at, updated_at\n        FROM platform_commands\n        WHERE project_id = $1\n           OR (workspace_id = $2 AND project_id IS NULL)\n           OR (project_id IS NULL AND workspace_id IS NULL)\n        ORDER BY\n            CASE WHEN project_id IS NOT NULL THEN 0\n                 WHEN workspace_id IS NOT NULL THEN 1\n                 ELSE 2 END ASC,\n            name ASC\n        LIMIT $3 OFFSET $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "persistent_session",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "129cef4a224f07c0fd032cfce9c2de4f9c2205df1f47ca92c2248211f221f8d9"
+}

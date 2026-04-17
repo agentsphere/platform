@@ -12,18 +12,17 @@ use uuid::Uuid;
 
 use std::time::Instant;
 
+use crate::secrets_request::{MAX_PENDING_PER_SESSION, SecretRequest, SecretRequestStatus};
+use crate::state::PlatformState;
 use platform_agent::provider::{ProgressEvent, ProgressKind};
 use platform_agent::pubsub_bridge;
-use platform_types::{AuditEntry, send_audit};
-use platform_types::AuthUser;
-use platform_types::ApiError;
-use platform_types::Permission;
 use platform_auth::resolver;
 use platform_secrets::engine;
-// TODO: wire from platform-agent or secrets crate
-use crate::secrets::request::{MAX_PENDING_PER_SESSION, SecretRequest, SecretRequestStatus};
+use platform_types::ApiError;
+use platform_types::AuthUser;
+use platform_types::Permission;
 use platform_types::validation;
-use crate::state::PlatformState;
+use platform_types::{AuditEntry, send_audit};
 
 use super::helpers::{ListResponse, require_admin};
 
@@ -80,6 +79,7 @@ struct SecretRequestResponse {
 fn get_master_key(state: &PlatformState) -> Result<[u8; 32], ApiError> {
     let hex_str = state
         .config
+        .secrets
         .master_key
         .as_deref()
         .ok_or_else(|| ApiError::ServiceUnavailable("secrets engine not configured".into()))?;
@@ -808,8 +808,17 @@ async fn require_workspace_admin(
     auth: &AuthUser,
     workspace_id: Uuid,
 ) -> Result<(), ApiError> {
-    // TODO: wire from platform crate
-    if !crate::workspace::service::is_admin(&state.pool, workspace_id, auth.user_id).await? {
+    let is_admin = sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM workspace_members
+            WHERE workspace_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')
+        ) as "exists!""#,
+        workspace_id,
+        auth.user_id,
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    if !is_admin {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -820,8 +829,17 @@ async fn require_workspace_member_for_secrets(
     auth: &AuthUser,
     workspace_id: Uuid,
 ) -> Result<(), ApiError> {
-    // TODO: wire from platform crate
-    if !crate::workspace::service::is_member(&state.pool, workspace_id, auth.user_id).await? {
+    let is_member = sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM workspace_members
+            WHERE workspace_id = $1 AND user_id = $2
+        ) as "exists!""#,
+        workspace_id,
+        auth.user_id,
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    if !is_member {
         return Err(ApiError::NotFound("workspace".into()));
     }
     Ok(())

@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT number, source_branch, target_branch, auto_merge_method, title\n               FROM merge_requests\n               WHERE project_id = $1 AND status = 'open' AND auto_merge = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "number",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "target_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "auto_merge_method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "title",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "3296f5a2c8eeeb7608ba8ddeb6b6acf6d7d71a32f7bf53599f77663f333f5753"
+}

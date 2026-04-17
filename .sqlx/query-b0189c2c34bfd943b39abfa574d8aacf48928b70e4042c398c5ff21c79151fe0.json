@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, owner_id, workspace_id, name, display_name, description, visibility, default_branch,\n               namespace_slug, agent_image, is_active, created_at, updated_at\n        FROM projects\n        WHERE is_active = true\n          AND ($1::uuid IS NULL OR owner_id = $1)\n          AND ($2::text IS NULL OR visibility = $2)\n          AND ($3::text IS NULL OR name ILIKE $3)\n          AND ($5::uuid IS NULL OR id = $5)\n          AND ($6::uuid IS NULL OR workspace_id = $6)\n          AND (\n              visibility = 'public'\n              OR visibility = 'internal'\n              OR owner_id = $4\n              OR EXISTS(\n                  SELECT 1 FROM user_roles ur\n                  JOIN role_permissions rp ON rp.role_id = ur.role_id\n                  JOIN permissions p ON p.id = rp.permission_id\n                  WHERE ur.user_id = $4 AND p.name = 'project:read'\n                  AND (ur.project_id = projects.id OR ur.project_id IS NULL)\n              )\n              OR EXISTS(\n                  SELECT 1 FROM workspace_members wm\n                  WHERE wm.workspace_id = projects.workspace_id\n                  AND wm.user_id = $4\n              )\n          )\n        ORDER BY created_at DESC\n        LIMIT $7 OFFSET $8\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "visibility",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "default_branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "namespace_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "agent_image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b0189c2c34bfd943b39abfa574d8aacf48928b70e4042c398c5ff21c79151fe0"
+}

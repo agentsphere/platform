@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT u.id as \"user_id!\", u.name as \"user_name!\",\n                      t.project_id, t.scope_workspace_id, t.scopes\n               FROM api_tokens t\n               JOIN users u ON t.user_id = u.id\n               WHERE t.token_hash = $1\n                 AND u.name = $2\n                 AND u.is_active = true\n                 AND (t.expires_at IS NULL OR t.expires_at > now())",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "scope_workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "scopes",
+        "type_info": "TextArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "ed0678cd07849d06478559f0c6089dab300ab8c0eedd09d681f6c73d4cf3aa4e"
+}
