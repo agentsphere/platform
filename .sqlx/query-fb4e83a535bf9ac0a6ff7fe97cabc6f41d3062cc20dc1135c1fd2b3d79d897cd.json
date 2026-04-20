@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT digest, media_type, content, size_bytes\n               FROM registry_manifests\n               WHERE repository_id = $1 AND digest = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "media_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fb4e83a535bf9ac0a6ff7fe97cabc6f41d3062cc20dc1135c1fd2b3d79d897cd"
+}

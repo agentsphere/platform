@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM registry_manifests WHERE repository_id = $1 AND digest = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "03580aaf79137c8d3b673b6815f4369ca30cdbf1537e3e4c2379caeb17baa5e4"
+}

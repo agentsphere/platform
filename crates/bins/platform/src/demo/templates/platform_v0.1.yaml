@@ -1,0 +1,61 @@
+pipeline:
+  on:
+    push:
+      branches: ["main"]
+    mr:
+      actions: [opened, synchronized]
+
+  steps:
+    - name: build-app
+      type: imagebuild
+      imageName: app
+      dockerfile: Dockerfile
+
+    - name: build-test
+      type: imagebuild
+      imageName: test
+      dockerfile: Dockerfile.test
+      only:
+        events: [mr]
+
+    - name: e2e
+      depends_on: [build-app, build-test]
+      only:
+        events: [mr]
+      deploy_test:
+        test_image: $REGISTRY/$PROJECT/test:$COMMIT_SHA
+        manifests: testinfra/
+        readiness_timeout: 120
+        wait_for_services: [platform-demo-app, platform-demo-db]
+
+    - name: sync-ops-repo
+      type: gitops_sync
+      depends_on: [build-app]
+      only:
+        events: [push]
+        branches: ["main"]
+      gitops:
+        copy: ["deploy/", ".platform.yaml"]
+
+    - name: watch-deploy
+      type: deploy_watch
+      depends_on: [sync-ops-repo]
+      only:
+        events: [push]
+        branches: ["main"]
+      deploy_watch:
+        environment: staging
+        timeout: 300
+
+flags:
+  - key: new_checkout_flow
+    default_value: false
+    description: "Enable the new checkout experience"
+  - key: dark_mode
+    default_value: false
+    description: "Enable dark mode theme"
+
+deploy:
+  variables:
+    staging: deploy/variables_staging.yaml
+    production: deploy/variables_prod.yaml

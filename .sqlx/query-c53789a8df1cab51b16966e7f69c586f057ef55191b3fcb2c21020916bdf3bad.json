@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT b.size_bytes FROM registry_blobs b\n           JOIN registry_blob_links bl ON bl.blob_digest = b.digest\n           WHERE b.digest = $1 AND bl.repository_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c53789a8df1cab51b16966e7f69c586f057ef55191b3fcb2c21020916bdf3bad"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT b.size_bytes, b.minio_path FROM registry_blobs b\n           JOIN registry_blob_links bl ON bl.blob_digest = b.digest\n           WHERE b.digest = $1 AND bl.repository_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "minio_path",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "607ce31ea063fa20c3162b2ec97baf3381f2c62ab260361e1b3646366628cbdc"
+}

@@ -42,6 +42,9 @@ impl<'a> PgProjectResolver<'a> {
 
 impl ProjectResolver for PgProjectResolver<'_> {
     async fn resolve(&self, owner: &str, repo: &str) -> Result<ResolvedProject, GitError> {
+        // Strip .git suffix — git clients append it to HTTP URLs
+        let repo_name = repo.strip_suffix(".git").unwrap_or(repo);
+
         let row = sqlx::query!(
             r#"SELECT p.id as "project_id!", p.owner_id as "owner_id!",
                       p.default_branch as "default_branch!", p.visibility as "visibility!"
@@ -49,17 +52,17 @@ impl ProjectResolver for PgProjectResolver<'_> {
                JOIN users u ON p.owner_id = u.id
                WHERE u.name = $1 AND p.name = $2 AND p.is_active = true"#,
             owner,
-            repo,
+            repo_name,
         )
         .fetch_optional(self.pool)
         .await
         .map_err(|e| GitError::Other(anyhow::anyhow!(e)))?
-        .ok_or_else(|| GitError::NotFound(format!("{owner}/{repo}")))?;
+        .ok_or_else(|| GitError::NotFound(format!("{owner}/{repo_name}")))?;
 
         Ok(ResolvedProject {
             project_id: row.project_id,
             owner_id: row.owner_id,
-            repo_disk_path: self.repos_path.join(owner).join(format!("{repo}.git")),
+            repo_disk_path: self.repos_path.join(owner).join(format!("{repo_name}.git")),
             default_branch: row.default_branch,
             visibility: row.visibility,
         })
@@ -139,6 +142,7 @@ impl GitAuthenticator for PgGitAuthenticator<'_> {
         // Treat password as an API token
         let token_hash = platform_auth::token::hash_token(password);
 
+        // Try user-scoped token auth first (username matches a real user)
         let row = sqlx::query!(
             r#"SELECT u.id as "user_id!", u.name as "user_name!",
                       t.project_id, t.scope_workspace_id, t.scopes
@@ -153,16 +157,43 @@ impl GitAuthenticator for PgGitAuthenticator<'_> {
         )
         .fetch_optional(self.pool)
         .await
+        .map_err(|e| GitError::Other(anyhow::anyhow!(e)))?;
+
+        if let Some(row) = row {
+            return Ok(GitUser {
+                user_id: row.user_id,
+                user_name: row.user_name,
+                ip_addr: None,
+                boundary_project_id: row.project_id,
+                boundary_workspace_id: row.scope_workspace_id,
+                token_scopes: Some(row.scopes),
+            });
+        }
+
+        // Fallback: token-only auth (GIT_ASKPASS uses the token as both
+        // username and password, so the username won't match any user name).
+        let fallback = sqlx::query!(
+            r#"SELECT u.id as "user_id!", u.name as "user_name!",
+                      t.project_id, t.scope_workspace_id, t.scopes
+               FROM api_tokens t
+               JOIN users u ON t.user_id = u.id
+               WHERE t.token_hash = $1
+                 AND u.is_active = true
+                 AND (t.expires_at IS NULL OR t.expires_at > now())"#,
+            &token_hash,
+        )
+        .fetch_optional(self.pool)
+        .await
         .map_err(|e| GitError::Other(anyhow::anyhow!(e)))?
         .ok_or(GitError::Unauthorized)?;
 
         Ok(GitUser {
-            user_id: row.user_id,
-            user_name: row.user_name,
+            user_id: fallback.user_id,
+            user_name: fallback.user_name,
             ip_addr: None,
-            boundary_project_id: row.project_id,
-            boundary_workspace_id: row.scope_workspace_id,
-            token_scopes: Some(row.scopes),
+            boundary_project_id: fallback.project_id,
+            boundary_workspace_id: fallback.scope_workspace_id,
+            token_scopes: Some(fallback.scopes),
         })
     }
 

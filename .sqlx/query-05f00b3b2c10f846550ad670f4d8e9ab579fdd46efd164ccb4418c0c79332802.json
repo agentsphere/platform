@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                SELECT 1 FROM registry_blob_links\n                WHERE repository_id = $1 AND blob_digest = $2\n            ) as \"exists!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!: bool",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "05f00b3b2c10f846550ad670f4d8e9ab579fdd46efd164ccb4418c0c79332802"
+}

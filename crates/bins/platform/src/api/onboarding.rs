@@ -278,16 +278,15 @@ async fn create_demo_project(
 ) -> Result<Json<DemoProjectResponse>, ApiError> {
     require_admin(&state, &auth).await?;
 
-    // TODO: wire from platform-operator — onboarding::demo_project not yet extracted
-    // let (project_id, project_name) =
-    //     crate::onboarding::demo_project::create_demo_project(&state, auth.user_id)
-    //         .await
-    //         .map_err(ApiError::Internal)?;
-    let _ = &state;
-    let _ = auth;
-    Err(ApiError::Internal(anyhow::anyhow!(
-        "demo project creation not yet wired in platform crate"
-    )))
+    let (project_id, project_name) =
+        crate::demo::demo_project::create_demo_project(&state, auth.user_id)
+            .await
+            .map_err(ApiError::Internal)?;
+
+    Ok(Json(DemoProjectResponse {
+        project_id,
+        project_name,
+    }))
 }
 
 // ---------------------------------------------------------------------------

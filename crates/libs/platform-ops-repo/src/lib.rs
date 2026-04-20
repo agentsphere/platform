@@ -293,7 +293,10 @@ pub async fn sync_from_project_repo(
 
     if file_list.is_empty() {
         tracing::debug!(%commit_sha, "no deploy/ directory found at commit");
-        return get_head_sha(ops_repo_path).await;
+        return get_head_sha(ops_repo_path).await.or_else(|_| {
+            // Ops repo may have no commits yet — return a sentinel
+            Ok(String::from("0000000000000000000000000000000000000000"))
+        });
     }
 
     // Read each file from project repo
@@ -442,17 +445,18 @@ impl OpsRepoManager for OpsRepoService {
         source: &Path,
         branch: &str,
     ) -> anyhow::Result<()> {
-        // Look up the ops repo for this project
-        let ops_repo_id: Uuid =
-            sqlx::query_scalar("SELECT o.id FROM ops_repos o WHERE o.project_id = $1 LIMIT 1")
-                .bind(project_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("no ops repo for project {project_id}"))?;
+        // Look up the ops repo path directly (not via sync_repo, which calls
+        // get_head_sha and fails on freshly-initialised empty bare repos).
+        let ops_repo_path: String = sqlx::query_scalar(
+            "SELECT o.repo_path FROM ops_repos o WHERE o.project_id = $1 LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no ops repo for project {project_id}"))?;
 
-        let (ops_repo_path, _sha, _branch) = sync_repo(&self.pool, ops_repo_id).await?;
         let source_sha = get_head_sha(source).await?;
-        sync_from_project_repo(source, &ops_repo_path, branch, &source_sha).await?;
+        sync_from_project_repo(source, Path::new(&ops_repo_path), branch, &source_sha).await?;
         Ok(())
     }
 

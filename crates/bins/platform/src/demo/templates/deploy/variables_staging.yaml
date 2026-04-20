@@ -1,0 +1,11 @@
+# Staging-specific deploy variables.
+# Merged into ops repo values/staging.yaml during gitops_sync.
+replicas: 1
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+log_level: debug

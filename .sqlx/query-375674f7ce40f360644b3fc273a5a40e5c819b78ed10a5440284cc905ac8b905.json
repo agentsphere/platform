@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO registry_manifests (repository_id, digest, media_type, content, size_bytes)\n           VALUES ($1, $2, $3, $4, $5)\n           ON CONFLICT (repository_id, digest)\n           DO UPDATE SET media_type = $3, content = $4, size_bytes = $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "375674f7ce40f360644b3fc273a5a40e5c819b78ed10a5440284cc905ac8b905"
+}

@@ -50,6 +50,9 @@ sqlx = { version = "0.8", features = [
     "migrate",
 ] }
 
+# Encoding
+base64 = "0.22"
+
 # Cache / pubsub
 fred = { version = "10", features = ["subscriber-client"] }
 
@@ -66,6 +69,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 
 # IDs + time
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
@@ -96,6 +100,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 argon2 = "0.5"
+rand = "0.9"
 
 # URL parsing
 url = "2"
@@ -108,6 +113,11 @@ rust-embed = { version = "8", features = ["compression"] }
 
 # TypeScript type generation
 ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-compat", "serde-json-impl"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+prost = "0.14"
+rustls = "0.23"
 
 [lints.rust]
 unsafe_code = "forbid"

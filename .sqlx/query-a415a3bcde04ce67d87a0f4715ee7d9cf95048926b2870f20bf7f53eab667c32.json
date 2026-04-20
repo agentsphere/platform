@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO registry_blob_links (repository_id, blob_digest)\n           VALUES ($1, $2)\n           ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a415a3bcde04ce67d87a0f4715ee7d9cf95048926b2870f20bf7f53eab667c32"
+}

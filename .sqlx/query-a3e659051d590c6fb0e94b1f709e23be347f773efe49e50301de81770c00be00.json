@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO registry_tags (repository_id, name, manifest_digest)\n               VALUES ($1, $2, $3)\n               ON CONFLICT (repository_id, name)\n               DO UPDATE SET manifest_digest = $3, updated_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a3e659051d590c6fb0e94b1f709e23be347f773efe49e50301de81770c00be00"
+}

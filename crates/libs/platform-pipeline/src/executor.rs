@@ -969,7 +969,10 @@ async fn execute_single_step<Svc: PipelineServices>(
         step_type: &step.step_type,
         git_clone_image: &state.config.git_clone_image,
         has_artifacts: !step_artifacts.is_empty(),
-        proxy_binary_path: if state.config.dev_mode {
+        // Skip proxy wrapping for imagebuild (kaniko) steps — kaniko doesn't
+        // serve HTTP traffic and the proxy captures child output via OTLP,
+        // making build errors invisible in pod logs.
+        proxy_binary_path: if state.config.dev_mode && step.step_type != "imagebuild" {
             state.config.proxy_binary_path.as_deref()
         } else {
             None
@@ -1834,7 +1837,7 @@ async fn capture_logs<Svc: PipelineServices>(
     match pods.logs(pod_name, &init_log_params).await {
         Ok(logs) => {
             if failed {
-                let truncated: String = logs.chars().take(2000).collect();
+                let truncated: String = logs.chars().take(8000).collect();
                 tracing::warn!(
                     pod = pod_name,
                     step = step_name,
@@ -1860,7 +1863,7 @@ async fn capture_logs<Svc: PipelineServices>(
     match pods.logs(pod_name, &log_params).await {
         Ok(logs) => {
             if failed {
-                let truncated: String = logs.chars().take(2000).collect();
+                let truncated: String = logs.chars().take(8000).collect();
                 tracing::error!(
                     pod = pod_name,
                     step = step_name,
@@ -2018,6 +2021,87 @@ async fn create_registry_secret<Svc: PipelineServices>(
 
     tracing::debug!(%pipeline_id, %secret_name, "created registry auth secret");
     Ok((secret_name, token_hash))
+}
+
+/// Create the `platform-registry-pull` secret in a `deploy_test` namespace.
+///
+/// Auth is keyed to both `registry_url` and `node_registry_url` so that
+/// containerd (pulling via the `DaemonSet` proxy on Kind nodes) finds matching
+/// credentials.  The secret name matches what `testinfra` manifests reference.
+async fn create_deploy_test_pull_secret<Svc: PipelineServices>(
+    state: &PipelineState<Svc>,
+    project_id: Uuid,
+    ns_name: &str,
+) -> Result<(), PipelineError> {
+    let registry_url = state
+        .config
+        .registry_url
+        .as_deref()
+        .ok_or_else(|| PipelineError::Other(anyhow::anyhow!("registry_url not configured")))?;
+
+    // Resolve project owner
+    let owner_id: Uuid =
+        sqlx::query_scalar("SELECT owner_id FROM projects WHERE id = $1 AND is_active = true")
+            .bind(project_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow::anyhow!("project not found: {project_id}"))
+            })?;
+
+    // Create short-lived API token (1 hour)
+    let (raw_token, token_hash) = token::generate_api_token();
+    sqlx::query(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at)
+         VALUES ($1, $2, 'registry-pull-deploy-test', $3, now() + interval '1 hour')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await?;
+
+    // Look up username for Docker config
+    let user_name = sqlx::query_scalar::<_, String>("SELECT name FROM users WHERE id = $1")
+        .bind(owner_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    // Build Docker config with auth for both registry URLs
+    let basic_auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("{user_name}:{raw_token}"));
+    let auth_entry = serde_json::json!({ "auth": basic_auth });
+    let mut auths = serde_json::Map::new();
+    auths.insert(registry_url.to_owned(), auth_entry.clone());
+    if let Some(node_url) = node_registry_url(&state.config)
+        && node_url != registry_url
+    {
+        auths.insert(node_url.to_owned(), auth_entry);
+    }
+    let config_json = serde_json::json!({ "auths": auths });
+
+    let secret = Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some("platform-registry-pull".into()),
+            labels: Some(BTreeMap::from([(
+                "platform.io/project".into(),
+                project_id.to_string(),
+            )])),
+            ..Default::default()
+        },
+        string_data: Some(BTreeMap::from([(
+            ".dockerconfigjson".into(),
+            config_json.to_string(),
+        )])),
+        type_: Some("kubernetes.io/dockerconfigjson".into()),
+        ..Default::default()
+    };
+
+    let secrets: Api<Secret> = Api::namespaced(state.kube.clone(), ns_name);
+    secrets.create(&PostParams::default(), &secret).await?;
+
+    tracing::debug!(%project_id, %ns_name, "created deploy_test registry pull secret");
+    Ok(())
 }
 
 /// Clean up the registry auth K8s Secret and the short-lived API token.
@@ -2664,13 +2748,11 @@ async fn execute_deploy_test_step<Svc: PipelineServices>(
         namespace: ns_name.clone(),
     };
 
-    // 2. Create registry pull secret in test namespace
-    if let Err(e) = state
-        .services
-        .ensure_pull_secret(&state.kube, &ns_name, project_id)
-        .await
-    {
-        tracing::warn!(error = %e, %ns_name, "failed to ensure registry pull secret for test namespace");
+    // 2. Create `platform-registry-pull` secret in test namespace.
+    //    Auth must be keyed to node_registry_url (DaemonSet proxy) so containerd
+    //    can find matching credentials when pulling images.
+    if let Err(e) = create_deploy_test_pull_secret(state, project_id, &ns_name).await {
+        tracing::warn!(error = %e, %ns_name, "failed to create registry pull secret for test namespace");
     }
 
     // 2b. Inject project secrets (scope: test/all) + OTEL tokens into test namespace

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Order History</h1>
+
+{% if not orders %}
+<div class="bg-gray-800 rounded-xl border border-gray-700 p-12 text-center">
+    <p class="text-gray-400 text-lg mb-4">No orders yet</p>
+    <a href="/" class="text-blue-400 hover:text-blue-300">&larr; Start shopping</a>
+</div>
+{% else %}
+<div class="space-y-4">
+    {% for order in orders %}
+    <div class="bg-gray-800 rounded-xl border border-gray-700 p-6">
+        <div class="flex items-center justify-between mb-3">
+            <div>
+                <span class="text-sm text-gray-400">Order #{{ order.id }}</span>
+                <span class="ml-3 text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full uppercase">{{ order.status }}</span>
+            </div>
+            <span class="text-sm text-gray-500">{{ order.created_at.strftime('%b %d, %Y %H:%M') if order.created_at.strftime is defined else order.created_at }}</span>
+        </div>
+        <div class="divide-y divide-gray-700">
+            {% for item in order.items %}
+            <div class="py-2 flex justify-between text-sm">
+                <span>{{ item.name }} &times; {{ item.quantity }}</span>
+                <span class="text-gray-400">${{ "%.2f" | format(item.price_cents * item.quantity / 100) }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        <div class="border-t border-gray-600 pt-3 mt-3 text-right">
+            <span class="text-lg font-bold text-blue-400">${{ "%.2f" | format(order.total_cents / 100) }}</span>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

@@ -446,10 +446,8 @@ mod tests {
     fn app_git_server_services_satisfies_marker() {
         // Compile-time verification that AppGitServerServices satisfies
         // GitServerServices via the blanket impl.
-        fn _assert<T: platform_git::GitServerServices>() {}
-        fn _check() {
-            _assert::<AppGitServerServices>();
-        }
+        fn assert_impl<T: platform_git::GitServerServices>() {}
+        assert_impl::<AppGitServerServices>();
     }
 
     #[test]

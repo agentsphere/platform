@@ -628,20 +628,14 @@ async fn handle_rolling_back<Svc: ReconcilerServices>(
     record_history(state, release, "rolled_back", "rolled_back", Some(0)).await;
     fire_webhook(state, release, "rolled_back").await;
 
-    let event = serde_json::json!({
-        "ReleaseRolledBack": {
-            "release_id": release.id,
-            "project_id": release.project_id,
-            "reason": "rollback requested",
-        }
-    });
-    let _ = state
-        .services
-        .publish_event(
-            &state.valkey,
-            &serde_json::to_string(&event).unwrap_or_default(),
-        )
-        .await;
+    let event = platform_types::PlatformEvent::ReleaseRolledBack {
+        release_id: release.id,
+        project_id: release.project_id,
+        reason: "rollback requested".into(),
+    };
+    if let Ok(json) = serde_json::to_string(&event) {
+        let _ = state.services.publish_event(&state.valkey, &json).await;
+    }
 
     Ok(())
 }
@@ -1662,20 +1656,15 @@ async fn publish_release_promoted<Svc: ReconcilerServices>(
     state: &DeployerState<Svc>,
     release: &PendingRelease,
 ) {
-    let event = serde_json::json!({
-        "ReleasePromoted": {
-            "release_id": release.id,
-            "project_id": release.project_id,
-            "image_ref": release.image_ref,
-        }
-    });
-    let _ = state
-        .services
-        .publish_event(
-            &state.valkey,
-            &serde_json::to_string(&event).unwrap_or_default(),
-        )
-        .await;
+    let event = platform_types::PlatformEvent::ReleasePromoted {
+        release_id: release.id,
+        project_id: release.project_id,
+        image_ref: release.image_ref.clone(),
+    };
+    let Ok(json) = serde_json::to_string(&event) else {
+        return;
+    };
+    let _ = state.services.publish_event(&state.valkey, &json).await;
 }
 
 // ---------------------------------------------------------------------------

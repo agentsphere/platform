@@ -7,26 +7,14 @@
 //! with background tasks for pipeline execution, deployment reconciliation,
 //! health monitoring, and event processing.
 
-mod api;
-mod bootstrap;
-mod config;
-mod eventbus;
-mod git;
-mod git_services;
-mod middleware;
-mod passkey;
-mod secrets_request;
-mod services;
-mod state;
-mod ui;
-
 use std::sync::Arc;
 
 use fred::interfaces::ClientLike;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::PlatformConfig;
-use crate::state::PlatformState;
+use platform_next::config::PlatformConfig;
+use platform_next::state::PlatformState;
+use platform_next::{api, eventbus, git, registry, services, ui};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -104,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(api::router())
+        .merge(registry::router())
         .fallback(ui::static_handler)
         .with_state(state.clone())
         .merge(git::router(&state))
@@ -175,16 +164,27 @@ async fn init_infrastructure(config: PlatformConfig) -> anyhow::Result<PlatformS
     tracing::info!("valkey connected");
 
     // ── MinIO ─────────────────────────────────────────────────────────────
-    let mut builder = opendal::services::S3::default()
+    let builder = opendal::services::S3::default()
         .endpoint(&config.storage.minio_endpoint)
         .access_key_id(&config.storage.minio_access_key)
         .secret_access_key(&config.storage.minio_secret_key)
         .bucket("platform")
         .region("us-east-1");
-    if config.storage.minio_insecure {
-        builder = builder.allow_anonymous();
-    }
-    let minio = opendal::Operator::new(builder)?.finish();
+    let minio = {
+        let op = opendal::Operator::new(builder)?.finish();
+        if config.storage.minio_insecure {
+            // Accept self-signed TLS certs (dev/test MinIO with generated certs)
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("insecure reqwest client: {e}"))?;
+            op.layer(opendal::layers::HttpClientLayer::new(
+                opendal::raw::HttpClient::with(client),
+            ))
+        } else {
+            op
+        }
+    };
     tracing::info!("minio configured");
 
     // ── Kubernetes ────────────────────────────────────────────────────────
