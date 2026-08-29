@@ -17,7 +17,7 @@ anyhow = "1"
 thiserror = "2"
 tempfile = "3"
 fred = { version = "10", features = ["subscriber-client"] }
-notify = "7"
+notify = "8"
 
 [dev-dependencies]
 serial_test = "3"
